@@ -1,0 +1,20 @@
+services:
+  postgres:
+    image: postgres:17
+    container_name: flooring-sales-portal-postgres
+    environment:
+      POSTGRES_DB: flooring_sales_portal
+      POSTGRES_USER: flooring_user
+      POSTGRES_PASSWORD: flooring_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U flooring_user -d flooring_sales_portal"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
