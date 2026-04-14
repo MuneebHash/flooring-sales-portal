@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Java / Maven
+**/target/
+*.class
+
+# Node
+node_modules/
+dist/
+
+# Env
+.env
+.env.*
