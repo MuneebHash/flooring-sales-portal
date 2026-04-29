@@ -468,6 +468,14 @@ After adding a payment, backend returns the payment summary inside the standard 
 }
 ```
 
+### Payment restrictions
+
+- salesperson cannot delete payments in MVP
+- salesperson cannot edit existing payments in MVP
+- payment amount must be greater than 0
+- payment amount must not exceed the latest official invoice version's `balance_due`
+- no overpayments in MVP
+
 ### Auto invoice version on payment
 
 Every time a payment is added, backend must automatically generate a new payment-driven invoice version.
@@ -545,6 +553,21 @@ If preconditions are not met, return 422 with a structured body:
 - payment-driven invoice versions must not silently include unsent live order edits
 - old versions are never modified
 - old versions remain in invoice history
+
+
+### Invoice due date rule
+
+Invoice `due_date` is derived from the order's `proposed_lay_date`, not from `invoice_date`.
+
+For manual invoice versions created by Create Invoice or Rewrite Invoice:
+
+- `due_date = proposed_lay_date - 2 calendar days`
+- `proposed_lay_date` must be present before invoice creation/rewrite
+- `due_date` may be earlier than `invoice_date`
+
+Payment-driven invoice versions carry forward the latest official invoice's `due_date` unchanged.
+
+Customer payment date does not change `due_date`.
 
 ### What is stored in the invoice snapshot (internal)
 Each invoice snapshot stores internally:
