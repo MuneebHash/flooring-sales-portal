@@ -468,20 +468,19 @@ After adding a payment, backend returns the payment summary inside the standard 
 }
 ```
 
-### Payment restrictions
-- salesperson cannot delete payments in MVP
-- salesperson cannot edit existing payments in MVP
-- no zero-value payments allowed (amount must be > 0)
-
 ### Auto invoice version on payment
-Every time a payment is added, backend must automatically generate a new invoice version/snapshot.
-This new version is built from:
-- current live order state at that moment
-- current total payments at that moment
 
-It must NOT be built from a previous invoice snapshot.
-Every invoice version is a standalone snapshot of the order and payment state at the time it was created.
+Every time a payment is added, backend must automatically generate a new payment-driven invoice version.
 
+This payment-driven version:
+- carries forward the latest official invoice sale snapshot
+- updates `total_paid`
+- updates `balance_due`
+- does not make unsent live order edits official
+
+Payment balance is based on the latest official invoice version’s `balance_due`, not on unsent live order edits.
+
+To make live order edits official, the salesperson must use Rewrite Invoice first.
 ---
 
 ## 14. Invoice Rules
