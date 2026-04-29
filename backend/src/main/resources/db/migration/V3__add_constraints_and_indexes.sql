@@ -367,9 +367,6 @@ ALTER TABLE invoice
     ADD CONSTRAINT chk_invoice_version_positive
     CHECK (version_number > 0);
 ALTER TABLE invoice
-    ADD CONSTRAINT chk_invoice_due_date_gte_invoice_date
-    CHECK (due_date IS NULL OR due_date >= invoice_date);
-ALTER TABLE invoice
     ADD CONSTRAINT chk_invoice_details_not_blank
     CHECK (trim(details_of_sale_snapshot) <> '');
 ALTER TABLE invoice

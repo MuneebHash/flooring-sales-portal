@@ -99,6 +99,16 @@ Examples:
 }
 ```
 
+### File binary I/O exception
+
+File upload and file download endpoints are the only allowed exception to the JSON-only request and response rules.
+
+- Upload endpoints may accept `multipart/form-data` requests.
+- Download endpoints may return raw binary file bytes with the file's stored `mime_type`.
+- Error responses for these endpoints still use the standard JSON error wrapper.
+- This exception applies only to endpoints whose explicit purpose is file binary I/O, such as attachment upload, attachment file download, and invoice PDF download.
+- Every other endpoint in the system remains JSON-only.
+
 ### Null vs absent
 - null fields are included in responses with value `null`
 - optional fields not provided in requests can be omitted entirely
@@ -528,11 +538,12 @@ If preconditions are not met, return 422 with a structured body:
 ```
 
 ### Invoice versioning
-- first invoice = version 1 (created by Create Invoice)
-- Rewrite Invoice = new version number (2, 3, ...)
-- Add Payment = also creates a new version automatically
-- every version is a full standalone snapshot built from current live order state + current total payments at that moment
-- a new version is never built from a previous invoice snapshot
+- first invoice = version 1, created by Create Invoice
+- manual Rewrite Invoice = new version number, created from current live order state
+- Add Payment = also creates a new payment-driven invoice version automatically
+- manual invoice versions make the current live order state official
+- payment-driven invoice versions carry forward the latest official sale snapshot and only update payment fields: `total_paid` and `balance_due`
+- payment-driven invoice versions must not silently include unsent live order edits
 - old versions are never modified
 - old versions remain in invoice history
 
@@ -644,11 +655,28 @@ A new invoice version is created only when the user clicks Rewrite Invoice.
 
 ## 18. Order Numbering
 
-- `order_id` is an internal surrogate primary key — never shown to users
-- `order_sequence_number` is the business-facing sequential number, unique per business
-- `order_number` is the formatted display string (e.g., `ORD-1-0001`)
-- the backend generates both `order_sequence_number` and `order_number` at order creation
-- the frontend never sends these values
+Order number format for MVP:
+
+{store_code}.{salesperson_code}.{order_sequence_number_padded_5}
+
+Example:
+store_code = 001
+salesperson_code = LW1
+order_sequence_number = 12345
+
+order_number = 001.LW1.12345
+
+Rules:
+- store_code comes from store.store_code
+- salesperson_code comes from app_user.salesperson_code
+- order_sequence_number remains unique per business
+- the sequence number is padded to 5 digits
+  - 1 -> 00001
+  - 25 -> 00025
+  - 12345 -> 12345
+- backend generates order_number at order creation
+- frontend never sends order_number
+- once created, order_number does not change even if store_code or salesperson_code changes later
 
 ---
 
@@ -697,3 +725,4 @@ Before designing any endpoint, verify:
 - [ ] Financial recalculation is included in mutation responses where applicable
 - [ ] Error responses follow the standard shape
 - [ ] 404 is used instead of 403 for cross-tenant access
+- [ ] File upload/download endpoints use the narrow binary I/O exception; all other endpoints remain JSON-only
