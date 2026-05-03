@@ -11,10 +11,27 @@ ALTER TABLE business
     ADD COLUMN slug VARCHAR(50);
 
 UPDATE business
-SET slug = CASE business_id
-    WHEN 1 THEN 'aussie-floors-group'
-    WHEN 2 THEN 'premier-flooring-co'
-END;
+SET slug = CASE
+    WHEN business_id = 1 THEN 'aussie-floors-group'
+    WHEN business_id = 2 THEN 'premier-flooring-co'
+    ELSE concat(
+        COALESCE(
+            NULLIF(
+                regexp_replace(
+                    regexp_replace(lower(trim(name)), '[^a-z0-9]+', '-', 'g'),
+                    '(^-|-$)',
+                    '',
+                    'g'
+                ),
+                ''
+            ),
+            'business'
+        ),
+        '-',
+        business_id
+    )
+END
+WHERE slug IS NULL;
 
 ALTER TABLE business
     ALTER COLUMN slug SET NOT NULL;
@@ -48,4 +65,7 @@ UPDATE invoice i
 SET due_date = so.proposed_lay_date - 2
 FROM sales_order so
 WHERE i.order_id = so.order_id
+  AND i.invoice_id = 1
+  AND i.order_id = 1
+  AND i.due_date = DATE '2026-04-28'
   AND so.proposed_lay_date IS NOT NULL;
