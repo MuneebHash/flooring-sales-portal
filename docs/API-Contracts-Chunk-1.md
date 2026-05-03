@@ -1,6 +1,6 @@
 # Sales Portal MVP — API Contracts · Chunk 1 (Lock-Ready)
 
-**Source of truth:** `docs/api-conventions-locked.md`. Where this doc is less specific than the conventions doc, the conventions doc wins.
+**Source of truth:** `docs/API-Conventions.md`. Where this doc is less specific than the conventions doc, the conventions doc wins.
 
 **V5 follow-ups (noted only — not applied here):**
 1. `business.slug`

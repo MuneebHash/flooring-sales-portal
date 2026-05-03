@@ -1,7 +1,7 @@
 # Sales Portal MVP — API Contracts · Chunk 2 (Lock-Ready)
 
 **Source of truth priority:**
-1. `docs/api-conventions-locked.md`
+1. `docs/API-Conventions.md`
 2. Locked Chunk 1 contract
 3. Locked DB schema (V2 / V3)
 
@@ -32,11 +32,13 @@ Deferred to **Chunk 3** (product/charge lines, totals/GP, notes, attachments):
 - GP info modal contents (Screen 11.2 — pure financial display).
 - Notes and attachments.
 
-Deferred to **Chunk 4** (invoice / payments / invoice history / minimum operations portal):
+Deferred to **Chunk 4** (invoice / payments / invoice history):
 - Invoice creation, rewrite, history, PDF.
 - Invoice precondition validation (conventions §14).
 - Payment recording and the auto-invoice-version side effect (conventions §13).
-- Operations Portal endpoints.
+
+Deferred to a separate future Operations Portal API contract:
+- Operations Portal catalog management endpoints.
 
 Already locked in **Chunk 1** — not reopened here:
 - `auth/login`, `auth/select-store`, `auth/logout`.
