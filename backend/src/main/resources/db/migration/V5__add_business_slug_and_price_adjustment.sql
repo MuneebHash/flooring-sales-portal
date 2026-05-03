@@ -45,7 +45,7 @@ ALTER TABLE sales_order
 -- Locked rule: invoice.due_date = sales_order.proposed_lay_date - 2 days.
 
 UPDATE invoice i
-SET due_date = so.proposed_lay_date - INTERVAL '2 days'
+SET due_date = so.proposed_lay_date - 2
 FROM sales_order so
 WHERE i.order_id = so.order_id
   AND so.proposed_lay_date IS NOT NULL;
