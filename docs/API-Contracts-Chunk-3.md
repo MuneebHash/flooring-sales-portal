@@ -1,7 +1,7 @@
 # Sales Portal MVP — API Contracts · Chunk 3 (Lock-Ready)
 
 **Source of truth priority:**
-1. `docs/api-conventions-locked.md`
+1. `docs/API-Conventions.md`
 2. Locked Chunk 1 contract
 3. Locked Chunk 2 contract
 4. Locked DB schema (V2 / V3)
