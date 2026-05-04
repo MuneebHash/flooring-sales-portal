@@ -29,7 +29,180 @@ tags:
   - name: Invoices
   - name: Payments
 
-paths: {}
+paths:
+  /auth/login:
+    post:
+      tags:
+        - Auth
+      summary: Login
+      operationId: login
+      security: []
+      description: >
+        Business is resolved from the URL slug. Login uses salesperson_code and password.
+        On success, the server creates a server-side session cookie (no JWT). Single-store
+        users receive active_store_id immediately. Multi-store users receive
+        store_selection_required as true and active_store_id as null.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/select-store:
+    post:
+      tags:
+        - Auth
+      summary: Select active store
+      operationId: selectStore
+      description: >
+        Session is required, but an active store in session is not required on entry.
+        The user must belong to the business resolved from slug. The requested store
+        must belong to that business and the user must have access. Re-selecting the
+        same store returns 200 idempotently. Selecting a different store after one is
+        already selected returns 409 STORE_ALREADY_SELECTED.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SelectStoreRequest'
+      responses:
+        '200':
+          description: Store selected or idempotent same-store reselect
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SelectStoreResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /auth/logout:
+    post:
+      tags:
+        - Auth
+      summary: Logout
+      operationId: logout
+      description: >
+        Session is required. Active store in session is not required. The server
+        invalidates the server-side session and clears the session cookie.
+      responses:
+        '200':
+          description: Logged out
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NullDataResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders:
+    get:
+      tags:
+        - Dashboard
+      summary: List dashboard orders
+      operationId: listDashboardOrders
+      description: >
+        Standard protected endpoint. Data is scoped to the active (business_id, store_id).
+        Empty results return 200 with an empty data array. Default ordering is
+        sales_order.created_at descending. Search is case-insensitive partial match across
+        sales_order.order_number, order_customer.first_name, order_customer.last_name,
+        order_customer.email, and order_customer.company_name. CANCELLED orders are
+        included unless filtered out. No sort query parameter in MVP. Status filter is a
+        single enum value only.
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Status'
+        - $ref: '#/components/parameters/WeekYear'
+        - $ref: '#/components/parameters/WeekNumber'
+        - $ref: '#/components/parameters/Search'
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardOrdersResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/status:
+    patch:
+      tags:
+        - Dashboard
+      summary: Update order status
+      operationId: updateOrderStatus
+      description: >
+        Dashboard-only status change on a standard protected endpoint. The order must
+        belong to the session business and store. Any status can change to any other
+        status. Setting LAID locks the order. Changing away from LAID unlocks the order.
+        Sending the same status returns 200 as a no-op. Cross-store or cross-business
+        misses return 404 ORDER_NOT_FOUND.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderStatusUpdateRequest'
+      responses:
+        '200':
+          description: Status updated or no-op
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderStatusUpdateResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
 components:
   securitySchemes:
@@ -119,6 +292,280 @@ components:
         maximum: 53
 
   schemas:
+    EmptyObjectRequest:
+      type: object
+      additionalProperties: false
+
+    UserSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - user_id
+        - first_name
+        - last_name
+        - salesperson_code
+      properties:
+        user_id:
+          type: integer
+          format: int64
+        first_name:
+          type: string
+        last_name:
+          type: string
+        salesperson_code:
+          type: string
+
+    StoreSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - store_id
+        - name
+        - store_code
+      properties:
+        store_id:
+          type: integer
+          format: int64
+        name:
+          type: string
+        store_code:
+          type: string
+
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - salesperson_code
+        - password
+      properties:
+        salesperson_code:
+          type: string
+        password:
+          type: string
+          format: password
+
+    LoginResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - user
+        - stores
+        - active_store_id
+        - store_selection_required
+      properties:
+        user:
+          $ref: '#/components/schemas/UserSummary'
+        stores:
+          type: array
+          items:
+            $ref: '#/components/schemas/StoreSummary'
+        active_store_id:
+          type: integer
+          format: int64
+          nullable: true
+        store_selection_required:
+          type: boolean
+
+    LoginResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/LoginResponse'
+        message:
+          type: string
+
+    SelectStoreRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - store_id
+      properties:
+        store_id:
+          type: integer
+          format: int64
+          minimum: 1
+
+    SelectStoreResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - user
+        - active_store
+      properties:
+        user:
+          $ref: '#/components/schemas/UserSummary'
+        active_store:
+          $ref: '#/components/schemas/StoreSummary'
+
+    SelectStoreResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/SelectStoreResponse'
+        message:
+          type: string
+
+    DashboardCustomer:
+      type: object
+      additionalProperties: false
+      required:
+        - first_name
+        - last_name
+        - email
+      properties:
+        first_name:
+          type: string
+        last_name:
+          type: string
+        email:
+          type: string
+
+    DashboardInstallAddress:
+      type: object
+      additionalProperties: false
+      required:
+        - street_number
+        - street
+        - suburb
+        - state_code
+        - postcode
+      properties:
+        unit_number:
+          type: string
+          nullable: true
+        street_number:
+          type: string
+        street:
+          type: string
+        suburb:
+          type: string
+        state_code:
+          type: string
+        postcode:
+          type: string
+
+    DashboardOrderRow:
+      type: object
+      additionalProperties: false
+      required:
+        - order_id
+        - order_number
+        - order_sequence_number
+        - flooring_type
+        - order_status
+        - customer
+        - install_address
+        - last_emailed_at
+        - week_year
+        - week_number
+        - gp
+        - gp_percent
+        - gp_warning
+      properties:
+        order_id:
+          type: integer
+          format: int64
+        order_number:
+          type: string
+        order_sequence_number:
+          type: integer
+        flooring_type:
+          $ref: '#/components/schemas/FlooringType'
+        order_status:
+          $ref: '#/components/schemas/OrderStatus'
+        customer:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/DashboardCustomer'
+        install_address:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/DashboardInstallAddress'
+        last_emailed_at:
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+          nullable: true
+        week_year:
+          type: integer
+        week_number:
+          type: integer
+        gp:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          nullable: true
+        gp_percent:
+          type: number
+          format: double
+          nullable: true
+          example: 48.57
+        gp_warning:
+          type: boolean
+
+    DashboardOrdersResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/DashboardOrderRow'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    OrderStatusUpdateRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - order_status
+      properties:
+        order_status:
+          $ref: '#/components/schemas/OrderStatus'
+
+    OrderStatusUpdateResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - order_id
+        - order_number
+        - order_status
+        - previous_order_status
+        - locked
+        - updated_at
+      properties:
+        order_id:
+          type: integer
+          format: int64
+        order_number:
+          type: string
+        order_status:
+          $ref: '#/components/schemas/OrderStatus'
+        previous_order_status:
+          $ref: '#/components/schemas/OrderStatus'
+        locked:
+          type: boolean
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    OrderStatusUpdateResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/OrderStatusUpdateResponse'
+        message:
+          type: string
+
     FlooringType:
       type: string
       enum:
