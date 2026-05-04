@@ -1074,6 +1074,144 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/invoices:
+    post:
+      tags:
+        - Invoices
+      summary: Create invoice version 1
+      operationId: createInvoice
+      description: >
+        Creates the first invoice snapshot for the order (version 1). The request body
+        must be an empty JSON object. This endpoint is allowed when the order status is
+        LAID if no invoice exists yet.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmptyObjectRequest'
+      responses:
+        '201':
+          description: Invoice created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    get:
+      tags:
+        - Invoices
+      summary: List invoices
+      operationId: listInvoices
+      description: >
+        Returns paginated invoice version history for the order, ordered by
+        version_number descending by default.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Invoices returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoicesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/invoices/rewrite:
+    post:
+      tags:
+        - Invoices
+      summary: Rewrite invoice
+      operationId: rewriteInvoice
+      description: >
+        Creates the next official invoice version from current live order state. The
+        request body must be an empty JSON object. Returns 422 when rewrite is blocked
+        (including LAID order lock, missing first invoice, or failed preconditions).
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmptyObjectRequest'
+      responses:
+        '201':
+          description: Invoice rewritten
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/invoices/{invoiceId}:
+    get:
+      tags:
+        - Invoices
+      summary: Get invoice
+      operationId: getInvoice
+      description: >
+        Returns a single invoice snapshot metadata record for the order. The invoice
+        must belong to the order in the path.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/InvoiceId'
+      responses:
+        '200':
+          description: Invoice returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   securitySchemes:
     SessionCookieAuth:
@@ -1814,6 +1952,130 @@ components:
     EmptyObjectRequest:
       type: object
       additionalProperties: false
+
+    InvoiceHistoryRow:
+      type: object
+      additionalProperties: false
+      required:
+        - invoice_id
+        - version_number
+        - invoice_date
+        - due_date
+        - sale_price_inc_gst
+        - total_paid
+        - balance_due
+        - created_by_user_id
+        - created_at
+        - pdf_download_path
+      properties:
+        invoice_id:
+          type: integer
+          format: int64
+        version_number:
+          type: integer
+        invoice_date:
+          $ref: '#/components/schemas/Date'
+        due_date:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Date'
+        sale_price_inc_gst:
+          $ref: '#/components/schemas/Money'
+        total_paid:
+          $ref: '#/components/schemas/Money'
+        balance_due:
+          $ref: '#/components/schemas/Money'
+        created_by_user_id:
+          type: integer
+          format: int64
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        pdf_download_path:
+          type: string
+
+    InvoicesResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/InvoiceHistoryRow'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    InvoiceDetail:
+      type: object
+      additionalProperties: false
+      required:
+        - invoice_id
+        - order_id
+        - version_number
+        - invoice_date
+        - due_date
+        - details_of_sale_snapshot
+        - sale_price_ex_gst
+        - sale_price_inc_gst
+        - total_paid
+        - balance_due
+        - created_by_user_id
+        - created_at
+        - pdf_download_path
+      properties:
+        invoice_id:
+          type: integer
+          format: int64
+        order_id:
+          type: integer
+          format: int64
+        version_number:
+          type: integer
+        invoice_date:
+          $ref: '#/components/schemas/Date'
+        due_date:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Date'
+        details_of_sale_snapshot:
+          type: string
+        sale_price_ex_gst:
+          $ref: '#/components/schemas/Money'
+        sale_price_inc_gst:
+          $ref: '#/components/schemas/Money'
+        total_paid:
+          $ref: '#/components/schemas/Money'
+        balance_due:
+          $ref: '#/components/schemas/Money'
+        created_by_user_id:
+          type: integer
+          format: int64
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        pdf_download_path:
+          type: string
+
+    InvoiceResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - invoice
+      properties:
+        invoice:
+          $ref: '#/components/schemas/InvoiceDetail'
+
+    InvoiceResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/InvoiceResponse'
+        message:
+          type: string
 
     UserSummary:
       type: object
