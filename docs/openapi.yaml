@@ -682,6 +682,119 @@ paths:
           $ref: '#/components/responses/UnprocessableEntity'
         '500':
           $ref: '#/components/responses/InternalServerError'
+  /orders/{orderId}/charge-lines:
+    post:
+      tags:
+        - Lines
+      summary: Add charge line to order
+      operationId: addChargeLine
+      description: >
+        Adds a charge line and returns the updated financial summary. Backend
+        snapshots charge_code, charge_name, price, and cost. Backend
+        calculates line_total and line_cost internally. Cost fields are never
+        accepted from the client. Charge must belong to the active store, be
+        active, and match the order flooring_type. Blocked when order is LAID
+        with 422 ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChargeLineCreateRequest'
+      responses:
+        '201':
+          description: Charge line added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeLineMutationResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/charge-lines/{lineId}:
+    patch:
+      tags:
+        - Lines
+      summary: Update charge line quantity and/or unit price
+      operationId: updateChargeLine
+      description: >
+        Updates quantity and/or unit price for an existing charge line and
+        returns the updated financial summary. At least one editable field must
+        be present. charge_id and snapshot fields cannot be changed, and cost
+        fields are never accepted from the client. The line must belong to the
+        order in the path. Blocked when order is LAID with 422 ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/LineId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChargeLinePatchRequest'
+      responses:
+        '200':
+          description: Charge line updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeLineMutationResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags:
+        - Lines
+      summary: Delete charge line from order
+      operationId: deleteChargeLine
+      description: >
+        Deletes a charge line, recomputes order_financial_summary, and returns
+        the deleted line id with the updated summary. The line must belong to
+        the order in the path. Blocked when order is LAID with 422
+        ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/LineId'
+      responses:
+        '200':
+          description: Charge line deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChargeLineDeleteResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
 components:
   securitySchemes:
@@ -929,6 +1042,100 @@ components:
         required:
           - quantity_lm
           - quantity_sqm
+
+    ChargeLineCreateRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - charge_id
+        - quantity
+      properties:
+        charge_id:
+          type: integer
+          format: int64
+          minimum: 1
+        quantity:
+          type: number
+          format: double
+          minimum: 0
+          exclusiveMinimum: true
+        unit_price:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+            - type: number
+              minimum: 0
+              exclusiveMinimum: true
+
+    ChargeLinePatchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        quantity:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          exclusiveMinimum: true
+        unit_price:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+            - type: number
+              minimum: 0
+              exclusiveMinimum: true
+      anyOf:
+        - required:
+            - quantity
+        - required:
+            - unit_price
+
+    ChargeLineMutationResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - charge_line
+        - order_financial_summary
+      properties:
+        charge_line:
+          $ref: '#/components/schemas/ChargeLineRead'
+        order_financial_summary:
+          $ref: '#/components/schemas/OrderFinancialSummary'
+
+    ChargeLineMutationResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/ChargeLineMutationResponse'
+        message:
+          type: string
+
+    ChargeLineDeleteResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - deleted_charge_line_id
+        - order_financial_summary
+      properties:
+        deleted_charge_line_id:
+          type: integer
+          format: int64
+        order_financial_summary:
+          $ref: '#/components/schemas/OrderFinancialSummary'
+
+    ChargeLineDeleteResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/ChargeLineDeleteResponse'
+        message:
+          type: string
 
     ProductLineMutationResponse:
       type: object
