@@ -796,6 +796,80 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/sale-price:
+    put:
+      tags:
+        - Financials
+      summary: Override sale price
+      operationId: overrideSalePrice
+      description: >
+        Salesperson manually overrides the GST-inclusive sale price shown in Details
+        of Sale. The frontend sends the final GST-inclusive sale price only, and
+        the backend derives and stores sales_order.price_adjustment_inc_gst.
+        price_adjustment_inc_gst may be negative, positive, or zero. The backend
+        recalculates sale_price_ex_gst, gp, and gp_percent. The frontend must not
+        send derived fields. Blocked when order is LAID with 422 ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SalePriceOverrideRequest'
+      responses:
+        '200':
+          description: Sale price overridden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SalePriceResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/sale-price/reset:
+    post:
+      tags:
+        - Financials
+      summary: Reset sale price override
+      operationId: resetSalePrice
+      description: >
+        Clears sales_order.price_adjustment_inc_gst back to null. Idempotent: reset
+        with no current adjustment is a 200 no-op. The backend recomputes and
+        returns order_financial_summary. Blocked when order is LAID with 422
+        ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Sale price reset or no-op
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SalePriceResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   securitySchemes:
     SessionCookieAuth:
@@ -1181,6 +1255,40 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/ProductLineDeleteResponse'
+        message:
+          type: string
+
+
+    SalePriceOverrideRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - final_sale_price_inc_gst
+      properties:
+        final_sale_price_inc_gst:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+            - type: number
+              minimum: 0
+              exclusiveMinimum: true
+
+    SalePriceResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - order_financial_summary
+      properties:
+        order_financial_summary:
+          $ref: '#/components/schemas/OrderFinancialSummary'
+
+    SalePriceResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/SalePriceResponse'
         message:
           type: string
 
