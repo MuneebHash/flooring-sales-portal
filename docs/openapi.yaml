@@ -567,6 +567,122 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/product-lines:
+    post:
+      tags:
+        - Lines
+      summary: Add product line to order
+      operationId: addProductLine
+      description: >
+        Adds a product line and returns the updated financial summary. Backend
+        snapshots product_code, product_name, pricing_unit, price, and cost.
+        Backend derives the missing quantity using 1 LM = 3.66 SQM and
+        calculates line_total and line_cost internally. Cost fields are never
+        accepted from the client. Product must belong to the active store, be
+        active, and match the order flooring_type. Blocked when order is LAID
+        with 422 ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductLineCreateRequest'
+      responses:
+        '201':
+          description: Product line added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductLineMutationResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/product-lines/{lineId}:
+    patch:
+      tags:
+        - Lines
+      summary: Update product line quantity and/or unit price
+      operationId: updateProductLine
+      description: >
+        Updates quantity and/or unit price for an existing product line and
+        returns the updated financial summary. At least one editable field must
+        be present, and at most one of quantity_lm or quantity_sqm may be
+        supplied. product_id and snapshot fields cannot be changed, and cost
+        fields are never accepted from the client. The line must belong to the
+        order in the path. Blocked when order is LAID with 422 ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/LineId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProductLinePatchRequest'
+      responses:
+        '200':
+          description: Product line updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductLineMutationResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+    delete:
+      tags:
+        - Lines
+      summary: Delete product line from order
+      operationId: deleteProductLine
+      description: >
+        Deletes a product line, recomputes order_financial_summary, and returns
+        the deleted line id with the updated summary. The line must belong to
+        the order in the path. Blocked when order is LAID with 422
+        ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/LineId'
+      responses:
+        '200':
+          description: Product line deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProductLineDeleteResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   securitySchemes:
     SessionCookieAuth:
@@ -739,6 +855,127 @@ components:
             $ref: '#/components/schemas/AvailableCharge'
         pagination:
           $ref: '#/components/schemas/Pagination'
+
+    ProductLineCreateRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - product_id
+      properties:
+        product_id:
+          type: integer
+          format: int64
+          minimum: 1
+        quantity_lm:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          exclusiveMinimum: true
+        quantity_sqm:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          exclusiveMinimum: true
+        unit_price:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+            - type: number
+              minimum: 0
+              exclusiveMinimum: true
+      oneOf:
+        - required:
+            - quantity_lm
+        - required:
+            - quantity_sqm
+      not:
+        required:
+          - quantity_lm
+          - quantity_sqm
+
+    ProductLinePatchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        quantity_lm:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          exclusiveMinimum: true
+        quantity_sqm:
+          type: number
+          format: double
+          nullable: true
+          minimum: 0
+          exclusiveMinimum: true
+        unit_price:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+            - type: number
+              minimum: 0
+              exclusiveMinimum: true
+      anyOf:
+        - required:
+            - quantity_lm
+        - required:
+            - quantity_sqm
+        - required:
+            - unit_price
+      not:
+        required:
+          - quantity_lm
+          - quantity_sqm
+
+    ProductLineMutationResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - product_line
+        - order_financial_summary
+      properties:
+        product_line:
+          $ref: '#/components/schemas/ProductLineRead'
+        order_financial_summary:
+          $ref: '#/components/schemas/OrderFinancialSummary'
+
+    ProductLineMutationResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/ProductLineMutationResponse'
+        message:
+          type: string
+
+    ProductLineDeleteResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - deleted_product_line_id
+        - order_financial_summary
+      properties:
+        deleted_product_line_id:
+          type: integer
+          format: int64
+        order_financial_summary:
+          $ref: '#/components/schemas/OrderFinancialSummary'
+
+    ProductLineDeleteResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/ProductLineDeleteResponse'
+        message:
+          type: string
 
     ProductLineRead:
       type: object
