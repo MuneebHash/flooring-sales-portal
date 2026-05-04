@@ -870,6 +870,76 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/notes:
+    get:
+      tags:
+        - Notes
+      summary: List order notes
+      operationId: listOrderNotes
+      description: >
+        Returns order notes in descending created_at order (newest first). Notes are
+        immutable and append-only for MVP. This read endpoint is allowed even when
+        the order status is LAID. The order must belong to the session business and
+        store.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Notes returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      tags:
+        - Notes
+      summary: Add order note
+      operationId: addOrderNote
+      description: >
+        Appends a new immutable note to the order. note_text is required and must be
+        non-blank after trim. The backend sets order_id, created_by_user_id, and
+        created_at. The client must not send order_note_id, order_id,
+        created_by_user_id, or created_at. This endpoint is allowed even when the
+        order status is LAID.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddNoteRequest'
+      responses:
+        '201':
+          description: Note added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddNoteResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   securitySchemes:
     SessionCookieAuth:
@@ -1447,6 +1517,66 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/OrderLinesResponse'
+        message:
+          type: string
+
+
+    NoteRead:
+      type: object
+      additionalProperties: false
+      required:
+        - order_note_id
+        - note_text
+        - created_at
+      properties:
+        order_note_id:
+          type: integer
+          format: int64
+        note_text:
+          type: string
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    NotesResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/NoteRead'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    AddNoteRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - note_text
+      properties:
+        note_text:
+          type: string
+
+    AddNoteResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - note
+      properties:
+        note:
+          $ref: '#/components/schemas/NoteRead'
+
+    AddNoteResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/AddNoteResponse'
         message:
           type: string
 
