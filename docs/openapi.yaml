@@ -473,6 +473,100 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+
+  /orders/{orderId}/available-products:
+    get:
+      tags:
+        - Catalog
+      summary: List available products for order
+      operationId: listAvailableProducts
+      description: >
+        Returns active store products available for the order's flooring type.
+        Cost fields are never exposed.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Search'
+      responses:
+        '200':
+          description: Available products returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailableProductsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/available-charges:
+    get:
+      tags:
+        - Catalog
+      summary: List available charges for order
+      operationId: listAvailableCharges
+      description: >
+        Returns active store charges available for the order's flooring type.
+        Cost fields are never exposed.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/Search'
+      responses:
+        '200':
+          description: Available charges returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AvailableChargesResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/lines:
+    get:
+      tags:
+        - Lines
+      summary: Get order product and charge lines
+      operationId: getOrderLines
+      description: >
+        Returns all product lines, charge lines, and live financial summary for
+        the order. Per-line cost fields are never exposed.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Order lines returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderLinesResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   securitySchemes:
     SessionCookieAuth:
@@ -561,6 +655,249 @@ components:
         maximum: 53
 
   schemas:
+    AvailableProduct:
+      type: object
+      additionalProperties: false
+      required:
+        - product_id
+        - code
+        - name
+        - flooring_type
+        - pricing_unit
+        - price
+        - stock_quantity
+        - stock_unit
+      properties:
+        product_id:
+          type: integer
+          format: int64
+        code:
+          type: string
+        name:
+          type: string
+        flooring_type:
+          $ref: '#/components/schemas/FlooringType'
+        pricing_unit:
+          $ref: '#/components/schemas/PricingUnit'
+        price:
+          $ref: '#/components/schemas/Money'
+        stock_quantity:
+          type: number
+          format: double
+          nullable: true
+        stock_unit:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/StockUnit'
+
+    AvailableProductsResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailableProduct'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    AvailableCharge:
+      type: object
+      additionalProperties: false
+      required:
+        - charge_id
+        - code
+        - name
+        - flooring_type
+        - price
+      properties:
+        charge_id:
+          type: integer
+          format: int64
+        code:
+          type: string
+        name:
+          type: string
+        flooring_type:
+          $ref: '#/components/schemas/FlooringType'
+        price:
+          $ref: '#/components/schemas/Money'
+
+    AvailableChargesResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AvailableCharge'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    ProductLineRead:
+      type: object
+      additionalProperties: false
+      required:
+        - order_product_line_id
+        - product_id
+        - product_code_snapshot
+        - product_name_snapshot
+        - pricing_unit_snapshot
+        - price_snapshot
+        - quantity_lm
+        - quantity_sqm
+        - unit_price
+        - line_total
+        - created_at
+        - updated_at
+      properties:
+        order_product_line_id:
+          type: integer
+          format: int64
+        product_id:
+          type: integer
+          format: int64
+        product_code_snapshot:
+          type: string
+        product_name_snapshot:
+          type: string
+        pricing_unit_snapshot:
+          $ref: '#/components/schemas/PricingUnit'
+        price_snapshot:
+          $ref: '#/components/schemas/Money'
+        quantity_lm:
+          type: number
+          format: double
+        quantity_sqm:
+          type: number
+          format: double
+        unit_price:
+          $ref: '#/components/schemas/Money'
+        line_total:
+          $ref: '#/components/schemas/Money'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    ChargeLineRead:
+      type: object
+      additionalProperties: false
+      required:
+        - order_charge_line_id
+        - charge_id
+        - charge_code_snapshot
+        - charge_name_snapshot
+        - price_snapshot
+        - quantity
+        - unit_price
+        - line_total
+        - created_at
+        - updated_at
+      properties:
+        order_charge_line_id:
+          type: integer
+          format: int64
+        charge_id:
+          type: integer
+          format: int64
+        charge_code_snapshot:
+          type: string
+        charge_name_snapshot:
+          type: string
+        price_snapshot:
+          $ref: '#/components/schemas/Money'
+        quantity:
+          type: number
+          format: double
+        unit_price:
+          $ref: '#/components/schemas/Money'
+        line_total:
+          $ref: '#/components/schemas/Money'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    OrderFinancialSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - product_subtotal
+        - charge_subtotal
+        - calculated_total_inc_gst
+        - price_adjustment_inc_gst
+        - final_sale_price_inc_gst
+        - sale_price_ex_gst
+        - total_cost
+        - gp
+        - gp_percent
+        - gp_warning
+      properties:
+        product_subtotal:
+          $ref: '#/components/schemas/Money'
+        charge_subtotal:
+          $ref: '#/components/schemas/Money'
+        calculated_total_inc_gst:
+          $ref: '#/components/schemas/Money'
+        price_adjustment_inc_gst:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        final_sale_price_inc_gst:
+          $ref: '#/components/schemas/Money'
+        sale_price_ex_gst:
+          $ref: '#/components/schemas/Money'
+        total_cost:
+          $ref: '#/components/schemas/Money'
+        gp:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        gp_percent:
+          type: number
+          format: double
+          nullable: true
+          example: 48.57
+        gp_warning:
+          type: boolean
+
+    OrderLinesResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - product_lines
+        - charge_lines
+        - order_financial_summary
+      properties:
+        product_lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/ProductLineRead'
+        charge_lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChargeLineRead'
+        order_financial_summary:
+          $ref: '#/components/schemas/OrderFinancialSummary'
+
+    OrderLinesResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/OrderLinesResponse'
+        message:
+          type: string
+
     EmptyObjectRequest:
       type: object
       additionalProperties: false
