@@ -940,6 +940,140 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/attachments:
+    get:
+      tags:
+        - Attachments
+      summary: List order attachments
+      operationId: listOrderAttachments
+      description: >
+        Returns attachments linked to the order in descending created_at order (newest first).
+        This read endpoint is allowed when the order status is LAID. The order must
+        belong to the session business and store.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+      responses:
+        '200':
+          description: Attachments returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttachmentsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      tags:
+        - Attachments
+      summary: Upload order attachment
+      operationId: uploadOrderAttachment
+      description: >
+        Uploads and links an attachment to the order. Multipart upload accepts PHOTO
+        only for Chunk 3. This endpoint is allowed when the order status is LAID.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/AttachmentUploadRequest'
+      responses:
+        '201':
+          description: Attachment uploaded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttachmentResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '415':
+          $ref: '#/components/responses/UnsupportedMediaType'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/attachments/{attachmentId}:
+    delete:
+      tags:
+        - Attachments
+      summary: Delete order attachment
+      operationId: deleteOrderAttachment
+      description: >
+        Deletes an attachment linked to the order. The attachment must belong to the
+        order in the path. Deletion is blocked when the order status is LAID and
+        returns 422 ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/AttachmentId'
+      responses:
+        '200':
+          description: Attachment deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AttachmentDeleteResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/attachments/{attachmentId}/file:
+    get:
+      tags:
+        - Attachments
+      summary: Download order attachment file
+      operationId: downloadOrderAttachmentFile
+      description: >
+        Returns raw binary file bytes for an attachment linked to the order. This read
+        endpoint is allowed when the order status is LAID.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/AttachmentId'
+      responses:
+        '200':
+          description: Attachment file returned
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 components:
   securitySchemes:
     SessionCookieAuth:
@@ -1028,6 +1162,103 @@ components:
         maximum: 53
 
   schemas:
+    AttachmentRead:
+      type: object
+      additionalProperties: false
+      required:
+        - order_attachment_id
+        - attachment_kind
+        - file_name
+        - mime_type
+        - file_size
+        - download_path
+        - created_at
+      properties:
+        order_attachment_id:
+          type: integer
+          format: int64
+        attachment_kind:
+          $ref: '#/components/schemas/AttachmentKind'
+        file_name:
+          type: string
+        mime_type:
+          type: string
+        file_size:
+          type: integer
+          format: int64
+        download_path:
+          type: string
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    AttachmentsResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+        - pagination
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/AttachmentRead'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    AttachmentUploadRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - file
+        - attachment_kind
+      properties:
+        file:
+          type: string
+          format: binary
+        attachment_kind:
+          $ref: '#/components/schemas/PhotoAttachmentKind'
+
+    AttachmentResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - attachment
+      properties:
+        attachment:
+          $ref: '#/components/schemas/AttachmentRead'
+
+    AttachmentResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/AttachmentResponse'
+        message:
+          type: string
+
+    AttachmentDeleteResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - deleted_attachment_id
+      properties:
+        deleted_attachment_id:
+          type: integer
+          format: int64
+
+    AttachmentDeleteResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/AttachmentDeleteResponse'
+        message:
+          type: string
+
     AvailableProduct:
       type: object
       additionalProperties: false
