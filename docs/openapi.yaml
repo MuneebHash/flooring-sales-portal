@@ -127,6 +127,7 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+
   /orders:
     get:
       tags:
@@ -155,6 +156,75 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DashboardOrdersResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+    post:
+      tags:
+        - Orders
+      summary: Create order
+      operationId: createOrder
+      description: >
+        Creates a new order shell. No customer, address, details-of-sale, or lines
+        are required at creation time. The backend sets business_id, store_id, and
+        user_id from the active session; the client never sends business_id,
+        store_id, or user_id. The backend generates order_sequence_number,
+        order_number, week_year, and week_number. order_status defaults to LEAD.
+        supply_only defaults to false. locked is derived and false on creation.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateOrderRequest'
+      responses:
+        '201':
+          description: Order created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateOrderResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}:
+    get:
+      tags:
+        - Orders
+      summary: Get order workspace
+      operationId: getOrder
+      description: >
+        Returns the Chunk 2 workspace state: header, customer, installation
+        address, billing address, details of sale, and persisted financial readback.
+        This is read-only and is allowed even when order_status is LAID. The order
+        must belong to the session business/store; cross-store or cross-business
+        misses return 404 ORDER_NOT_FOUND. This endpoint does not include live
+        order_financial_summary; that belongs to Chunk 3 mutation responses.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Order returned
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderWorkspaceResponseWrapper'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -201,6 +271,205 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/customer:
+    put:
+      tags:
+        - Customer
+      summary: Save order customer
+      operationId: saveOrderCustomer
+      description: >
+        Creates or replaces the single customer row for an order. PUT is a full
+        replacement for customer fields. Optional fields omitted in the request are
+        written as null. There is one customer row per order. This endpoint is
+        blocked when the order is LAID and returns 422 ORDER_LOCKED. The order must
+        belong to the session business/store.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CustomerUpsertRequest'
+      responses:
+        '200':
+          description: Customer created or replaced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CustomerResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/addresses/installation:
+    put:
+      tags:
+        - Addresses
+      summary: Save installation address
+      operationId: saveInstallationAddress
+      description: >
+        Creates or replaces the installation address. The path determines
+        address_type = INSTALLATION and address_type is not accepted in the request
+        body. PUT is a full replacement for address fields. Optional unit_number
+        omitted in the request is written as null. This endpoint is blocked when the
+        order is LAID and returns 422 ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressUpsertRequest'
+      responses:
+        '200':
+          description: Installation address created or replaced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InstallationAddressResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/addresses/billing:
+    put:
+      tags:
+        - Addresses
+      summary: Save billing address
+      operationId: saveBillingAddress
+      description: >
+        Creates or replaces the billing address. The path determines
+        address_type = BILLING and address_type is not accepted in the request body.
+        PUT is a full replacement for address fields. Optional unit_number omitted
+        in the request is written as null. This endpoint is blocked when the order
+        is LAID and returns 422 ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddressUpsertRequest'
+      responses:
+        '200':
+          description: Billing address created or replaced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingAddressResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/addresses/billing/copy-from-installation:
+    post:
+      tags:
+        - Addresses
+      summary: Copy installation address to billing
+      operationId: copyBillingAddressFromInstallation
+      description: >
+        The backend copies the existing installation address into the billing
+        address. No request body is required. If no installation
+        address exists, the endpoint returns 422 INSTALLATION_ADDRESS_REQUIRED. If a
+        billing address exists it is replaced; if it does not exist it is created.
+        Copied fields are unit_number, street_number, street, suburb, state_code,
+        and postcode. This endpoint is blocked when the order is LAID and returns
+        422 ORDER_LOCKED.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Billing address copied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BillingAddressResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/details-of-sale:
+    put:
+      tags:
+        - DetailsOfSale
+      summary: Save details of sale
+      operationId: saveDetailsOfSale
+      description: >
+        Updates non-line, non-payment details-of-sale fields on sales_order. PUT is
+        a full replacement for the fields this endpoint owns. Required fields not
+        present return 400. Optional fields omitted in the request are written as
+        null. This endpoint does not include order_financial_summary because these
+        fields do not affect financials. Sale price override and Reset Price belong
+        to Chunk 3. This endpoint is blocked when the order is LAID and returns 422
+        ORDER_LOCKED. proposed_lay_date and lay_date_status must be either both
+        null/omitted or both non-null.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DetailsOfSaleRequest'
+      responses:
+        '200':
+          description: Details of sale saved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DetailsOfSaleResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -430,6 +699,7 @@ components:
       type: object
       additionalProperties: false
       required:
+        - unit_number
         - street_number
         - street
         - suburb
@@ -563,6 +833,453 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/OrderStatusUpdateResponse'
+        message:
+          type: string
+
+    CreateOrderRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - flooring_type
+      properties:
+        flooring_type:
+          $ref: '#/components/schemas/FlooringType'
+
+    OrderHeader:
+      type: object
+      additionalProperties: false
+      required:
+        - order_id
+        - order_number
+        - order_sequence_number
+        - flooring_type
+        - order_status
+        - supply_only
+        - plan_numbers
+        - proposed_lay_date
+        - lay_date_status
+        - details_of_sale
+        - last_emailed_at
+        - week_year
+        - week_number
+        - created_at
+        - updated_at
+        - locked
+      properties:
+        order_id:
+          type: integer
+          format: int64
+        order_number:
+          type: string
+        order_sequence_number:
+          type: integer
+        flooring_type:
+          $ref: '#/components/schemas/FlooringType'
+        order_status:
+          $ref: '#/components/schemas/OrderStatus'
+        supply_only:
+          type: boolean
+        plan_numbers:
+          type: string
+          nullable: true
+        proposed_lay_date:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Date'
+        lay_date_status:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LayDateStatus'
+        details_of_sale:
+          type: string
+          nullable: true
+        last_emailed_at:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+        week_year:
+          type: integer
+        week_number:
+          type: integer
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        locked:
+          type: boolean
+
+    CreateOrderResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/OrderHeader'
+        message:
+          type: string
+
+    OrderCustomer:
+      type: object
+      additionalProperties: false
+      required:
+        - first_name
+        - middle_name
+        - last_name
+        - email
+        - mobile
+        - home_phone
+        - work_phone
+        - company_name
+      properties:
+        first_name:
+          type: string
+        middle_name:
+          type: string
+          nullable: true
+        last_name:
+          type: string
+        email:
+          type: string
+        mobile:
+          type: string
+        home_phone:
+          type: string
+          nullable: true
+        work_phone:
+          type: string
+          nullable: true
+        company_name:
+          type: string
+          nullable: true
+
+    OrderAddress:
+      type: object
+      additionalProperties: false
+      required:
+        - unit_number
+        - street_number
+        - street
+        - suburb
+        - state_code
+        - postcode
+      properties:
+        unit_number:
+          type: string
+          nullable: true
+        street_number:
+          type: string
+        street:
+          type: string
+        suburb:
+          type: string
+        state_code:
+          type: string
+        postcode:
+          type: string
+
+    PersistedFinancials:
+      type: object
+      additionalProperties: false
+      required:
+        - sale_price_ex_gst
+        - total_cost
+        - gp
+        - gp_percent
+      properties:
+        sale_price_ex_gst:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        total_cost:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        gp:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Money'
+        gp_percent:
+          type: number
+          format: double
+          nullable: true
+          example: 48.57
+
+    OrderWorkspace:
+      type: object
+      additionalProperties: false
+      required:
+        - order_id
+        - order_number
+        - order_sequence_number
+        - flooring_type
+        - order_status
+        - supply_only
+        - plan_numbers
+        - proposed_lay_date
+        - lay_date_status
+        - details_of_sale
+        - last_emailed_at
+        - week_year
+        - week_number
+        - created_at
+        - updated_at
+        - locked
+        - customer
+        - install_address
+        - billing_address
+        - persisted_financials
+      properties:
+        order_id:
+          type: integer
+          format: int64
+        order_number:
+          type: string
+        order_sequence_number:
+          type: integer
+        flooring_type:
+          $ref: '#/components/schemas/FlooringType'
+        order_status:
+          $ref: '#/components/schemas/OrderStatus'
+        supply_only:
+          type: boolean
+        plan_numbers:
+          type: string
+          nullable: true
+        proposed_lay_date:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Date'
+        lay_date_status:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LayDateStatus'
+        details_of_sale:
+          type: string
+          nullable: true
+        last_emailed_at:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+        week_year:
+          type: integer
+        week_number:
+          type: integer
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+        locked:
+          type: boolean
+        customer:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/OrderCustomer'
+        install_address:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/OrderAddress'
+        billing_address:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/OrderAddress'
+        persisted_financials:
+          $ref: '#/components/schemas/PersistedFinancials'
+
+    OrderWorkspaceResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/OrderWorkspace'
+
+    CustomerUpsertRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - first_name
+        - last_name
+        - email
+        - mobile
+      properties:
+        first_name:
+          type: string
+        middle_name:
+          type: string
+          nullable: true
+        last_name:
+          type: string
+        email:
+          type: string
+        mobile:
+          type: string
+        home_phone:
+          type: string
+          nullable: true
+        work_phone:
+          type: string
+          nullable: true
+        company_name:
+          type: string
+          nullable: true
+
+    CustomerResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - customer
+      properties:
+        customer:
+          $ref: '#/components/schemas/OrderCustomer'
+
+    CustomerResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/CustomerResponse'
+        message:
+          type: string
+
+    AddressUpsertRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - street_number
+        - street
+        - suburb
+        - state_code
+        - postcode
+      properties:
+        unit_number:
+          type: string
+          nullable: true
+        street_number:
+          type: string
+        street:
+          type: string
+        suburb:
+          type: string
+        state_code:
+          type: string
+        postcode:
+          type: string
+
+    InstallationAddressResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - install_address
+      properties:
+        install_address:
+          $ref: '#/components/schemas/OrderAddress'
+
+    InstallationAddressResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/InstallationAddressResponse'
+        message:
+          type: string
+
+    BillingAddressResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - billing_address
+      properties:
+        billing_address:
+          $ref: '#/components/schemas/OrderAddress'
+
+    BillingAddressResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/BillingAddressResponse'
+        message:
+          type: string
+
+    DetailsOfSaleRequest:
+      type: object
+      additionalProperties: false
+      description: proposed_lay_date and lay_date_status must be either both null/omitted or both non-null.
+      required:
+        - supply_only
+      properties:
+        supply_only:
+          type: boolean
+        plan_numbers:
+          type: string
+          nullable: true
+        proposed_lay_date:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Date'
+        lay_date_status:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LayDateStatus'
+        details_of_sale:
+          type: string
+          nullable: true
+
+    DetailsOfSaleFields:
+      type: object
+      additionalProperties: false
+      required:
+        - supply_only
+        - plan_numbers
+        - proposed_lay_date
+        - lay_date_status
+        - details_of_sale
+      properties:
+        supply_only:
+          type: boolean
+        plan_numbers:
+          type: string
+          nullable: true
+        proposed_lay_date:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Date'
+        lay_date_status:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LayDateStatus'
+        details_of_sale:
+          type: string
+          nullable: true
+
+    DetailsOfSaleResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - details_of_sale_fields
+        - updated_at
+      properties:
+        details_of_sale_fields:
+          $ref: '#/components/schemas/DetailsOfSaleFields'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    DetailsOfSaleResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/DetailsOfSaleResponse'
         message:
           type: string
 
