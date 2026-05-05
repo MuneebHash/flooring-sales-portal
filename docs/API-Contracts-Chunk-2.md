@@ -86,7 +86,7 @@ All endpoints below are **Standard protected** (all 7 checks from conventions §
 {
   "data": {
     "order_id": 19,
-    "order_number": "001.LW1.00001",
+    "order_number": "SYD-CBD.LC1.00001",
     "order_sequence_number": 9,
     "flooring_type": "SOFT",
     "order_status": "LEAD",
@@ -154,7 +154,7 @@ All endpoints below are **Standard protected** (all 7 checks from conventions §
 {
   "data": {
     "order_id": 1,
-    "order_number": "001.LW1.00001",
+    "order_number": "SYD-CBD.LC1.00001",
     "order_sequence_number": 1,
     "flooring_type": "SOFT",
     "order_status": "ACCEPTED",

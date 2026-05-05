@@ -37,7 +37,7 @@
 **Request DTO**
 ```json
 {
-  "salesperson_code": "LC01",
+  "salesperson_code": "LC1",
   "password": "password123"
 }
 ```
@@ -54,7 +54,7 @@
       "user_id": 1,
       "first_name": "Liam",
       "last_name": "Carter",
-      "salesperson_code": "LC01"
+      "salesperson_code": "LC1"
     },
     "stores": [
       {
@@ -78,7 +78,7 @@
       "user_id": 1,
       "first_name": "Liam",
       "last_name": "Carter",
-      "salesperson_code": "LC01"
+      "salesperson_code": "LC1"
     },
     "stores": [
       { "store_id": 1, "name": "Aussie Floors Sydney CBD", "store_code": "SYD-CBD" },
@@ -164,7 +164,7 @@
       "user_id": 1,
       "first_name": "Liam",
       "last_name": "Carter",
-      "salesperson_code": "LC01"
+      "salesperson_code": "LC1"
     },
     "active_store": {
       "store_id": 1,
@@ -278,7 +278,7 @@
   "data": [
     {
       "order_id": 1,
-      "order_number": "001.LW1.00001",
+      "order_number": "SYD-CBD.LC1.00001",
       "order_sequence_number": 1,
       "flooring_type": "SOFT",
       "order_status": "ACCEPTED",
@@ -315,7 +315,7 @@
 **Per-row field rules — all grounded in the locked schema**
 
 - `order_id` — `sales_order.order_id`. Internal PK. Returned so the frontend can build URLs (e.g. `/orders/{orderId}`). Not a display value (conventions §18).
-- `order_number` — `sales_order.order_number` exactly as stored. The dashboard's "Order #" column displays this string verbatim. The contract does not prescribe a format; conventions §18 leaves the format to the backend and gives only an example.
+- `order_number` — `sales_order.order_number` exactly as stored. The dashboard's "Order #" column displays this string verbatim. The format is locked in conventions §18: `{store_code}.{salesperson_code}.{order_sequence_number_padded_5}`.
 - `order_sequence_number` — `sales_order.order_sequence_number`. Returned alongside `order_number` so the frontend has the raw sequence value if needed.
 - `flooring_type` — `sales_order.flooring_type`. Always `SOFT` or `HARD`. NOT NULL on every order, set at creation, locked per conventions §17.
 - `order_status` — `sales_order.order_status` enum value. NOT NULL.
@@ -383,7 +383,7 @@
 {
   "data": {
     "order_id": 1,
-    "order_number": "001.LW1.00001",
+    "order_number": "SYD-CBD.LC1.00001",
     "order_status": "LAID",
     "previous_order_status": "ACCEPTED",
     "locked": true,
@@ -521,7 +521,7 @@ These apply across every Chunk 1 endpoint and are the single source of enforceme
    - `install_address_summary` (formatted string) → `install_address` nested object with the raw DB columns (`unit_number, street_number, street, suburb, state_code, postcode`).
    - Both objects are nullable when the underlying row does not exist; nullability is now locked, not open.
    - This avoids inventing punctuation/concatenation rules; the frontend builds the display string from the grounded fields.
-6. **`order_number` is no longer prescribed a format.** It is returned exactly as stored on `sales_order.order_number` (conventions §18 example is illustrative, not contractual). `order_sequence_number` is exposed alongside it for completeness.
+6. **`order_number` uses the locked conventions §18 format.** It is returned exactly as stored on `sales_order.order_number`, and the frontend displays it verbatim. `order_sequence_number` is exposed alongside it for completeness.
 7. **`flooring_type` retained on dashboard rows.** Strict definition: `sales_order.flooring_type`, NOT NULL, value `SOFT` or `HARD`, locked at order creation per conventions §17. No conditional language.
 8. **`last_emailed_at` retained as a grounded, nullable timestamp field.** No display formatting, no update semantics defined here — that is out of scope for Chunk 1.
 9. **`status` filter locked to single value.** Comma-separated multi-status (allowed by conventions §7 in general) is not used in Chunk 1; the dashboard filter UI is a single-select dropdown. Only the 6 currently locked statuses are accepted.

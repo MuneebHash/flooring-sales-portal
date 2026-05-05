@@ -677,28 +677,64 @@ A new invoice version is created only when the user clicks Rewrite Invoice.
 
 ## 18. Order Numbering
 
+### 18.1 salesperson_code
+
+`salesperson_code` is locked to exactly 3 characters.
+
+Format:
+
+```text
+{first_initial}{last_initial}{number}
+```
+
+Database format rule:
+
+```text
+^[A-Z]{2}[0-9]$
+```
+
+Examples:
+- Liam Carter -> LC1
+- Sophie Nguyen -> SN1
+- Jack Williams -> JW1
+- Emma Patel -> EP1
+
+### 18.2 order_number
+
 Order number format for MVP:
 
+```text
 {store_code}.{salesperson_code}.{order_sequence_number_padded_5}
+```
 
-Example:
-store_code = 001
-salesperson_code = LW1
-order_sequence_number = 12345
+Examples:
+- SYD-CBD.LC1.00001
+- SYD-CBD.SN1.00003
+- SYD-PARR.JW1.00005
+- MEL-CBD.OS1.00001
 
-order_number = 001.LW1.12345
+Worked example:
+
+```text
+store_code = SYD-CBD
+salesperson_code = LC1
+order_sequence_number = 1
+
+order_number = SYD-CBD.LC1.00001
+```
 
 Rules:
-- store_code comes from store.store_code
-- salesperson_code comes from app_user.salesperson_code
-- order_sequence_number remains unique per business
-- the sequence number is padded to 5 digits
+- `store_code` comes from `store.store_code`.
+- `salesperson_code` comes from `app_user.salesperson_code` and must match the locked format in §18.1.
+- `order_sequence_number` remains unique per business.
+- The sequence number is padded to 5 digits:
   - 1 -> 00001
   - 25 -> 00025
   - 12345 -> 12345
-- backend generates order_number at order creation
-- frontend never sends order_number
-- once created, order_number does not change even if store_code or salesperson_code changes later
+- Backend generates `order_number` at order creation.
+- Frontend displays `order_number` verbatim.
+- Frontend never sends or edits `order_number`.
+- Once created, `order_number` does not change even if `store_code` or `salesperson_code` changes later.
 
 ---
 

@@ -10,7 +10,7 @@
 1. `business.slug`
 2. `sales_order.price_adjustment_inc_gst` — required for sale price override / reset.
 
-**Order number format (locked):** `{store_code}.{salesperson_code}.{order_sequence_number_padded_5}` — e.g. `001.LW1.00042`. Backend-generated at order creation. Frontend never sends `order_number`. Used in Chunk 3 examples below.
+**Order number format (locked):** `{store_code}.{salesperson_code}.{order_sequence_number_padded_5}` — e.g. `SYD-CBD.LC1.00042`. Backend-generated at order creation. Frontend never sends `order_number`. Used in Chunk 3 examples below.
 
 ---
 

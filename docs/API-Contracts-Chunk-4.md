@@ -11,7 +11,7 @@
 1. `business.slug`
 2. `sales_order.price_adjustment_inc_gst` — drives the live financial summary used by Create Invoice and manual Rewrite Invoice snapshots.
 
-**Order number format (locked):** `{store_code}.{salesperson_code}.{order_sequence_number_padded_5}` — e.g. `001.LW1.00042`. Backend-generated; frontend never sends it. Used in invoice PDF filenames.
+**Order number format (locked):** `{store_code}.{salesperson_code}.{order_sequence_number_padded_5}` — e.g. `SYD-CBD.LC1.00042`. Backend-generated; frontend never sends it. Used in invoice PDF filenames.
 
 **File-binary exception (accepted in conventions §3):** file upload endpoints may accept `multipart/form-data`; file download endpoints may return raw binary bytes. Chunk 4 uses this exception only for the invoice PDF download endpoint (D.5).
 
@@ -351,7 +351,7 @@ Each row uses the shared DTO `invoice_history_row` (see E.1).
 **Response — 200 OK**
 - Body: raw PDF bytes.
 - `Content-Type: application/pdf`.
-- `Content-Disposition: inline; filename="invoice-{order_number}-v{version_number}.pdf"` — backend builds the filename using the locked order_number format (e.g. `invoice-001.LW1.00042-v3.pdf`).
+- `Content-Disposition: inline; filename="invoice-{order_number}-v{version_number}.pdf"` — backend builds the filename using the locked order_number format (e.g. `invoice-SYD-CBD.LC1.00042-v3.pdf`).
 - `Content-Length`: file size.
 
 This is **not** a JSON response (file-binary exception). Errors at this endpoint use the standard JSON error wrapper.
