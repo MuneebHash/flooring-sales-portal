@@ -1,21 +1,63 @@
-import { AppHeader } from './components/AppHeader'
-import { Dashboard } from './components/Dashboard'
+import type { ReactNode } from 'react'
+import {
+  BrowserRouter,
+  Navigate,
+  Route,
+  Routes,
+} from 'react-router-dom'
+import { AuthProvider, useAuth } from './lib/auth'
+import { DashboardPage } from './components/DashboardPage'
+import { Login } from './components/Login'
+import { StoreSelection } from './components/StoreSelection'
 
-const SESSION = {
-  storeName: 'Aussie Floors Sydney CBD',
-  storeCode: 'SYD-CBD',
-  salesperson: 'Liam Carter',
-  salespersonCode: 'LC1',
+function RequireAuth({ children }: { children: ReactNode }) {
+  const { isAuthenticated } = useAuth()
+  if (!isAuthenticated) return <Navigate to="/login" replace />
+  return <>{children}</>
+}
+
+function RequireStore({ children }: { children: ReactNode }) {
+  const { activeStore } = useAuth()
+  if (!activeStore) return <Navigate to="/select-store" replace />
+  return <>{children}</>
+}
+
+function RootRedirect() {
+  const { isAuthenticated, activeStore } = useAuth()
+  if (!isAuthenticated) return <Navigate to="/login" replace />
+  if (!activeStore) return <Navigate to="/select-store" replace />
+  return <Navigate to="/dashboard" replace />
 }
 
 function App() {
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <div className="mx-auto max-w-7xl px-6 py-6 space-y-5">
-        <AppHeader {...SESSION} />
-        <Dashboard />
-      </div>
-    </div>
+    <BrowserRouter>
+      <AuthProvider>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+          <Route
+            path="/select-store"
+            element={
+              <RequireAuth>
+                <StoreSelection />
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/dashboard"
+            element={
+              <RequireAuth>
+                <RequireStore>
+                  <DashboardPage />
+                </RequireStore>
+              </RequireAuth>
+            }
+          />
+          <Route path="/" element={<RootRedirect />} />
+          <Route path="*" element={<RootRedirect />} />
+        </Routes>
+      </AuthProvider>
+    </BrowserRouter>
   )
 }
 
