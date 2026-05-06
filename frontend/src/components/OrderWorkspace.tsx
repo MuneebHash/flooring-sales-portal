@@ -1,5 +1,10 @@
 import { useState } from 'react'
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import {
+  Link,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router-dom'
 import { AppHeader } from './AppHeader'
 import { ArrowLeftIcon } from './icons'
 import { Button } from './ui/Button'
@@ -12,6 +17,11 @@ import {
   FLOORING_TONES,
   type FlooringType,
 } from '../lib/flooring'
+import type {
+  Address,
+  CustomerDetails,
+} from '../data/mockOrderDetails'
+import { MOCK_ORDER_DETAILS } from '../data/mockOrderDetails'
 
 const TAB_IDS = [
   'customer',
@@ -39,16 +49,24 @@ function isFlooringType(value: string | null): value is FlooringType {
   return value === 'SOFT' || value === 'HARD'
 }
 
-export function OrderWorkspace() {
-  const [searchParams] = useSearchParams()
-  const flooringTypeRaw = searchParams.get('flooring_type')
+type ShellProps = {
+  mode: 'new' | 'existing'
+  flooringType: FlooringType
+  orderNumber?: string
+  customer?: CustomerDetails | null
+  installationAddress?: Address | null
+  billingAddress?: Address | null
+}
+
+function WorkspaceShell({
+  mode,
+  flooringType,
+  orderNumber,
+  customer,
+  installationAddress,
+  billingAddress,
+}: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
-
-  if (!isFlooringType(flooringTypeRaw)) {
-    return <InvalidWorkspace />
-  }
-
-  const flooringType: FlooringType = flooringTypeRaw
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -65,9 +83,15 @@ export function OrderWorkspace() {
           </Link>
           <div className="mt-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div className="flex items-center gap-3 flex-wrap">
-              <h2 className="text-2xl font-bold text-slate-900 tracking-tight">
-                New order
-              </h2>
+              {mode === 'new' ? (
+                <h2 className="text-2xl font-bold text-slate-900 tracking-tight">
+                  New order
+                </h2>
+              ) : (
+                <h2 className="text-2xl font-bold font-mono tracking-tight text-slate-900">
+                  {orderNumber}
+                </h2>
+              )}
               <span
                 className={`inline-flex items-center px-2.5 py-1 rounded-md border text-xs font-medium ${FLOORING_TONES[flooringType]}`}
               >
@@ -88,7 +112,13 @@ export function OrderWorkspace() {
         <Panel className="overflow-hidden">
           <Tabs tabs={TABS} active={activeTab} onChange={setActiveTab} />
           <div className="p-6">
-            {activeTab === 'customer' && <CustomerTab />}
+            {activeTab === 'customer' && (
+              <CustomerTab
+                customer={customer}
+                installationAddress={installationAddress}
+                billingAddress={billingAddress}
+              />
+            )}
             {activeTab === 'products' && (
               <PlaceholderTab
                 title="Products & Charges"
@@ -126,6 +156,42 @@ export function OrderWorkspace() {
   )
 }
 
+export function OrderWorkspace() {
+  const params = useParams<{ orderId: string }>()
+  const [searchParams] = useSearchParams()
+
+  if (params.orderId !== undefined) {
+    const orderId = Number.parseInt(params.orderId, 10)
+    const details = Number.isFinite(orderId)
+      ? MOCK_ORDER_DETAILS[orderId]
+      : undefined
+    if (!details) return <NotFoundWorkspace />
+    return (
+      <WorkspaceShell
+        key={`existing-${orderId}`}
+        mode="existing"
+        flooringType={details.flooring_type}
+        orderNumber={details.order_number}
+        customer={details.customer}
+        installationAddress={details.installation_address}
+        billingAddress={details.billing_address}
+      />
+    )
+  }
+
+  const flooringTypeRaw = searchParams.get('flooring_type')
+  if (!isFlooringType(flooringTypeRaw)) {
+    return <InvalidWorkspace />
+  }
+  return (
+    <WorkspaceShell
+      key={`new-${flooringTypeRaw}`}
+      mode="new"
+      flooringType={flooringTypeRaw}
+    />
+  )
+}
+
 function InvalidWorkspace() {
   const navigate = useNavigate()
   return (
@@ -139,6 +205,35 @@ function InvalidWorkspace() {
           <p className="text-sm text-slate-500 mt-2">
             Choose Soft flooring or Hard flooring from the Dashboard to start
             a new order.
+          </p>
+          <div className="mt-5">
+            <Button
+              variant="success"
+              size="md"
+              onClick={() => navigate('/dashboard')}
+            >
+              Back to dashboard
+            </Button>
+          </div>
+        </Panel>
+      </div>
+    </div>
+  )
+}
+
+function NotFoundWorkspace() {
+  const navigate = useNavigate()
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      <div className="mx-auto max-w-7xl px-6 py-6 space-y-5">
+        <AppHeader />
+        <Panel className="p-8 max-w-[520px] mx-auto text-center">
+          <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
+            Order not found
+          </h2>
+          <p className="text-sm text-slate-500 mt-2">
+            We couldn't find that order. It may have been removed or the link
+            is incorrect.
           </p>
           <div className="mt-5">
             <Button

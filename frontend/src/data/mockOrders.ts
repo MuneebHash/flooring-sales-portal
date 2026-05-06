@@ -2,6 +2,7 @@ import type { OrderStatus } from '../lib/statuses'
 import type { FlooringType } from '../lib/flooring'
 
 export type Order = {
+  order_id: number
   order_number: string
   flooring_type: FlooringType
   status: OrderStatus
@@ -16,6 +17,7 @@ export type Order = {
 
 export const MOCK_ORDERS: Order[] = [
   {
+    order_id: 1,
     order_number: 'SYD-CBD.LC1.00001',
     flooring_type: 'SOFT',
     status: 'ACCEPTED',
@@ -28,6 +30,7 @@ export const MOCK_ORDERS: Order[] = [
     last_emailed: 'Not emailed',
   },
   {
+    order_id: 2,
     order_number: 'SYD-CBD.LC1.00002',
     flooring_type: 'HARD',
     status: 'LEAD',
@@ -40,6 +43,7 @@ export const MOCK_ORDERS: Order[] = [
     last_emailed: 'Not emailed',
   },
   {
+    order_id: 3,
     order_number: 'SYD-CBD.SN1.00003',
     flooring_type: 'SOFT',
     status: 'FOLLOW_UP',
@@ -52,6 +56,7 @@ export const MOCK_ORDERS: Order[] = [
     last_emailed: 'Not emailed',
   },
   {
+    order_id: 4,
     order_number: 'SYD-CBD.SN1.00004',
     flooring_type: 'HARD',
     status: 'NEW_ACHIEVED_SALE',

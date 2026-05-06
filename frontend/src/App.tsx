@@ -64,6 +64,16 @@ function App() {
               </RequireAuth>
             }
           />
+          <Route
+            path="/orders/:orderId"
+            element={
+              <RequireAuth>
+                <RequireStore>
+                  <OrderWorkspace />
+                </RequireStore>
+              </RequireAuth>
+            }
+          />
           <Route path="/" element={<RootRedirect />} />
           <Route path="*" element={<RootRedirect />} />
         </Routes>

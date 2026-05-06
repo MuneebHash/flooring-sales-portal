@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Badge } from './ui/Badge'
 import { Button } from './ui/Button'
 import { Panel } from './ui/Panel'
@@ -19,6 +20,7 @@ import { MOCK_ORDERS } from '../data/mockOrders'
 type StatusFilter = OrderStatus | 'ALL'
 
 export function Dashboard() {
+  const navigate = useNavigate()
   const [orders, setOrders] = useState<Order[]>(MOCK_ORDERS)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL')
@@ -160,7 +162,11 @@ export function Dashboard() {
                         {o.order_number}
                       </div>
                       <div className="flex items-center gap-2 mt-1.5">
-                        <Button variant="success-outline" size="sm">
+                        <Button
+                          variant="success-outline"
+                          size="sm"
+                          onClick={() => navigate(`/orders/${o.order_id}`)}
+                        >
                           Open
                         </Button>
                         <Badge tone={FLOORING_TONES[o.flooring_type]}>
