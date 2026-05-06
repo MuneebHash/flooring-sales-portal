@@ -1,6 +1,5 @@
 import type { OrderStatus } from '../lib/statuses'
-
-export type FlooringType = 'SOFT' | 'HARD'
+import type { FlooringType } from '../lib/flooring'
 
 export type Order = {
   order_number: string

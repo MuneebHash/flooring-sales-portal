@@ -2,6 +2,7 @@ import { useMemo, useState } from 'react'
 import { Badge } from './ui/Badge'
 import { Button } from './ui/Button'
 import { Panel } from './ui/Panel'
+import { NewOrderModal } from './NewOrderModal'
 import { StatusSelect } from './StatusSelect'
 import {
   ChevronDownIcon,
@@ -21,6 +22,7 @@ export function Dashboard() {
   const [orders, setOrders] = useState<Order[]>(MOCK_ORDERS)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL')
+  const [newOrderOpen, setNewOrderOpen] = useState(false)
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -50,6 +52,7 @@ export function Dashboard() {
   }
 
   return (
+    <>
     <Panel className="p-6">
       <div className="flex items-center justify-between gap-4 mb-6">
         <div className="flex items-center gap-3">
@@ -60,9 +63,13 @@ export function Dashboard() {
             {filtered.length} of {orders.length}
           </span>
         </div>
-        <Button variant="success" size="md">
+        <Button
+          variant="success"
+          size="md"
+          onClick={() => setNewOrderOpen(true)}
+        >
           <PlusIcon className="w-4 h-4" />
-          New invoice
+          New order
         </Button>
       </div>
 
@@ -222,5 +229,10 @@ export function Dashboard() {
         </table>
       </div>
     </Panel>
+    <NewOrderModal
+      open={newOrderOpen}
+      onClose={() => setNewOrderOpen(false)}
+    />
+    </>
   )
 }

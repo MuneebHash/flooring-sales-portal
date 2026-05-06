@@ -1,6 +1,11 @@
-import type { FlooringType } from '../data/mockOrders'
+export type FlooringType = 'SOFT' | 'HARD'
+
+export const FLOORING_LABELS: Record<FlooringType, string> = {
+  SOFT: 'Soft flooring',
+  HARD: 'Hard flooring',
+}
 
 export const FLOORING_TONES: Record<FlooringType, string> = {
-  SOFT: 'bg-slate-100 text-slate-600 border-slate-200',
-  HARD: 'bg-stone-100 text-stone-700 border-stone-200',
+  SOFT: 'bg-rose-50 text-rose-700 border-rose-200',
+  HARD: 'bg-emerald-50 text-emerald-700 border-emerald-200',
 }
