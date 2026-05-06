@@ -8,6 +8,7 @@ import {
 import { AuthProvider, useAuth } from './lib/auth'
 import { DashboardPage } from './components/DashboardPage'
 import { Login } from './components/Login'
+import { OrderWorkspace } from './components/OrderWorkspace'
 import { StoreSelection } from './components/StoreSelection'
 
 function RequireAuth({ children }: { children: ReactNode }) {
@@ -49,6 +50,16 @@ function App() {
               <RequireAuth>
                 <RequireStore>
                   <DashboardPage />
+                </RequireStore>
+              </RequireAuth>
+            }
+          />
+          <Route
+            path="/orders/new"
+            element={
+              <RequireAuth>
+                <RequireStore>
+                  <OrderWorkspace />
                 </RequireStore>
               </RequireAuth>
             }

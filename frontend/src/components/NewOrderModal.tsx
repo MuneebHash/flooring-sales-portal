@@ -1,3 +1,4 @@
+import { useNavigate } from 'react-router-dom'
 import { Modal } from './ui/Modal'
 import { FLOORING_LABELS, type FlooringType } from '../lib/flooring'
 
@@ -15,9 +16,12 @@ const OPTION_STYLES: Record<FlooringType, string> = {
 }
 
 export function NewOrderModal({ open, onClose, onSelect }: Props) {
+  const navigate = useNavigate()
+
   const handleSelect = (type: FlooringType) => {
     onSelect?.(type)
     onClose()
+    navigate(`/orders/new?flooring_type=${type}`)
   }
 
   return (
