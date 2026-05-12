@@ -21,6 +21,16 @@ export type Address = {
   postcode: string
 }
 
+export type LayDateStatus = 'CONFIRMED' | 'TO_BE_CONFIRMED'
+
+export type SaleDetails = {
+  supply_only: boolean
+  plan_numbers: string | null
+  proposed_lay_date: string | null
+  lay_date_status: LayDateStatus | null
+  details_of_sale: string | null
+}
+
 export type OrderDetails = {
   order_id: number
   order_number: string
@@ -31,6 +41,7 @@ export type OrderDetails = {
   customer: CustomerDetails | null
   installation_address: Address | null
   billing_address: Address | null
+  sale_details: SaleDetails | null
 }
 
 export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
@@ -67,6 +78,14 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
       state_code: 'NSW',
       postcode: '2000',
     },
+    sale_details: {
+      supply_only: false,
+      plan_numbers: 'PLN-4420',
+      proposed_lay_date: '2026-05-01',
+      lay_date_status: 'CONFIRMED',
+      details_of_sale:
+        'Supply and install plush carpet to lounge and dining rooms. Furniture to be moved by installer.',
+    },
   },
   2: {
     order_id: 2,
@@ -78,6 +97,7 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     customer: null,
     installation_address: null,
     billing_address: null,
+    sale_details: null,
   },
   3: {
     order_id: 3,
@@ -89,6 +109,7 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     customer: null,
     installation_address: null,
     billing_address: null,
+    sale_details: null,
   },
   4: {
     order_id: 4,
@@ -100,5 +121,6 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     customer: null,
     installation_address: null,
     billing_address: null,
+    sale_details: null,
   },
 }
