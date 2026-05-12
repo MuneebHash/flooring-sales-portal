@@ -6,7 +6,7 @@ SaaS sales portal for flooring stores (franchise-style). Replaces paper-based qu
 ## Critical workflow rules — read every session
 
 - Never commit unless the user explicitly says "commit". Show diffs and build output; stop short of git commit.
-- main is protected. All work happens on feature branches. Active branch right now: phase5-ui-prototype.
+- `main` is protected. All work happens on feature branches. Confirm the current branch with `git branch --show-current` before editing.
 - Always run npm run build from /frontend before claiming done. Report errors verbatim. Do not say "done" if the build is broken.
 - Do not modify backend/, docs/, *.sql migrations, or openapi.yaml unless the user explicitly asks.
 - Current UI prototype phase: static mock data only. No backend/API calls. No localStorage or sessionStorage. Auth state lives in React memory only.
@@ -78,7 +78,9 @@ When adding new shared primitives, place them in src/components/ui/ and match th
 - Reuse existing primitives. If a needed primitive does not exist, create it under src/components/ui/ first, then use it.
 
 ## Order Workspace tab order
-1. Customer — customer details + installation address + billing address in one tab
+1. Customer — contains two sub-tabs:
+   - Details: customer details fields
+   - Addresses: installation address + billing address
 2. Products & Charges
 3. Details of Sale
 4. Notes & Photos
