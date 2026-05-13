@@ -31,6 +31,21 @@ export type SaleDetails = {
   details_of_sale: string | null
 }
 
+export type OrderNote = {
+  order_note_id: number
+  note_text: string
+  created_at: string
+}
+
+export type OrderAttachment = {
+  order_attachment_id: number
+  attachment_kind: 'PHOTO'
+  file_name: string
+  mime_type: string
+  file_size: number
+  created_at: string
+}
+
 export type OrderDetails = {
   order_id: number
   order_number: string
@@ -42,6 +57,8 @@ export type OrderDetails = {
   installation_address: Address | null
   billing_address: Address | null
   sale_details: SaleDetails | null
+  notes: OrderNote[]
+  attachments: OrderAttachment[]
 }
 
 export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
@@ -86,6 +103,60 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
       details_of_sale:
         'Supply and install plush carpet to lounge and dining rooms. Furniture to be moved by installer.',
     },
+    notes: [
+      {
+        order_note_id: 3,
+        note_text:
+          'Plan numbers updated after on-site measure — confirmed PLN-4420.',
+        created_at: '2026-04-18T15:20:00',
+      },
+      {
+        order_note_id: 2,
+        note_text:
+          'Confirmed underlay choice on follow-up call — 10mm dual-density.',
+        created_at: '2026-04-16T11:45:00',
+      },
+      {
+        order_note_id: 1,
+        note_text:
+          'Customer prefers Saturday morning installation. Side gate access from rear lane.',
+        created_at: '2026-04-14T10:05:00',
+      },
+    ],
+    attachments: [
+      {
+        order_attachment_id: 1,
+        attachment_kind: 'PHOTO',
+        file_name: 'lounge-before.jpg',
+        mime_type: 'image/jpeg',
+        file_size: 2148576,
+        created_at: '2026-04-14T09:42:00',
+      },
+      {
+        order_attachment_id: 2,
+        attachment_kind: 'PHOTO',
+        file_name: 'dining-before.jpg',
+        mime_type: 'image/jpeg',
+        file_size: 1843200,
+        created_at: '2026-04-14T09:45:00',
+      },
+      {
+        order_attachment_id: 3,
+        attachment_kind: 'PHOTO',
+        file_name: 'skirting-detail.jpg',
+        mime_type: 'image/jpeg',
+        file_size: 952400,
+        created_at: '2026-04-14T09:48:00',
+      },
+      {
+        order_attachment_id: 4,
+        attachment_kind: 'PHOTO',
+        file_name: 'site-measure-plan.png',
+        mime_type: 'image/png',
+        file_size: 3140800,
+        created_at: '2026-04-18T15:18:00',
+      },
+    ],
   },
   2: {
     order_id: 2,
@@ -98,6 +169,8 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     installation_address: null,
     billing_address: null,
     sale_details: null,
+    notes: [],
+    attachments: [],
   },
   3: {
     order_id: 3,
@@ -110,6 +183,8 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     installation_address: null,
     billing_address: null,
     sale_details: null,
+    notes: [],
+    attachments: [],
   },
   4: {
     order_id: 4,
@@ -122,5 +197,7 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     installation_address: null,
     billing_address: null,
     sale_details: null,
+    notes: [],
+    attachments: [],
   },
 }

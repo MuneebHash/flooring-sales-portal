@@ -12,6 +12,7 @@ import { Panel } from './ui/Panel'
 import { Tabs } from './ui/Tabs'
 import { CustomerTab } from './workspace/CustomerTab'
 import { DetailsOfSaleTab } from './workspace/DetailsOfSaleTab'
+import { NotesPhotosTab } from './workspace/NotesPhotosTab'
 import { PlaceholderTab } from './workspace/PlaceholderTab'
 import {
   FLOORING_LABELS,
@@ -21,6 +22,8 @@ import {
 import type {
   Address,
   CustomerDetails,
+  OrderAttachment,
+  OrderNote,
   SaleDetails,
 } from '../data/mockOrderDetails'
 import { MOCK_ORDER_DETAILS } from '../data/mockOrderDetails'
@@ -59,6 +62,8 @@ type ShellProps = {
   installationAddress?: Address | null
   billingAddress?: Address | null
   saleDetails?: SaleDetails | null
+  notes?: OrderNote[] | null
+  attachments?: OrderAttachment[] | null
 }
 
 function WorkspaceShell({
@@ -69,6 +74,8 @@ function WorkspaceShell({
   installationAddress,
   billingAddress,
   saleDetails,
+  notes,
+  attachments,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
 
@@ -133,10 +140,7 @@ function WorkspaceShell({
               <DetailsOfSaleTab saleDetails={saleDetails} />
             )}
             {activeTab === 'notes' && (
-              <PlaceholderTab
-                title="Notes & Photos"
-                text="Notes and site photos will be added here."
-              />
+              <NotesPhotosTab notes={notes} attachments={attachments} />
             )}
             {activeTab === 'payments' && (
               <PlaceholderTab
@@ -177,6 +181,8 @@ export function OrderWorkspace() {
         installationAddress={details.installation_address}
         billingAddress={details.billing_address}
         saleDetails={details.sale_details}
+        notes={details.notes}
+        attachments={details.attachments}
       />
     )
   }
