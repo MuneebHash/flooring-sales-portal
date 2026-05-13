@@ -65,6 +65,26 @@ export type PaymentSummary = {
   balance_due: number | null
 }
 
+export type InvoiceSummary = {
+  invoice_total: number
+  total_paid: number
+  balance_due: number
+  current_version: number | null
+}
+
+export type InvoiceVersion = {
+  invoice_id: number
+  version_number: number
+  invoice_date: string
+  due_date: string
+  sale_price_inc_gst: number
+  total_paid: number
+  balance_due: number
+  pdf_filename: string
+  details_of_sale_snapshot: string
+  created_at: string
+}
+
 export type OrderDetails = {
   order_id: number
   order_number: string
@@ -80,6 +100,8 @@ export type OrderDetails = {
   attachments: OrderAttachment[]
   payments: OrderPayment[]
   payment_summary: PaymentSummary
+  invoice_summary: InvoiceSummary
+  invoice_versions: InvoiceVersion[]
 }
 
 export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
@@ -191,6 +213,27 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
       total_paid: 500.0,
       balance_due: 424.0,
     },
+    invoice_summary: {
+      invoice_total: 924.0,
+      total_paid: 500.0,
+      balance_due: 424.0,
+      current_version: 1,
+    },
+    invoice_versions: [
+      {
+        invoice_id: 1,
+        version_number: 1,
+        invoice_date: '2026-04-14',
+        due_date: '2026-04-29',
+        sale_price_inc_gst: 924.0,
+        total_paid: 500.0,
+        balance_due: 424.0,
+        pdf_filename: 'invoice-SYD-CBD.LC1.00001-v1.pdf',
+        details_of_sale_snapshot:
+          'Supply and install plush carpet to lounge and dining rooms. Furniture to be moved by installer.',
+        created_at: '2026-04-14T11:00:00',
+      },
+    ],
   },
   2: {
     order_id: 2,
@@ -207,6 +250,13 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     attachments: [],
     payments: [],
     payment_summary: { total_paid: 0.0, balance_due: null },
+    invoice_summary: {
+      invoice_total: 0.0,
+      total_paid: 0.0,
+      balance_due: 0.0,
+      current_version: null,
+    },
+    invoice_versions: [],
   },
   3: {
     order_id: 3,
@@ -223,6 +273,13 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     attachments: [],
     payments: [],
     payment_summary: { total_paid: 0.0, balance_due: null },
+    invoice_summary: {
+      invoice_total: 0.0,
+      total_paid: 0.0,
+      balance_due: 0.0,
+      current_version: null,
+    },
+    invoice_versions: [],
   },
   4: {
     order_id: 4,
@@ -239,5 +296,12 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     attachments: [],
     payments: [],
     payment_summary: { total_paid: 0.0, balance_due: null },
+    invoice_summary: {
+      invoice_total: 0.0,
+      total_paid: 0.0,
+      balance_due: 0.0,
+      current_version: null,
+    },
+    invoice_versions: [],
   },
 }

@@ -12,6 +12,7 @@ import { Panel } from './ui/Panel'
 import { Tabs } from './ui/Tabs'
 import { CustomerTab } from './workspace/CustomerTab'
 import { DetailsOfSaleTab } from './workspace/DetailsOfSaleTab'
+import { InvoiceTab } from './workspace/InvoiceTab'
 import { NotesPhotosTab } from './workspace/NotesPhotosTab'
 import { PaymentsTab } from './workspace/PaymentsTab'
 import { PlaceholderTab } from './workspace/PlaceholderTab'
@@ -23,6 +24,8 @@ import {
 import type {
   Address,
   CustomerDetails,
+  InvoiceSummary,
+  InvoiceVersion,
   OrderAttachment,
   OrderNote,
   OrderPayment,
@@ -69,6 +72,8 @@ type ShellProps = {
   attachments?: OrderAttachment[] | null
   payments?: OrderPayment[] | null
   paymentSummary?: PaymentSummary | null
+  invoiceSummary?: InvoiceSummary | null
+  invoiceVersions?: InvoiceVersion[] | null
 }
 
 function WorkspaceShell({
@@ -83,6 +88,8 @@ function WorkspaceShell({
   attachments,
   payments,
   paymentSummary,
+  invoiceSummary,
+  invoiceVersions,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
 
@@ -156,9 +163,13 @@ function WorkspaceShell({
               />
             )}
             {activeTab === 'invoice' && (
-              <PlaceholderTab
-                title="Invoice"
-                text="Invoice creation and history will appear here."
+              <InvoiceTab
+                orderNumber={orderNumber}
+                customer={customer}
+                billingAddress={billingAddress}
+                saleDetails={saleDetails}
+                invoiceSummary={invoiceSummary}
+                invoiceVersions={invoiceVersions}
               />
             )}
           </div>
@@ -192,6 +203,8 @@ export function OrderWorkspace() {
         attachments={details.attachments}
         payments={details.payments}
         paymentSummary={details.payment_summary}
+        invoiceSummary={details.invoice_summary}
+        invoiceVersions={details.invoice_versions}
       />
     )
   }
