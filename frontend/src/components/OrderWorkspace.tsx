@@ -15,7 +15,7 @@ import { DetailsOfSaleTab } from './workspace/DetailsOfSaleTab'
 import { InvoiceTab } from './workspace/InvoiceTab'
 import { NotesPhotosTab } from './workspace/NotesPhotosTab'
 import { PaymentsTab } from './workspace/PaymentsTab'
-import { PlaceholderTab } from './workspace/PlaceholderTab'
+import { ProductsChargesTab } from './workspace/ProductsChargesTab'
 import {
   FLOORING_LABELS,
   FLOORING_TONES,
@@ -23,6 +23,7 @@ import {
 } from '../lib/flooring'
 import type {
   Address,
+  ChargeLine,
   CustomerDetails,
   InvoiceSummary,
   InvoiceVersion,
@@ -30,9 +31,20 @@ import type {
   OrderNote,
   OrderPayment,
   PaymentSummary,
+  PricingSummary,
+  ProductLine,
   SaleDetails,
 } from '../data/mockOrderDetails'
 import { MOCK_ORDER_DETAILS } from '../data/mockOrderDetails'
+
+const MONEY_FORMATTER = new Intl.NumberFormat('en-AU', {
+  style: 'currency',
+  currency: 'AUD',
+})
+
+function formatMoney(value: number): string {
+  return MONEY_FORMATTER.format(value)
+}
 
 const TAB_IDS = [
   'customer',
@@ -74,6 +86,9 @@ type ShellProps = {
   paymentSummary?: PaymentSummary | null
   invoiceSummary?: InvoiceSummary | null
   invoiceVersions?: InvoiceVersion[] | null
+  productLines?: ProductLine[] | null
+  chargeLines?: ChargeLine[] | null
+  pricingSummary?: PricingSummary | null
 }
 
 function WorkspaceShell({
@@ -90,6 +105,9 @@ function WorkspaceShell({
   paymentSummary,
   invoiceSummary,
   invoiceVersions,
+  productLines,
+  chargeLines,
+  pricingSummary,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
 
@@ -128,7 +146,7 @@ function WorkspaceShell({
                 Sale total
               </div>
               <div className="text-2xl font-bold tabular-nums text-slate-900 mt-0.5">
-                $0.00
+                {formatMoney(pricingSummary?.sale_total_inc_gst ?? 0)}
               </div>
             </div>
           </div>
@@ -145,9 +163,9 @@ function WorkspaceShell({
               />
             )}
             {activeTab === 'products' && (
-              <PlaceholderTab
-                title="Products & Charges"
-                text="Products and charges will be added here."
+              <ProductsChargesTab
+                productLines={productLines}
+                chargeLines={chargeLines}
               />
             )}
             {activeTab === 'details' && (
@@ -205,6 +223,9 @@ export function OrderWorkspace() {
         paymentSummary={details.payment_summary}
         invoiceSummary={details.invoice_summary}
         invoiceVersions={details.invoice_versions}
+        productLines={details.product_lines}
+        chargeLines={details.charge_lines}
+        pricingSummary={details.pricing_summary}
       />
     )
   }

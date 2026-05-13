@@ -85,6 +85,38 @@ export type InvoiceVersion = {
   created_at: string
 }
 
+export type PricingUnit = 'LM' | 'SQM'
+
+export type ProductLine = {
+  order_product_line_id: number
+  product_code: string
+  product_name: string
+  pricing_unit: PricingUnit
+  quantity_lm: number
+  quantity_sqm: number
+  unit_price: number
+  line_total: number
+}
+
+export type ChargeLine = {
+  order_charge_line_id: number
+  charge_code: string
+  charge_name: string
+  quantity: number
+  unit_price: number
+  line_total: number
+}
+
+export type PricingSummary = {
+  product_subtotal: number
+  charge_subtotal: number
+  sale_total_ex_gst: number
+  sale_total_inc_gst: number
+  total_cost: number
+  gp: number
+  gp_percent: number | null
+}
+
 export type OrderDetails = {
   order_id: number
   order_number: string
@@ -102,6 +134,9 @@ export type OrderDetails = {
   payment_summary: PaymentSummary
   invoice_summary: InvoiceSummary
   invoice_versions: InvoiceVersion[]
+  product_lines: ProductLine[]
+  charge_lines: ChargeLine[]
+  pricing_summary: PricingSummary
 }
 
 export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
@@ -234,6 +269,55 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
         created_at: '2026-04-14T11:00:00',
       },
     ],
+    product_lines: [
+      {
+        order_product_line_id: 1,
+        product_code: 'PLU-001',
+        product_name: 'Plush Carpet Premium',
+        pricing_unit: 'LM',
+        quantity_lm: 6.0,
+        quantity_sqm: 21.96,
+        unit_price: 45.0,
+        line_total: 270.0,
+      },
+      {
+        order_product_line_id: 2,
+        product_code: 'UND-010',
+        product_name: 'Premium Foam Underlay 10mm',
+        pricing_unit: 'LM',
+        quantity_lm: 6.0,
+        quantity_sqm: 21.96,
+        unit_price: 15.0,
+        line_total: 90.0,
+      },
+    ],
+    charge_lines: [
+      {
+        order_charge_line_id: 1,
+        charge_code: 'INST-S',
+        charge_name: 'Carpet Installation',
+        quantity: 22.0,
+        unit_price: 15.0,
+        line_total: 330.0,
+      },
+      {
+        order_charge_line_id: 2,
+        charge_code: 'DISP-S',
+        charge_name: 'Removal & Disposal',
+        quantity: 1.0,
+        unit_price: 150.0,
+        line_total: 150.0,
+      },
+    ],
+    pricing_summary: {
+      product_subtotal: 360.0,
+      charge_subtotal: 480.0,
+      sale_total_ex_gst: 840.0,
+      sale_total_inc_gst: 924.0,
+      total_cost: 432.0,
+      gp: 408.0,
+      gp_percent: 48.57,
+    },
   },
   2: {
     order_id: 2,
@@ -257,6 +341,17 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
       current_version: null,
     },
     invoice_versions: [],
+    product_lines: [],
+    charge_lines: [],
+    pricing_summary: {
+      product_subtotal: 0.0,
+      charge_subtotal: 0.0,
+      sale_total_ex_gst: 0.0,
+      sale_total_inc_gst: 0.0,
+      total_cost: 0.0,
+      gp: 0.0,
+      gp_percent: null,
+    },
   },
   3: {
     order_id: 3,
@@ -280,6 +375,17 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
       current_version: null,
     },
     invoice_versions: [],
+    product_lines: [],
+    charge_lines: [],
+    pricing_summary: {
+      product_subtotal: 0.0,
+      charge_subtotal: 0.0,
+      sale_total_ex_gst: 0.0,
+      sale_total_inc_gst: 0.0,
+      total_cost: 0.0,
+      gp: 0.0,
+      gp_percent: null,
+    },
   },
   4: {
     order_id: 4,
@@ -303,5 +409,16 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
       current_version: null,
     },
     invoice_versions: [],
+    product_lines: [],
+    charge_lines: [],
+    pricing_summary: {
+      product_subtotal: 0.0,
+      charge_subtotal: 0.0,
+      sale_total_ex_gst: 0.0,
+      sale_total_inc_gst: 0.0,
+      total_cost: 0.0,
+      gp: 0.0,
+      gp_percent: null,
+    },
   },
 }
