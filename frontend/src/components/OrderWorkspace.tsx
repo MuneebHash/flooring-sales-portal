@@ -164,6 +164,7 @@ function WorkspaceShell({
             )}
             {activeTab === 'products' && (
               <ProductsChargesTab
+                flooringType={flooringType}
                 productLines={productLines}
                 chargeLines={chargeLines}
               />

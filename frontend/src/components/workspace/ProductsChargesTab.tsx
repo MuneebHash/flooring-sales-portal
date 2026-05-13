@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { Button } from '../ui/Button'
 import { ChevronDownIcon, SearchIcon, TrashIcon } from '../icons'
+import type { FlooringType } from '../../lib/flooring'
 import type {
   ChargeLine,
   PricingUnit,
@@ -8,6 +9,7 @@ import type {
 } from '../../data/mockOrderDetails'
 
 type Props = {
+  flooringType: FlooringType
   productLines?: ProductLine[] | null
   chargeLines?: ChargeLine[] | null
 }
@@ -33,6 +35,7 @@ type ChargeDraft = {
 type ProductCatalogueEntry = {
   product_code: string
   product_name: string
+  flooring_type: FlooringType
   pricing_unit: PricingUnit
   default_price: number
 }
@@ -49,30 +52,35 @@ const PRODUCT_CATALOGUE: ProductCatalogueEntry[] = [
   {
     product_code: 'PLU-001',
     product_name: 'Plush Carpet Premium',
+    flooring_type: 'SOFT',
     pricing_unit: 'LM',
     default_price: 45.0,
   },
   {
     product_code: 'UND-010',
     product_name: 'Premium Foam Underlay 10mm',
+    flooring_type: 'SOFT',
     pricing_unit: 'LM',
     default_price: 15.0,
   },
   {
     product_code: 'PLU-002',
     product_name: 'Wool Berber Carpet',
+    flooring_type: 'SOFT',
     pricing_unit: 'LM',
     default_price: 32.0,
   },
   {
     product_code: 'VIN-020',
     product_name: 'Hybrid Vinyl Plank',
+    flooring_type: 'HARD',
     pricing_unit: 'SQM',
     default_price: 58.0,
   },
   {
     product_code: 'TIM-030',
     product_name: 'Engineered Timber Oak',
+    flooring_type: 'HARD',
     pricing_unit: 'SQM',
     default_price: 82.0,
   },
@@ -123,6 +131,16 @@ function toFixed2(value: number): string {
   return value.toFixed(2)
 }
 
+function deriveSqmFromLm(lmString: string): string {
+  const lm = parseDecimal(lmString)
+  return lm > 0 ? toFixed2(round2(lm * LM_TO_SQM)) : ''
+}
+
+function deriveLmFromSqm(sqmString: string): string {
+  const sqm = parseDecimal(sqmString)
+  return sqm > 0 ? toFixed2(round2(sqm / LM_TO_SQM)) : ''
+}
+
 function computeProductSubtotal(line: ProductDraft): number {
   const qty =
     line.pricing_unit === 'LM'
@@ -150,13 +168,14 @@ const CARD_INPUT_CLASS =
 const PANEL_INPUT_CLASS =
   'w-full h-10 mt-1 rounded-md border border-slate-300 bg-white px-3 text-sm text-slate-900 placeholder:text-slate-400 tabular-nums focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/30 focus-visible:border-indigo-500'
 
-const PANEL_READONLY_CLASS =
-  'w-full h-10 mt-1 rounded-md border border-slate-200 bg-slate-50 px-3 text-sm text-slate-700 tabular-nums flex items-center'
-
 const REMOVE_BUTTON_CLASS =
   'inline-flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:bg-rose-50 hover:text-rose-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-500/30 transition-colors'
 
-export function ProductsChargesTab({ productLines, chargeLines }: Props) {
+export function ProductsChargesTab({
+  flooringType,
+  productLines,
+  chargeLines,
+}: Props) {
   const [products, setProducts] = useState<ProductDraft[]>(() =>
     (productLines ?? []).map((p) => ({
       order_product_line_id: p.order_product_line_id,
@@ -187,6 +206,7 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
     null,
   )
   const [productPanelLm, setProductPanelLm] = useState('')
+  const [productPanelSqm, setProductPanelSqm] = useState('')
   const [productPanelPrice, setProductPanelPrice] = useState('')
 
   const [chargeSearch, setChargeSearch] = useState('')
@@ -203,8 +223,10 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
     CHARGE_CATALOGUE.find((c) => c.charge_code === selectedChargeCode) ?? null
 
   const productResults = productSearch.trim()
-    ? PRODUCT_CATALOGUE.filter((p) =>
-        matchesQuery(productSearch, p.product_code, p.product_name),
+    ? PRODUCT_CATALOGUE.filter(
+        (p) =>
+          p.flooring_type === flooringType &&
+          matchesQuery(productSearch, p.product_code, p.product_name),
       )
     : []
   const chargeResults = chargeSearch.trim()
@@ -212,11 +234,6 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
         matchesQuery(chargeSearch, c.charge_code, c.charge_name),
       )
     : []
-
-  const productPanelSqm = (() => {
-    const lm = parseDecimal(productPanelLm)
-    return lm > 0 ? toFixed2(round2(lm * LM_TO_SQM)) : ''
-  })()
 
   const productSubtotal = round2(
     products.reduce((sum, l) => sum + computeProductSubtotal(l), 0),
@@ -227,15 +244,29 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
 
   function handleProductLm(id: number, value: string) {
     setProducts((prev) =>
-      prev.map((line) => {
-        if (line.order_product_line_id !== id) return line
-        const lm = parseDecimal(value)
-        return {
-          ...line,
-          quantity_lm: value,
-          quantity_sqm: toFixed2(round2(lm * LM_TO_SQM)),
-        }
-      }),
+      prev.map((line) =>
+        line.order_product_line_id === id
+          ? {
+              ...line,
+              quantity_lm: value,
+              quantity_sqm: deriveSqmFromLm(value),
+            }
+          : line,
+      ),
+    )
+  }
+
+  function handleProductSqm(id: number, value: string) {
+    setProducts((prev) =>
+      prev.map((line) =>
+        line.order_product_line_id === id
+          ? {
+              ...line,
+              quantity_sqm: value,
+              quantity_lm: deriveLmFromSqm(value),
+            }
+          : line,
+      ),
     )
   }
 
@@ -279,16 +310,28 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
     )
   }
 
+  function handlePanelLm(value: string) {
+    setProductPanelLm(value)
+    setProductPanelSqm(deriveSqmFromLm(value))
+  }
+
+  function handlePanelSqm(value: string) {
+    setProductPanelSqm(value)
+    setProductPanelLm(deriveLmFromSqm(value))
+  }
+
   function selectProduct(entry: ProductCatalogueEntry) {
     setSelectedProductCode(entry.product_code)
     setProductSearch('')
     setProductPanelLm('')
+    setProductPanelSqm('')
     setProductPanelPrice(toFixed2(entry.default_price))
   }
 
   function clearProductSelection() {
     setSelectedProductCode(null)
     setProductPanelLm('')
+    setProductPanelSqm('')
     setProductPanelPrice('')
   }
 
@@ -296,12 +339,14 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
     setProductSearch('')
     setSelectedProductCode(null)
     setProductPanelLm('')
+    setProductPanelSqm('')
     setProductPanelPrice('')
   }
 
   function handleAddProductLine() {
     if (!selectedProduct) return
     const lm = parseDecimal(productPanelLm)
+    const sqm = parseDecimal(productPanelSqm)
     const price = parseDecimal(productPanelPrice)
     const newLine: ProductDraft = {
       order_product_line_id: Date.now(),
@@ -309,7 +354,7 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
       product_name: selectedProduct.product_name,
       pricing_unit: selectedProduct.pricing_unit,
       quantity_lm: toFixed2(lm),
-      quantity_sqm: toFixed2(round2(lm * LM_TO_SQM)),
+      quantity_sqm: toFixed2(sqm),
       unit_price: toFixed2(price),
     }
     setProducts((prev) => [...prev, newLine])
@@ -449,7 +494,10 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
                               <span className="font-mono text-slate-500">
                                 {entry.pricing_unit}
                               </span>
-                              <span>{formatMoney(entry.default_price)}</span>
+                              <span>
+                                {formatMoney(entry.default_price)} /{' '}
+                                {entry.pricing_unit}
+                              </span>
                             </div>
                           </button>
                         </li>
@@ -468,7 +516,7 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
                         {selectedProduct.product_name}
                       </div>
                       <div className="mt-0.5 text-[11px] text-slate-500">
-                        Pricing unit:{' '}
+                        Priced per{' '}
                         <span className="font-mono">
                           {selectedProduct.pricing_unit}
                         </span>
@@ -491,7 +539,7 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
                         type="text"
                         inputMode="decimal"
                         value={productPanelLm}
-                        onChange={(e) => setProductPanelLm(e.target.value)}
+                        onChange={(e) => handlePanelLm(e.target.value)}
                         placeholder="0.00"
                         className={PANEL_INPUT_CLASS}
                       />
@@ -500,13 +548,18 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
                       <label className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
                         SQM
                       </label>
-                      <div className={PANEL_READONLY_CLASS}>
-                        {productPanelSqm || '—'}
-                      </div>
+                      <input
+                        type="text"
+                        inputMode="decimal"
+                        value={productPanelSqm}
+                        onChange={(e) => handlePanelSqm(e.target.value)}
+                        placeholder="0.00"
+                        className={PANEL_INPUT_CLASS}
+                      />
                     </div>
                     <div>
                       <label className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
-                        Unit price
+                        Unit price / {selectedProduct.pricing_unit}
                       </label>
                       <input
                         type="text"
@@ -618,23 +671,40 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
                             aria-label={`${line.product_code} LM quantity`}
                           />
                         </td>
-                        <td className="px-3 py-2 text-right tabular-nums text-slate-700 whitespace-nowrap text-sm">
-                          {line.quantity_sqm}
-                        </td>
                         <td className="px-3 py-2">
                           <input
                             type="text"
                             inputMode="decimal"
-                            value={line.unit_price}
+                            value={line.quantity_sqm}
                             onChange={(e) =>
-                              handleProductPrice(
+                              handleProductSqm(
                                 line.order_product_line_id,
                                 e.target.value,
                               )
                             }
                             className={CELL_INPUT_CLASS}
-                            aria-label={`${line.product_code} unit price`}
+                            aria-label={`${line.product_code} SQM quantity`}
                           />
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center gap-1">
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              value={line.unit_price}
+                              onChange={(e) =>
+                                handleProductPrice(
+                                  line.order_product_line_id,
+                                  e.target.value,
+                                )
+                              }
+                              className={CELL_INPUT_CLASS}
+                              aria-label={`${line.product_code} unit price`}
+                            />
+                            <span className="font-mono text-[10px] text-slate-500 whitespace-nowrap">
+                              /{line.pricing_unit}
+                            </span>
+                          </div>
                         </td>
                         <td className="px-3 py-2 text-right tabular-nums font-semibold text-slate-900 whitespace-nowrap">
                           {formatMoney(computeProductSubtotal(line))}
@@ -713,13 +783,22 @@ export function ProductsChargesTab({ productLines, chargeLines }: Props) {
                         <label className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
                           SQM
                         </label>
-                        <div className="h-9 mt-0.5 rounded-md border border-slate-200 bg-slate-50 px-2 flex items-center justify-end text-sm text-slate-700 tabular-nums">
-                          {line.quantity_sqm}
-                        </div>
+                        <input
+                          type="text"
+                          inputMode="decimal"
+                          value={line.quantity_sqm}
+                          onChange={(e) =>
+                            handleProductSqm(
+                              line.order_product_line_id,
+                              e.target.value,
+                            )
+                          }
+                          className={CARD_INPUT_CLASS}
+                        />
                       </div>
                       <div>
                         <label className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">
-                          Unit price
+                          Unit price / {line.pricing_unit}
                         </label>
                         <input
                           type="text"
