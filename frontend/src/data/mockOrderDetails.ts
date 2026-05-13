@@ -46,6 +46,25 @@ export type OrderAttachment = {
   created_at: string
 }
 
+export type PaymentMethod =
+  | 'CASH'
+  | 'CREDIT_CARD'
+  | 'EFTPOS'
+  | 'BANK_TRANSFER'
+
+export type OrderPayment = {
+  payment_transaction_id: number
+  payment_method: PaymentMethod
+  amount: number
+  payment_reference: string | null
+  created_at: string
+}
+
+export type PaymentSummary = {
+  total_paid: number
+  balance_due: number | null
+}
+
 export type OrderDetails = {
   order_id: number
   order_number: string
@@ -59,6 +78,8 @@ export type OrderDetails = {
   sale_details: SaleDetails | null
   notes: OrderNote[]
   attachments: OrderAttachment[]
+  payments: OrderPayment[]
+  payment_summary: PaymentSummary
 }
 
 export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
@@ -157,6 +178,19 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
         created_at: '2026-04-18T15:18:00',
       },
     ],
+    payments: [
+      {
+        payment_transaction_id: 1,
+        payment_method: 'EFTPOS',
+        amount: 500.0,
+        payment_reference: 'EFTPOS-20260414',
+        created_at: '2026-04-14T11:05:00',
+      },
+    ],
+    payment_summary: {
+      total_paid: 500.0,
+      balance_due: 424.0,
+    },
   },
   2: {
     order_id: 2,
@@ -171,6 +205,8 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     sale_details: null,
     notes: [],
     attachments: [],
+    payments: [],
+    payment_summary: { total_paid: 0.0, balance_due: null },
   },
   3: {
     order_id: 3,
@@ -185,6 +221,8 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     sale_details: null,
     notes: [],
     attachments: [],
+    payments: [],
+    payment_summary: { total_paid: 0.0, balance_due: null },
   },
   4: {
     order_id: 4,
@@ -199,5 +237,7 @@ export const MOCK_ORDER_DETAILS: Record<number, OrderDetails> = {
     sale_details: null,
     notes: [],
     attachments: [],
+    payments: [],
+    payment_summary: { total_paid: 0.0, balance_due: null },
   },
 }

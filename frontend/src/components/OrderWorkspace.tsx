@@ -13,6 +13,7 @@ import { Tabs } from './ui/Tabs'
 import { CustomerTab } from './workspace/CustomerTab'
 import { DetailsOfSaleTab } from './workspace/DetailsOfSaleTab'
 import { NotesPhotosTab } from './workspace/NotesPhotosTab'
+import { PaymentsTab } from './workspace/PaymentsTab'
 import { PlaceholderTab } from './workspace/PlaceholderTab'
 import {
   FLOORING_LABELS,
@@ -24,6 +25,8 @@ import type {
   CustomerDetails,
   OrderAttachment,
   OrderNote,
+  OrderPayment,
+  PaymentSummary,
   SaleDetails,
 } from '../data/mockOrderDetails'
 import { MOCK_ORDER_DETAILS } from '../data/mockOrderDetails'
@@ -64,6 +67,8 @@ type ShellProps = {
   saleDetails?: SaleDetails | null
   notes?: OrderNote[] | null
   attachments?: OrderAttachment[] | null
+  payments?: OrderPayment[] | null
+  paymentSummary?: PaymentSummary | null
 }
 
 function WorkspaceShell({
@@ -76,6 +81,8 @@ function WorkspaceShell({
   saleDetails,
   notes,
   attachments,
+  payments,
+  paymentSummary,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
 
@@ -143,9 +150,9 @@ function WorkspaceShell({
               <NotesPhotosTab notes={notes} attachments={attachments} />
             )}
             {activeTab === 'payments' && (
-              <PlaceholderTab
-                title="Payments"
-                text="Payments will be recorded here."
+              <PaymentsTab
+                payments={payments}
+                paymentSummary={paymentSummary}
               />
             )}
             {activeTab === 'invoice' && (
@@ -183,6 +190,8 @@ export function OrderWorkspace() {
         saleDetails={details.sale_details}
         notes={details.notes}
         attachments={details.attachments}
+        payments={details.payments}
+        paymentSummary={details.payment_summary}
       />
     )
   }
