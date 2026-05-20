@@ -9,7 +9,7 @@ SaaS sales portal for flooring stores (franchise-style). Replaces paper-based qu
 - `main` is protected. All work happens on feature branches. Confirm the current branch with `git branch --show-current` before editing.
 - Always run npm run build from /frontend before claiming done. Report errors verbatim. Do not say "done" if the build is broken.
 - Do not modify backend/, docs/, *.sql migrations, or openapi.yaml unless the user explicitly asks.
-- Current UI prototype phase: static mock data only. No backend/API calls. No localStorage or sessionStorage. Auth state lives in React memory only.
+- Frontend prototype is merged on `main`. It uses static mock data and React-memory auth only. No backend/API calls yet. No localStorage or sessionStorage. This stays true until Phase 9 wires real APIs.
 - Existing committed mock screens should not be redesigned unless the user explicitly asks for visual refinement.
 - Match locked terminology exactly. Never invent statuses, enums, terms, or order number formats. If unsure, ask.
 - Minimal scope. Do what is asked. Do not freelance scope from later sprints into the current one.
@@ -99,6 +99,8 @@ When adding new shared primitives, place them in src/components/ui/ and match th
 
 ## Where the real rules live
 For backend, API, or business-rule questions, read these files directly. Do not guess:
+- docs/Phases.md  ← current phase, time budget, build order
+- docs/Phase-6-Frontend-Backend-Handoff.md  ← mock limitations, field map, hardcoded values to replace
 - docs/API-Conventions.md
 - docs/API-Contracts-Chunk-1.md
 - docs/API-Contracts-Chunk-2.md
