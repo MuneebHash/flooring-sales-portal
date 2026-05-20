@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  frontend-build:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  backend-build:
+    name: Backend compile and test
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: flooring_user
+          POSTGRES_PASSWORD: flooring_pass
+          POSTGRES_DB: flooring_sales_portal
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U flooring_user -d flooring_sales_portal"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Make mvnw executable
+        working-directory: backend
+        run: chmod +x ./mvnw
+
+      - name: Maven verify (compile + tests; Flyway validates on Spring context load)
+        working-directory: backend
+        run: ./mvnw -B -ntp verify
+
+  locked-migrations:
+    name: Locked migration protection (V1-V6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for changes to locked migrations V1-V6
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.event.after }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            BASE="$PR_BASE_SHA"
+            HEAD="$PR_HEAD_SHA"
+            RANGE="$BASE...$HEAD"
+            echo "Pull request: diffing $RANGE (three-dot)"
+            changed=$(git diff --name-only "$BASE...$HEAD")
+          else
+            BASE="$PUSH_BEFORE"
+            HEAD="$PUSH_AFTER"
+            echo "Push: diffing $BASE..$HEAD (two-dot)"
+            changed=$(git diff --name-only "$BASE" "$HEAD")
+          fi
+
+          # grep returns 1 when no matches; "|| true" prevents the step
+          # from failing on a clean diff. We fail only if matches exist.
+          matches=$(printf '%s\n' "$changed" | grep -E '^backend/src/main/resources/db/migration/V[1-6]__.*\.sql$' || true)
+
+          if [ -n "$matches" ]; then
+            echo "ERROR: Locked migration files V1-V6 were modified:"
+            printf '%s\n' "$matches"
+            exit 1
+          fi
+
+          echo "OK: no locked migration files (V1-V6) modified."
