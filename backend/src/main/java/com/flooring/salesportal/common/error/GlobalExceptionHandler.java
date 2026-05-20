@@ -13,7 +13,6 @@ import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
 import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.validation.FieldError;
-import org.springframework.web.ErrorResponseException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
@@ -74,16 +73,14 @@ public class GlobalExceptionHandler {
         return badRequest(ErrorCode.VALIDATION_FAILED, List.of(detail));
     }
 
-    @ExceptionHandler(ErrorResponseException.class)
-    public ResponseEntity<ErrorResponse> handleErrorResponseException(ErrorResponseException ex) {
-        HttpStatusCode statusCode = ex.getStatusCode();
-        ErrorCode errorCode = mapStatusToErrorCode(statusCode);
-        ErrorBody body = new ErrorBody(errorCode.name(), errorCode.defaultMessage(), null);
-        return ResponseEntity.status(statusCode).body(new ErrorResponse(body));
-    }
-
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleUnexpected(Exception ex) {
+        if (ex instanceof org.springframework.web.ErrorResponse errorResponse) {
+            HttpStatusCode statusCode = errorResponse.getStatusCode();
+            ErrorCode errorCode = mapStatusToErrorCode(statusCode);
+            ErrorBody body = new ErrorBody(errorCode.name(), errorCode.defaultMessage(), null);
+            return ResponseEntity.status(statusCode).body(new ErrorResponse(body));
+        }
         log.error("Unhandled exception", ex);
         ErrorBody body = new ErrorBody(
                 ErrorCode.INTERNAL_SERVER_ERROR.name(),

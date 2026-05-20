@@ -117,6 +117,16 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    void httpRequestMethodNotSupported_implementsErrorResponseButNotErrorResponseException_preservesStatus() throws Exception {
+        // /test/not-found is GET-only; POSTing triggers HttpRequestMethodNotSupportedException,
+        // which implements org.springframework.web.ErrorResponse but does NOT extend ErrorResponseException.
+        // Must still resolve to 405 + VALIDATION_FAILED, never 500 INTERNAL_SERVER_ERROR.
+        mockMvc.perform(post("/test/not-found"))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+    }
+
+    @Test
     void malformedJson_returns400MalformedJson() throws Exception {
         mockMvc.perform(post("/test/valid")
                         .contentType(MediaType.APPLICATION_JSON)
