@@ -7,6 +7,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
 import org.springframework.context.annotation.Import;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -16,6 +17,7 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.server.ResponseStatusException;
 
 import static org.hamcrest.Matchers.hasItem;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
@@ -90,6 +92,31 @@ class GlobalExceptionHandlerTest {
     }
 
     @Test
+    void beanValidation_translatesCamelCaseFieldToSnakeCase() throws Exception {
+        mockMvc.perform(post("/test/valid-camel")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[*].field", hasItem("first_name")))
+                .andExpect(jsonPath("$.error.details[*].field", org.hamcrest.Matchers.not(hasItem("firstName"))));
+    }
+
+    @Test
+    void responseStatusException_preservesCarriedStatus() throws Exception {
+        mockMvc.perform(get("/test/response-status-404"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    @Test
+    void responseStatusException_unlistedClientError_mapsToValidationFailed() throws Exception {
+        mockMvc.perform(get("/test/response-status-405"))
+                .andExpect(status().isMethodNotAllowed())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+    }
+
+    @Test
     void malformedJson_returns400MalformedJson() throws Exception {
         mockMvc.perform(post("/test/valid")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -161,6 +188,10 @@ class GlobalExceptionHandlerTest {
         public void valid(@Valid @RequestBody Payload payload) {
         }
 
+        @PostMapping("/valid-camel")
+        public void validCamel(@Valid @RequestBody CamelPayload payload) {
+        }
+
         @GetMapping("/type-mismatch/{id}")
         public void typeMismatch(@PathVariable int id) {
         }
@@ -169,12 +200,25 @@ class GlobalExceptionHandlerTest {
         public void missingParam(@RequestParam String name) {
         }
 
+        @GetMapping("/response-status-404")
+        public void responseStatus404() {
+            throw new ResponseStatusException(HttpStatus.NOT_FOUND, "Order not found.");
+        }
+
+        @GetMapping("/response-status-405")
+        public void responseStatus405() {
+            throw new ResponseStatusException(HttpStatus.METHOD_NOT_ALLOWED, "Method not allowed.");
+        }
+
         @GetMapping("/boom")
         public void boom() {
             throw new RuntimeException("uh oh");
         }
 
         record Payload(@NotBlank String name) {
+        }
+
+        record CamelPayload(@NotBlank String firstName) {
         }
     }
 }
