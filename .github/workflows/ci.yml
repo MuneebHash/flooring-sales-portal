@@ -85,17 +85,29 @@ jobs:
             HEAD="$PR_HEAD_SHA"
             RANGE="$BASE...$HEAD"
             echo "Pull request: diffing $RANGE (three-dot)"
-            changed=$(git diff --name-only "$BASE...$HEAD")
+            changed=$(git diff --name-status "$BASE...$HEAD")
           else
             BASE="$PUSH_BEFORE"
             HEAD="$PUSH_AFTER"
             echo "Push: diffing $BASE..$HEAD (two-dot)"
-            changed=$(git diff --name-only "$BASE" "$HEAD")
+            changed=$(git diff --name-status "$BASE" "$HEAD")
           fi
+
+          # --name-status lines are tab-separated:
+          #   "<status>\t<path>"            for A / M / D / T
+          #   "<status>\t<old>\t<new>"      for R<sim> / C<sim>
+          # We must inspect BOTH old and new paths on rename/copy lines.
+          # Otherwise a locked V1-V6 migration could be renamed to a
+          # non-matching filename and slip past --name-only's "new path
+          # only" reporting.
+          paths=$(printf '%s\n' "$changed" | awk -F'\t' '
+            $1 ~ /^[RC]/ { print $2; print $3; next }
+            NF >= 2      { print $2 }
+          ')
 
           # grep returns 1 when no matches; "|| true" prevents the step
           # from failing on a clean diff. We fail only if matches exist.
-          matches=$(printf '%s\n' "$changed" | grep -E '^backend/src/main/resources/db/migration/V[1-6]__.*\.sql$' || true)
+          matches=$(printf '%s\n' "$paths" | grep -E '^backend/src/main/resources/db/migration/V[1-6]__.*\.sql$' || true)
 
           if [ -n "$matches" ]; then
             echo "ERROR: Locked migration files V1-V6 were modified:"
