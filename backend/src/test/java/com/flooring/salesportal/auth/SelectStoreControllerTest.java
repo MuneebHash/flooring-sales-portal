@@ -195,6 +195,44 @@ class SelectStoreControllerTest {
     }
 
     @Test
+    void userLookupFailure_doesNotWriteSessionStoreId() throws Exception {
+        // Proves ordering: AuthService.selectStore must complete every read (including the
+        // app_user lookup) before it touches the session. We construct a state where every
+        // earlier check passes but the final user load returns empty, then assert no
+        // store_id was written.
+        Long testUserId = 999L;
+        jdbcTemplate.update("""
+                INSERT INTO app_user
+                    (user_id, business_id, first_name, last_name, salesperson_code, email, password_hash)
+                VALUES
+                    (?, 1, 'Test', 'User', 'TU1', 'tu1@aussiefloors.com.au', 'irrelevant-not-bcrypt-hash')
+                """, testUserId);
+        jdbcTemplate.update(
+                "INSERT INTO user_store_access (business_id, user_id, store_id) VALUES (1, ?, 1)",
+                testUserId);
+
+        MockHttpSession session = new MockHttpSession();
+        session.setAttribute("user_id", testUserId);
+        session.setAttribute("business_id", 1L);
+
+        // Orphan the access row by removing the user. Drop the composite user FK so the
+        // delete is allowed; both DDL and DML happen inside the @Transactional test
+        // boundary and roll back at the end.
+        jdbcTemplate.execute("ALTER TABLE user_store_access DROP CONSTRAINT fk_user_store_access_user");
+        jdbcTemplate.update("DELETE FROM app_user WHERE user_id = ?", testUserId);
+
+        mockMvc.perform(post(SELECT_STORE_URL)
+                        .session(session)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"store_id\":1}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+
+        assertNull(session.getAttribute("store_id"),
+                "store_id must NOT be written when the later app_user lookup fails");
+    }
+
+    @Test
     void nonPositiveStoreId_returns400() throws Exception {
         MockHttpSession session = liamMultiStoreSession();
 

@@ -18,6 +18,7 @@ import org.springframework.web.context.WebApplicationContext;
 
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -225,6 +226,30 @@ class LoginControllerTest {
         assertEquals(1L, session.getAttribute("business_id"));
         assertNull(session.getAttribute("store_id"),
                 "Stale store_id from a reused session must be removed on multi-store login");
+    }
+
+    @Test
+    void successfulLogin_rotatesSessionId() throws Exception {
+        MockHttpSession session = new MockHttpSession();
+        String oldSessionId = session.getId();
+
+        mockMvc.perform(post(LOGIN_URL)
+                        .session(session)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"salesperson_code\":\"LC1\",\"password\":\"password123\"}"))
+                .andExpect(status().isOk());
+
+        // Spring's MockHttpServletRequest.changeSessionId() delegates to the bound
+        // MockHttpSession, which regenerates its internal id. So the same session
+        // reference now reports a fresh id after login.
+        String newSessionId = session.getId();
+        assertNotEquals(oldSessionId, newSessionId,
+                "Session id must rotate on successful login to mitigate session fixation");
+
+        // Authenticated attributes are written onto the rotated session.
+        assertEquals(1L, session.getAttribute("user_id"));
+        assertEquals(1L, session.getAttribute("business_id"));
+        assertEquals(1, session.getAttribute("store_id"));
     }
 
     @Test

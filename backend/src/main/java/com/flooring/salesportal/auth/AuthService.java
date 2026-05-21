@@ -77,6 +77,9 @@ public class AuthService {
         }
 
         HttpSession session = httpRequest.getSession(true);
+        // Rotate the session id before storing authenticated attributes so a pre-login
+        // identifier cannot be reused to hijack the now-authenticated session (fixation).
+        httpRequest.changeSessionId();
         session.setAttribute(SessionContext.USER_ID, user.getUserId());
         session.setAttribute(SessionContext.BUSINESS_ID, business.getBusinessId());
         // Drop any stale store_id from a reused session so a multi-store login can never
@@ -133,6 +136,17 @@ public class AuthService {
             throw new ForbiddenException(ErrorCode.FORBIDDEN, "Access to this store is not permitted.");
         }
 
+        // Load entities for the response BEFORE touching the session, so a failed lookup
+        // cannot leave the session half-mutated (e.g. store_id written while user load
+        // fails). The session is only written once every read has succeeded and the
+        // conflict check has cleared.
+        Store store = storeRepository.findById(requestedStoreId)
+                .orElseThrow(() -> new NotFoundException(ErrorCode.NOT_FOUND, "Store not found."));
+        AppUser user = appUserRepository.findById(sessionUserId)
+                .orElseThrow(() -> new UnauthorizedException(
+                        ErrorCode.UNAUTHORIZED,
+                        ErrorCode.UNAUTHORIZED.defaultMessage()));
+
         Integer currentStoreId = SessionContext.storeId(session);
         if (currentStoreId != null && !currentStoreId.equals(requestedStoreId)) {
             throw new ConflictException(
@@ -143,13 +157,6 @@ public class AuthService {
         if (currentStoreId == null) {
             session.setAttribute(SessionContext.STORE_ID, requestedStoreId);
         }
-
-        Store store = storeRepository.findById(requestedStoreId)
-                .orElseThrow(() -> new NotFoundException(ErrorCode.NOT_FOUND, "Store not found."));
-        AppUser user = appUserRepository.findById(sessionUserId)
-                .orElseThrow(() -> new UnauthorizedException(
-                        ErrorCode.UNAUTHORIZED,
-                        ErrorCode.UNAUTHORIZED.defaultMessage()));
 
         SelectStoreResponse body = new SelectStoreResponse(toUserDto(user), toStoreDto(store));
         return ApiResponse.ok(body, STORE_SELECTED_MESSAGE);
