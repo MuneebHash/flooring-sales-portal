@@ -7,9 +7,12 @@ public enum ErrorCode {
     VALIDATION_FAILED(HttpStatus.BAD_REQUEST, "One or more fields are invalid."),
     MALFORMED_JSON(HttpStatus.BAD_REQUEST, "Request body is malformed."),
     UNAUTHORIZED(HttpStatus.UNAUTHORIZED, "Authentication required."),
+    INVALID_CREDENTIALS(HttpStatus.UNAUTHORIZED, "Invalid salesperson code or password."),
     FORBIDDEN(HttpStatus.FORBIDDEN, "Access denied."),
+    NO_STORE_ACCESS(HttpStatus.FORBIDDEN, "You do not have access to any store in this business."),
     NOT_FOUND(HttpStatus.NOT_FOUND, "Resource not found."),
     CONFLICT(HttpStatus.CONFLICT, "Conflict."),
+    STORE_ALREADY_SELECTED(HttpStatus.CONFLICT, "A different store is already selected in this session. Log out to switch stores."),
     BUSINESS_RULE_VIOLATION(HttpStatus.UNPROCESSABLE_ENTITY, "Business rule violation."),
     INTERNAL_SERVER_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
 

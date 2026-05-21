@@ -25,7 +25,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-@WebMvcTest
+@WebMvcTest(controllers = GlobalExceptionHandlerTest.StubController.class)
 @AutoConfigureMockMvc(addFilters = false)
 @Import(GlobalExceptionHandlerTest.StubController.class)
 class GlobalExceptionHandlerTest {
