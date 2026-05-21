@@ -8,7 +8,6 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockHttpSession;
-import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.test.context.junit.jupiter.SpringExtension;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
@@ -37,20 +36,11 @@ class LoginControllerTest {
     @Autowired
     private JdbcTemplate jdbcTemplate;
 
-    @Autowired
-    private PasswordEncoder passwordEncoder;
-
     private MockMvc mockMvc;
 
     @BeforeEach
     void setUp() {
         mockMvc = MockMvcBuilders.webAppContextSetup(context).build();
-        // Re-seed the demo password hash for every user with one this PasswordEncoder accepts.
-        // The V4 hash predates the encoder configuration we now run with, so it does not
-        // verify against the documented demo password. Rewriting it inside the test transaction
-        // keeps the migration locked while letting login succeed for known credentials.
-        String hash = passwordEncoder.encode("password123");
-        jdbcTemplate.update("UPDATE app_user SET password_hash = ?", hash);
     }
 
     @Test

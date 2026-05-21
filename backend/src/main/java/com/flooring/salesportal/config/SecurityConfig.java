@@ -15,6 +15,8 @@ public class SecurityConfig {
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
+                // CSRF disabled for MVP API wiring. SP_SESSION uses HttpOnly + SameSite=Lax.
+                // CSRF token support is a follow-up hardening item before production/frontend wiring.
                 .csrf(AbstractHttpConfigurer::disable)
                 .formLogin(AbstractHttpConfigurer::disable)
                 .httpBasic(AbstractHttpConfigurer::disable)
