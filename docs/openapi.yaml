@@ -139,9 +139,9 @@ paths:
         Empty results return 200 with an empty data array. Default ordering is
         sales_order.created_at descending. Search is case-insensitive partial match across
         sales_order.order_number, order_customer.first_name, order_customer.last_name,
-        order_customer.email, and order_customer.company_name. CANCELLED orders are
-        included unless filtered out. No sort query parameter in MVP. Status filter is a
-        single enum value only.
+        order_customer.email, order_customer.company_name, and order_customer.mobile.
+        CANCELLED orders are included unless filtered out. No sort query parameter in MVP.
+        Status filter is a single enum value only.
       parameters:
         - $ref: '#/components/parameters/Page'
         - $ref: '#/components/parameters/PageSize'
@@ -2477,8 +2477,6 @@ components:
         - week_year
         - week_number
         - gp
-        - gp_percent
-        - gp_warning
       properties:
         order_id:
           type: integer
@@ -2511,13 +2509,6 @@ components:
           allOf:
             - $ref: '#/components/schemas/Money'
           nullable: true
-        gp_percent:
-          type: number
-          format: double
-          nullable: true
-          example: 48.57
-        gp_warning:
-          type: boolean
 
     DashboardOrdersResponse:
       type: object

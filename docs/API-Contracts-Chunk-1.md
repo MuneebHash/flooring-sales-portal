@@ -298,9 +298,7 @@
       "last_emailed_at": null,
       "week_year": 2026,
       "week_number": 15,
-      "gp": 408.00,
-      "gp_percent": 48.57,
-      "gp_warning": false
+      "gp": 408.00
     }
   ],
   "pagination": {
@@ -324,8 +322,6 @@
 - `last_emailed_at` — `sales_order.last_emailed_at`. May be `null`. Returned as ISO 8601 timestamp per conventions §5. The field is exposed as-stored; this contract does not introduce update behavior or a display format for it.
 - `week_year`, `week_number` — `sales_order.week_year` and `sales_order.week_number`. NOT NULL (DB constraints).
 - `gp` — `sales_order.gp`. Two decimal places. May be `null`.
-- `gp_percent` — `sales_order.gp_percent`. Two decimal places. May be `null`.
-- `gp_warning` — derived. **Locked rule:** `gp_warning = true` iff `gp_percent` is non-null AND `gp_percent < 15`. Otherwise `gp_warning = false`. In particular, when `gp` and `gp_percent` are both `null` (empty-order GP), `gp_warning = false` (conventions §12).
 
 **Business rules / scoping**
 - Only rows where `sales_order.business_id = session.business_id` AND `sales_order.store_id = session.store_id` are returned.
@@ -339,6 +335,7 @@
   - `order_customer.last_name`
   - `order_customer.email`
   - `order_customer.company_name`
+  - `order_customer.mobile`
   A row matches if any of those fields matches. Orders with no `order_customer` row can still match via `order_number`.
 
 **Validation**
@@ -485,12 +482,11 @@ These apply across every Chunk 1 endpoint and are the single source of enforceme
 
 **C.7 Money, percentages, dates, timestamps**
 - Money formatting applies to `gp` — `DECIMAL(10,2)`, always two decimal places (conventions §5).
-- Percentage formatting applies to `gp_percent`, also returned with two decimal places.
 - Dates: `YYYY-MM-DD`. Timestamps: `YYYY-MM-DDTHH:mm:ss`, server local time (Australia).
 
 **C.8 GP display (locked)**
-- `gp`, `gp_percent` may be `null` for orders with no priced lines or zero revenue (conventions §12).
-- `gp_warning = true` iff `gp_percent` is non-null AND `< 15`. Otherwise `false`. Empty-order GP (`gp = null`, `gp_percent = null`) → `gp_warning = false`.
+- `gp` may be `null` for orders with no priced lines or zero revenue (conventions §12).
+- `gp_percent` and the `gp_warning` concept are not part of the dashboard list response. They belong later in Details of Sale (conventions §12), not on the dashboard.
 
 **C.9 Dashboard row nullability (locked)**
 - Orders without an `order_customer` row → `customer: null`.
@@ -498,7 +494,7 @@ These apply across every Chunk 1 endpoint and are the single source of enforceme
 - All other dashboard row fields are sourced from `sales_order` and are always present (NOT NULL columns) except `last_emailed_at` (nullable in DB).
 
 **C.10 Search (locked)**
-- Case-insensitive partial match on `sales_order.order_number`, `order_customer.first_name`, `order_customer.last_name`, `order_customer.email`, `order_customer.company_name`.
+- Case-insensitive partial match on `sales_order.order_number`, `order_customer.first_name`, `order_customer.last_name`, `order_customer.email`, `order_customer.company_name`, `order_customer.mobile`.
 - A row matches if any of those fields matches.
 - Orders with no `order_customer` row can still match via `order_number`.
 
@@ -515,7 +511,7 @@ These apply across every Chunk 1 endpoint and are the single source of enforceme
    - Different store selected → **409 `STORE_ALREADY_SELECTED`**.
    - No longer an open question.
 3. **Locked "zero accessible active stores" on login** → **403 `NO_STORE_ACCESS`**.
-4. **Locked empty-order GP on dashboard rows** → `gp = null`, `gp_percent = null`, `gp_warning = false`.
+4. **Locked empty-order GP on dashboard rows** → `gp = null`.
 5. **Replaced prescriptive display strings with grounded structured fields** on dashboard rows:
    - `customer_name` (concatenated string) → `customer` nested object with `first_name` and `last_name`.
    - `install_address_summary` (formatted string) → `install_address` nested object with the raw DB columns (`unit_number, street_number, street, suburb, state_code, postcode`).
@@ -530,7 +526,8 @@ These apply across every Chunk 1 endpoint and are the single source of enforceme
 12. **Dropped soft / non-contract questions:** session cookie attributes, slug case-sensitivity, `auth/me`, `flooring_type` "if needed" wording. None remain.
 13. **Login normalized.** `app_user.is_active = false` is treated as 401 `INVALID_CREDENTIALS` (does not reveal which check failed). Stores list requires both `user_store_access` row AND `store.is_active = true`.
 14. **Added `email` to the dashboard `customer` nested object.** The dashboard surfaces customer email next to last-emailed timing, so the frontend needs it. `email` is sourced from `order_customer.email`, which is NOT NULL with a non-blank CHECK constraint when the row exists. Search rule (B.4 and C.10) updated to also match against `order_customer.email`.
-15. **Corrected wording in C.7.** `gp_percent` is no longer described as money. C.7 now distinguishes money formatting (applies to `gp`) from percentage formatting (applies to `gp_percent`); both are returned with two decimal places.
+15. **Corrected wording in C.7.** C.7 describes money formatting (applies to `gp`), dates, and timestamps.
+16. **Dashboard list response trimmed (this correction).** Removed `gp_percent` and `gp_warning` from the `GET /orders` response (DTO example + field rules + C.8). The dashboard list returns `gp` only; `gp_percent` and the `gp_warning` concept move to Details of Sale and remain part of the wider system. Added `order_customer.mobile` to the dashboard search fields (B.4 and C.10).
 
 ---
 
