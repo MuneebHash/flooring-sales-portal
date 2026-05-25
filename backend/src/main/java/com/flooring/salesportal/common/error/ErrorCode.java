@@ -11,6 +11,7 @@ public enum ErrorCode {
     FORBIDDEN(HttpStatus.FORBIDDEN, "Access denied."),
     NO_STORE_ACCESS(HttpStatus.FORBIDDEN, "You do not have access to any store in this business."),
     NOT_FOUND(HttpStatus.NOT_FOUND, "Resource not found."),
+    ORDER_NOT_FOUND(HttpStatus.NOT_FOUND, "Order not found."),
     CONFLICT(HttpStatus.CONFLICT, "Conflict."),
     STORE_ALREADY_SELECTED(HttpStatus.CONFLICT, "A different store is already selected in this session. Log out to switch stores."),
     BUSINESS_RULE_VIOLATION(HttpStatus.UNPROCESSABLE_ENTITY, "Business rule violation."),
