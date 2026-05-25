@@ -114,7 +114,17 @@ export async function request<T>(
     })
   }
 
-  const parsed = await parseBody(response)
+  let parsed: unknown
+  try {
+    parsed = await parseBody(response)
+  } catch (err) {
+    throw new ApiError({
+      status: response.status,
+      code: null,
+      message: 'Failed to read response body.',
+      details: err,
+    })
+  }
   if (!response.ok) {
     throw toApiError(
       response.status,
