@@ -487,7 +487,7 @@ Only merge when:
 | 14 | Deployment | 1–2 days | ⬜ |
 | 15 | Pilot fixes | 1–2 days buffer | ⬜ |
 
-**Original target:** 12–13 working days stretch.  
+**Original target:** 12–13 working days stretch.
 **Realistic target:** 14–17 working days.
 
 ---
