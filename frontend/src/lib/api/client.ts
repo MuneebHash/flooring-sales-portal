@@ -27,13 +27,33 @@ function buildUrl(path: string, query?: QueryParams): string {
   return queryString.length > 0 ? `${url}?${queryString}` : url
 }
 
+function isRawBodyInit(value: unknown): value is BodyInit {
+  return (
+    typeof value === 'string' ||
+    value instanceof FormData ||
+    value instanceof Blob ||
+    value instanceof URLSearchParams ||
+    value instanceof ArrayBuffer ||
+    ArrayBuffer.isView(value) ||
+    (typeof ReadableStream !== 'undefined' && value instanceof ReadableStream)
+  )
+}
+
 async function parseBody(response: Response): Promise<unknown> {
   if (response.status === 204) return null
   const text = await response.text()
   if (text.length === 0) return null
   try {
     return JSON.parse(text)
-  } catch {
+  } catch (err) {
+    if (response.ok) {
+      throw new ApiError({
+        status: response.status,
+        code: null,
+        message: 'Response body is not valid JSON.',
+        details: err,
+      })
+    }
     return null
   }
 }
@@ -91,10 +111,14 @@ export async function request<T>(
   const finalHeaders = new Headers(headers)
   let requestBody: BodyInit | undefined
   if (hasBody) {
-    if (!finalHeaders.has('content-type')) {
-      finalHeaders.set('Content-Type', 'application/json')
+    if (isRawBodyInit(body)) {
+      requestBody = body
+    } else {
+      requestBody = JSON.stringify(body)
+      if (!finalHeaders.has('content-type')) {
+        finalHeaders.set('Content-Type', 'application/json')
+      }
     }
-    requestBody = typeof body === 'string' ? body : JSON.stringify(body)
   }
 
   let response: Response
@@ -118,6 +142,7 @@ export async function request<T>(
   try {
     parsed = await parseBody(response)
   } catch (err) {
+    if (err instanceof ApiError) throw err
     throw new ApiError({
       status: response.status,
       code: null,
