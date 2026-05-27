@@ -4,7 +4,12 @@ import {
   useState,
   type ReactNode,
 } from 'react'
-import { MOCK_AUTH_SCENARIOS } from '../data/mockAuth'
+import { ApiError } from './api/ApiError'
+import {
+  loginRequest,
+  logoutRequest,
+  selectStoreRequest,
+} from './api/authApi'
 
 export type User = {
   user_id: number
@@ -26,6 +31,7 @@ type AuthState = {
 }
 
 export type LoginResult = { ok: true } | { ok: false; error: string }
+export type SelectStoreResult = { ok: true } | { ok: false; error: string }
 
 type AuthContextValue = AuthState & {
   isAuthenticated: boolean
@@ -33,55 +39,71 @@ type AuthContextValue = AuthState & {
     salesperson_code: string,
     password: string,
   ) => Promise<LoginResult>
-  selectStore: (store_id: number) => void
-  logout: () => void
+  selectStore: (store_id: number) => Promise<SelectStoreResult>
+  logout: () => Promise<void>
 }
 
 const AuthContext = createContext<AuthContextValue | undefined>(undefined)
 
+const EMPTY_STATE: AuthState = {
+  user: null,
+  stores: [],
+  activeStore: null,
+}
+
+function errorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return err.message
+  if (err instanceof Error && err.message.length > 0) return err.message
+  return fallback
+}
+
 export function AuthProvider({ children }: { children: ReactNode }) {
-  const [state, setState] = useState<AuthState>({
-    user: null,
-    stores: [],
-    activeStore: null,
-  })
+  const [state, setState] = useState<AuthState>(EMPTY_STATE)
 
   const login = async (
     salesperson_code: string,
     password: string,
   ): Promise<LoginResult> => {
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    const scenario = MOCK_AUTH_SCENARIOS.find(
-      (s) =>
-        s.salesperson_code === salesperson_code && s.password === password,
-    )
-    if (!scenario) {
-      return { ok: false, error: 'Invalid salesperson code or password.' }
+    try {
+      const response = await loginRequest({ salesperson_code, password })
+      const { user, stores, active_store_id } = response.data
+      const activeStore =
+        active_store_id !== null
+          ? stores.find((s) => s.store_id === active_store_id) ?? null
+          : null
+      setState({ user, stores, activeStore })
+      return { ok: true }
+    } catch (err) {
+      return {
+        ok: false,
+        error: errorMessage(err, 'Login failed. Please try again.'),
+      }
     }
-    const activeStore =
-      scenario.active_store_id !== null
-        ? scenario.stores.find(
-            (s) => s.store_id === scenario.active_store_id,
-          ) ?? null
-        : null
-    setState({
-      user: scenario.user,
-      stores: scenario.stores,
-      activeStore,
-    })
-    return { ok: true }
   }
 
-  const selectStore = (store_id: number) => {
-    setState((prev) => {
-      const found = prev.stores.find((s) => s.store_id === store_id)
-      if (!found) return prev
-      return { ...prev, activeStore: found }
-    })
+  const selectStore = async (
+    store_id: number,
+  ): Promise<SelectStoreResult> => {
+    try {
+      const response = await selectStoreRequest({ store_id })
+      const { active_store } = response.data
+      setState((prev) => ({ ...prev, activeStore: active_store }))
+      return { ok: true }
+    } catch (err) {
+      return {
+        ok: false,
+        error: errorMessage(err, 'Could not select store. Please try again.'),
+      }
+    }
   }
 
-  const logout = () => {
-    setState({ user: null, stores: [], activeStore: null })
+  const logout = async (): Promise<void> => {
+    try {
+      await logoutRequest()
+    } catch {
+      // Session already gone or network failure — still clear local state.
+    }
+    setState(EMPTY_STATE)
   }
 
   return (
