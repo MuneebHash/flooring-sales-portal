@@ -11,7 +11,6 @@ export type Order = {
   address: string
   week: string
   gp: string
-  gp_percent: number | null
   last_emailed: string
 }
 
@@ -26,7 +25,6 @@ export const MOCK_ORDERS: Order[] = [
     address: '42 Oxford Street, Paddington NSW 2021',
     week: '15 / 2026',
     gp: '$408.00',
-    gp_percent: 48.57,
     last_emailed: 'Not emailed',
   },
   {
@@ -39,7 +37,6 @@ export const MOCK_ORDERS: Order[] = [
     address: 'No install address',
     week: '15 / 2026',
     gp: '—',
-    gp_percent: null,
     last_emailed: 'Not emailed',
   },
   {
@@ -52,7 +49,6 @@ export const MOCK_ORDERS: Order[] = [
     address: 'No install address',
     week: '14 / 2026',
     gp: '—',
-    gp_percent: null,
     last_emailed: 'Not emailed',
   },
   {
@@ -65,7 +61,6 @@ export const MOCK_ORDERS: Order[] = [
     address: 'No install address',
     week: '14 / 2026',
     gp: '—',
-    gp_percent: null,
     last_emailed: 'Not emailed',
   },
 ]
