@@ -30,6 +30,9 @@ export function Dashboard() {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [statusError, setStatusError] = useState<string | null>(null)
+  const [pendingStatusOrderIds, setPendingStatusOrderIds] = useState<
+    Set<number>
+  >(() => new Set())
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL')
   const [newOrderOpen, setNewOrderOpen] = useState(false)
@@ -85,7 +88,9 @@ export function Dashboard() {
     next: OrderStatus,
   ) => {
     if (next === current) return
+    if (pendingStatusOrderIds.has(orderId)) return
     setStatusError(null)
+    setPendingStatusOrderIds((prev) => new Set(prev).add(orderId))
     try {
       const response = await updateOrderStatus(orderId, next)
       const updated = response.data.order_status
@@ -100,6 +105,12 @@ export function Dashboard() {
           ? err.message
           : 'Could not update status. Please try again.'
       setStatusError(message)
+    } finally {
+      setPendingStatusOrderIds((prev) => {
+        const nextPending = new Set(prev)
+        nextPending.delete(orderId)
+        return nextPending
+      })
     }
   }
 
@@ -287,6 +298,7 @@ export function Dashboard() {
                     <td className="px-4 py-3 align-top">
                       <StatusSelect
                         value={o.status}
+                        disabled={pendingStatusOrderIds.has(o.order_id)}
                         onChange={(next) =>
                           handleStatusChange(o.order_id, o.status, next)
                         }
