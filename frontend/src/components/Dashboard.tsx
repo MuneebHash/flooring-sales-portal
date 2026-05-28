@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Badge } from './ui/Badge'
 import { Button } from './ui/Button'
@@ -15,16 +15,53 @@ import type { OrderStatus } from '../lib/statuses'
 import { STATUS_LABELS, STATUS_ORDER } from '../lib/statuses'
 import { FLOORING_TONES } from '../lib/flooring'
 import type { Order } from '../data/mockOrders'
-import { MOCK_ORDERS } from '../data/mockOrders'
+import { ApiError } from '../lib/api/ApiError'
+import {
+  fetchDashboardOrders,
+  updateOrderStatus,
+} from '../lib/api/ordersApi'
+import { apiRowToOrder } from '../lib/api/ordersAdapter'
 
 type StatusFilter = OrderStatus | 'ALL'
 
 export function Dashboard() {
   const navigate = useNavigate()
-  const [orders, setOrders] = useState<Order[]>(MOCK_ORDERS)
+  const [orders, setOrders] = useState<Order[]>([])
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [statusError, setStatusError] = useState<string | null>(null)
+  const [pendingStatusOrderIds, setPendingStatusOrderIds] = useState<
+    Set<number>
+  >(() => new Set())
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('ALL')
   const [newOrderOpen, setNewOrderOpen] = useState(false)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setLoadError(null)
+    fetchDashboardOrders()
+      .then((response) => {
+        if (cancelled) return
+        setOrders(response.data.map(apiRowToOrder))
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        const message =
+          err instanceof ApiError && err.message.length > 0
+            ? err.message
+            : 'Could not load orders. Please try again.'
+        setLoadError(message)
+      })
+      .finally(() => {
+        if (cancelled) return
+        setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -45,12 +82,36 @@ export function Dashboard() {
     })
   }, [orders, search, statusFilter])
 
-  const updateStatus = (orderNumber: string, next: OrderStatus) => {
-    setOrders((prev) =>
-      prev.map((o) =>
-        o.order_number === orderNumber ? { ...o, status: next } : o,
-      ),
-    )
+  const handleStatusChange = async (
+    orderId: number,
+    current: OrderStatus,
+    next: OrderStatus,
+  ) => {
+    if (next === current) return
+    if (pendingStatusOrderIds.has(orderId)) return
+    setStatusError(null)
+    setPendingStatusOrderIds((prev) => new Set(prev).add(orderId))
+    try {
+      const response = await updateOrderStatus(orderId, next)
+      const updated = response.data.order_status
+      setOrders((prev) =>
+        prev.map((o) =>
+          o.order_id === orderId ? { ...o, status: updated } : o,
+        ),
+      )
+    } catch (err) {
+      const message =
+        err instanceof ApiError && err.message.length > 0
+          ? err.message
+          : 'Could not update status. Please try again.'
+      setStatusError(message)
+    } finally {
+      setPendingStatusOrderIds((prev) => {
+        const nextPending = new Set(prev)
+        nextPending.delete(orderId)
+        return nextPending
+      })
+    }
   }
 
   return (
@@ -109,6 +170,12 @@ export function Dashboard() {
         </div>
       </div>
 
+      {statusError !== null ? (
+        <div className="mb-4 rounded-lg border border-red-200 bg-red-50 px-4 py-2.5 text-sm text-red-700">
+          {statusError}
+        </div>
+      ) : null}
+
       <div className="overflow-hidden border border-slate-200 rounded-xl">
         <table className="w-full table-fixed text-sm">
           <thead className="bg-slate-100 text-[11px] uppercase tracking-wider text-slate-600 border-b border-slate-200">
@@ -135,26 +202,42 @@ export function Dashboard() {
             </tr>
           </thead>
           <tbody className="divide-y divide-slate-100">
-            {filtered.length === 0 ? (
+            {loading ? (
+              <tr>
+                <td colSpan={7} className="px-4 py-12 text-center">
+                  <span className="text-sm text-slate-500">
+                    Loading orders…
+                  </span>
+                </td>
+              </tr>
+            ) : loadError !== null ? (
+              <tr>
+                <td colSpan={7} className="px-4 py-12 text-center">
+                  <span className="text-sm text-red-600">{loadError}</span>
+                </td>
+              </tr>
+            ) : filtered.length === 0 ? (
               <tr>
                 <td colSpan={7} className="px-4 py-12 text-center">
                   <div className="inline-flex flex-col items-center gap-1">
                     <span className="text-sm text-slate-500">
-                      No orders match your filters.
+                      {orders.length === 0
+                        ? 'No orders yet.'
+                        : 'No orders match your filters.'}
                     </span>
                     <span className="text-xs text-slate-400">
-                      Try adjusting your search or status.
+                      {orders.length === 0
+                        ? 'New orders will appear here.'
+                        : 'Try adjusting your search or status.'}
                     </span>
                   </div>
                 </td>
               </tr>
             ) : (
               filtered.map((o) => {
-                const positiveGp =
-                  o.gp_percent !== null && o.gp_percent > 0
                 return (
                   <tr
-                    key={o.order_number}
+                    key={o.order_id}
                     className="transition-colors hover:bg-slate-50"
                   >
                     <td className="px-4 py-3 align-top">
@@ -200,13 +283,6 @@ export function Dashboard() {
                       <div className="text-sm font-medium text-slate-900 tabular-nums">
                         {o.gp}
                       </div>
-                      <div
-                        className={`text-xs font-medium tabular-nums mt-0.5 ${positiveGp ? 'text-emerald-600' : 'text-slate-400'}`}
-                      >
-                        {o.gp_percent !== null
-                          ? `${o.gp_percent.toFixed(2)}%`
-                          : '—'}
-                      </div>
                     </td>
                     <td className="px-4 py-3 align-top">
                       <div className="flex items-start gap-1.5 text-xs text-slate-500">
@@ -222,8 +298,9 @@ export function Dashboard() {
                     <td className="px-4 py-3 align-top">
                       <StatusSelect
                         value={o.status}
+                        disabled={pendingStatusOrderIds.has(o.order_id)}
                         onChange={(next) =>
-                          updateStatus(o.order_number, next)
+                          handleStatusChange(o.order_id, o.status, next)
                         }
                       />
                     </td>
