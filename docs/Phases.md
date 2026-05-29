@@ -16,18 +16,19 @@
   - `PATCH /api/v1/{slug}/orders/{orderId}/status`
 - Phase 8 → Phase 9 bridge complete:
   - local-dev CORS for Vite frontend origins `http://localhost:5173` and `http://localhost:5174`
+- Phase 9 frontend wire Chunk 1 complete:
+  - frontend API client foundation (PR #25)
+  - real auth wiring (PR #26)
+  - real dashboard list + status patch wiring (PR #32)
 
 **Current next phase:**
-- Phase 9: Frontend wire Chunk 1
+- Phase 10: Chunk 2 — Order Shell + Customer + Addresses + Details
 
 **Not started:**
-- Frontend wiring to real APIs
 - Chunk 2–4 backend/frontend implementation
 - Stripe
 - Deployment
 - Pilot/hardening
-
-**Target:** Deployed MVP in 12–13 working days. Stretch goal, not a contract.
 
 ---
 
@@ -90,8 +91,8 @@ Actual output:
 
 Status:
 - Merged to `main`
-- Mock data only
-- No real API wiring yet
+- Mock data only at the time
+- Real API wiring later completed in Phase 9 for the Chunk 1 auth/dashboard flow
 
 ### Phase 6: Frontend/Backend Handoff Doc — ✅ DONE
 
@@ -213,42 +214,80 @@ Tracked deployment follow-up:
 - Production must override `app.cors.allowed-origins` with real frontend origin(s) in Phase 14.
 - Do not rely on localhost origins in production deployment config.
 
-### Phase 9: Frontend Wire Chunk 1 — ⏭ NEXT
+### Phase 9: Frontend Wire Chunk 1 — ✅ DONE
 
-**Estimate:** 0.5–1 day
+Goal achieved:
+Login → dashboard → status-update run on real backend for the Chunk 1 auth/dashboard flow. Store-select is implemented but not runtime-tested because no multi-store seed user exists yet.
 
-Goal:
-Wire the existing Phase 5 frontend prototype to real Chunk 1 backend APIs.
+#### Phase 9.1 Frontend API Client Foundation — ✅ DONE
 
-Backend already available:
-- login
-- select-store
-- logout
-- dashboard list
-- status patch
-- local-dev CORS
+Merged in PR #25.
 
-Frontend work:
-- Add API client
-- Add credentialed requests with cookies
-- Replace mock auth with real auth calls
-- Replace mock dashboard orders with real `GET /orders`
-- Wire status dropdown to real `PATCH /orders/{orderId}/status`
-- Add loading states
-- Add error states
-- Handle session loss by returning to login
-- Keep Phase 5 UI structure unless a specific integration issue forces a small adjustment
+Implemented:
+- `frontend/src/lib/api/` foundation: `config.ts`, `types.ts`, `ApiError.ts`, `client.ts`, `paths.ts`, `index.ts`
+- native fetch-based request helper with `credentials: 'include'`
+- typed success / collection / error response wrappers
+- `ApiError` class normalizing backend error shape
+- `apiPath(slug, path)` URL builder
+- `VITE_API_BASE_URL` config with local fallback
+- Codex-driven hardenings:
+  - network failures wrapped as `ApiError` (status 0)
+  - response body read failures wrapped as `ApiError`
+  - raw `BodyInit` bodies (FormData, Blob, URLSearchParams, etc.) pass through untouched
+  - invalid JSON on 2xx surfaces as `ApiError`
+  - guarded `ReadableStream` check
 
-Done when:
-- login works against backend
-- multi-store select works if needed
-- dashboard loads real seeded orders
-- status dropdown updates real backend status
-- browser cookie/session flow works end-to-end
+#### Phase 9.2 Frontend Auth Wiring — ✅ DONE
 
-### Phase 10: Chunk 2 — Order Shell + Customer + Addresses + Details
+Merged in PR #26.
 
-**Estimate:** 3 days backend + frontend wiring
+Implemented:
+- `frontend/src/lib/tenant.ts` with centralized `DEFAULT_BUSINESS_SLUG = 'aussie-floors-group'`
+- `frontend/src/lib/api/authApi.ts` typed login / select-store / logout wrappers
+- `auth.tsx` rewired off mock to real backend
+- single-store login derives `activeStore` from `active_store_id`
+- multi-store path implemented but not runtime-tested — no multi-store seed user yet
+- async `selectStore` + `logout`, 409 `STORE_ALREADY_SELECTED` surfaces backend message
+- logout clears local React state on both success and failure
+- single-store login smoke-tested end-to-end (200 OK)
+
+#### Phase 9.3 Frontend Dashboard Wiring + Status Patch — ✅ DONE
+
+Merged in PR #32.
+
+Implemented:
+- `frontend/src/lib/api/ordersApi.ts` with `DashboardOrderRow`, `OrderStatusUpdateResponse`, `fetchDashboardOrders()`, `updateOrderStatus()`
+- `frontend/src/lib/api/ordersAdapter.ts` mapping backend rows to frontend display shape
+- adapter rules:
+  - `customer null → "No customer yet"`, else `"first_name last_name"`
+  - `install_address null → "No install address"`, else `"{unit?}/{street_number} {street}, {suburb} {state_code} {postcode}"`
+  - `week = "{week_number} / {week_year}"`
+  - `gp null → "—"`, else `"$N.NN"`
+  - `last_emailed_at null → "Not emailed"`, else `"DD Month YYYY"`
+- removed `gp_percent` from `Order` type and dashboard render (Chunk 1 contract returns `gp` only)
+- loading / error / empty states on dashboard
+- status dropdown wired to real PATCH using `order_id`
+- no optimistic update; failed PATCH keeps old status and shows error banner
+- same-status PATCH short-circuited client-side
+- Codex-driven hardening: pending status PATCHes tracked as a `Set<number>`, each row independently disabled while its own PATCH is in flight (prevents stale response overwrite races)
+- end-to-end smoke test passed: login, dashboard load, status persist on refresh, failed PATCH does not fake-update UI, client-side search/filter works
+
+Locked product decisions captured during Phase 9:
+- Dashboard is store-level for MVP — anyone with access to a store sees that store's orders.
+- No role-based visibility. Access-based only.
+- Sales Portal vs Store Portal dashboard split is a future concern, not tracked as an issue.
+
+Tracked follow-ups created as GitHub issues:
+- #27 Replace hardcoded business slug with dynamic business selection
+- #28 Add multi-store demo user and test store selection
+- #29 Add CSRF protection before production
+- #30 Configure production CORS origins
+- #31 Move shared auth types out of `auth.tsx`
+
+Known deferrals carried forward (not tracked as issues, accepted for MVP):
+- Dashboard fetches page 1 at `page_size=100` and filters/searches client-side. Server-side search + pagination deferred until order volume requires it.
+
+### Phase 10: Chunk 2 — Order Shell + Customer + Addresses + Details — ⏭ NEXT
 
 Backend endpoints:
 - `POST /orders`
@@ -273,9 +312,10 @@ Done when:
 - fill customer/address/details
 - save and reopen the order workspace
 
-### Phase 11: Chunk 3 — Products, Charges, Lines, Notes, Photos
+Note:
+- Phase 10 introduces the first `SalesOrder` JPA entity (deliberately deferred from Chunk 1).
 
-**Estimate:** 3.5 days backend + frontend wiring
+### Phase 11: Chunk 3 — Products, Charges, Lines, Notes, Photos
 
 Backend endpoints:
 - available products search
@@ -306,8 +346,6 @@ Done when:
 
 ### Phase 12: Chunk 4 — Invoices + Payments
 
-**Estimate:** 3 days backend + frontend wiring
-
 Backend endpoints:
 - create invoice v1
 - rewrite invoice
@@ -335,8 +373,6 @@ Done when:
 
 ### Phase 13: Stripe
 
-**Estimate:** 1.5 days hard cap
-
 If slipping:
 - cut to post-MVP
 - or keep only simplest test-mode payment flow
@@ -354,8 +390,6 @@ Done when:
 
 ### Phase 14: Deployment
 
-**Estimate:** 1–2 days
-
 Target:
 - single VM deployment is acceptable
 - Docker Compose:
@@ -368,10 +402,10 @@ Target:
 - basic DB backup
 
 Deployment config requirements:
-- production must set real `app.cors.allowed-origins`
+- production must set real `app.cors.allowed-origins` (issue #30)
 - production must not rely on localhost CORS defaults
 - cookie `secure=true` should be enabled for HTTPS production
-- CSRF strategy must be decided before production if browser session-cookie auth remains
+- CSRF strategy must be decided before production if browser session-cookie auth remains (issue #29)
 - secrets must not be committed
 
 Done when:
@@ -380,8 +414,6 @@ Done when:
 - DB survives restart
 
 ### Phase 15: Pilot / Hardening
-
-**Estimate:** 1–2 days buffer
 
 Tasks:
 - manually load initial product catalog/prices
@@ -398,16 +430,24 @@ Done when:
 
 ## 5. Tracked Deferrals / Follow-ups
 
-These are known and accepted. They do not block Phase 9.
+These are known and accepted. They do not block the next phase.
+
+### GitHub Issues
+
+- #27 Replace hardcoded business slug with dynamic business selection
+- #28 Add multi-store demo user and test store selection
+- #29 Add CSRF protection before production
+- #30 Configure production CORS origins
+- #31 Move shared auth types out of `auth.tsx`
 
 ### Security / Production Hardening
 
-- CSRF token strategy for browser session-cookie auth
+- CSRF token strategy for browser session-cookie auth (issue #29)
   - currently deferred
   - required before production deployment if cross-site/browser session use remains
 - Cookie `secure=true` per environment
   - required for HTTPS production
-- CORS production origin config
+- CORS production origin config (issue #30)
   - production must override `app.cors.allowed-origins`
   - real frontend origin(s) must be configured during Phase 14
 - Rate limiting for login
@@ -422,6 +462,14 @@ These are known and accepted. They do not block Phase 9.
   - can be optimized later if needed
 - Dashboard count/list are not wrapped in read-only transaction
   - acceptable for MVP scale
+
+### Frontend
+
+- Dashboard fetches page 1 at `page_size=100` and filters client-side
+  - acceptable while seed/early-pilot stores have few orders
+  - server-side search + pagination to be added when order volume requires it
+- Move shared auth types (`User`, `Store`) out of `auth.tsx` to break the type-only import cycle with `authApi.ts` (issue #31)
+- Replace `DEFAULT_BUSINESS_SLUG` constant with dynamic business resolution (issue #27)
 
 ### Test / Build Hygiene
 
@@ -447,11 +495,10 @@ Examples:
 
 One screen group or flow per branch.
 
-For Phase 9, likely branches:
+Phase 9 used:
 - `feature/frontend-api-client`
 - `feature/frontend-wire-auth`
-- `feature/frontend-wire-dashboard`
-- `feature/frontend-wire-status-patch`
+- `feature/frontend-wire-dashboard` (list + status patch combined)
 
 Adjust only if splitting becomes inefficient.
 
@@ -473,39 +520,16 @@ Only merge when:
 
 ---
 
-## 7. Time Budget Checklist
+## 7. Immediate Next Step
 
-| # | Phase | Estimate | Status |
-|---|-------|----------|--------|
-| 7 | CI Setup | 0.5–1 day | ✅ Done |
-| 8 | Backend Chunk 1 + CORS bridge | 2–2.5 days | ✅ Done |
-| 9 | Frontend wire Chunk 1 | 0.5–1 day | ⏭ Next |
-| 10 | Backend Chunk 2 + frontend wire | 3 days | ⬜ |
-| 11 | Backend Chunk 3 + frontend wire | 3.5 days | ⬜ |
-| 12 | Backend Chunk 4 + frontend wire | 3 days | ⬜ |
-| 13 | Stripe | 1.5 days hard cap | ⬜ |
-| 14 | Deployment | 1–2 days | ⬜ |
-| 15 | Pilot fixes | 1–2 days buffer | ⬜ |
+Phase 10 — Chunk 2: Order Shell + Customer + Addresses + Details.
 
-**Original target:** 12–13 working days stretch.
-**Realistic target:** 14–17 working days.
+This is the next vertical slice: backend endpoints built and then wired to the frontend through small branches. It also introduces the first `SalesOrder` JPA entity.
 
----
+Start by drafting the Phase 10 spec from `docs/API-Contracts-Chunk-2.md` and the existing mock frontend (`NewOrderModal`, order workspace, customer/address/details-of-sale screens).
 
-## 8. Immediate Next Step
-
-Phase 9 — Frontend wire Chunk 1.
-
-Start by planning the first frontend integration branch.
-
-Recommended first branch:
-
-`feature/frontend-api-client`
-
-Purpose:
-- create API client foundation
-- configure credentialed requests
-- centralize API error handling
-- prepare auth/dashboard wiring without changing too many screens at once
-
-Do not start Chunk 2 backend until Phase 9 Chunk 1 frontend flow is working end-to-end.
+Recommended branch order to be decided during spec drafting. Likely splits:
+- backend order shell (`POST /orders`, `GET /orders/{orderId}`)
+- backend customer + addresses
+- backend details-of-sale
+- frontend wiring per matching slice
