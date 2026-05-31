@@ -1,6 +1,7 @@
 package com.flooring.salesportal.order;
 
 import com.flooring.salesportal.common.api.ErrorDetail;
+import com.flooring.salesportal.common.error.BusinessRuleException;
 import com.flooring.salesportal.common.error.ErrorCode;
 import com.flooring.salesportal.common.error.NotFoundException;
 import com.flooring.salesportal.common.error.ValidationException;
@@ -9,6 +10,8 @@ import com.flooring.salesportal.common.session.RequestContextGuard;
 import com.flooring.salesportal.order.dto.AddressDto;
 import com.flooring.salesportal.order.dto.CreateOrderRequest;
 import com.flooring.salesportal.order.dto.CustomerDto;
+import com.flooring.salesportal.order.dto.CustomerSaveRequest;
+import com.flooring.salesportal.order.dto.CustomerSaveResponse;
 import com.flooring.salesportal.order.dto.OrderHeaderResponse;
 import com.flooring.salesportal.order.dto.OrderWorkspaceResponse;
 import com.flooring.salesportal.order.dto.PersistedFinancialsDto;
@@ -23,6 +26,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.temporal.IsoFields;
+import java.util.ArrayList;
 import java.util.List;
 
 @Service
@@ -41,6 +45,7 @@ public class OrderService {
     private final OrderCreateRepository orderCreateRepository;
     private final SalesOrderRepository salesOrderRepository;
     private final OrderCustomerRepository orderCustomerRepository;
+    private final OrderCustomerWriteRepository orderCustomerWriteRepository;
     private final OrderAddressRepository orderAddressRepository;
 
     public OrderService(RequestContextGuard requestContextGuard,
@@ -49,6 +54,7 @@ public class OrderService {
                         OrderCreateRepository orderCreateRepository,
                         SalesOrderRepository salesOrderRepository,
                         OrderCustomerRepository orderCustomerRepository,
+                        OrderCustomerWriteRepository orderCustomerWriteRepository,
                         OrderAddressRepository orderAddressRepository) {
         this.requestContextGuard = requestContextGuard;
         this.storeRepository = storeRepository;
@@ -56,6 +62,7 @@ public class OrderService {
         this.orderCreateRepository = orderCreateRepository;
         this.salesOrderRepository = salesOrderRepository;
         this.orderCustomerRepository = orderCustomerRepository;
+        this.orderCustomerWriteRepository = orderCustomerWriteRepository;
         this.orderAddressRepository = orderAddressRepository;
     }
 
@@ -172,6 +179,56 @@ public class OrderService {
                 persistedFinancials);
     }
 
+    /**
+     * PUT /orders/{orderId}/customer. Insert-or-full-replace the one {@code order_customer} row.
+     * Gate-first ordering (approved): guard → parse orderId → scoped lookup → 404 → LAID → 422 →
+     * only then validate body and upsert. So a LAID in-scope order with an invalid body still
+     * returns 422 ORDER_LOCKED, and a cross-store/cross-business order with an invalid body still
+     * returns 404 ORDER_NOT_FOUND.
+     */
+    @Transactional
+    public CustomerSaveResponse saveCustomer(String slug,
+                                             String orderIdRaw,
+                                             CustomerSaveRequest body,
+                                             HttpServletRequest httpRequest) {
+        // 1. Standard-protected guard.
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+
+        // 2. Validate the path variable as a positive integer.
+        long orderId = parseOrderId(orderIdRaw);
+
+        // 3. Scope to the session's (business_id, store_id). Missing / cross-store / cross-business
+        //    all return empty -> 404 ORDER_NOT_FOUND with no existence leak.
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        // 4. Only after the order is confirmed in-scope: LAID is locked for customer edits.
+        if (STATUS_LAID.equals(order.getOrderStatus())) {
+            throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
+        }
+
+        // 5. Validate + trim the body. Full-replace: optional omitted/null fields become null.
+        CustomerDto customer = validateAndTrimCustomer(body);
+
+        // 6. One clock for created_at (insert only) / updated_at. Native upsert respects
+        //    uq_order_customer_order, preserves created_at on replace, refreshes updated_at.
+        LocalDateTime now = LocalDateTime.now();
+        orderCustomerWriteRepository.upsert(
+                orderId,
+                customer.firstName(),
+                customer.middleName(),
+                customer.lastName(),
+                customer.email(),
+                customer.mobile(),
+                customer.homePhone(),
+                customer.workPhone(),
+                customer.companyName(),
+                now);
+
+        return new CustomerSaveResponse(customer);
+    }
+
     private static String validateFlooringType(CreateOrderRequest body) {
         String value = body == null ? null : body.flooringType();
         if (value == null) {
@@ -201,6 +258,62 @@ public class OrderService {
         throw new ValidationException(
                 ErrorCode.VALIDATION_FAILED.defaultMessage(),
                 List.of(new ErrorDetail(null, "order_id", "Must be a positive integer.")));
+    }
+
+    /**
+     * Validate the customer body and return trimmed values as a {@link CustomerDto}. Collects all
+     * field errors (validated in field order) into one VALIDATION_FAILED so {@code details[0]} is
+     * the first offending field. Required: first_name, last_name, email (must contain {@code @}),
+     * mobile. Optionals, when provided non-null, must be non-blank after trim; otherwise null.
+     */
+    private static CustomerDto validateAndTrimCustomer(CustomerSaveRequest body) {
+        List<ErrorDetail> errors = new ArrayList<>();
+        String firstName = requireNonBlank(body == null ? null : body.firstName(), "first_name", errors);
+        String lastName  = requireNonBlank(body == null ? null : body.lastName(), "last_name", errors);
+        String email     = requireEmail(body == null ? null : body.email(), errors);
+        String mobile    = requireNonBlank(body == null ? null : body.mobile(), "mobile", errors);
+        String middleName  = optionalNonBlank(body == null ? null : body.middleName(), "middle_name", errors);
+        String homePhone   = optionalNonBlank(body == null ? null : body.homePhone(), "home_phone", errors);
+        String workPhone   = optionalNonBlank(body == null ? null : body.workPhone(), "work_phone", errors);
+        String companyName = optionalNonBlank(body == null ? null : body.companyName(), "company_name", errors);
+
+        if (!errors.isEmpty()) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
+        }
+
+        return new CustomerDto(firstName, middleName, lastName, email, mobile, homePhone, workPhone, companyName);
+    }
+
+    private static String requireNonBlank(String raw, String field, List<ErrorDetail> errors) {
+        if (raw == null || raw.isBlank()) {
+            errors.add(new ErrorDetail(null, field, "Required."));
+            return null;
+        }
+        return raw.trim();
+    }
+
+    private static String requireEmail(String raw, List<ErrorDetail> errors) {
+        if (raw == null || raw.isBlank()) {
+            errors.add(new ErrorDetail(null, "email", "Required."));
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (!trimmed.contains("@")) {
+            errors.add(new ErrorDetail(null, "email", "Must be a valid email address."));
+            return null;
+        }
+        return trimmed;
+    }
+
+    private static String optionalNonBlank(String raw, String field, List<ErrorDetail> errors) {
+        if (raw == null) {
+            return null;
+        }
+        if (raw.isBlank()) {
+            errors.add(new ErrorDetail(null, field, "Must not be blank."));
+            return null;
+        }
+        return raw.trim();
     }
 
     private static OrderAddress findAddress(List<OrderAddress> addresses, String addressType) {

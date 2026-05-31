@@ -17,10 +17,13 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.context.WebApplicationContext;
 
+import java.sql.Timestamp;
+
 import static org.hamcrest.Matchers.matchesPattern;
 import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -48,6 +51,8 @@ class OrderControllerTest {
     private static final long ORDER_OTHER_STORE_SAME_BUSINESS = 5L;
     private static final long ORDER_OTHER_BUSINESS = 9L;
     private static final long ORDER_DOES_NOT_EXIST = 99_999L;
+    // order 6: business 1 / store 2 / LAID — cross-store AND laid, to prove 404 wins over 422.
+    private static final long ORDER_LAID_OTHER_STORE = 6L;
 
     // Business 1 seeded order_sequence_number values are 1..8, so the next create is 9.
     private static final int EXPECTED_NEXT_SEQ = 9;
@@ -498,5 +503,510 @@ class OrderControllerTest {
                 .andExpect(jsonPath("$.data.store_id").doesNotExist())
                 .andExpect(jsonPath("$.data.user_id").doesNotExist())
                 .andExpect(jsonPath("$.data.price_adjustment_inc_gst").doesNotExist());
+    }
+
+    // ================================================================
+    // PUT /orders/{orderId}/customer
+    // ================================================================
+
+    // Distinct full-replace value set, different from the seeded order-1 customer, so replace tests
+    // can prove every column changed.
+    private static final String VALID_CUSTOMER_BODY = """
+            {
+              "first_name":"Patricia",
+              "middle_name":"Anne",
+              "last_name":"Hughes",
+              "email":"patricia.hughes@example.com",
+              "mobile":"0400111222",
+              "home_phone":"0299998888",
+              "work_phone":"0288887777",
+              "company_name":"Hughes Pty Ltd"
+            }
+            """;
+
+    // Required fields only; all four optionals omitted -> must be written as null on replace.
+    private static final String REQUIRED_ONLY_BODY = """
+            {
+              "first_name":"Patricia",
+              "last_name":"Hughes",
+              "email":"patricia.hughes@example.com",
+              "mobile":"0400111222"
+            }
+            """;
+
+    private static String customerUrl(String slug, Object orderId) {
+        return "/api/v1/" + slug + "/orders/" + orderId + "/customer";
+    }
+
+    private static String customerUrl(Object orderId) {
+        return customerUrl(SLUG_AUSSIE, orderId);
+    }
+
+    // ---- Standard-protected gating (valid JSON so the request reaches the service guard) ----
+
+    @Test
+    void customer_noSession_returns401() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void customer_sessionWithoutStoreId_returns403() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamSessionNoStore())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void customer_slugBusinessDoesNotMatchSessionBusiness_returnsGeneric404() throws Exception {
+        mockMvc.perform(put(customerUrl(SLUG_PREMIER, ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    @Test
+    void customer_unknownSlug_returnsGeneric404() throws Exception {
+        mockMvc.perform(put(customerUrl("nonexistent-slug", ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    @Test
+    void customer_inactiveBusiness_returnsGeneric404() throws Exception {
+        jdbcTemplate.update("UPDATE business SET is_active = FALSE WHERE business_id = ?", BUSINESS_AUSSIE);
+
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    // ---- Path validation 400s ----
+
+    @Test
+    void customer_invalidOrderIdFormat_returns400_fieldOrderId() throws Exception {
+        mockMvc.perform(put(customerUrl("abc"))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    @Test
+    void customer_nonPositiveOrderId_returns400_fieldOrderId() throws Exception {
+        mockMvc.perform(put(customerUrl("0"))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    // ---- Resource-level 404s (no existence leak) ----
+
+    @Test
+    void customer_orderDoesNotExist_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_DOES_NOT_EXIST))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void customer_orderInAnotherStoreSameBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void customer_orderInAnotherBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_OTHER_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // Cross-store order with an INVALID body still returns 404 — scoped lookup fails before body
+    // validation (gate-first), so we never leak existence via a 400.
+    @Test
+    void customer_crossStoreOrderWithInvalidBody_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // Cross-store order that is ALSO laid returns 404, never 422 — existence check wins.
+    @Test
+    void customer_crossStoreLaidOrder_returns404_notLocked() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_LAID_OTHER_STORE))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // ---- LAID lock 422 (after scoped lookup) ----
+
+    @Test
+    void customer_laidInScopeOrder_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"))
+                .andExpect(jsonPath("$.error.message").value("Order is laid and cannot be edited."));
+    }
+
+    // LAID in-scope order with an INVALID body still returns 422 — LAID gate runs before body
+    // validation (gate-first).
+    @Test
+    void customer_laidInScopeOrderWithInvalidBody_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // ---- Body validation 400s (in-scope, editable order) ----
+
+    @Test
+    void customer_malformedJson_returns400_malformedJson() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    @Test
+    void customer_missingRequiredFields_returns400_firstFieldFirstName() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("first_name"));
+    }
+
+    @Test
+    void customer_blankRequiredField_returns400_fieldFirstName() throws Exception {
+        String body = """
+                {
+                  "first_name":"   ",
+                  "last_name":"Hughes",
+                  "email":"patricia.hughes@example.com",
+                  "mobile":"0400111222"
+                }
+                """;
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("first_name"));
+    }
+
+    @Test
+    void customer_emailWithoutAt_returns400_fieldEmail() throws Exception {
+        String body = """
+                {
+                  "first_name":"Patricia",
+                  "last_name":"Hughes",
+                  "email":"patricia.hughes.example.com",
+                  "mobile":"0400111222"
+                }
+                """;
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("email"));
+    }
+
+    @Test
+    void customer_blankProvidedOptional_returns400_fieldMiddleName() throws Exception {
+        String body = """
+                {
+                  "first_name":"Patricia",
+                  "last_name":"Hughes",
+                  "email":"patricia.hughes@example.com",
+                  "mobile":"0400111222",
+                  "middle_name":"   "
+                }
+                """;
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("middle_name"));
+    }
+
+    // ---- Successful create (order had no customer row) ----
+
+    @Test
+    void customer_createForOrderWithNoCustomer_returns200_andPersists() throws Exception {
+        // Order 2 starts with no order_customer row.
+        Integer before = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM order_customer WHERE order_id = ?", Integer.class, ORDER_EMPTY);
+        Assertions.assertEquals(Integer.valueOf(0), before, "precondition: order 2 has no customer");
+
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Customer saved."))
+                .andExpect(jsonPath("$.data.customer.first_name").value("Patricia"))
+                .andExpect(jsonPath("$.data.customer.middle_name").value("Anne"))
+                .andExpect(jsonPath("$.data.customer.last_name").value("Hughes"))
+                .andExpect(jsonPath("$.data.customer.email").value("patricia.hughes@example.com"))
+                .andExpect(jsonPath("$.data.customer.mobile").value("0400111222"))
+                .andExpect(jsonPath("$.data.customer.home_phone").value("0299998888"))
+                .andExpect(jsonPath("$.data.customer.work_phone").value("0288887777"))
+                .andExpect(jsonPath("$.data.customer.company_name").value("Hughes Pty Ltd"));
+
+        // Exactly one row, scoped to the order, with the saved values.
+        Integer after = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM order_customer WHERE order_id = ?", Integer.class, ORDER_EMPTY);
+        Assertions.assertEquals(Integer.valueOf(1), after, "exactly one customer row created");
+        String firstName = jdbcTemplate.queryForObject(
+                "SELECT first_name FROM order_customer WHERE order_id = ?", String.class, ORDER_EMPTY);
+        Assertions.assertEquals("Patricia", firstName);
+    }
+
+    // ---- Successful replace (order already had a customer row) ----
+
+    @Test
+    void customer_replaceExistingCustomer_returns200_allColumnsReplaced() throws Exception {
+        // Order 1 starts with James Wilson (seed).
+        mockMvc.perform(put(customerUrl(ORDER_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Customer saved."))
+                .andExpect(jsonPath("$.data.customer.first_name").value("Patricia"))
+                .andExpect(jsonPath("$.data.customer.last_name").value("Hughes"));
+
+        // Still exactly one row (uq_order_customer_order respected — no duplicate insert).
+        Integer count = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM order_customer WHERE order_id = ?", Integer.class, ORDER_FULL);
+        Assertions.assertEquals(Integer.valueOf(1), count, "replace must not create a second row");
+
+        // Every column replaced.
+        Assertions.assertEquals("Patricia", jdbcTemplate.queryForObject(
+                "SELECT first_name FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertEquals("Anne", jdbcTemplate.queryForObject(
+                "SELECT middle_name FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertEquals("Hughes", jdbcTemplate.queryForObject(
+                "SELECT last_name FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertEquals("patricia.hughes@example.com", jdbcTemplate.queryForObject(
+                "SELECT email FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertEquals("0400111222", jdbcTemplate.queryForObject(
+                "SELECT mobile FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertEquals("0299998888", jdbcTemplate.queryForObject(
+                "SELECT home_phone FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertEquals("0288887777", jdbcTemplate.queryForObject(
+                "SELECT work_phone FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertEquals("Hughes Pty Ltd", jdbcTemplate.queryForObject(
+                "SELECT company_name FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+    }
+
+    // Omitted optional fields overwrite previous non-null values with null (no merge).
+    @Test
+    void customer_omittedOptionals_clearPreviousValuesToNull() throws Exception {
+        // Order 1 seed has home_phone '0298765432'.
+        mockMvc.perform(put(customerUrl(ORDER_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(REQUIRED_ONLY_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.customer.middle_name").value(nullValue()))
+                .andExpect(jsonPath("$.data.customer.home_phone").value(nullValue()))
+                .andExpect(jsonPath("$.data.customer.work_phone").value(nullValue()))
+                .andExpect(jsonPath("$.data.customer.company_name").value(nullValue()));
+
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT middle_name FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT home_phone FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT work_phone FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT company_name FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+    }
+
+    // Explicit null optional fields are written as null too (same as omitted).
+    @Test
+    void customer_explicitNullOptionals_writtenAsNull() throws Exception {
+        String body = """
+                {
+                  "first_name":"Patricia",
+                  "middle_name":null,
+                  "last_name":"Hughes",
+                  "email":"patricia.hughes@example.com",
+                  "mobile":"0400111222",
+                  "home_phone":null,
+                  "work_phone":null,
+                  "company_name":null
+                }
+                """;
+        mockMvc.perform(put(customerUrl(ORDER_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.customer.home_phone").value(nullValue()));
+
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT home_phone FROM order_customer WHERE order_id = ?", String.class, ORDER_FULL));
+    }
+
+    // Leading/trailing whitespace is trimmed before storage.
+    @Test
+    void customer_storesTrimmedValues() throws Exception {
+        String body = """
+                {
+                  "first_name":"  Patricia  ",
+                  "middle_name":"  Anne  ",
+                  "last_name":"  Hughes  ",
+                  "email":"  patricia.hughes@example.com  ",
+                  "mobile":"  0400111222  ",
+                  "home_phone":"  0299998888  ",
+                  "work_phone":"  0288887777  ",
+                  "company_name":"  Hughes Pty Ltd  "
+                }
+                """;
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.customer.first_name").value("Patricia"))
+                .andExpect(jsonPath("$.data.customer.company_name").value("Hughes Pty Ltd"));
+
+        Assertions.assertEquals("Patricia", jdbcTemplate.queryForObject(
+                "SELECT first_name FROM order_customer WHERE order_id = ?", String.class, ORDER_EMPTY));
+        Assertions.assertEquals("Hughes Pty Ltd", jdbcTemplate.queryForObject(
+                "SELECT company_name FROM order_customer WHERE order_id = ?", String.class, ORDER_EMPTY));
+    }
+
+    // Replace preserves created_at and moves updated_at forward.
+    @Test
+    void customer_replacePreservesCreatedAt_updatesUpdatedAt() throws Exception {
+        Timestamp createdBefore = jdbcTemplate.queryForObject(
+                "SELECT created_at FROM order_customer WHERE order_id = ?", Timestamp.class, ORDER_FULL);
+        Timestamp updatedBefore = jdbcTemplate.queryForObject(
+                "SELECT updated_at FROM order_customer WHERE order_id = ?", Timestamp.class, ORDER_FULL);
+        Assertions.assertNotNull(createdBefore);
+        Assertions.assertNotNull(updatedBefore);
+
+        mockMvc.perform(put(customerUrl(ORDER_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isOk());
+
+        Timestamp createdAfter = jdbcTemplate.queryForObject(
+                "SELECT created_at FROM order_customer WHERE order_id = ?", Timestamp.class, ORDER_FULL);
+        Timestamp updatedAfter = jdbcTemplate.queryForObject(
+                "SELECT updated_at FROM order_customer WHERE order_id = ?", Timestamp.class, ORDER_FULL);
+
+        Assertions.assertEquals(createdBefore, createdAfter, "created_at must be preserved on replace");
+        Assertions.assertTrue(updatedAfter.after(createdAfter),
+                "updated_at must move past created_at on replace");
+    }
+
+    // ---- Response shape: only the customer wrapper, no internal IDs / timestamps / order fields ----
+
+    @Test
+    void customer_response_excludesInternalIdsTimestampsAndOrderFields() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.customer").exists())
+                // Internal IDs / timestamps must not leak on the nested customer.
+                .andExpect(jsonPath("$.data.customer.order_customer_id").doesNotExist())
+                .andExpect(jsonPath("$.data.customer.order_id").doesNotExist())
+                .andExpect(jsonPath("$.data.customer.created_at").doesNotExist())
+                .andExpect(jsonPath("$.data.customer.updated_at").doesNotExist())
+                .andExpect(jsonPath("$.data.customer.business_id").doesNotExist())
+                .andExpect(jsonPath("$.data.customer.store_id").doesNotExist())
+                .andExpect(jsonPath("$.data.customer.user_id").doesNotExist())
+                // No order header fields on the response data.
+                .andExpect(jsonPath("$.data.order_id").doesNotExist())
+                .andExpect(jsonPath("$.data.order_status").doesNotExist())
+                .andExpect(jsonPath("$.data.order_number").doesNotExist())
+                .andExpect(jsonPath("$.data.install_address").doesNotExist())
+                .andExpect(jsonPath("$.data.billing_address").doesNotExist())
+                .andExpect(jsonPath("$.data.persisted_financials").doesNotExist())
+                .andExpect(jsonPath("$.data.order_financial_summary").doesNotExist());
+    }
+
+    // ---- Phase 10A GET reflects the saved customer within the same transaction ----
+
+    @Test
+    void customer_thenGet_reflectsSavedCustomer() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_CUSTOMER_BODY))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(get(getUrl(ORDER_EMPTY)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.customer.first_name").value("Patricia"))
+                .andExpect(jsonPath("$.data.customer.middle_name").value("Anne"))
+                .andExpect(jsonPath("$.data.customer.last_name").value("Hughes"))
+                .andExpect(jsonPath("$.data.customer.email").value("patricia.hughes@example.com"))
+                .andExpect(jsonPath("$.data.customer.mobile").value("0400111222"))
+                .andExpect(jsonPath("$.data.customer.home_phone").value("0299998888"))
+                .andExpect(jsonPath("$.data.customer.work_phone").value("0288887777"))
+                .andExpect(jsonPath("$.data.customer.company_name").value("Hughes Pty Ltd"));
     }
 }
