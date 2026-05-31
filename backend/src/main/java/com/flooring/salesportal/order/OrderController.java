@@ -1,10 +1,8 @@
 package com.flooring.salesportal.order;
 
 import com.flooring.salesportal.common.api.ApiResponse;
-import com.flooring.salesportal.order.dto.AddressUpsertRequest;
 import com.flooring.salesportal.order.dto.BillingAddressResponse;
 import com.flooring.salesportal.order.dto.CreateOrderRequest;
-import com.flooring.salesportal.order.dto.CustomerSaveRequest;
 import com.flooring.salesportal.order.dto.CustomerSaveResponse;
 import com.flooring.salesportal.order.dto.InstallationAddressResponse;
 import com.flooring.salesportal.order.dto.OrderHeaderResponse;
@@ -56,24 +54,27 @@ public class OrderController {
 
     // orderId is captured as a String so non-numeric and non-positive values both flow through
     // the service's manual validation and produce VALIDATION_FAILED with field "order_id".
+    // The body is taken as a raw String (not a typed DTO) so JSON parsing happens INSIDE the
+    // service, strictly after the guard / orderId / scoped lookup / 404 / LAID gates — Spring
+    // parses typed @RequestBody before the controller runs, which would let malformed JSON 400
+    // ahead of those gates. @RequestBody(required = false): a missing body arrives as null.
     @PutMapping("/{orderId}/customer")
     public ApiResponse<CustomerSaveResponse> saveCustomer(
             @PathVariable String slug,
             @PathVariable("orderId") String orderId,
-            @RequestBody(required = false) CustomerSaveRequest body,
+            @RequestBody(required = false) String body,
             HttpServletRequest httpRequest) {
         return ApiResponse.ok(orderService.saveCustomer(slug, orderId, body, httpRequest), "Customer saved.");
     }
 
     // orderId is captured as a String so non-numeric and non-positive values both flow through
     // the service's manual validation and produce VALIDATION_FAILED with field "order_id".
-    // @RequestBody(required = false): a missing/empty body reaches the service as null and is
-    // handled by gate-first validation (404/422 before body validation), never an NPE.
+    // Raw String body (see saveCustomer): JSON parsing happens inside the service, after all gates.
     @PutMapping("/{orderId}/addresses/installation")
     public ApiResponse<InstallationAddressResponse> saveInstallationAddress(
             @PathVariable String slug,
             @PathVariable("orderId") String orderId,
-            @RequestBody(required = false) AddressUpsertRequest body,
+            @RequestBody(required = false) String body,
             HttpServletRequest httpRequest) {
         return ApiResponse.ok(
                 orderService.saveInstallationAddress(slug, orderId, body, httpRequest),
@@ -82,11 +83,12 @@ public class OrderController {
 
     // orderId is captured as a String so non-numeric and non-positive values both flow through
     // the service's manual validation and produce VALIDATION_FAILED with field "order_id".
+    // Raw String body (see saveCustomer): JSON parsing happens inside the service, after all gates.
     @PutMapping("/{orderId}/addresses/billing")
     public ApiResponse<BillingAddressResponse> saveBillingAddress(
             @PathVariable String slug,
             @PathVariable("orderId") String orderId,
-            @RequestBody(required = false) AddressUpsertRequest body,
+            @RequestBody(required = false) String body,
             HttpServletRequest httpRequest) {
         return ApiResponse.ok(
                 orderService.saveBillingAddress(slug, orderId, body, httpRequest),

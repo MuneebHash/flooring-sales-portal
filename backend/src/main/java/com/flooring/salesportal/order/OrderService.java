@@ -1,8 +1,11 @@
 package com.flooring.salesportal.order;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.flooring.salesportal.common.api.ErrorDetail;
 import com.flooring.salesportal.common.error.BusinessRuleException;
 import com.flooring.salesportal.common.error.ErrorCode;
+import com.flooring.salesportal.common.error.MalformedJsonException;
 import com.flooring.salesportal.common.error.NotFoundException;
 import com.flooring.salesportal.common.error.ValidationException;
 import com.flooring.salesportal.common.session.RequestContext;
@@ -65,6 +68,7 @@ public class OrderService {
     private final OrderCustomerWriteRepository orderCustomerWriteRepository;
     private final OrderAddressRepository orderAddressRepository;
     private final OrderAddressWriteRepository orderAddressWriteRepository;
+    private final ObjectMapper objectMapper;
 
     public OrderService(RequestContextGuard requestContextGuard,
                         StoreRepository storeRepository,
@@ -74,7 +78,8 @@ public class OrderService {
                         OrderCustomerRepository orderCustomerRepository,
                         OrderCustomerWriteRepository orderCustomerWriteRepository,
                         OrderAddressRepository orderAddressRepository,
-                        OrderAddressWriteRepository orderAddressWriteRepository) {
+                        OrderAddressWriteRepository orderAddressWriteRepository,
+                        ObjectMapper objectMapper) {
         this.requestContextGuard = requestContextGuard;
         this.storeRepository = storeRepository;
         this.appUserRepository = appUserRepository;
@@ -84,6 +89,7 @@ public class OrderService {
         this.orderCustomerWriteRepository = orderCustomerWriteRepository;
         this.orderAddressRepository = orderAddressRepository;
         this.orderAddressWriteRepository = orderAddressWriteRepository;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -202,14 +208,16 @@ public class OrderService {
     /**
      * PUT /orders/{orderId}/customer. Insert-or-full-replace the one {@code order_customer} row.
      * Gate-first ordering (approved): guard → parse orderId → scoped lookup → 404 → LAID → 422 →
-     * only then validate body and upsert. So a LAID in-scope order with an invalid body still
-     * returns 422 ORDER_LOCKED, and a cross-store/cross-business order with an invalid body still
-     * returns 404 ORDER_NOT_FOUND.
+     * only then parse the raw JSON body, validate it, and upsert. So a LAID in-scope order with a
+     * malformed/invalid body still returns 422 ORDER_LOCKED, and a cross-store/cross-business order
+     * still returns 404 ORDER_NOT_FOUND — body parsing/validation never runs ahead of the gates.
+     * The body arrives as a raw String (parsed here, not by Spring) precisely so malformed JSON
+     * cannot 400 before these gates.
      */
     @Transactional
     public CustomerSaveResponse saveCustomer(String slug,
                                              String orderIdRaw,
-                                             CustomerSaveRequest body,
+                                             String body,
                                              HttpServletRequest httpRequest) {
         // 1. Standard-protected guard.
         RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
@@ -231,8 +239,11 @@ public class OrderService {
             throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
         }
 
-        // 5. Validate + trim the body. Full-replace: optional omitted/null fields become null.
-        CustomerDto customer = validateAndTrimCustomer(body);
+        // 5. Parse the raw JSON body (malformed -> 400 MALFORMED_JSON), then validate + trim.
+        //    Null/blank body parses to null and flows to validation as all-fields-missing.
+        //    Full-replace: optional omitted/null fields become null.
+        CustomerSaveRequest request = parseBodyAfterGates(body, CustomerSaveRequest.class);
+        CustomerDto customer = validateAndTrimCustomer(request);
 
         // 6. One clock for created_at (insert only) / updated_at. Native upsert respects
         //    uq_order_customer_order, preserves created_at on replace, refreshes updated_at.
@@ -262,7 +273,7 @@ public class OrderService {
     @Transactional
     public InstallationAddressResponse saveInstallationAddress(String slug,
                                                                String orderIdRaw,
-                                                               AddressUpsertRequest body,
+                                                               String body,
                                                                HttpServletRequest httpRequest) {
         AddressDto address = saveAddress(slug, orderIdRaw, body, httpRequest, ADDRESS_INSTALLATION);
         return new InstallationAddressResponse(address);
@@ -276,7 +287,7 @@ public class OrderService {
     @Transactional
     public BillingAddressResponse saveBillingAddress(String slug,
                                                      String orderIdRaw,
-                                                     AddressUpsertRequest body,
+                                                     String body,
                                                      HttpServletRequest httpRequest) {
         AddressDto address = saveAddress(slug, orderIdRaw, body, httpRequest, ADDRESS_BILLING);
         return new BillingAddressResponse(address);
@@ -285,14 +296,16 @@ public class OrderService {
     /**
      * Shared body of the two address PUTs. Gate order: guard → parse orderId → scoped FOR UPDATE
      * lookup (missing/cross-store/cross-business → 404 ORDER_NOT_FOUND, no existence leak) → LAID
-     * (422 ORDER_LOCKED) → validate + trim body (400 VALIDATION_FAILED; {@code body == null} from
-     * {@code @RequestBody(required=false)} is treated as all-fields-missing, not an NPE) → native
-     * upsert. The pessimistic write lock plus this {@code @Transactional} method serialize all
-     * address writes for the order against a concurrent PATCH-status update to LAID.
+     * (422 ORDER_LOCKED) → parse raw JSON body (malformed → 400 MALFORMED_JSON) → validate + trim
+     * (400 VALIDATION_FAILED; a null/blank body parses to null and is treated as all-fields-missing,
+     * not an NPE) → native upsert. The body arrives as a raw String (parsed here, not by Spring) so
+     * malformed JSON cannot 400 before the gates. The pessimistic write lock plus this
+     * {@code @Transactional} method serialize all address writes for the order against a concurrent
+     * PATCH-status update to LAID.
      */
     private AddressDto saveAddress(String slug,
                                    String orderIdRaw,
-                                   AddressUpsertRequest body,
+                                   String body,
                                    HttpServletRequest httpRequest,
                                    String addressType) {
         // 1. Standard-protected guard.
@@ -311,8 +324,11 @@ public class OrderService {
             throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
         }
 
-        // 5. Validate + trim the body. Full-replace: optional omitted/null unit_number becomes null.
-        AddressDto address = validateAndTrimAddress(body);
+        // 5. Parse the raw JSON body (malformed -> 400 MALFORMED_JSON), then validate + trim.
+        //    Null/blank body parses to null -> all-fields-missing. Full-replace: omitted/null
+        //    unit_number becomes null.
+        AddressUpsertRequest request = parseBodyAfterGates(body, AddressUpsertRequest.class);
+        AddressDto address = validateAndTrimAddress(request);
 
         // 6. One clock for created_at (insert only) / updated_at. Native upsert respects
         //    uq_order_address_order_type, preserves created_at on replace, refreshes updated_at.
@@ -417,6 +433,29 @@ public class OrderService {
         throw new ValidationException(
                 ErrorCode.VALIDATION_FAILED.defaultMessage(),
                 List.of(new ErrorDetail(null, "order_id", "Must be a positive integer.")));
+    }
+
+    /**
+     * Parse a raw request body into {@code type} <em>after</em> the mutation gates (guard →
+     * orderId → scoped lookup → 404 → LAID → 422) have passed — the body is taken as a raw String
+     * by the controller precisely so this parse cannot run ahead of those gates. A {@code null} or
+     * blank body returns {@code null}, which downstream {@code validateAndTrim*} treats as
+     * all-fields-missing (→ 400 VALIDATION_FAILED). Well-formed-but-incomplete JSON (e.g.
+     * {@code "{}"}) parses successfully and likewise flows to validation. Only genuinely
+     * unparseable input throws {@link MalformedJsonException} (→ 400 MALFORMED_JSON, same wrapper
+     * as Spring's HttpMessageNotReadableException via {@code handleApiException}). Uses the shared
+     * Spring {@link ObjectMapper}, so global Jackson behaviour (snake_case, unknown fields ignored)
+     * is preserved.
+     */
+    private <T> T parseBodyAfterGates(String rawBody, Class<T> type) {
+        if (rawBody == null || rawBody.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(rawBody, type);
+        } catch (JsonProcessingException ex) {
+            throw new MalformedJsonException();
+        }
     }
 
     /**

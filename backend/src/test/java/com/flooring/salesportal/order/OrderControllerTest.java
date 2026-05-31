@@ -705,6 +705,9 @@ class OrderControllerTest {
 
     // ---- Body validation 400s (in-scope, editable order) ----
 
+    // Valid editable in-scope order + malformed JSON -> 400 MALFORMED_JSON. The body is parsed
+    // INSIDE the service, after the guard/orderId/scoped-lookup/LAID gates, so this only 400s
+    // because order 2 is in-scope and not LAID (gates pass, then the post-gate parse fails).
     @Test
     void customer_malformedJson_returns400_malformedJson() throws Exception {
         mockMvc.perform(put(customerUrl(ORDER_EMPTY))
@@ -713,6 +716,55 @@ class OrderControllerTest {
                         .content("{"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    // ---- Malformed JSON is gate-first: gates run before the body is parsed ----
+
+    // No session + malformed JSON -> 401, not 400. The guard rejects before any body parse.
+    @Test
+    void customer_noSessionMalformedJson_returns401() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    // Cross-store + malformed JSON -> 404, not 400. Scoped lookup fails before any body parse.
+    @Test
+    void customer_crossStoreMalformedJson_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // LAID in-scope + malformed JSON -> 422, not 400. LAID gate runs before any body parse.
+    @Test
+    void customer_laidInScopeMalformedJson_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // Null/blank body -> parses to null -> validateAndTrimCustomer(null) -> 400 VALIDATION_FAILED,
+    // first field first_name. No NPE.
+    @Test
+    void customer_blankBody_returns400_fieldFirstName() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("first_name"));
     }
 
     @Test
@@ -1299,6 +1351,8 @@ class OrderControllerTest {
 
     // ---- Body validation 400s ----
 
+    // Valid editable in-scope order + malformed JSON -> 400 MALFORMED_JSON. Parsed INSIDE the
+    // service, after all gates; only 400s because order 2 is in-scope and not LAID.
     @Test
     void install_malformedJson_returns400_malformedJson() throws Exception {
         mockMvc.perform(put(installUrl(ORDER_EMPTY))
@@ -1307,6 +1361,52 @@ class OrderControllerTest {
                         .content("{"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    // ---- Malformed JSON is gate-first ----
+
+    @Test
+    void install_noSessionMalformedJson_returns401() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void install_crossStoreMalformedJson_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void install_laidInScopeMalformedJson_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // Null/blank body -> parses to null -> validateAndTrimAddress(null) -> 400 VALIDATION_FAILED,
+    // first field street_number. No NPE.
+    @Test
+    void install_blankBody_returns400_fieldStreetNumber() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("street_number"));
     }
 
     @Test
@@ -1729,6 +1829,63 @@ class OrderControllerTest {
                         .session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("street_number"));
+    }
+
+    // ---- Malformed JSON is gate-first ----
+
+    @Test
+    void billing_noSessionMalformedJson_returns401() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void billing_crossStoreMalformedJson_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void billing_laidInScopeMalformedJson_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // Valid editable in-scope order + malformed JSON -> 400 MALFORMED_JSON (post-gate parse).
+    @Test
+    void billing_malformedJson_returns400_malformedJson() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    // Null/blank body -> parses to null -> validateAndTrimAddress(null) -> 400 VALIDATION_FAILED,
+    // first field street_number. No NPE.
+    @Test
+    void billing_blankBody_returns400_fieldStreetNumber() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(""))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
                 .andExpect(jsonPath("$.error.details[0].field").value("street_number"));
