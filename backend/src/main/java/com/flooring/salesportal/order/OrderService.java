@@ -39,6 +39,12 @@ public class OrderService {
     private static final String ADDRESS_INSTALLATION = "INSTALLATION";
     private static final String ADDRESS_BILLING = "BILLING";
 
+    // order_customer VARCHAR limits, taken directly from V2__create_tables.sql.
+    private static final int MAX_NAME = 100;    // first_name / middle_name / last_name VARCHAR(100)
+    private static final int MAX_EMAIL = 255;   // email VARCHAR(255)
+    private static final int MAX_PHONE = 20;    // mobile / home_phone / work_phone VARCHAR(20)
+    private static final int MAX_COMPANY = 150; // company_name VARCHAR(150)
+
     private final RequestContextGuard requestContextGuard;
     private final StoreRepository storeRepository;
     private final AppUserRepository appUserRepository;
@@ -268,17 +274,19 @@ public class OrderService {
      * field errors (validated in field order) into one VALIDATION_FAILED so {@code details[0]} is
      * the first offending field. Required: first_name, last_name, email (must contain {@code @}),
      * mobile. Optionals, when provided non-null, must be non-blank after trim; otherwise null.
+     * Every value is trimmed first, then checked against its {@code order_customer} VARCHAR limit
+     * so overlong input is a normal 400 VALIDATION_FAILED rather than a native-upsert 500.
      */
     private static CustomerDto validateAndTrimCustomer(CustomerSaveRequest body) {
         List<ErrorDetail> errors = new ArrayList<>();
-        String firstName = requireNonBlank(body == null ? null : body.firstName(), "first_name", errors);
-        String lastName  = requireNonBlank(body == null ? null : body.lastName(), "last_name", errors);
-        String email     = requireEmail(body == null ? null : body.email(), errors);
-        String mobile    = requireNonBlank(body == null ? null : body.mobile(), "mobile", errors);
-        String middleName  = optionalNonBlank(body == null ? null : body.middleName(), "middle_name", errors);
-        String homePhone   = optionalNonBlank(body == null ? null : body.homePhone(), "home_phone", errors);
-        String workPhone   = optionalNonBlank(body == null ? null : body.workPhone(), "work_phone", errors);
-        String companyName = optionalNonBlank(body == null ? null : body.companyName(), "company_name", errors);
+        String firstName = requireNonBlank(body == null ? null : body.firstName(), "first_name", MAX_NAME, errors);
+        String lastName  = requireNonBlank(body == null ? null : body.lastName(), "last_name", MAX_NAME, errors);
+        String email     = requireEmail(body == null ? null : body.email(), MAX_EMAIL, errors);
+        String mobile    = requireNonBlank(body == null ? null : body.mobile(), "mobile", MAX_PHONE, errors);
+        String middleName  = optionalNonBlank(body == null ? null : body.middleName(), "middle_name", MAX_NAME, errors);
+        String homePhone   = optionalNonBlank(body == null ? null : body.homePhone(), "home_phone", MAX_PHONE, errors);
+        String workPhone   = optionalNonBlank(body == null ? null : body.workPhone(), "work_phone", MAX_PHONE, errors);
+        String companyName = optionalNonBlank(body == null ? null : body.companyName(), "company_name", MAX_COMPANY, errors);
 
         if (!errors.isEmpty()) {
             throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
@@ -287,15 +295,20 @@ public class OrderService {
         return new CustomerDto(firstName, middleName, lastName, email, mobile, homePhone, workPhone, companyName);
     }
 
-    private static String requireNonBlank(String raw, String field, List<ErrorDetail> errors) {
+    private static String requireNonBlank(String raw, String field, int maxLength, List<ErrorDetail> errors) {
         if (raw == null || raw.isBlank()) {
             errors.add(new ErrorDetail(null, field, "Required."));
             return null;
         }
-        return raw.trim();
+        String trimmed = raw.trim();
+        if (trimmed.length() > maxLength) {
+            errors.add(new ErrorDetail(null, field, "Must be at most " + maxLength + " characters."));
+            return null;
+        }
+        return trimmed;
     }
 
-    private static String requireEmail(String raw, List<ErrorDetail> errors) {
+    private static String requireEmail(String raw, int maxLength, List<ErrorDetail> errors) {
         if (raw == null || raw.isBlank()) {
             errors.add(new ErrorDetail(null, "email", "Required."));
             return null;
@@ -305,10 +318,14 @@ public class OrderService {
             errors.add(new ErrorDetail(null, "email", "Must be a valid email address."));
             return null;
         }
+        if (trimmed.length() > maxLength) {
+            errors.add(new ErrorDetail(null, "email", "Must be at most " + maxLength + " characters."));
+            return null;
+        }
         return trimmed;
     }
 
-    private static String optionalNonBlank(String raw, String field, List<ErrorDetail> errors) {
+    private static String optionalNonBlank(String raw, String field, int maxLength, List<ErrorDetail> errors) {
         if (raw == null) {
             return null;
         }
@@ -316,7 +333,12 @@ public class OrderService {
             errors.add(new ErrorDetail(null, field, "Must not be blank."));
             return null;
         }
-        return raw.trim();
+        String trimmed = raw.trim();
+        if (trimmed.length() > maxLength) {
+            errors.add(new ErrorDetail(null, field, "Must be at most " + maxLength + " characters."));
+            return null;
+        }
+        return trimmed;
     }
 
     private static OrderAddress findAddress(List<OrderAddress> addresses, String addressType) {

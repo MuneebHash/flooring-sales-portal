@@ -784,6 +784,95 @@ class OrderControllerTest {
                 .andExpect(jsonPath("$.error.details[0].field").value("middle_name"));
     }
 
+    // ---- Max-length validation (order_customer VARCHAR limits from V2) ----
+
+    @Test
+    void customer_firstNameOverDbLimit_returns400_fieldFirstName() throws Exception {
+        String overlong = "a".repeat(101); // first_name VARCHAR(100)
+        String body = "{"
+                + "\"first_name\":\"" + overlong + "\","
+                + "\"last_name\":\"Hughes\","
+                + "\"email\":\"patricia.hughes@example.com\","
+                + "\"mobile\":\"0400111222\"}";
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("first_name"));
+    }
+
+    @Test
+    void customer_emailOverDbLimit_returns400_fieldEmail() throws Exception {
+        // email VARCHAR(255). Still contains '@', so the only failure is length.
+        String overlong = "a".repeat(250) + "@example.com";
+        String body = "{"
+                + "\"first_name\":\"Patricia\","
+                + "\"last_name\":\"Hughes\","
+                + "\"email\":\"" + overlong + "\","
+                + "\"mobile\":\"0400111222\"}";
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("email"));
+    }
+
+    @Test
+    void customer_mobileOverDbLimit_returns400_fieldMobile() throws Exception {
+        String overlong = "1".repeat(21); // mobile VARCHAR(20)
+        String body = "{"
+                + "\"first_name\":\"Patricia\","
+                + "\"last_name\":\"Hughes\","
+                + "\"email\":\"patricia.hughes@example.com\","
+                + "\"mobile\":\"" + overlong + "\"}";
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("mobile"));
+    }
+
+    @Test
+    void customer_companyNameOverDbLimit_returns400_fieldCompanyName() throws Exception {
+        String overlong = "c".repeat(151); // company_name VARCHAR(150)
+        String body = "{"
+                + "\"first_name\":\"Patricia\","
+                + "\"last_name\":\"Hughes\","
+                + "\"email\":\"patricia.hughes@example.com\","
+                + "\"mobile\":\"0400111222\","
+                + "\"company_name\":\"" + overlong + "\"}";
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("company_name"));
+    }
+
+    // A value exactly at the limit is accepted (boundary check).
+    @Test
+    void customer_firstNameAtDbLimit_returns200() throws Exception {
+        String atLimit = "a".repeat(100); // first_name VARCHAR(100)
+        String body = "{"
+                + "\"first_name\":\"" + atLimit + "\","
+                + "\"last_name\":\"Hughes\","
+                + "\"email\":\"patricia.hughes@example.com\","
+                + "\"mobile\":\"0400111222\"}";
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.customer.first_name").value(atLimit));
+    }
+
     // ---- Successful create (order had no customer row) ----
 
     @Test
