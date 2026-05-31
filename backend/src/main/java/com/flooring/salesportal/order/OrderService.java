@@ -1,6 +1,7 @@
 package com.flooring.salesportal.order;
 
 import com.flooring.salesportal.common.api.ErrorDetail;
+import com.flooring.salesportal.common.error.BusinessRuleException;
 import com.flooring.salesportal.common.error.ErrorCode;
 import com.flooring.salesportal.common.error.NotFoundException;
 import com.flooring.salesportal.common.error.ValidationException;
@@ -9,6 +10,8 @@ import com.flooring.salesportal.common.session.RequestContextGuard;
 import com.flooring.salesportal.order.dto.AddressDto;
 import com.flooring.salesportal.order.dto.CreateOrderRequest;
 import com.flooring.salesportal.order.dto.CustomerDto;
+import com.flooring.salesportal.order.dto.CustomerSaveRequest;
+import com.flooring.salesportal.order.dto.CustomerSaveResponse;
 import com.flooring.salesportal.order.dto.OrderHeaderResponse;
 import com.flooring.salesportal.order.dto.OrderWorkspaceResponse;
 import com.flooring.salesportal.order.dto.PersistedFinancialsDto;
@@ -23,6 +26,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.temporal.IsoFields;
+import java.util.ArrayList;
 import java.util.List;
 
 @Service
@@ -35,12 +39,19 @@ public class OrderService {
     private static final String ADDRESS_INSTALLATION = "INSTALLATION";
     private static final String ADDRESS_BILLING = "BILLING";
 
+    // order_customer VARCHAR limits, taken directly from V2__create_tables.sql.
+    private static final int MAX_NAME = 100;    // first_name / middle_name / last_name VARCHAR(100)
+    private static final int MAX_EMAIL = 255;   // email VARCHAR(255)
+    private static final int MAX_PHONE = 20;    // mobile / home_phone / work_phone VARCHAR(20)
+    private static final int MAX_COMPANY = 150; // company_name VARCHAR(150)
+
     private final RequestContextGuard requestContextGuard;
     private final StoreRepository storeRepository;
     private final AppUserRepository appUserRepository;
     private final OrderCreateRepository orderCreateRepository;
     private final SalesOrderRepository salesOrderRepository;
     private final OrderCustomerRepository orderCustomerRepository;
+    private final OrderCustomerWriteRepository orderCustomerWriteRepository;
     private final OrderAddressRepository orderAddressRepository;
 
     public OrderService(RequestContextGuard requestContextGuard,
@@ -49,6 +60,7 @@ public class OrderService {
                         OrderCreateRepository orderCreateRepository,
                         SalesOrderRepository salesOrderRepository,
                         OrderCustomerRepository orderCustomerRepository,
+                        OrderCustomerWriteRepository orderCustomerWriteRepository,
                         OrderAddressRepository orderAddressRepository) {
         this.requestContextGuard = requestContextGuard;
         this.storeRepository = storeRepository;
@@ -56,6 +68,7 @@ public class OrderService {
         this.orderCreateRepository = orderCreateRepository;
         this.salesOrderRepository = salesOrderRepository;
         this.orderCustomerRepository = orderCustomerRepository;
+        this.orderCustomerWriteRepository = orderCustomerWriteRepository;
         this.orderAddressRepository = orderAddressRepository;
     }
 
@@ -172,6 +185,59 @@ public class OrderService {
                 persistedFinancials);
     }
 
+    /**
+     * PUT /orders/{orderId}/customer. Insert-or-full-replace the one {@code order_customer} row.
+     * Gate-first ordering (approved): guard → parse orderId → scoped lookup → 404 → LAID → 422 →
+     * only then validate body and upsert. So a LAID in-scope order with an invalid body still
+     * returns 422 ORDER_LOCKED, and a cross-store/cross-business order with an invalid body still
+     * returns 404 ORDER_NOT_FOUND.
+     */
+    @Transactional
+    public CustomerSaveResponse saveCustomer(String slug,
+                                             String orderIdRaw,
+                                             CustomerSaveRequest body,
+                                             HttpServletRequest httpRequest) {
+        // 1. Standard-protected guard.
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+
+        // 2. Validate the path variable as a positive integer.
+        long orderId = parseOrderId(orderIdRaw);
+
+        // 3. Scope to the session's (business_id, store_id) with a pessimistic write lock
+        //    (SELECT ... FOR UPDATE). Locking inside this @Transactional method closes the
+        //    read-then-write race: a concurrent PATCH-status update to LAID cannot interleave
+        //    between this read and the upsert commit. Missing / cross-store / cross-business
+        //    all return empty -> 404 ORDER_NOT_FOUND with no existence leak.
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        // 4. Only after the order is confirmed in-scope: LAID is locked for customer edits.
+        if (STATUS_LAID.equals(order.getOrderStatus())) {
+            throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
+        }
+
+        // 5. Validate + trim the body. Full-replace: optional omitted/null fields become null.
+        CustomerDto customer = validateAndTrimCustomer(body);
+
+        // 6. One clock for created_at (insert only) / updated_at. Native upsert respects
+        //    uq_order_customer_order, preserves created_at on replace, refreshes updated_at.
+        LocalDateTime now = LocalDateTime.now();
+        orderCustomerWriteRepository.upsert(
+                orderId,
+                customer.firstName(),
+                customer.middleName(),
+                customer.lastName(),
+                customer.email(),
+                customer.mobile(),
+                customer.homePhone(),
+                customer.workPhone(),
+                customer.companyName(),
+                now);
+
+        return new CustomerSaveResponse(customer);
+    }
+
     private static String validateFlooringType(CreateOrderRequest body) {
         String value = body == null ? null : body.flooringType();
         if (value == null) {
@@ -201,6 +267,78 @@ public class OrderService {
         throw new ValidationException(
                 ErrorCode.VALIDATION_FAILED.defaultMessage(),
                 List.of(new ErrorDetail(null, "order_id", "Must be a positive integer.")));
+    }
+
+    /**
+     * Validate the customer body and return trimmed values as a {@link CustomerDto}. Collects all
+     * field errors (validated in field order) into one VALIDATION_FAILED so {@code details[0]} is
+     * the first offending field. Required: first_name, last_name, email (must contain {@code @}),
+     * mobile. Optionals, when provided non-null, must be non-blank after trim; otherwise null.
+     * Every value is trimmed first, then checked against its {@code order_customer} VARCHAR limit
+     * so overlong input is a normal 400 VALIDATION_FAILED rather than a native-upsert 500.
+     */
+    private static CustomerDto validateAndTrimCustomer(CustomerSaveRequest body) {
+        List<ErrorDetail> errors = new ArrayList<>();
+        String firstName = requireNonBlank(body == null ? null : body.firstName(), "first_name", MAX_NAME, errors);
+        String lastName  = requireNonBlank(body == null ? null : body.lastName(), "last_name", MAX_NAME, errors);
+        String email     = requireEmail(body == null ? null : body.email(), MAX_EMAIL, errors);
+        String mobile    = requireNonBlank(body == null ? null : body.mobile(), "mobile", MAX_PHONE, errors);
+        String middleName  = optionalNonBlank(body == null ? null : body.middleName(), "middle_name", MAX_NAME, errors);
+        String homePhone   = optionalNonBlank(body == null ? null : body.homePhone(), "home_phone", MAX_PHONE, errors);
+        String workPhone   = optionalNonBlank(body == null ? null : body.workPhone(), "work_phone", MAX_PHONE, errors);
+        String companyName = optionalNonBlank(body == null ? null : body.companyName(), "company_name", MAX_COMPANY, errors);
+
+        if (!errors.isEmpty()) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
+        }
+
+        return new CustomerDto(firstName, middleName, lastName, email, mobile, homePhone, workPhone, companyName);
+    }
+
+    private static String requireNonBlank(String raw, String field, int maxLength, List<ErrorDetail> errors) {
+        if (raw == null || raw.isBlank()) {
+            errors.add(new ErrorDetail(null, field, "Required."));
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (trimmed.length() > maxLength) {
+            errors.add(new ErrorDetail(null, field, "Must be at most " + maxLength + " characters."));
+            return null;
+        }
+        return trimmed;
+    }
+
+    private static String requireEmail(String raw, int maxLength, List<ErrorDetail> errors) {
+        if (raw == null || raw.isBlank()) {
+            errors.add(new ErrorDetail(null, "email", "Required."));
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (!trimmed.contains("@")) {
+            errors.add(new ErrorDetail(null, "email", "Must be a valid email address."));
+            return null;
+        }
+        if (trimmed.length() > maxLength) {
+            errors.add(new ErrorDetail(null, "email", "Must be at most " + maxLength + " characters."));
+            return null;
+        }
+        return trimmed;
+    }
+
+    private static String optionalNonBlank(String raw, String field, int maxLength, List<ErrorDetail> errors) {
+        if (raw == null) {
+            return null;
+        }
+        if (raw.isBlank()) {
+            errors.add(new ErrorDetail(null, field, "Must not be blank."));
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (trimmed.length() > maxLength) {
+            errors.add(new ErrorDetail(null, field, "Must be at most " + maxLength + " characters."));
+            return null;
+        }
+        return trimmed;
     }
 
     private static OrderAddress findAddress(List<OrderAddress> addresses, String addressType) {

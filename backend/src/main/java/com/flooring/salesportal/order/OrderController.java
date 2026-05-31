@@ -2,6 +2,8 @@ package com.flooring.salesportal.order;
 
 import com.flooring.salesportal.common.api.ApiResponse;
 import com.flooring.salesportal.order.dto.CreateOrderRequest;
+import com.flooring.salesportal.order.dto.CustomerSaveRequest;
+import com.flooring.salesportal.order.dto.CustomerSaveResponse;
 import com.flooring.salesportal.order.dto.OrderHeaderResponse;
 import com.flooring.salesportal.order.dto.OrderWorkspaceResponse;
 import jakarta.servlet.http.HttpServletRequest;
@@ -9,6 +11,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.ResponseStatus;
@@ -46,5 +49,16 @@ public class OrderController {
             @PathVariable("orderId") String orderId,
             HttpServletRequest httpRequest) {
         return ApiResponse.ok(orderService.getOrder(slug, orderId, httpRequest));
+    }
+
+    // orderId is captured as a String so non-numeric and non-positive values both flow through
+    // the service's manual validation and produce VALIDATION_FAILED with field "order_id".
+    @PutMapping("/{orderId}/customer")
+    public ApiResponse<CustomerSaveResponse> saveCustomer(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestBody(required = false) CustomerSaveRequest body,
+            HttpServletRequest httpRequest) {
+        return ApiResponse.ok(orderService.saveCustomer(slug, orderId, body, httpRequest), "Customer saved.");
     }
 }
