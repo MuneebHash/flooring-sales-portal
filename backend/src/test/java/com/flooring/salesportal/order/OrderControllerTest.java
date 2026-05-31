@@ -705,6 +705,9 @@ class OrderControllerTest {
 
     // ---- Body validation 400s (in-scope, editable order) ----
 
+    // Valid editable in-scope order + malformed JSON -> 400 MALFORMED_JSON. The body is parsed
+    // INSIDE the service, after the guard/orderId/scoped-lookup/LAID gates, so this only 400s
+    // because order 2 is in-scope and not LAID (gates pass, then the post-gate parse fails).
     @Test
     void customer_malformedJson_returns400_malformedJson() throws Exception {
         mockMvc.perform(put(customerUrl(ORDER_EMPTY))
@@ -713,6 +716,55 @@ class OrderControllerTest {
                         .content("{"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    // ---- Malformed JSON is gate-first: gates run before the body is parsed ----
+
+    // No session + malformed JSON -> 401, not 400. The guard rejects before any body parse.
+    @Test
+    void customer_noSessionMalformedJson_returns401() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    // Cross-store + malformed JSON -> 404, not 400. Scoped lookup fails before any body parse.
+    @Test
+    void customer_crossStoreMalformedJson_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // LAID in-scope + malformed JSON -> 422, not 400. LAID gate runs before any body parse.
+    @Test
+    void customer_laidInScopeMalformedJson_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // Null/blank body -> parses to null -> validateAndTrimCustomer(null) -> 400 VALIDATION_FAILED,
+    // first field first_name. No NPE.
+    @Test
+    void customer_blankBody_returns400_fieldFirstName() throws Exception {
+        mockMvc.perform(put(customerUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("first_name"));
     }
 
     @Test
@@ -1097,5 +1149,981 @@ class OrderControllerTest {
                 .andExpect(jsonPath("$.data.customer.home_phone").value("0299998888"))
                 .andExpect(jsonPath("$.data.customer.work_phone").value("0288887777"))
                 .andExpect(jsonPath("$.data.customer.company_name").value("Hughes Pty Ltd"));
+    }
+
+    // ================================================================
+    // PUT /orders/{orderId}/addresses/installation
+    // PUT /orders/{orderId}/addresses/billing
+    // POST /orders/{orderId}/addresses/billing/copy-from-installation
+    // ================================================================
+
+    // Distinct full value set, different from the seeded order-1 addresses, so replace tests can
+    // prove every column changed.
+    private static final String VALID_ADDRESS_BODY = """
+            {
+              "unit_number":"12",
+              "street_number":"88",
+              "street":"Crown Street",
+              "suburb":"Surry Hills",
+              "state_code":"NSW",
+              "postcode":"2010"
+            }
+            """;
+
+    // Required fields only; unit_number omitted -> must be written as null on replace.
+    private static final String REQUIRED_ONLY_ADDRESS_BODY = """
+            {
+              "street_number":"88",
+              "street":"Crown Street",
+              "suburb":"Surry Hills",
+              "state_code":"NSW",
+              "postcode":"2010"
+            }
+            """;
+
+    private static String installUrl(String slug, Object orderId) {
+        return "/api/v1/" + slug + "/orders/" + orderId + "/addresses/installation";
+    }
+
+    private static String installUrl(Object orderId) {
+        return installUrl(SLUG_AUSSIE, orderId);
+    }
+
+    private static String billingUrl(String slug, Object orderId) {
+        return "/api/v1/" + slug + "/orders/" + orderId + "/addresses/billing";
+    }
+
+    private static String billingUrl(Object orderId) {
+        return billingUrl(SLUG_AUSSIE, orderId);
+    }
+
+    private static String copyUrl(String slug, Object orderId) {
+        return "/api/v1/" + slug + "/orders/" + orderId + "/addresses/billing/copy-from-installation";
+    }
+
+    private static String copyUrl(Object orderId) {
+        return copyUrl(SLUG_AUSSIE, orderId);
+    }
+
+    private Integer addressCount(long orderId, String addressType) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM order_address WHERE order_id = ? AND address_type = CAST(? AS address_type)",
+                Integer.class, orderId, addressType);
+    }
+
+    private String addressColumn(long orderId, String addressType, String column) {
+        return jdbcTemplate.queryForObject(
+                "SELECT " + column + " FROM order_address WHERE order_id = ? AND address_type = CAST(? AS address_type)",
+                String.class, orderId, addressType);
+    }
+
+    // ================================================================
+    // Installation save
+    // ================================================================
+
+    // ---- Standard-protected gating ----
+
+    @Test
+    void install_noSession_returns401() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void install_sessionWithoutStoreId_returns403() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamSessionNoStore())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void install_slugBusinessDoesNotMatchSessionBusiness_returnsGeneric404() throws Exception {
+        mockMvc.perform(put(installUrl(SLUG_PREMIER, ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    // ---- Path validation 400s ----
+
+    @Test
+    void install_invalidOrderIdFormat_returns400_fieldOrderId() throws Exception {
+        mockMvc.perform(put(installUrl("abc"))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    @Test
+    void install_nonPositiveOrderId_returns400_fieldOrderId() throws Exception {
+        mockMvc.perform(put(installUrl("0"))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    // ---- Resource-level 404s (no existence leak) ----
+
+    @Test
+    void install_orderInAnotherStoreSameBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void install_orderInAnotherBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_OTHER_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // Cross-store order with an INVALID body still returns 404 — scoped lookup fails before body
+    // validation (gate-first).
+    @Test
+    void install_crossStoreOrderWithInvalidBody_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // Cross-store order that is ALSO laid returns 404, never 422 — existence check wins.
+    @Test
+    void install_crossStoreLaidOrder_returns404_notLocked() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_LAID_OTHER_STORE))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // ---- LAID lock 422 (after scoped lookup) ----
+
+    @Test
+    void install_laidInScopeOrder_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // LAID in-scope order with an INVALID body still returns 422 — LAID gate runs before body
+    // validation (gate-first).
+    @Test
+    void install_laidInScopeOrderWithInvalidBody_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // ---- Body validation 400s ----
+
+    // Valid editable in-scope order + malformed JSON -> 400 MALFORMED_JSON. Parsed INSIDE the
+    // service, after all gates; only 400s because order 2 is in-scope and not LAID.
+    @Test
+    void install_malformedJson_returns400_malformedJson() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    // ---- Malformed JSON is gate-first ----
+
+    @Test
+    void install_noSessionMalformedJson_returns401() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void install_crossStoreMalformedJson_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void install_laidInScopeMalformedJson_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // Null/blank body -> parses to null -> validateAndTrimAddress(null) -> 400 VALIDATION_FAILED,
+    // first field street_number. No NPE.
+    @Test
+    void install_blankBody_returns400_fieldStreetNumber() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("street_number"));
+    }
+
+    @Test
+    void install_missingRequiredFields_returns400_firstFieldStreetNumber() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("street_number"));
+    }
+
+    @Test
+    void install_blankRequiredField_returns400_fieldStreet() throws Exception {
+        String body = """
+                {
+                  "street_number":"88",
+                  "street":"   ",
+                  "suburb":"Surry Hills",
+                  "state_code":"NSW",
+                  "postcode":"2010"
+                }
+                """;
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("street"));
+    }
+
+    @Test
+    void install_blankProvidedUnitNumber_returns400_fieldUnitNumber() throws Exception {
+        String body = """
+                {
+                  "unit_number":"   ",
+                  "street_number":"88",
+                  "street":"Crown Street",
+                  "suburb":"Surry Hills",
+                  "state_code":"NSW",
+                  "postcode":"2010"
+                }
+                """;
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_number"));
+    }
+
+    // ---- Max-length validation (order_address VARCHAR limits from V2) ----
+
+    private static String addressBody(String unit, String streetNumber, String street,
+                                      String suburb, String stateCode, String postcode) {
+        StringBuilder sb = new StringBuilder("{");
+        if (unit != null) {
+            sb.append("\"unit_number\":\"").append(unit).append("\",");
+        }
+        sb.append("\"street_number\":\"").append(streetNumber).append("\",");
+        sb.append("\"street\":\"").append(street).append("\",");
+        sb.append("\"suburb\":\"").append(suburb).append("\",");
+        sb.append("\"state_code\":\"").append(stateCode).append("\",");
+        sb.append("\"postcode\":\"").append(postcode).append("\"}");
+        return sb.toString();
+    }
+
+    @Test
+    void install_unitNumberOverDbLimit_returns400_fieldUnitNumber() throws Exception {
+        String body = addressBody("u".repeat(21), "88", "Crown Street", "Surry Hills", "NSW", "2010");
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_number"));
+    }
+
+    @Test
+    void install_streetNumberOverDbLimit_returns400_fieldStreetNumber() throws Exception {
+        String body = addressBody(null, "8".repeat(21), "Crown Street", "Surry Hills", "NSW", "2010");
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("street_number"));
+    }
+
+    @Test
+    void install_streetOverDbLimit_returns400_fieldStreet() throws Exception {
+        String body = addressBody(null, "88", "s".repeat(256), "Surry Hills", "NSW", "2010");
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("street"));
+    }
+
+    @Test
+    void install_suburbOverDbLimit_returns400_fieldSuburb() throws Exception {
+        String body = addressBody(null, "88", "Crown Street", "s".repeat(101), "NSW", "2010");
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("suburb"));
+    }
+
+    @Test
+    void install_stateCodeOverDbLimit_returns400_fieldStateCode() throws Exception {
+        String body = addressBody(null, "88", "Crown Street", "Surry Hills", "S".repeat(21), "2010");
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("state_code"));
+    }
+
+    @Test
+    void install_postcodeOverDbLimit_returns400_fieldPostcode() throws Exception {
+        String body = addressBody(null, "88", "Crown Street", "Surry Hills", "NSW", "2".repeat(11));
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("postcode"));
+    }
+
+    @Test
+    void install_fieldsAtDbLimit_returns200() throws Exception {
+        String body = addressBody("u".repeat(20), "8".repeat(20), "s".repeat(255),
+                "b".repeat(100), "S".repeat(20), "2".repeat(10));
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.install_address.postcode").value("2".repeat(10)));
+    }
+
+    // ---- Successful create (order had no installation row) ----
+
+    @Test
+    void install_createForOrderWithNoAddress_returns200_andPersists() throws Exception {
+        Assertions.assertEquals(Integer.valueOf(0), addressCount(ORDER_EMPTY, "INSTALLATION"),
+                "precondition: order 2 has no installation address");
+
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Installation address saved."))
+                .andExpect(jsonPath("$.data.install_address.unit_number").value("12"))
+                .andExpect(jsonPath("$.data.install_address.street_number").value("88"))
+                .andExpect(jsonPath("$.data.install_address.street").value("Crown Street"))
+                .andExpect(jsonPath("$.data.install_address.suburb").value("Surry Hills"))
+                .andExpect(jsonPath("$.data.install_address.state_code").value("NSW"))
+                .andExpect(jsonPath("$.data.install_address.postcode").value("2010"));
+
+        Assertions.assertEquals(Integer.valueOf(1), addressCount(ORDER_EMPTY, "INSTALLATION"),
+                "exactly one installation row created");
+        Assertions.assertEquals("Crown Street", addressColumn(ORDER_EMPTY, "INSTALLATION", "street"));
+    }
+
+    // ---- Successful replace (order already had an installation row) ----
+
+    @Test
+    void install_replaceExisting_returns200_allColumnsReplaced_noDuplicateRow() throws Exception {
+        // Order 1 seed installation: 42 Oxford Street, Paddington (unit null).
+        mockMvc.perform(put(installUrl(ORDER_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.install_address.street").value("Crown Street"));
+
+        Assertions.assertEquals(Integer.valueOf(1), addressCount(ORDER_FULL, "INSTALLATION"),
+                "replace must not create a second installation row");
+        Assertions.assertEquals("12", addressColumn(ORDER_FULL, "INSTALLATION", "unit_number"));
+        Assertions.assertEquals("88", addressColumn(ORDER_FULL, "INSTALLATION", "street_number"));
+        Assertions.assertEquals("Crown Street", addressColumn(ORDER_FULL, "INSTALLATION", "street"));
+        Assertions.assertEquals("Surry Hills", addressColumn(ORDER_FULL, "INSTALLATION", "suburb"));
+        Assertions.assertEquals("NSW", addressColumn(ORDER_FULL, "INSTALLATION", "state_code"));
+        Assertions.assertEquals("2010", addressColumn(ORDER_FULL, "INSTALLATION", "postcode"));
+    }
+
+    // Omitted unit_number overwrites a previous non-null value with null (full replace, no merge).
+    @Test
+    void install_omittedUnitNumber_storesNull() throws Exception {
+        // First save with a unit_number, then replace with a body that omits it.
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isOk());
+        Assertions.assertEquals("12", addressColumn(ORDER_EMPTY, "INSTALLATION", "unit_number"));
+
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(REQUIRED_ONLY_ADDRESS_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.install_address.unit_number").value(nullValue()));
+
+        Assertions.assertNull(addressColumn(ORDER_EMPTY, "INSTALLATION", "unit_number"));
+    }
+
+    // Explicit null unit_number is written as null too (same as omitted).
+    @Test
+    void install_explicitNullUnitNumber_storesNull() throws Exception {
+        String body = """
+                {
+                  "unit_number":null,
+                  "street_number":"88",
+                  "street":"Crown Street",
+                  "suburb":"Surry Hills",
+                  "state_code":"NSW",
+                  "postcode":"2010"
+                }
+                """;
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.install_address.unit_number").value(nullValue()));
+
+        Assertions.assertNull(addressColumn(ORDER_EMPTY, "INSTALLATION", "unit_number"));
+    }
+
+    // Leading/trailing whitespace is trimmed before storage.
+    @Test
+    void install_storesTrimmedValues() throws Exception {
+        String body = """
+                {
+                  "unit_number":"  12  ",
+                  "street_number":"  88  ",
+                  "street":"  Crown Street  ",
+                  "suburb":"  Surry Hills  ",
+                  "state_code":"  NSW  ",
+                  "postcode":"  2010  "
+                }
+                """;
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.install_address.unit_number").value("12"))
+                .andExpect(jsonPath("$.data.install_address.street").value("Crown Street"));
+
+        Assertions.assertEquals("Crown Street", addressColumn(ORDER_EMPTY, "INSTALLATION", "street"));
+    }
+
+    // Replace preserves created_at and moves updated_at forward.
+    @Test
+    void install_replacePreservesCreatedAt_updatesUpdatedAt() throws Exception {
+        Timestamp createdBefore = jdbcTemplate.queryForObject(
+                "SELECT created_at FROM order_address WHERE order_id = ? AND address_type = 'INSTALLATION'::address_type",
+                Timestamp.class, ORDER_FULL);
+        Assertions.assertNotNull(createdBefore);
+
+        mockMvc.perform(put(installUrl(ORDER_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isOk());
+
+        Timestamp createdAfter = jdbcTemplate.queryForObject(
+                "SELECT created_at FROM order_address WHERE order_id = ? AND address_type = 'INSTALLATION'::address_type",
+                Timestamp.class, ORDER_FULL);
+        Timestamp updatedAfter = jdbcTemplate.queryForObject(
+                "SELECT updated_at FROM order_address WHERE order_id = ? AND address_type = 'INSTALLATION'::address_type",
+                Timestamp.class, ORDER_FULL);
+
+        Assertions.assertEquals(createdBefore, createdAfter, "created_at must be preserved on replace");
+        Assertions.assertTrue(updatedAfter.after(createdAfter) || updatedAfter.equals(createdAfter),
+                "updated_at must be refreshed to at least the new clock on replace");
+    }
+
+    // ---- Response shape: only the install_address wrapper, nothing else ----
+
+    @Test
+    void install_response_excludesBillingAndInternalFields() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.install_address").exists())
+                .andExpect(jsonPath("$.data.billing_address").doesNotExist())
+                // No address_type / internal IDs / timestamps leak on the nested object.
+                .andExpect(jsonPath("$.data.install_address.address_type").doesNotExist())
+                .andExpect(jsonPath("$.data.install_address.order_address_id").doesNotExist())
+                .andExpect(jsonPath("$.data.install_address.order_id").doesNotExist())
+                .andExpect(jsonPath("$.data.install_address.created_at").doesNotExist())
+                .andExpect(jsonPath("$.data.install_address.updated_at").doesNotExist())
+                // No order header fields.
+                .andExpect(jsonPath("$.data.order_id").doesNotExist())
+                .andExpect(jsonPath("$.data.customer").doesNotExist())
+                .andExpect(jsonPath("$.data.persisted_financials").doesNotExist());
+    }
+
+    // ================================================================
+    // Billing save (same coverage as installation; response only has billing_address)
+    // ================================================================
+
+    @Test
+    void billing_noSession_returns401() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void billing_sessionWithoutStoreId_returns403() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamSessionNoStore())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void billing_invalidOrderIdFormat_returns400_fieldOrderId() throws Exception {
+        mockMvc.perform(put(billingUrl("abc"))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    @Test
+    void billing_orderInAnotherStoreSameBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void billing_orderInAnotherBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_OTHER_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void billing_crossStoreOrderWithInvalidBody_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void billing_crossStoreLaidOrder_returns404_notLocked() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_LAID_OTHER_STORE))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void billing_laidInScopeOrder_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    @Test
+    void billing_laidInScopeOrderWithInvalidBody_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    @Test
+    void billing_missingRequiredFields_returns400_firstFieldStreetNumber() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("street_number"));
+    }
+
+    // ---- Malformed JSON is gate-first ----
+
+    @Test
+    void billing_noSessionMalformedJson_returns401() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void billing_crossStoreMalformedJson_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void billing_laidInScopeMalformedJson_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // Valid editable in-scope order + malformed JSON -> 400 MALFORMED_JSON (post-gate parse).
+    @Test
+    void billing_malformedJson_returns400_malformedJson() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    // Null/blank body -> parses to null -> validateAndTrimAddress(null) -> 400 VALIDATION_FAILED,
+    // first field street_number. No NPE.
+    @Test
+    void billing_blankBody_returns400_fieldStreetNumber() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("street_number"));
+    }
+
+    @Test
+    void billing_postcodeOverDbLimit_returns400_fieldPostcode() throws Exception {
+        String body = addressBody(null, "88", "Crown Street", "Surry Hills", "NSW", "2".repeat(11));
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("postcode"));
+    }
+
+    @Test
+    void billing_createForOrderWithNoAddress_returns200_andPersists() throws Exception {
+        Assertions.assertEquals(Integer.valueOf(0), addressCount(ORDER_EMPTY, "BILLING"),
+                "precondition: order 2 has no billing address");
+
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Billing address saved."))
+                .andExpect(jsonPath("$.data.billing_address.street").value("Crown Street"));
+
+        Assertions.assertEquals(Integer.valueOf(1), addressCount(ORDER_EMPTY, "BILLING"),
+                "exactly one billing row created");
+    }
+
+    @Test
+    void billing_replaceExisting_returns200_noDuplicateRow() throws Exception {
+        // Order 1 seed billing: unit 3, 15 Pitt Street, Sydney.
+        mockMvc.perform(put(billingUrl(ORDER_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.billing_address.street").value("Crown Street"));
+
+        Assertions.assertEquals(Integer.valueOf(1), addressCount(ORDER_FULL, "BILLING"),
+                "replace must not create a second billing row");
+        Assertions.assertEquals("Crown Street", addressColumn(ORDER_FULL, "BILLING", "street"));
+    }
+
+    @Test
+    void billing_response_excludesInstallAndInternalFields() throws Exception {
+        mockMvc.perform(put(billingUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.billing_address").exists())
+                .andExpect(jsonPath("$.data.install_address").doesNotExist())
+                .andExpect(jsonPath("$.data.billing_address.address_type").doesNotExist())
+                .andExpect(jsonPath("$.data.billing_address.order_address_id").doesNotExist())
+                .andExpect(jsonPath("$.data.billing_address.order_id").doesNotExist())
+                .andExpect(jsonPath("$.data.billing_address.created_at").doesNotExist())
+                .andExpect(jsonPath("$.data.billing_address.updated_at").doesNotExist())
+                .andExpect(jsonPath("$.data.order_id").doesNotExist())
+                .andExpect(jsonPath("$.data.customer").doesNotExist());
+    }
+
+    // Independent address rows: saving installation does not touch billing and vice versa.
+    @Test
+    void install_doesNotCreateBillingRow() throws Exception {
+        mockMvc.perform(put(installUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_ADDRESS_BODY))
+                .andExpect(status().isOk());
+
+        Assertions.assertEquals(Integer.valueOf(1), addressCount(ORDER_EMPTY, "INSTALLATION"));
+        Assertions.assertEquals(Integer.valueOf(0), addressCount(ORDER_EMPTY, "BILLING"),
+                "installation save must not create a billing row");
+    }
+
+    // ================================================================
+    // Billing copy from installation
+    // ================================================================
+
+    // ---- Standard-protected gating ----
+
+    @Test
+    void copy_noSession_returns401() throws Exception {
+        mockMvc.perform(post(copyUrl(ORDER_FULL)))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void copy_sessionWithoutStoreId_returns403() throws Exception {
+        mockMvc.perform(post(copyUrl(ORDER_FULL)).session(liamSessionNoStore()))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    // ---- Path validation ----
+
+    @Test
+    void copy_invalidOrderIdFormat_returns400_fieldOrderId() throws Exception {
+        mockMvc.perform(post(copyUrl("abc")).session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    // ---- Resource-level 404s (no existence leak) ----
+
+    @Test
+    void copy_orderInAnotherStoreSameBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(post(copyUrl(ORDER_OTHER_STORE_SAME_BUSINESS)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void copy_orderInAnotherBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(post(copyUrl(ORDER_OTHER_BUSINESS)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // ---- LAID before installation-exists precondition ----
+
+    @Test
+    void copy_laidWithNoInstallation_returns422_orderLocked() throws Exception {
+        // Order 2 has no installation row; making it LAID must yield ORDER_LOCKED, not
+        // INSTALLATION_ADDRESS_REQUIRED (LAID gate runs first).
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(post(copyUrl(ORDER_EMPTY)).session(liamStore1Session()))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // ---- Installation-exists precondition ----
+
+    @Test
+    void copy_noInstallation_returns422_installationAddressRequired() throws Exception {
+        // Order 2 has no installation row. Assert by error.code only (no message-text assertion).
+        Assertions.assertEquals(Integer.valueOf(0), addressCount(ORDER_EMPTY, "INSTALLATION"),
+                "precondition: order 2 has no installation address");
+
+        mockMvc.perform(post(copyUrl(ORDER_EMPTY)).session(liamStore1Session()))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("INSTALLATION_ADDRESS_REQUIRED"));
+
+        // No billing row was written.
+        Assertions.assertEquals(Integer.valueOf(0), addressCount(ORDER_EMPTY, "BILLING"),
+                "no billing row may be created when installation is missing");
+    }
+
+    // ---- Create billing from installation (billing absent) ----
+
+    @Test
+    void copy_installationExistsBillingAbsent_createsBilling() throws Exception {
+        // Remove order 1's seeded billing row so billing is absent; installation (Oxford St) remains.
+        jdbcTemplate.update("DELETE FROM order_address WHERE order_id = ? AND address_type = 'BILLING'::address_type",
+                ORDER_FULL);
+        Assertions.assertEquals(Integer.valueOf(0), addressCount(ORDER_FULL, "BILLING"));
+
+        mockMvc.perform(post(copyUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Billing address copied from installation address."))
+                // Installation values (unit_number is null in seed) copied verbatim.
+                .andExpect(jsonPath("$.data.billing_address.unit_number").value(nullValue()))
+                .andExpect(jsonPath("$.data.billing_address.street_number").value("42"))
+                .andExpect(jsonPath("$.data.billing_address.street").value("Oxford Street"))
+                .andExpect(jsonPath("$.data.billing_address.suburb").value("Paddington"))
+                .andExpect(jsonPath("$.data.billing_address.state_code").value("NSW"))
+                .andExpect(jsonPath("$.data.billing_address.postcode").value("2021"));
+
+        Assertions.assertEquals(Integer.valueOf(1), addressCount(ORDER_FULL, "BILLING"),
+                "exactly one billing row created");
+        Assertions.assertNull(addressColumn(ORDER_FULL, "BILLING", "unit_number"),
+                "null unit_number must be copied as null");
+        Assertions.assertEquals("Oxford Street", addressColumn(ORDER_FULL, "BILLING", "street"));
+    }
+
+    // ---- Replace billing from installation (billing present) ----
+
+    @Test
+    void copy_installationExistsBillingPresent_replacesBilling_noDuplicate() throws Exception {
+        // Order 1 has both rows: install = Oxford St (unit null), billing = Pitt St (unit '3').
+        mockMvc.perform(post(copyUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.billing_address.street").value("Oxford Street"))
+                .andExpect(jsonPath("$.data.billing_address.unit_number").value(nullValue()));
+
+        Assertions.assertEquals(Integer.valueOf(1), addressCount(ORDER_FULL, "BILLING"),
+                "copy-replace must not create a second billing row");
+        // Billing now mirrors installation.
+        Assertions.assertNull(addressColumn(ORDER_FULL, "BILLING", "unit_number"));
+        Assertions.assertEquals("42", addressColumn(ORDER_FULL, "BILLING", "street_number"));
+        Assertions.assertEquals("Oxford Street", addressColumn(ORDER_FULL, "BILLING", "street"));
+        Assertions.assertEquals("Paddington", addressColumn(ORDER_FULL, "BILLING", "suburb"));
+        Assertions.assertEquals("NSW", addressColumn(ORDER_FULL, "BILLING", "state_code"));
+        Assertions.assertEquals("2021", addressColumn(ORDER_FULL, "BILLING", "postcode"));
+        // Installation row untouched.
+        Assertions.assertEquals("Oxford Street", addressColumn(ORDER_FULL, "INSTALLATION", "street"));
+    }
+
+    // Copy-replace preserves billing created_at and refreshes updated_at.
+    @Test
+    void copy_replacePreservesBillingCreatedAt_updatesUpdatedAt() throws Exception {
+        Timestamp createdBefore = jdbcTemplate.queryForObject(
+                "SELECT created_at FROM order_address WHERE order_id = ? AND address_type = 'BILLING'::address_type",
+                Timestamp.class, ORDER_FULL);
+        Assertions.assertNotNull(createdBefore);
+
+        mockMvc.perform(post(copyUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk());
+
+        Timestamp createdAfter = jdbcTemplate.queryForObject(
+                "SELECT created_at FROM order_address WHERE order_id = ? AND address_type = 'BILLING'::address_type",
+                Timestamp.class, ORDER_FULL);
+        Timestamp updatedAfter = jdbcTemplate.queryForObject(
+                "SELECT updated_at FROM order_address WHERE order_id = ? AND address_type = 'BILLING'::address_type",
+                Timestamp.class, ORDER_FULL);
+
+        Assertions.assertEquals(createdBefore, createdAfter, "billing created_at must be preserved on copy-replace");
+        Assertions.assertTrue(updatedAfter.after(createdAfter) || updatedAfter.equals(createdAfter),
+                "billing updated_at must be refreshed on copy-replace");
+    }
+
+    @Test
+    void copy_response_excludesInstallAndInternalFields() throws Exception {
+        mockMvc.perform(post(copyUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.billing_address").exists())
+                .andExpect(jsonPath("$.data.install_address").doesNotExist())
+                .andExpect(jsonPath("$.data.billing_address.address_type").doesNotExist())
+                .andExpect(jsonPath("$.data.billing_address.order_id").doesNotExist())
+                .andExpect(jsonPath("$.data.order_id").doesNotExist());
     }
 }

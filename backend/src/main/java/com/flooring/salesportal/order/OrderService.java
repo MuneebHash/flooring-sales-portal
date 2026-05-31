@@ -1,17 +1,23 @@
 package com.flooring.salesportal.order;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.flooring.salesportal.common.api.ErrorDetail;
 import com.flooring.salesportal.common.error.BusinessRuleException;
 import com.flooring.salesportal.common.error.ErrorCode;
+import com.flooring.salesportal.common.error.MalformedJsonException;
 import com.flooring.salesportal.common.error.NotFoundException;
 import com.flooring.salesportal.common.error.ValidationException;
 import com.flooring.salesportal.common.session.RequestContext;
 import com.flooring.salesportal.common.session.RequestContextGuard;
 import com.flooring.salesportal.order.dto.AddressDto;
+import com.flooring.salesportal.order.dto.AddressUpsertRequest;
+import com.flooring.salesportal.order.dto.BillingAddressResponse;
 import com.flooring.salesportal.order.dto.CreateOrderRequest;
 import com.flooring.salesportal.order.dto.CustomerDto;
 import com.flooring.salesportal.order.dto.CustomerSaveRequest;
 import com.flooring.salesportal.order.dto.CustomerSaveResponse;
+import com.flooring.salesportal.order.dto.InstallationAddressResponse;
 import com.flooring.salesportal.order.dto.OrderHeaderResponse;
 import com.flooring.salesportal.order.dto.OrderWorkspaceResponse;
 import com.flooring.salesportal.order.dto.PersistedFinancialsDto;
@@ -45,6 +51,14 @@ public class OrderService {
     private static final int MAX_PHONE = 20;    // mobile / home_phone / work_phone VARCHAR(20)
     private static final int MAX_COMPANY = 150; // company_name VARCHAR(150)
 
+    // order_address VARCHAR limits, taken directly from V2__create_tables.sql.
+    private static final int MAX_UNIT_NUMBER = 20;    // unit_number VARCHAR(20)
+    private static final int MAX_STREET_NUMBER = 20;  // street_number VARCHAR(20)
+    private static final int MAX_STREET = 255;        // street VARCHAR(255)
+    private static final int MAX_SUBURB = 100;        // suburb VARCHAR(100)
+    private static final int MAX_STATE_CODE = 20;     // state_code VARCHAR(20)
+    private static final int MAX_POSTCODE = 10;       // postcode VARCHAR(10)
+
     private final RequestContextGuard requestContextGuard;
     private final StoreRepository storeRepository;
     private final AppUserRepository appUserRepository;
@@ -53,6 +67,8 @@ public class OrderService {
     private final OrderCustomerRepository orderCustomerRepository;
     private final OrderCustomerWriteRepository orderCustomerWriteRepository;
     private final OrderAddressRepository orderAddressRepository;
+    private final OrderAddressWriteRepository orderAddressWriteRepository;
+    private final ObjectMapper objectMapper;
 
     public OrderService(RequestContextGuard requestContextGuard,
                         StoreRepository storeRepository,
@@ -61,7 +77,9 @@ public class OrderService {
                         SalesOrderRepository salesOrderRepository,
                         OrderCustomerRepository orderCustomerRepository,
                         OrderCustomerWriteRepository orderCustomerWriteRepository,
-                        OrderAddressRepository orderAddressRepository) {
+                        OrderAddressRepository orderAddressRepository,
+                        OrderAddressWriteRepository orderAddressWriteRepository,
+                        ObjectMapper objectMapper) {
         this.requestContextGuard = requestContextGuard;
         this.storeRepository = storeRepository;
         this.appUserRepository = appUserRepository;
@@ -70,6 +88,8 @@ public class OrderService {
         this.orderCustomerRepository = orderCustomerRepository;
         this.orderCustomerWriteRepository = orderCustomerWriteRepository;
         this.orderAddressRepository = orderAddressRepository;
+        this.orderAddressWriteRepository = orderAddressWriteRepository;
+        this.objectMapper = objectMapper;
     }
 
     /**
@@ -188,14 +208,16 @@ public class OrderService {
     /**
      * PUT /orders/{orderId}/customer. Insert-or-full-replace the one {@code order_customer} row.
      * Gate-first ordering (approved): guard → parse orderId → scoped lookup → 404 → LAID → 422 →
-     * only then validate body and upsert. So a LAID in-scope order with an invalid body still
-     * returns 422 ORDER_LOCKED, and a cross-store/cross-business order with an invalid body still
-     * returns 404 ORDER_NOT_FOUND.
+     * only then parse the raw JSON body, validate it, and upsert. So a LAID in-scope order with a
+     * malformed/invalid body still returns 422 ORDER_LOCKED, and a cross-store/cross-business order
+     * still returns 404 ORDER_NOT_FOUND — body parsing/validation never runs ahead of the gates.
+     * The body arrives as a raw String (parsed here, not by Spring) precisely so malformed JSON
+     * cannot 400 before these gates.
      */
     @Transactional
     public CustomerSaveResponse saveCustomer(String slug,
                                              String orderIdRaw,
-                                             CustomerSaveRequest body,
+                                             String body,
                                              HttpServletRequest httpRequest) {
         // 1. Standard-protected guard.
         RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
@@ -217,8 +239,11 @@ public class OrderService {
             throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
         }
 
-        // 5. Validate + trim the body. Full-replace: optional omitted/null fields become null.
-        CustomerDto customer = validateAndTrimCustomer(body);
+        // 5. Parse the raw JSON body (malformed -> 400 MALFORMED_JSON), then validate + trim.
+        //    Null/blank body parses to null and flows to validation as all-fields-missing.
+        //    Full-replace: optional omitted/null fields become null.
+        CustomerSaveRequest request = parseBodyAfterGates(body, CustomerSaveRequest.class);
+        CustomerDto customer = validateAndTrimCustomer(request);
 
         // 6. One clock for created_at (insert only) / updated_at. Native upsert respects
         //    uq_order_customer_order, preserves created_at on replace, refreshes updated_at.
@@ -236,6 +261,147 @@ public class OrderService {
                 now);
 
         return new CustomerSaveResponse(customer);
+    }
+
+    /**
+     * PUT /orders/{orderId}/addresses/installation. Insert-or-full-replace the one
+     * {@code order_address} row of type INSTALLATION. Same gate-first ordering as
+     * {@link #saveCustomer}: guard → parse orderId → scoped FOR UPDATE lookup → 404 → LAID → 422 →
+     * only then validate body and upsert. The path determines {@code address_type}; it is never
+     * read from the body.
+     */
+    @Transactional
+    public InstallationAddressResponse saveInstallationAddress(String slug,
+                                                               String orderIdRaw,
+                                                               String body,
+                                                               HttpServletRequest httpRequest) {
+        AddressDto address = saveAddress(slug, orderIdRaw, body, httpRequest, ADDRESS_INSTALLATION);
+        return new InstallationAddressResponse(address);
+    }
+
+    /**
+     * PUT /orders/{orderId}/addresses/billing. Insert-or-full-replace the one
+     * {@code order_address} row of type BILLING. Same gate-first ordering as
+     * {@link #saveInstallationAddress}; the path determines {@code address_type}.
+     */
+    @Transactional
+    public BillingAddressResponse saveBillingAddress(String slug,
+                                                     String orderIdRaw,
+                                                     String body,
+                                                     HttpServletRequest httpRequest) {
+        AddressDto address = saveAddress(slug, orderIdRaw, body, httpRequest, ADDRESS_BILLING);
+        return new BillingAddressResponse(address);
+    }
+
+    /**
+     * Shared body of the two address PUTs. Gate order: guard → parse orderId → scoped FOR UPDATE
+     * lookup (missing/cross-store/cross-business → 404 ORDER_NOT_FOUND, no existence leak) → LAID
+     * (422 ORDER_LOCKED) → parse raw JSON body (malformed → 400 MALFORMED_JSON) → validate + trim
+     * (400 VALIDATION_FAILED; a null/blank body parses to null and is treated as all-fields-missing,
+     * not an NPE) → native upsert. The body arrives as a raw String (parsed here, not by Spring) so
+     * malformed JSON cannot 400 before the gates. The pessimistic write lock plus this
+     * {@code @Transactional} method serialize all address writes for the order against a concurrent
+     * PATCH-status update to LAID.
+     */
+    private AddressDto saveAddress(String slug,
+                                   String orderIdRaw,
+                                   String body,
+                                   HttpServletRequest httpRequest,
+                                   String addressType) {
+        // 1. Standard-protected guard.
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+
+        // 2. Validate the path variable as a positive integer.
+        long orderId = parseOrderId(orderIdRaw);
+
+        // 3. Scope to the session's (business_id, store_id) with a pessimistic write lock.
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        // 4. Only after the order is confirmed in-scope: LAID is locked for address edits.
+        if (STATUS_LAID.equals(order.getOrderStatus())) {
+            throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
+        }
+
+        // 5. Parse the raw JSON body (malformed -> 400 MALFORMED_JSON), then validate + trim.
+        //    Null/blank body parses to null -> all-fields-missing. Full-replace: omitted/null
+        //    unit_number becomes null.
+        AddressUpsertRequest request = parseBodyAfterGates(body, AddressUpsertRequest.class);
+        AddressDto address = validateAndTrimAddress(request);
+
+        // 6. One clock for created_at (insert only) / updated_at. Native upsert respects
+        //    uq_order_address_order_type, preserves created_at on replace, refreshes updated_at.
+        LocalDateTime now = LocalDateTime.now();
+        upsertAddress(orderId, addressType, address, now);
+
+        return address;
+    }
+
+    /**
+     * POST /orders/{orderId}/addresses/billing/copy-from-installation. Copies the existing
+     * INSTALLATION address into the BILLING row (create or replace). Gate order: guard → parse
+     * orderId → scoped FOR UPDATE lookup → 404 → LAID → 422 → only then read INSTALLATION → if
+     * absent 422 INSTALLATION_ADDRESS_REQUIRED. A LAID order with no installation row returns
+     * ORDER_LOCKED (the LAID gate runs first), and a cross-store/cross-business order returns 404
+     * before any installation-exists check (no existence leak). Reading the INSTALLATION row
+     * without its own row lock is safe: the sales_order FOR UPDATE lock serializes every address
+     * mutation for this order, since all address endpoints take that lock first. Atomic in this
+     * single {@code @Transactional} method.
+     */
+    @Transactional
+    public BillingAddressResponse copyBillingFromInstallation(String slug,
+                                                              String orderIdRaw,
+                                                              HttpServletRequest httpRequest) {
+        // 1. Standard-protected guard.
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+
+        // 2. Validate the path variable as a positive integer.
+        long orderId = parseOrderId(orderIdRaw);
+
+        // 3. Scope to the session's (business_id, store_id) with a pessimistic write lock.
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        // 4. LAID is locked for address edits — checked before the installation-exists precondition.
+        if (STATUS_LAID.equals(order.getOrderStatus())) {
+            throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
+        }
+
+        // 5. Read the existing INSTALLATION row. Absent → 422, no write occurs.
+        OrderAddress installation = findAddress(orderAddressRepository.findByOrderId(orderId), ADDRESS_INSTALLATION);
+        if (installation == null) {
+            throw new BusinessRuleException(
+                    ErrorCode.INSTALLATION_ADDRESS_REQUIRED,
+                    ErrorCode.INSTALLATION_ADDRESS_REQUIRED.defaultMessage());
+        }
+
+        // 6. Copy all six columns into BILLING (create or replace), one clock for timestamps.
+        AddressDto billing = new AddressDto(
+                installation.getUnitNumber(),
+                installation.getStreetNumber(),
+                installation.getStreet(),
+                installation.getSuburb(),
+                installation.getStateCode(),
+                installation.getPostcode());
+        LocalDateTime now = LocalDateTime.now();
+        upsertAddress(orderId, ADDRESS_BILLING, billing, now);
+
+        return new BillingAddressResponse(billing);
+    }
+
+    private void upsertAddress(long orderId, String addressType, AddressDto address, LocalDateTime now) {
+        orderAddressWriteRepository.upsert(
+                orderId,
+                addressType,
+                address.unitNumber(),
+                address.streetNumber(),
+                address.street(),
+                address.suburb(),
+                address.stateCode(),
+                address.postcode(),
+                now);
     }
 
     private static String validateFlooringType(CreateOrderRequest body) {
@@ -270,6 +436,29 @@ public class OrderService {
     }
 
     /**
+     * Parse a raw request body into {@code type} <em>after</em> the mutation gates (guard →
+     * orderId → scoped lookup → 404 → LAID → 422) have passed — the body is taken as a raw String
+     * by the controller precisely so this parse cannot run ahead of those gates. A {@code null} or
+     * blank body returns {@code null}, which downstream {@code validateAndTrim*} treats as
+     * all-fields-missing (→ 400 VALIDATION_FAILED). Well-formed-but-incomplete JSON (e.g.
+     * {@code "{}"}) parses successfully and likewise flows to validation. Only genuinely
+     * unparseable input throws {@link MalformedJsonException} (→ 400 MALFORMED_JSON, same wrapper
+     * as Spring's HttpMessageNotReadableException via {@code handleApiException}). Uses the shared
+     * Spring {@link ObjectMapper}, so global Jackson behaviour (snake_case, unknown fields ignored)
+     * is preserved.
+     */
+    private <T> T parseBodyAfterGates(String rawBody, Class<T> type) {
+        if (rawBody == null || rawBody.isBlank()) {
+            return null;
+        }
+        try {
+            return objectMapper.readValue(rawBody, type);
+        } catch (JsonProcessingException ex) {
+            throw new MalformedJsonException();
+        }
+    }
+
+    /**
      * Validate the customer body and return trimmed values as a {@link CustomerDto}. Collects all
      * field errors (validated in field order) into one VALIDATION_FAILED so {@code details[0]} is
      * the first offending field. Required: first_name, last_name, email (must contain {@code @}),
@@ -293,6 +482,32 @@ public class OrderService {
         }
 
         return new CustomerDto(firstName, middleName, lastName, email, mobile, homePhone, workPhone, companyName);
+    }
+
+    /**
+     * Validate the address body and return trimmed values as an {@link AddressDto}. Collects all
+     * field errors (validated in field order) into one VALIDATION_FAILED so {@code details[0]} is
+     * the first offending field. Required: street_number, street, suburb, state_code, postcode —
+     * each non-blank after trim. {@code unit_number} is optional; when provided non-null it must be
+     * non-blank after trim, otherwise null. Validates exactly what V2/V3 enforce — non-blank after
+     * trim plus the {@code order_address} VARCHAR limit — and nothing more (no state-code list, no
+     * postcode format). A {@code null} body (from {@code @RequestBody(required=false)}) is treated
+     * as all-required-fields-missing → 400, never an NPE.
+     */
+    private static AddressDto validateAndTrimAddress(AddressUpsertRequest body) {
+        List<ErrorDetail> errors = new ArrayList<>();
+        String streetNumber = requireNonBlank(body == null ? null : body.streetNumber(), "street_number", MAX_STREET_NUMBER, errors);
+        String street       = requireNonBlank(body == null ? null : body.street(), "street", MAX_STREET, errors);
+        String suburb       = requireNonBlank(body == null ? null : body.suburb(), "suburb", MAX_SUBURB, errors);
+        String stateCode    = requireNonBlank(body == null ? null : body.stateCode(), "state_code", MAX_STATE_CODE, errors);
+        String postcode     = requireNonBlank(body == null ? null : body.postcode(), "postcode", MAX_POSTCODE, errors);
+        String unitNumber   = optionalNonBlank(body == null ? null : body.unitNumber(), "unit_number", MAX_UNIT_NUMBER, errors);
+
+        if (!errors.isEmpty()) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
+        }
+
+        return new AddressDto(unitNumber, streetNumber, street, suburb, stateCode, postcode);
     }
 
     private static String requireNonBlank(String raw, String field, int maxLength, List<ErrorDetail> errors) {

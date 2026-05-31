@@ -16,6 +16,7 @@ public enum ErrorCode {
     STORE_ALREADY_SELECTED(HttpStatus.CONFLICT, "A different store is already selected in this session. Log out to switch stores."),
     BUSINESS_RULE_VIOLATION(HttpStatus.UNPROCESSABLE_ENTITY, "Business rule violation."),
     ORDER_LOCKED(HttpStatus.UNPROCESSABLE_ENTITY, "Order is laid and cannot be edited."),
+    INSTALLATION_ADDRESS_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "Installation address must exist before copying it to billing."),
     INTERNAL_SERVER_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
 
     private final HttpStatus status;
