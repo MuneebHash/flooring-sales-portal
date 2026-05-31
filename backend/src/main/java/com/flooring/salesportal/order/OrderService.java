@@ -197,10 +197,13 @@ public class OrderService {
         // 2. Validate the path variable as a positive integer.
         long orderId = parseOrderId(orderIdRaw);
 
-        // 3. Scope to the session's (business_id, store_id). Missing / cross-store / cross-business
+        // 3. Scope to the session's (business_id, store_id) with a pessimistic write lock
+        //    (SELECT ... FOR UPDATE). Locking inside this @Transactional method closes the
+        //    read-then-write race: a concurrent PATCH-status update to LAID cannot interleave
+        //    between this read and the upsert commit. Missing / cross-store / cross-business
         //    all return empty -> 404 ORDER_NOT_FOUND with no existence leak.
         SalesOrder order = salesOrderRepository
-                .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
+                .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
 
         // 4. Only after the order is confirmed in-scope: LAID is locked for customer edits.
