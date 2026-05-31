@@ -4,6 +4,7 @@ import com.flooring.salesportal.common.api.ApiResponse;
 import com.flooring.salesportal.order.dto.BillingAddressResponse;
 import com.flooring.salesportal.order.dto.CreateOrderRequest;
 import com.flooring.salesportal.order.dto.CustomerSaveResponse;
+import com.flooring.salesportal.order.dto.DetailsOfSaleSaveResponse;
 import com.flooring.salesportal.order.dto.InstallationAddressResponse;
 import com.flooring.salesportal.order.dto.OrderHeaderResponse;
 import com.flooring.salesportal.order.dto.OrderWorkspaceResponse;
@@ -106,5 +107,20 @@ public class OrderController {
         return ApiResponse.ok(
                 orderService.copyBillingFromInstallation(slug, orderId, httpRequest),
                 "Billing address copied from installation address.");
+    }
+
+    // orderId is captured as a String so non-numeric and non-positive values both flow through
+    // the service's manual validation and produce VALIDATION_FAILED with field "order_id".
+    // Raw String body (see saveCustomer): JSON parsing happens inside the service, after all gates,
+    // so malformed JSON cannot 400 ahead of the guard / orderId / scoped-lookup / 404 / LAID gates.
+    @PutMapping("/{orderId}/details-of-sale")
+    public ApiResponse<DetailsOfSaleSaveResponse> saveDetailsOfSale(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestBody(required = false) String body,
+            HttpServletRequest httpRequest) {
+        return ApiResponse.ok(
+                orderService.saveDetailsOfSale(slug, orderId, body, httpRequest),
+                "Details of sale saved.");
     }
 }

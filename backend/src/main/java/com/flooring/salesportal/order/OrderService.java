@@ -1,6 +1,7 @@
 package com.flooring.salesportal.order;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.flooring.salesportal.common.api.ErrorDetail;
 import com.flooring.salesportal.common.error.BusinessRuleException;
@@ -17,6 +18,9 @@ import com.flooring.salesportal.order.dto.CreateOrderRequest;
 import com.flooring.salesportal.order.dto.CustomerDto;
 import com.flooring.salesportal.order.dto.CustomerSaveRequest;
 import com.flooring.salesportal.order.dto.CustomerSaveResponse;
+import com.flooring.salesportal.order.dto.DetailsOfSaleFieldsDto;
+import com.flooring.salesportal.order.dto.DetailsOfSaleSaveRequest;
+import com.flooring.salesportal.order.dto.DetailsOfSaleSaveResponse;
 import com.flooring.salesportal.order.dto.InstallationAddressResponse;
 import com.flooring.salesportal.order.dto.OrderHeaderResponse;
 import com.flooring.salesportal.order.dto.OrderWorkspaceResponse;
@@ -31,6 +35,9 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+import java.time.format.ResolverStyle;
 import java.time.temporal.IsoFields;
 import java.util.ArrayList;
 import java.util.List;
@@ -44,6 +51,17 @@ public class OrderService {
     private static final String STATUS_LAID = "LAID";
     private static final String ADDRESS_INSTALLATION = "INSTALLATION";
     private static final String ADDRESS_BILLING = "BILLING";
+
+    // lay_date_status enum values (V1__create_enums.sql). Validated as exact strings so an invalid
+    // value is a VALIDATION_FAILED on field lay_date_status, never a Jackson parse error.
+    private static final String LAY_DATE_CONFIRMED = "CONFIRMED";
+    private static final String LAY_DATE_TO_BE_CONFIRMED = "TO_BE_CONFIRMED";
+
+    // Strict ISO YYYY-MM-DD parsing for proposed_lay_date: "uuuu-MM-dd" + ResolverStyle.STRICT
+    // rejects impossible dates (e.g. 2026-02-30) and non-zero-padded / malformed forms, so an
+    // invalid date is a VALIDATION_FAILED on field proposed_lay_date rather than MALFORMED_JSON.
+    private static final DateTimeFormatter STRICT_ISO_DATE =
+            DateTimeFormatter.ofPattern("uuuu-MM-dd").withResolverStyle(ResolverStyle.STRICT);
 
     // order_customer VARCHAR limits, taken directly from V2__create_tables.sql.
     private static final int MAX_NAME = 100;    // first_name / middle_name / last_name VARCHAR(100)
@@ -68,6 +86,7 @@ public class OrderService {
     private final OrderCustomerWriteRepository orderCustomerWriteRepository;
     private final OrderAddressRepository orderAddressRepository;
     private final OrderAddressWriteRepository orderAddressWriteRepository;
+    private final SalesOrderDetailsWriteRepository salesOrderDetailsWriteRepository;
     private final ObjectMapper objectMapper;
 
     public OrderService(RequestContextGuard requestContextGuard,
@@ -79,6 +98,7 @@ public class OrderService {
                         OrderCustomerWriteRepository orderCustomerWriteRepository,
                         OrderAddressRepository orderAddressRepository,
                         OrderAddressWriteRepository orderAddressWriteRepository,
+                        SalesOrderDetailsWriteRepository salesOrderDetailsWriteRepository,
                         ObjectMapper objectMapper) {
         this.requestContextGuard = requestContextGuard;
         this.storeRepository = storeRepository;
@@ -89,6 +109,7 @@ public class OrderService {
         this.orderCustomerWriteRepository = orderCustomerWriteRepository;
         this.orderAddressRepository = orderAddressRepository;
         this.orderAddressWriteRepository = orderAddressWriteRepository;
+        this.salesOrderDetailsWriteRepository = salesOrderDetailsWriteRepository;
         this.objectMapper = objectMapper;
     }
 
@@ -404,6 +425,61 @@ public class OrderService {
                 now);
     }
 
+    /**
+     * PUT /orders/{orderId}/details-of-sale. Full-replace of the five non-line, non-payment
+     * "details of sale" columns on {@code sales_order}. Same gate-first ordering as
+     * {@link #saveCustomer}: guard → parse orderId → scoped FOR UPDATE lookup (missing/cross-store/
+     * cross-business → 404 ORDER_NOT_FOUND, no existence leak) → LAID (422 ORDER_LOCKED) → parse raw
+     * JSON body (unreadable → 400 MALFORMED_JSON) → validate + normalise (400 VALIDATION_FAILED) →
+     * native UPDATE. The body arrives as a raw String (parsed here, not by Spring) so malformed JSON
+     * cannot 400 before the gates; a null/blank body parses to a null DTO and is treated as
+     * all-fields-missing (→ 400 on {@code supply_only}), never an NPE. The pessimistic write lock
+     * plus this {@code @Transactional} method serialize the write against a concurrent PATCH-status
+     * update to LAID. The response carries only the saved fields + {@code updated_at} — no financial
+     * summary (§E.7).
+     */
+    @Transactional
+    public DetailsOfSaleSaveResponse saveDetailsOfSale(String slug,
+                                                       String orderIdRaw,
+                                                       String body,
+                                                       HttpServletRequest httpRequest) {
+        // 1. Standard-protected guard.
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+
+        // 2. Validate the path variable as a positive integer.
+        long orderId = parseOrderId(orderIdRaw);
+
+        // 3. Scope to the session's (business_id, store_id) with a pessimistic write lock.
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        // 4. Only after the order is confirmed in-scope: LAID is locked for details-of-sale edits.
+        if (STATUS_LAID.equals(order.getOrderStatus())) {
+            throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
+        }
+
+        // 5. Parse the raw JSON body (unreadable -> 400 MALFORMED_JSON), then validate + normalise.
+        //    Null/blank body parses to null and flows to validation as supply_only-missing.
+        //    Full-replace: optional omitted/null fields become null.
+        DetailsOfSaleSaveRequest request = parseBodyAfterGates(body, DetailsOfSaleSaveRequest.class);
+        DetailsOfSaleFieldsDto fields = validateAndNormalizeDetails(request);
+
+        // 6. One clock for updated_at. The native UPDATE refreshes updated_at and leaves created_at
+        //    and every financial / line column untouched.
+        LocalDateTime now = LocalDateTime.now();
+        salesOrderDetailsWriteRepository.update(
+                orderId,
+                fields.supplyOnly(),
+                fields.planNumbers(),
+                fields.proposedLayDate(),
+                fields.layDateStatus(),
+                fields.detailsOfSale(),
+                now);
+
+        return new DetailsOfSaleSaveResponse(fields, now);
+    }
+
     private static String validateFlooringType(CreateOrderRequest body) {
         String value = body == null ? null : body.flooringType();
         if (value == null) {
@@ -508,6 +584,100 @@ public class OrderService {
         }
 
         return new AddressDto(unitNumber, streetNumber, street, suburb, stateCode, postcode);
+    }
+
+    /**
+     * Validate and normalise the details-of-sale body into a {@link DetailsOfSaleFieldsDto}.
+     * Collects all field errors (validated in contract field order: supply_only → plan_numbers →
+     * proposed_lay_date → lay_date_status → pair rule → details_of_sale) into one VALIDATION_FAILED
+     * so {@code details[0]} is the first offending field.
+     *
+     * <p>{@code supply_only} is required and read from the {@link JsonNode}: a missing component
+     * ({@code null}), an explicit JSON null ({@link JsonNode#isNull()}), and any non-boolean value
+     * are all 400 on field {@code supply_only} — never a default, never a parse error.
+     * {@code plan_numbers} / {@code details_of_sale} are optional TEXT (no length cap), non-blank
+     * after trim when non-null. {@code proposed_lay_date} is optional, strict {@code YYYY-MM-DD}
+     * when non-null. {@code lay_date_status} is optional, exactly {@code CONFIRMED} or
+     * {@code TO_BE_CONFIRMED} when non-null. The pair rule requires both lay-date fields set or both
+     * null; a mismatch is reported on field {@code lay_date_status}. A {@code null} body (null/blank
+     * raw request) is treated as all-fields-missing → 400 on {@code supply_only}, never an NPE.
+     */
+    private static DetailsOfSaleFieldsDto validateAndNormalizeDetails(DetailsOfSaleSaveRequest body) {
+        List<ErrorDetail> errors = new ArrayList<>();
+
+        // 1. supply_only — required boolean, read from the JsonNode so wrong/missing/null values
+        //    are validation errors (not parse errors) on field supply_only.
+        boolean supplyOnly = false;
+        JsonNode supplyOnlyNode = body == null ? null : body.supplyOnly();
+        if (supplyOnlyNode == null || supplyOnlyNode.isNull()) {
+            errors.add(new ErrorDetail(null, "supply_only", "Required."));
+        } else if (!supplyOnlyNode.isBoolean()) {
+            errors.add(new ErrorDetail(null, "supply_only", "Must be a boolean."));
+        } else {
+            supplyOnly = supplyOnlyNode.booleanValue();
+        }
+
+        // 2. plan_numbers — optional; non-blank after trim when non-null; no length cap (TEXT).
+        String planNumbers = optionalText(body == null ? null : body.planNumbers(), "plan_numbers", errors);
+
+        // 3. proposed_lay_date — optional; strict YYYY-MM-DD when non-null. "provided" tracks a
+        //    successfully parsed value, so a present-but-invalid date does not pair with a status.
+        LocalDate proposedLayDate = null;
+        boolean proposedLayDateProvided = false;
+        String proposedLayDateRaw = body == null ? null : body.proposedLayDate();
+        if (proposedLayDateRaw != null) {
+            try {
+                proposedLayDate = LocalDate.parse(proposedLayDateRaw.trim(), STRICT_ISO_DATE);
+                proposedLayDateProvided = true;
+            } catch (DateTimeParseException ex) {
+                errors.add(new ErrorDetail(null, "proposed_lay_date", "Must be a valid date in YYYY-MM-DD format."));
+            }
+        }
+
+        // 4. lay_date_status — optional; exactly CONFIRMED or TO_BE_CONFIRMED when non-null.
+        String layDateStatus = null;
+        boolean layDateStatusProvided = false;
+        String layDateStatusRaw = body == null ? null : body.layDateStatus();
+        if (layDateStatusRaw != null) {
+            if (LAY_DATE_CONFIRMED.equals(layDateStatusRaw) || LAY_DATE_TO_BE_CONFIRMED.equals(layDateStatusRaw)) {
+                layDateStatus = layDateStatusRaw;
+                layDateStatusProvided = true;
+            } else {
+                errors.add(new ErrorDetail(null, "lay_date_status", "Must be one of CONFIRMED, TO_BE_CONFIRMED."));
+            }
+        }
+
+        // 5. pair rule — both lay-date fields set or both null. Reported on lay_date_status.
+        if (proposedLayDateProvided != layDateStatusProvided) {
+            errors.add(new ErrorDetail(null, "lay_date_status",
+                    "proposed_lay_date and lay_date_status must both be set or both be null."));
+        }
+
+        // 6. details_of_sale — optional; non-blank after trim when non-null; no length cap (TEXT).
+        String detailsOfSale = optionalText(body == null ? null : body.detailsOfSale(), "details_of_sale", errors);
+
+        if (!errors.isEmpty()) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
+        }
+
+        return new DetailsOfSaleFieldsDto(supplyOnly, planNumbers, proposedLayDate, layDateStatus, detailsOfSale);
+    }
+
+    /**
+     * Optional free-text field with no length cap (DB type TEXT): {@code null} stays {@code null};
+     * a non-null value is trimmed and must be non-blank, otherwise a VALIDATION_FAILED detail on
+     * {@code field}. Used for {@code plan_numbers} and {@code details_of_sale}.
+     */
+    private static String optionalText(String raw, String field, List<ErrorDetail> errors) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) {
+            errors.add(new ErrorDetail(null, field, "Must not be blank."));
+            return null;
+        }
+        return trimmed;
     }
 
     private static String requireNonBlank(String raw, String field, int maxLength, List<ErrorDetail> errors) {
