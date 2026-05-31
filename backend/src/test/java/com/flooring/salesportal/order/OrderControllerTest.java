@@ -2517,6 +2517,98 @@ class OrderControllerTest {
                 .andExpect(jsonPath("$.data.details_of_sale_fields.lay_date_status").value("TO_BE_CONFIRMED"));
     }
 
+    // ---- Wrong JSON scalar type (object/array) is VALIDATION_FAILED on the field, NOT
+    //      MALFORMED_JSON. The request DTO types every field as JsonNode so Jackson never throws
+    //      while binding a structurally valid body — type errors are caught in validation. ----
+
+    @Test
+    void details_planNumbersObject_returns400_fieldPlanNumbers_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"plan_numbers\": {}}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("plan_numbers"));
+    }
+
+    @Test
+    void details_planNumbersArray_returns400_fieldPlanNumbers_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"plan_numbers\": [\"PLN-1\"]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("plan_numbers"));
+    }
+
+    @Test
+    void details_proposedLayDateObject_returns400_fieldProposedLayDate_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": {}}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("proposed_lay_date"));
+    }
+
+    @Test
+    void details_proposedLayDateArray_returns400_fieldProposedLayDate_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": [\"2026-05-01\"]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("proposed_lay_date"));
+    }
+
+    @Test
+    void details_layDateStatusObject_returns400_fieldLayDateStatus_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": \"2026-05-01\", \"lay_date_status\": {}}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("lay_date_status"));
+    }
+
+    @Test
+    void details_layDateStatusArray_returns400_fieldLayDateStatus_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": \"2026-05-01\", \"lay_date_status\": [\"CONFIRMED\"]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("lay_date_status"));
+    }
+
+    @Test
+    void details_detailsOfSaleObject_returns400_fieldDetailsOfSale_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"details_of_sale\": {}}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("details_of_sale"));
+    }
+
+    @Test
+    void details_detailsOfSaleArray_returns400_fieldDetailsOfSale_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"details_of_sale\": [\"text\"]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("details_of_sale"));
+    }
+
     // ---- Successful saves ----
 
     @Test

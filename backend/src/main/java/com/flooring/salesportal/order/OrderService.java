@@ -592,21 +592,24 @@ public class OrderService {
      * proposed_lay_date → lay_date_status → pair rule → details_of_sale) into one VALIDATION_FAILED
      * so {@code details[0]} is the first offending field.
      *
-     * <p>{@code supply_only} is required and read from the {@link JsonNode}: a missing component
-     * ({@code null}), an explicit JSON null ({@link JsonNode#isNull()}), and any non-boolean value
-     * are all 400 on field {@code supply_only} — never a default, never a parse error.
-     * {@code plan_numbers} / {@code details_of_sale} are optional TEXT (no length cap), non-blank
-     * after trim when non-null. {@code proposed_lay_date} is optional, strict {@code YYYY-MM-DD}
-     * when non-null. {@code lay_date_status} is optional, exactly {@code CONFIRMED} or
-     * {@code TO_BE_CONFIRMED} when non-null. The pair rule requires both lay-date fields set or both
-     * null; a mismatch is reported on field {@code lay_date_status}. A {@code null} body (null/blank
-     * raw request) is treated as all-fields-missing → 400 on {@code supply_only}, never an NPE.
+     * <p>Every field is read from a {@link JsonNode} so any valid-JSON value (including a wrong type
+     * such as an object/array, or {@code null}) is a VALIDATION_FAILED on the relevant field rather
+     * than a Jackson parse error promoted to MALFORMED_JSON. {@code supply_only} is required: a
+     * missing component ({@code null}), an explicit JSON null ({@link JsonNode#isNull()}), and any
+     * non-boolean value are all 400 on field {@code supply_only}. {@code plan_numbers} /
+     * {@code details_of_sale} are optional TEXT (no length cap): when present and non-null they must
+     * be JSON strings, non-blank after trim. {@code proposed_lay_date} is optional: when present and
+     * non-null it must be a JSON string holding a strict {@code YYYY-MM-DD} date. {@code lay_date_status}
+     * is optional: when present and non-null it must be a JSON string of exactly {@code CONFIRMED}
+     * or {@code TO_BE_CONFIRMED}. The pair rule requires both lay-date fields set or both null; a
+     * mismatch is reported on field {@code lay_date_status}. A {@code null} body (null/blank raw
+     * request) is treated as all-fields-missing → 400 on {@code supply_only}, never an NPE.
      */
     private static DetailsOfSaleFieldsDto validateAndNormalizeDetails(DetailsOfSaleSaveRequest body) {
         List<ErrorDetail> errors = new ArrayList<>();
 
-        // 1. supply_only — required boolean, read from the JsonNode so wrong/missing/null values
-        //    are validation errors (not parse errors) on field supply_only.
+        // 1. supply_only — required boolean. A missing/null node or any non-boolean value (string,
+        //    number, object, array) is a validation error on field supply_only — never a default.
         boolean supplyOnly = false;
         JsonNode supplyOnlyNode = body == null ? null : body.supplyOnly();
         if (supplyOnlyNode == null || supplyOnlyNode.isNull()) {
@@ -617,30 +620,38 @@ public class OrderService {
             supplyOnly = supplyOnlyNode.booleanValue();
         }
 
-        // 2. plan_numbers — optional; non-blank after trim when non-null; no length cap (TEXT).
-        String planNumbers = optionalText(body == null ? null : body.planNumbers(), "plan_numbers", errors);
+        // 2. plan_numbers — optional; must be a JSON string when present and non-null; non-blank
+        //    after trim; no length cap (TEXT).
+        String planNumbers = optionalStringNode(body == null ? null : body.planNumbers(), "plan_numbers", errors);
 
-        // 3. proposed_lay_date — optional; strict YYYY-MM-DD when non-null. "provided" tracks a
-        //    successfully parsed value, so a present-but-invalid date does not pair with a status.
+        // 3. proposed_lay_date — optional; must be a JSON string holding a strict YYYY-MM-DD date.
+        //    "provided" tracks a successfully parsed value, so a present-but-invalid date (wrong
+        //    type or bad format) does not pair with a status.
         LocalDate proposedLayDate = null;
         boolean proposedLayDateProvided = false;
-        String proposedLayDateRaw = body == null ? null : body.proposedLayDate();
-        if (proposedLayDateRaw != null) {
-            try {
-                proposedLayDate = LocalDate.parse(proposedLayDateRaw.trim(), STRICT_ISO_DATE);
-                proposedLayDateProvided = true;
-            } catch (DateTimeParseException ex) {
+        JsonNode proposedLayDateNode = body == null ? null : body.proposedLayDate();
+        if (proposedLayDateNode != null && !proposedLayDateNode.isNull()) {
+            if (!proposedLayDateNode.isTextual()) {
                 errors.add(new ErrorDetail(null, "proposed_lay_date", "Must be a valid date in YYYY-MM-DD format."));
+            } else {
+                try {
+                    proposedLayDate = LocalDate.parse(proposedLayDateNode.textValue().trim(), STRICT_ISO_DATE);
+                    proposedLayDateProvided = true;
+                } catch (DateTimeParseException ex) {
+                    errors.add(new ErrorDetail(null, "proposed_lay_date", "Must be a valid date in YYYY-MM-DD format."));
+                }
             }
         }
 
-        // 4. lay_date_status — optional; exactly CONFIRMED or TO_BE_CONFIRMED when non-null.
+        // 4. lay_date_status — optional; must be a JSON string of exactly CONFIRMED or
+        //    TO_BE_CONFIRMED when present and non-null.
         String layDateStatus = null;
         boolean layDateStatusProvided = false;
-        String layDateStatusRaw = body == null ? null : body.layDateStatus();
-        if (layDateStatusRaw != null) {
-            if (LAY_DATE_CONFIRMED.equals(layDateStatusRaw) || LAY_DATE_TO_BE_CONFIRMED.equals(layDateStatusRaw)) {
-                layDateStatus = layDateStatusRaw;
+        JsonNode layDateStatusNode = body == null ? null : body.layDateStatus();
+        if (layDateStatusNode != null && !layDateStatusNode.isNull()) {
+            String value = layDateStatusNode.isTextual() ? layDateStatusNode.textValue() : null;
+            if (LAY_DATE_CONFIRMED.equals(value) || LAY_DATE_TO_BE_CONFIRMED.equals(value)) {
+                layDateStatus = value;
                 layDateStatusProvided = true;
             } else {
                 errors.add(new ErrorDetail(null, "lay_date_status", "Must be one of CONFIRMED, TO_BE_CONFIRMED."));
@@ -653,8 +664,9 @@ public class OrderService {
                     "proposed_lay_date and lay_date_status must both be set or both be null."));
         }
 
-        // 6. details_of_sale — optional; non-blank after trim when non-null; no length cap (TEXT).
-        String detailsOfSale = optionalText(body == null ? null : body.detailsOfSale(), "details_of_sale", errors);
+        // 6. details_of_sale — optional; must be a JSON string when present and non-null; non-blank
+        //    after trim; no length cap (TEXT).
+        String detailsOfSale = optionalStringNode(body == null ? null : body.detailsOfSale(), "details_of_sale", errors);
 
         if (!errors.isEmpty()) {
             throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
@@ -664,15 +676,21 @@ public class OrderService {
     }
 
     /**
-     * Optional free-text field with no length cap (DB type TEXT): {@code null} stays {@code null};
-     * a non-null value is trimmed and must be non-blank, otherwise a VALIDATION_FAILED detail on
-     * {@code field}. Used for {@code plan_numbers} and {@code details_of_sale}.
+     * Optional free-text field with no length cap (DB type TEXT), read from a {@link JsonNode}: a
+     * missing component ({@code null}) or explicit JSON null stays {@code null}; a non-string node
+     * (object/array/number/boolean) is a VALIDATION_FAILED type error on {@code field}; a string is
+     * trimmed and must be non-blank, otherwise a VALIDATION_FAILED blank error on {@code field}.
+     * Used for {@code plan_numbers} and {@code details_of_sale}.
      */
-    private static String optionalText(String raw, String field, List<ErrorDetail> errors) {
-        if (raw == null) {
+    private static String optionalStringNode(JsonNode node, String field, List<ErrorDetail> errors) {
+        if (node == null || node.isNull()) {
             return null;
         }
-        String trimmed = raw.trim();
+        if (!node.isTextual()) {
+            errors.add(new ErrorDetail(null, field, "Must be a string."));
+            return null;
+        }
+        String trimmed = node.textValue().trim();
         if (trimmed.isEmpty()) {
             errors.add(new ErrorDetail(null, field, "Must not be blank."));
             return null;
