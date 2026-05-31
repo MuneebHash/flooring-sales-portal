@@ -1,6 +1,8 @@
 package com.flooring.salesportal.order;
 
 import com.jayway.jsonpath.JsonPath;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -65,6 +67,12 @@ class OrderControllerTest {
 
     @Autowired
     private JdbcTemplate jdbcTemplate;
+
+    // Used only to detach managed entities between a write and a read within the single
+    // test-scoped transaction, simulating the separate persistence contexts that distinct HTTP
+    // requests get in production (the native UPDATE write path bypasses Hibernate's identity map).
+    @PersistenceContext
+    private EntityManager entityManager;
 
     private MockMvc mockMvc;
 
@@ -2125,5 +2133,683 @@ class OrderControllerTest {
                 .andExpect(jsonPath("$.data.billing_address.address_type").doesNotExist())
                 .andExpect(jsonPath("$.data.billing_address.order_id").doesNotExist())
                 .andExpect(jsonPath("$.data.order_id").doesNotExist());
+    }
+
+    // ================================================================
+    // PUT /orders/{orderId}/details-of-sale  (Phase 10D)
+    // ================================================================
+
+    // Full valid set. Order 2 (ORDER_EMPTY) seeds all five fields null, so a create-style save here
+    // proves every field is written.
+    private static final String VALID_DETAILS_BODY = """
+            {
+              "supply_only": true,
+              "plan_numbers": "PLN-4420",
+              "proposed_lay_date": "2026-05-01",
+              "lay_date_status": "CONFIRMED",
+              "details_of_sale": "Supply and install plush carpet to lounge and dining rooms."
+            }
+            """;
+
+    private static String detailsUrl(String slug, Object orderId) {
+        return "/api/v1/" + slug + "/orders/" + orderId + "/details-of-sale";
+    }
+
+    private static String detailsUrl(Object orderId) {
+        return detailsUrl(SLUG_AUSSIE, orderId);
+    }
+
+    // ---- Standard-protected gating (valid JSON so the request reaches the service guard) ----
+
+    @Test
+    void details_noSession_returns401() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void details_sessionWithoutStoreId_returns403() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamSessionNoStore())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void details_slugBusinessDoesNotMatchSessionBusiness_returnsGeneric404() throws Exception {
+        mockMvc.perform(put(detailsUrl(SLUG_PREMIER, ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    @Test
+    void details_unknownSlug_returnsGeneric404() throws Exception {
+        mockMvc.perform(put(detailsUrl("nonexistent-slug", ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    // ---- Path validation 400s ----
+
+    @Test
+    void details_invalidOrderIdFormat_returns400_fieldOrderId() throws Exception {
+        mockMvc.perform(put(detailsUrl("abc"))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    @Test
+    void details_nonPositiveOrderId_returns400_fieldOrderId() throws Exception {
+        mockMvc.perform(put(detailsUrl("0"))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    // ---- Resource-level 404s (no existence leak) ----
+
+    @Test
+    void details_orderInAnotherStoreSameBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void details_orderInAnotherBusiness_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_OTHER_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // Cross-store + INVALID body still 404 — scoped lookup fails before body validation (gate-first).
+    @Test
+    void details_crossStoreOrderWithInvalidBody_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // Cross-store + malformed JSON still 404 — scoped lookup fails before any body parse (gate-first).
+    @Test
+    void details_crossStoreMalformedJson_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_OTHER_STORE_SAME_BUSINESS))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // ---- LAID lock 422 (after scoped lookup) ----
+
+    @Test
+    void details_laidInScopeOrder_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"))
+                .andExpect(jsonPath("$.error.message").value("Order is laid and cannot be edited."));
+    }
+
+    // LAID in-scope + INVALID body still 422 — LAID gate runs before body validation (gate-first).
+    @Test
+    void details_laidInScopeOrderWithInvalidBody_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // LAID in-scope + malformed JSON still 422 — LAID gate runs before any body parse (gate-first).
+    @Test
+    void details_laidInScopeMalformedJson_returns422_orderLocked() throws Exception {
+        jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", ORDER_EMPTY);
+
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    // ---- Body parsing (in-scope, editable order) ----
+
+    // Valid editable in-scope order + malformed JSON -> 400 MALFORMED_JSON. Parsed INSIDE the
+    // service, after all gates; only 400s because order 2 is in-scope and not LAID.
+    @Test
+    void details_malformedJson_returns400_malformedJson() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    // Null/blank body -> parses to null -> validation -> 400 VALIDATION_FAILED, first field
+    // supply_only. No NPE.
+    @Test
+    void details_blankBody_returns400_fieldSupplyOnly() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("supply_only"));
+    }
+
+    // {} parses successfully, then fails validation with field supply_only (required).
+    @Test
+    void details_emptyObject_returns400_fieldSupplyOnly() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("supply_only"));
+    }
+
+    // Unknown fields are ignored (existing global Jackson behaviour) — supply_only present -> 200.
+    @Test
+    void details_unknownFieldsIgnored_returns200() throws Exception {
+        String body = """
+                {
+                  "supply_only": false,
+                  "totally_unknown_field": "ignored",
+                  "gp_percent": 99.9
+                }
+                """;
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.details_of_sale_fields.supply_only").value(false));
+    }
+
+    // ---- supply_only validation (JsonNode-typed: wrong/missing/null are VALIDATION, not parse) ----
+
+    @Test
+    void details_missingSupplyOnly_returns400_fieldSupplyOnly() throws Exception {
+        // Valid JSON, supply_only absent; other fields present so this isolates the missing-required.
+        String body = """
+                { "plan_numbers": "PLN-1" }
+                """;
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("supply_only"));
+    }
+
+    @Test
+    void details_nullSupplyOnly_returns400_fieldSupplyOnly() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": null}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("supply_only"));
+    }
+
+    // Non-boolean valid JSON value -> VALIDATION_FAILED on supply_only, NOT MALFORMED_JSON.
+    @Test
+    void details_nonBooleanSupplyOnly_returns400_fieldSupplyOnly_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": \"abc\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("supply_only"));
+    }
+
+    // ---- Optional string validation (TEXT — non-blank-if-present, no length cap) ----
+
+    @Test
+    void details_blankPlanNumbers_returns400_fieldPlanNumbers() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"plan_numbers\": \"   \"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("plan_numbers"));
+    }
+
+    @Test
+    void details_blankDetailsOfSale_returns400_fieldDetailsOfSale() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"details_of_sale\": \"   \"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("details_of_sale"));
+    }
+
+    // ---- proposed_lay_date validation (strict YYYY-MM-DD; invalid is VALIDATION, not MALFORMED) ----
+
+    @Test
+    void details_invalidDateFormat_returns400_fieldProposedLayDate() throws Exception {
+        // No lay_date_status, so the pair rule is satisfied (both treated absent) and the only
+        // error is the date format.
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": \"2026/05/01\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("proposed_lay_date"));
+    }
+
+    @Test
+    void details_impossibleDate_returns400_fieldProposedLayDate() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": \"2026-02-30\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("proposed_lay_date"));
+    }
+
+    // ---- lay_date_status validation (enum; invalid is VALIDATION, not MALFORMED) ----
+
+    @Test
+    void details_invalidLayDateStatus_returns400_fieldLayDateStatus_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": \"2026-05-01\", \"lay_date_status\": \"MAYBE\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("lay_date_status"));
+    }
+
+    // ---- Lay-date pair rule (reported on field lay_date_status) ----
+
+    @Test
+    void details_dateWithoutStatus_returns400_fieldLayDateStatus() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": \"2026-05-01\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("lay_date_status"))
+                .andExpect(jsonPath("$.error.details[0].message")
+                        .value("proposed_lay_date and lay_date_status must both be set or both be null."));
+    }
+
+    @Test
+    void details_statusWithoutDate_returns400_fieldLayDateStatus() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"lay_date_status\": \"CONFIRMED\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("lay_date_status"));
+    }
+
+    @Test
+    void details_bothLayDateFieldsNull_returns200() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.details_of_sale_fields.proposed_lay_date").value(nullValue()))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.lay_date_status").value(nullValue()));
+    }
+
+    @Test
+    void details_bothLayDateFieldsValid_returns200() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": \"2026-05-01\", \"lay_date_status\": \"TO_BE_CONFIRMED\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.details_of_sale_fields.proposed_lay_date").value("2026-05-01"))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.lay_date_status").value("TO_BE_CONFIRMED"));
+    }
+
+    // ---- Wrong JSON scalar type (object/array) is VALIDATION_FAILED on the field, NOT
+    //      MALFORMED_JSON. The request DTO types every field as JsonNode so Jackson never throws
+    //      while binding a structurally valid body — type errors are caught in validation. ----
+
+    @Test
+    void details_planNumbersObject_returns400_fieldPlanNumbers_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"plan_numbers\": {}}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("plan_numbers"));
+    }
+
+    @Test
+    void details_planNumbersArray_returns400_fieldPlanNumbers_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"plan_numbers\": [\"PLN-1\"]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("plan_numbers"));
+    }
+
+    @Test
+    void details_proposedLayDateObject_returns400_fieldProposedLayDate_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": {}}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("proposed_lay_date"));
+    }
+
+    @Test
+    void details_proposedLayDateArray_returns400_fieldProposedLayDate_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": [\"2026-05-01\"]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("proposed_lay_date"));
+    }
+
+    @Test
+    void details_layDateStatusObject_returns400_fieldLayDateStatus_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": \"2026-05-01\", \"lay_date_status\": {}}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("lay_date_status"));
+    }
+
+    @Test
+    void details_layDateStatusArray_returns400_fieldLayDateStatus_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"proposed_lay_date\": \"2026-05-01\", \"lay_date_status\": [\"CONFIRMED\"]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("lay_date_status"));
+    }
+
+    @Test
+    void details_detailsOfSaleObject_returns400_fieldDetailsOfSale_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"details_of_sale\": {}}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("details_of_sale"));
+    }
+
+    @Test
+    void details_detailsOfSaleArray_returns400_fieldDetailsOfSale_notMalformed() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true, \"details_of_sale\": [\"text\"]}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("details_of_sale"));
+    }
+
+    // ---- Successful saves ----
+
+    @Test
+    void details_fullValidBody_returns200_andPersists() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Details of sale saved."))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.supply_only").value(true))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.plan_numbers").value("PLN-4420"))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.proposed_lay_date").value("2026-05-01"))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.lay_date_status").value("CONFIRMED"))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.details_of_sale")
+                        .value("Supply and install plush carpet to lounge and dining rooms."))
+                .andExpect(jsonPath("$.data.updated_at").value(matchesPattern(ISO_LOCAL_PATTERN)));
+
+        // DB readback.
+        Assertions.assertEquals(Boolean.TRUE, jdbcTemplate.queryForObject(
+                "SELECT supply_only FROM sales_order WHERE order_id = ?", Boolean.class, ORDER_EMPTY));
+        Assertions.assertEquals("PLN-4420", jdbcTemplate.queryForObject(
+                "SELECT plan_numbers FROM sales_order WHERE order_id = ?", String.class, ORDER_EMPTY));
+        Assertions.assertEquals("2026-05-01", jdbcTemplate.queryForObject(
+                "SELECT proposed_lay_date::text FROM sales_order WHERE order_id = ?", String.class, ORDER_EMPTY));
+        Assertions.assertEquals("CONFIRMED", jdbcTemplate.queryForObject(
+                "SELECT lay_date_status::text FROM sales_order WHERE order_id = ?", String.class, ORDER_EMPTY));
+        Assertions.assertEquals("Supply and install plush carpet to lounge and dining rooms.",
+                jdbcTemplate.queryForObject(
+                        "SELECT details_of_sale FROM sales_order WHERE order_id = ?", String.class, ORDER_EMPTY));
+    }
+
+    // Full-replace: optional fields OMITTED from the body are written as null (no merge). Order 1
+    // seeds proposed_lay_date, lay_date_status, and details_of_sale non-null.
+    @Test
+    void details_omittedOptionals_clearPreviousValuesToNull() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"supply_only\": true}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.details_of_sale_fields.plan_numbers").value(nullValue()))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.proposed_lay_date").value(nullValue()))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.lay_date_status").value(nullValue()))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.details_of_sale").value(nullValue()));
+
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT plan_numbers FROM sales_order WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT proposed_lay_date FROM sales_order WHERE order_id = ?", java.sql.Date.class, ORDER_FULL));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT lay_date_status::text FROM sales_order WHERE order_id = ?", String.class, ORDER_FULL));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT details_of_sale FROM sales_order WHERE order_id = ?", String.class, ORDER_FULL));
+    }
+
+    // Explicit JSON null optionals are written as null too.
+    @Test
+    void details_explicitNullOptionals_writeNull() throws Exception {
+        String body = """
+                {
+                  "supply_only": false,
+                  "plan_numbers": null,
+                  "proposed_lay_date": null,
+                  "lay_date_status": null,
+                  "details_of_sale": null
+                }
+                """;
+        mockMvc.perform(put(detailsUrl(ORDER_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.details_of_sale_fields.supply_only").value(false))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.plan_numbers").value(nullValue()))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.proposed_lay_date").value(nullValue()))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.lay_date_status").value(nullValue()))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.details_of_sale").value(nullValue()));
+    }
+
+    // Non-null string fields are trimmed before storage.
+    @Test
+    void details_trimsStringFields_beforeStorage() throws Exception {
+        String body = """
+                {
+                  "supply_only": true,
+                  "plan_numbers": "   PLN-9   ",
+                  "details_of_sale": "   Lounge carpet only.   "
+                }
+                """;
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.details_of_sale_fields.plan_numbers").value("PLN-9"))
+                .andExpect(jsonPath("$.data.details_of_sale_fields.details_of_sale").value("Lounge carpet only."));
+
+        Assertions.assertEquals("PLN-9", jdbcTemplate.queryForObject(
+                "SELECT plan_numbers FROM sales_order WHERE order_id = ?", String.class, ORDER_EMPTY));
+        Assertions.assertEquals("Lounge carpet only.", jdbcTemplate.queryForObject(
+                "SELECT details_of_sale FROM sales_order WHERE order_id = ?", String.class, ORDER_EMPTY));
+    }
+
+    // TEXT columns have no length cap — a 5000-char value is accepted (proves no invented max-length).
+    @Test
+    void details_longTextValues_accepted_returns200() throws Exception {
+        String longPlan = "P".repeat(5000);
+        String longDetails = "D".repeat(5000);
+        String body = "{\"supply_only\": true,"
+                + "\"plan_numbers\": \"" + longPlan + "\","
+                + "\"details_of_sale\": \"" + longDetails + "\"}";
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(body))
+                .andExpect(status().isOk());
+
+        Assertions.assertEquals(Integer.valueOf(5000), jdbcTemplate.queryForObject(
+                "SELECT length(plan_numbers) FROM sales_order WHERE order_id = ?", Integer.class, ORDER_EMPTY));
+        Assertions.assertEquals(Integer.valueOf(5000), jdbcTemplate.queryForObject(
+                "SELECT length(details_of_sale) FROM sales_order WHERE order_id = ?", Integer.class, ORDER_EMPTY));
+    }
+
+    // updated_at is refreshed on save; created_at is preserved.
+    @Test
+    void details_save_refreshesUpdatedAt_preservesCreatedAt() throws Exception {
+        Timestamp createdBefore = jdbcTemplate.queryForObject(
+                "SELECT created_at FROM sales_order WHERE order_id = ?", Timestamp.class, ORDER_EMPTY);
+        Timestamp updatedBefore = jdbcTemplate.queryForObject(
+                "SELECT updated_at FROM sales_order WHERE order_id = ?", Timestamp.class, ORDER_EMPTY);
+
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isOk());
+
+        Timestamp createdAfter = jdbcTemplate.queryForObject(
+                "SELECT created_at FROM sales_order WHERE order_id = ?", Timestamp.class, ORDER_EMPTY);
+        Timestamp updatedAfter = jdbcTemplate.queryForObject(
+                "SELECT updated_at FROM sales_order WHERE order_id = ?", Timestamp.class, ORDER_EMPTY);
+
+        Assertions.assertEquals(createdBefore, createdAfter, "created_at must be preserved on save");
+        Assertions.assertTrue(updatedAfter.after(updatedBefore), "updated_at must move forward on save");
+    }
+
+    // GET /orders/{orderId} reflects the saved details-of-sale fields.
+    @Test
+    void details_savedThenGet_reflectsFields() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isOk());
+
+        // Detach the managed SalesOrder so the GET re-reads from the DB (mirrors production, where
+        // PUT and GET run in separate transactions / persistence contexts). The native UPDATE wrote
+        // straight to the shared tx connection but did not refresh Hibernate's identity map.
+        entityManager.clear();
+
+        mockMvc.perform(get(getUrl(ORDER_EMPTY)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.supply_only").value(true))
+                .andExpect(jsonPath("$.data.plan_numbers").value("PLN-4420"))
+                .andExpect(jsonPath("$.data.proposed_lay_date").value("2026-05-01"))
+                .andExpect(jsonPath("$.data.lay_date_status").value("CONFIRMED"))
+                .andExpect(jsonPath("$.data.details_of_sale")
+                        .value("Supply and install plush carpet to lounge and dining rooms."));
+    }
+
+    // ---- Response shape: only details_of_sale_fields + updated_at; no leakage ----
+
+    @Test
+    void details_response_containsOnlyFieldsAndUpdatedAt_noLeakage() throws Exception {
+        mockMvc.perform(put(detailsUrl(ORDER_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(VALID_DETAILS_BODY))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Details of sale saved."))
+                .andExpect(jsonPath("$.data.details_of_sale_fields").exists())
+                .andExpect(jsonPath("$.data.updated_at").exists())
+                // no financial summary / GP / price / cost fields
+                .andExpect(jsonPath("$.data.order_financial_summary").doesNotExist())
+                .andExpect(jsonPath("$.data.sale_price_ex_gst").doesNotExist())
+                .andExpect(jsonPath("$.data.total_cost").doesNotExist())
+                .andExpect(jsonPath("$.data.gp").doesNotExist())
+                .andExpect(jsonPath("$.data.gp_percent").doesNotExist())
+                .andExpect(jsonPath("$.data.gp_warning").doesNotExist())
+                .andExpect(jsonPath("$.data.details_of_sale_fields.sale_price_ex_gst").doesNotExist())
+                .andExpect(jsonPath("$.data.details_of_sale_fields.gp").doesNotExist())
+                // no customer / addresses
+                .andExpect(jsonPath("$.data.customer").doesNotExist())
+                .andExpect(jsonPath("$.data.install_address").doesNotExist())
+                .andExpect(jsonPath("$.data.billing_address").doesNotExist())
+                // no internal IDs / created_at
+                .andExpect(jsonPath("$.data.order_id").doesNotExist())
+                .andExpect(jsonPath("$.data.business_id").doesNotExist())
+                .andExpect(jsonPath("$.data.store_id").doesNotExist())
+                .andExpect(jsonPath("$.data.user_id").doesNotExist())
+                .andExpect(jsonPath("$.data.created_at").doesNotExist());
     }
 }
