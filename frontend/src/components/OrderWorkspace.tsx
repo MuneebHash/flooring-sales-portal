@@ -66,6 +66,12 @@ type ShellProps = {
   // Lifts confirmed server-saved customer/address data up so workspace state
   // (and sibling tabs) stay in sync without a refetch.
   onCustomerSaved: (saved: CustomerSavedPayload) => void
+  // Lifts the server-confirmed details-of-sale fields (and refreshed updated_at)
+  // up so workspace state stays in sync without a refetch.
+  onDetailsSaved: (saved: {
+    fields: DetailsOfSaleFields
+    updated_at: string
+  }) => void
 }
 
 function WorkspaceShell({
@@ -79,6 +85,7 @@ function WorkspaceShell({
   billingAddress,
   saleDetails,
   onCustomerSaved,
+  onDetailsSaved,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
 
@@ -150,7 +157,12 @@ function WorkspaceShell({
               <ProductsChargesTab flooringType={flooringType} />
             )}
             {activeTab === 'details' && (
-              <DetailsOfSaleTab saleDetails={saleDetails} />
+              <DetailsOfSaleTab
+                orderId={orderId}
+                locked={locked}
+                saleDetails={saleDetails}
+                onSaved={onDetailsSaved}
+              />
             )}
             {activeTab === 'notes' && <NotesPhotosTab />}
             {activeTab === 'payments' && <PaymentsTab />}
@@ -270,6 +282,29 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
     })
   }
 
+  // Details-of-sale saves are confirmed server-side. Fold the server-confirmed
+  // fields back into workspace state as flat header fields (matching how the
+  // workspace stores them and how saleDetails is recomputed per render), plus
+  // the refreshed updated_at, so the tab re-seeds correctly and sibling tabs see
+  // fresh data without a refetch.
+  function handleDetailsSaved(saved: {
+    fields: DetailsOfSaleFields
+    updated_at: string
+  }) {
+    setWorkspace((prev) => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        supply_only: saved.fields.supply_only,
+        plan_numbers: saved.fields.plan_numbers,
+        proposed_lay_date: saved.fields.proposed_lay_date,
+        lay_date_status: saved.fields.lay_date_status,
+        details_of_sale: saved.fields.details_of_sale,
+        updated_at: saved.updated_at,
+      }
+    })
+  }
+
   return (
     <WorkspaceShell
       key={orderId}
@@ -283,6 +318,7 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
       billingAddress={workspace.billing_address}
       saleDetails={saleDetails}
       onCustomerSaved={handleCustomerSaved}
+      onDetailsSaved={handleDetailsSaved}
     />
   )
 }

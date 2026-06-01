@@ -203,3 +203,18 @@ export function copyBillingFromInstallation(
     ),
   )
 }
+
+// PUT /api/v1/{slug}/orders/{orderId}/details-of-sale — full-replace of the five
+// non-line, non-payment details-of-sale fields on sales_order. Optional fields
+// sent as null are cleared server-side, so the caller must send the complete
+// field set (see DetailsOfSaleSaveRequest). The response returns the
+// server-normalised fields plus the refreshed updated_at — no financial summary.
+export function saveDetailsOfSale(
+  orderId: number,
+  body: DetailsOfSaleSaveRequest,
+): Promise<ApiSuccess<DetailsOfSaleSaveResponse>> {
+  return put<ApiSuccess<DetailsOfSaleSaveResponse>>(
+    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/details-of-sale`),
+    body,
+  )
+}
