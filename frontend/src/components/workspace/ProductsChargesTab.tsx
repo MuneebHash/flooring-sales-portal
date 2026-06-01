@@ -2,11 +2,7 @@ import { useState } from 'react'
 import { Button } from '../ui/Button'
 import { ChevronDownIcon, SearchIcon, TrashIcon } from '../icons'
 import type { FlooringType } from '../../lib/flooring'
-import type {
-  ChargeLine,
-  PricingUnit,
-  ProductLine,
-} from '../../data/mockOrderDetails'
+import type { ChargeLine, PricingUnit, ProductLine } from './types'
 
 type Props = {
   flooringType: FlooringType

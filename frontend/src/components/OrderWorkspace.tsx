@@ -1,10 +1,5 @@
-import { useState } from 'react'
-import {
-  Link,
-  useNavigate,
-  useParams,
-  useSearchParams,
-} from 'react-router-dom'
+import { useEffect, useState, type ReactNode } from 'react'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 import { AppHeader } from './AppHeader'
 import { ArrowLeftIcon } from './icons'
 import { Button } from './ui/Button'
@@ -21,30 +16,19 @@ import {
   FLOORING_TONES,
   type FlooringType,
 } from '../lib/flooring'
+import {
+  STATUS_LABELS,
+  STATUS_STYLES,
+  type OrderStatus,
+} from '../lib/statuses'
+import { ApiError } from '../lib/api/ApiError'
+import { fetchOrderWorkspace } from '../lib/api/orderWorkspaceApi'
 import type {
-  Address,
-  ChargeLine,
-  CustomerDetails,
-  InvoiceSummary,
-  InvoiceVersion,
-  OrderAttachment,
-  OrderNote,
-  OrderPayment,
-  PaymentSummary,
-  PricingSummary,
-  ProductLine,
-  SaleDetails,
-} from '../data/mockOrderDetails'
-import { MOCK_ORDER_DETAILS } from '../data/mockOrderDetails'
-
-const MONEY_FORMATTER = new Intl.NumberFormat('en-AU', {
-  style: 'currency',
-  currency: 'AUD',
-})
-
-function formatMoney(value: number): string {
-  return MONEY_FORMATTER.format(value)
-}
+  DetailsOfSaleFields,
+  OrderAddress,
+  OrderCustomer,
+  OrderWorkspace as OrderWorkspaceData,
+} from '../lib/api/orderWorkspaceApi'
 
 const TAB_IDS = [
   'customer',
@@ -68,46 +52,28 @@ const TAB_LABELS: Record<TabId, string> = {
 
 const TABS = TAB_IDS.map((id) => ({ id, label: TAB_LABELS[id] }))
 
-function isFlooringType(value: string | null): value is FlooringType {
-  return value === 'SOFT' || value === 'HARD'
-}
-
 type ShellProps = {
-  mode: 'new' | 'existing'
   flooringType: FlooringType
-  orderNumber?: string
-  customer?: CustomerDetails | null
-  installationAddress?: Address | null
-  billingAddress?: Address | null
-  saleDetails?: SaleDetails | null
-  notes?: OrderNote[] | null
-  attachments?: OrderAttachment[] | null
-  payments?: OrderPayment[] | null
-  paymentSummary?: PaymentSummary | null
-  invoiceSummary?: InvoiceSummary | null
-  invoiceVersions?: InvoiceVersion[] | null
-  productLines?: ProductLine[] | null
-  chargeLines?: ChargeLine[] | null
-  pricingSummary?: PricingSummary | null
+  orderNumber: string
+  orderStatus: OrderStatus
+  // Threaded for later Phase 10E sub-branches that wire saves and disable
+  // protected edits when locked. 10E.1 only reflects it read-only.
+  locked: boolean
+  customer: OrderCustomer | null
+  installationAddress: OrderAddress | null
+  billingAddress: OrderAddress | null
+  saleDetails: DetailsOfSaleFields | null
 }
 
 function WorkspaceShell({
-  mode,
   flooringType,
   orderNumber,
+  orderStatus,
+  locked,
   customer,
   installationAddress,
   billingAddress,
   saleDetails,
-  notes,
-  attachments,
-  payments,
-  paymentSummary,
-  invoiceSummary,
-  invoiceVersions,
-  productLines,
-  chargeLines,
-  pricingSummary,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
 
@@ -126,27 +92,37 @@ function WorkspaceShell({
           </Link>
           <div className="mt-3 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
             <div className="flex items-center gap-3 flex-wrap">
-              {mode === 'new' ? (
-                <h2 className="text-2xl font-bold text-slate-900 tracking-tight">
-                  New order
-                </h2>
-              ) : (
-                <h2 className="text-2xl font-bold font-mono tracking-tight text-slate-900">
-                  {orderNumber}
-                </h2>
-              )}
+              <h2 className="text-2xl font-bold font-mono tracking-tight text-slate-900">
+                {orderNumber}
+              </h2>
               <span
                 className={`inline-flex items-center px-2.5 py-1 rounded-md border text-xs font-medium ${FLOORING_TONES[flooringType]}`}
               >
                 {FLOORING_LABELS[flooringType]}
               </span>
+              <span
+                className={`inline-flex items-center px-2.5 py-1 rounded-md border text-xs font-medium ${STATUS_STYLES[orderStatus]}`}
+              >
+                {STATUS_LABELS[orderStatus]}
+              </span>
+              {locked && (
+                <span className="inline-flex items-center px-2 py-1 rounded-md border border-slate-300 bg-slate-100 text-slate-600 text-[11px] font-medium">
+                  Locked
+                </span>
+              )}
             </div>
             <div className="text-left sm:text-right">
               <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
                 Sale total
               </div>
-              <div className="text-2xl font-bold tabular-nums text-slate-900 mt-0.5">
-                {formatMoney(pricingSummary?.sale_total_inc_gst ?? 0)}
+              {/* Sale total is produced by the backend financial summary in
+                  Chunk 3. Phase 10E.1 wires no financial logic, so show a
+                  non-financial placeholder rather than a money value. */}
+              <div className="text-2xl font-bold tabular-nums text-slate-400 mt-0.5">
+                —
+              </div>
+              <div className="mt-0.5 text-[11px] text-slate-500">
+                Not priced yet
               </div>
             </div>
           </div>
@@ -163,32 +139,19 @@ function WorkspaceShell({
               />
             )}
             {activeTab === 'products' && (
-              <ProductsChargesTab
-                flooringType={flooringType}
-                productLines={productLines}
-                chargeLines={chargeLines}
-              />
+              <ProductsChargesTab flooringType={flooringType} />
             )}
             {activeTab === 'details' && (
               <DetailsOfSaleTab saleDetails={saleDetails} />
             )}
-            {activeTab === 'notes' && (
-              <NotesPhotosTab notes={notes} attachments={attachments} />
-            )}
-            {activeTab === 'payments' && (
-              <PaymentsTab
-                payments={payments}
-                paymentSummary={paymentSummary}
-              />
-            )}
+            {activeTab === 'notes' && <NotesPhotosTab />}
+            {activeTab === 'payments' && <PaymentsTab />}
             {activeTab === 'invoice' && (
               <InvoiceTab
                 orderNumber={orderNumber}
                 customer={customer}
                 billingAddress={billingAddress}
                 saleDetails={saleDetails}
-                invoiceSummary={invoiceSummary}
-                invoiceVersions={invoiceVersions}
               />
             )}
           </div>
@@ -200,104 +163,219 @@ function WorkspaceShell({
 
 export function OrderWorkspace() {
   const params = useParams<{ orderId: string }>()
-  const [searchParams] = useSearchParams()
 
-  if (params.orderId !== undefined) {
-    const orderId = Number.parseInt(params.orderId, 10)
-    const details = Number.isFinite(orderId)
-      ? MOCK_ORDER_DETAILS[orderId]
-      : undefined
-    if (!details) return <NotFoundWorkspace />
+  // The static /orders/new route mounts this component with no :orderId. New
+  // orders are created from the New Order modal (POST /orders), which then
+  // navigates to /orders/{order_id}, so this route is only a direct-link
+  // fallback rather than a place to fake an unsaved order shell.
+  if (params.orderId === undefined) {
+    return <NewOrderNotice />
+  }
+
+  const raw = params.orderId
+  const orderId = Number(raw)
+  const isValidOrderId =
+    /^\d+$/.test(raw) && Number.isSafeInteger(orderId) && orderId > 0
+  if (!isValidOrderId) {
+    return <InvalidWorkspace />
+  }
+
+  return <ExistingOrderWorkspace orderId={orderId} />
+}
+
+function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
+  const [workspace, setWorkspace] = useState<OrderWorkspaceData | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [notFound, setNotFound] = useState(false)
+  const [reloadToken, setReloadToken] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setLoadError(null)
+    setNotFound(false)
+    setWorkspace(null)
+    fetchOrderWorkspace(orderId)
+      .then((response) => {
+        if (cancelled) return
+        setWorkspace(response.data)
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        if (err instanceof ApiError && err.code === 'ORDER_NOT_FOUND') {
+          setNotFound(true)
+          return
+        }
+        const message =
+          err instanceof ApiError && err.message.length > 0
+            ? err.message
+            : 'Could not load this order. Please try again.'
+        setLoadError(message)
+      })
+      .finally(() => {
+        if (cancelled) return
+        setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId, reloadToken])
+
+  if (loading) return <LoadingWorkspace />
+  if (notFound) return <NotFoundWorkspace />
+  if (loadError !== null) {
     return (
-      <WorkspaceShell
-        key={`existing-${orderId}`}
-        mode="existing"
-        flooringType={details.flooring_type}
-        orderNumber={details.order_number}
-        customer={details.customer}
-        installationAddress={details.installation_address}
-        billingAddress={details.billing_address}
-        saleDetails={details.sale_details}
-        notes={details.notes}
-        attachments={details.attachments}
-        payments={details.payments}
-        paymentSummary={details.payment_summary}
-        invoiceSummary={details.invoice_summary}
-        invoiceVersions={details.invoice_versions}
-        productLines={details.product_lines}
-        chargeLines={details.charge_lines}
-        pricingSummary={details.pricing_summary}
+      <ErrorWorkspace
+        message={loadError}
+        onRetry={() => setReloadToken((token) => token + 1)}
       />
     )
   }
+  if (!workspace) return <NotFoundWorkspace />
 
-  const flooringTypeRaw = searchParams.get('flooring_type')
-  if (!isFlooringType(flooringTypeRaw)) {
-    return <InvalidWorkspace />
+  const saleDetails: DetailsOfSaleFields = {
+    supply_only: workspace.supply_only,
+    plan_numbers: workspace.plan_numbers,
+    proposed_lay_date: workspace.proposed_lay_date,
+    lay_date_status: workspace.lay_date_status,
+    details_of_sale: workspace.details_of_sale,
   }
+
   return (
     <WorkspaceShell
-      key={`new-${flooringTypeRaw}`}
-      mode="new"
-      flooringType={flooringTypeRaw}
+      key={orderId}
+      flooringType={workspace.flooring_type}
+      orderNumber={workspace.order_number}
+      orderStatus={workspace.order_status}
+      locked={workspace.locked}
+      customer={workspace.customer}
+      installationAddress={workspace.install_address}
+      billingAddress={workspace.billing_address}
+      saleDetails={saleDetails}
     />
+  )
+}
+
+function WorkspaceMessage({ children }: { children: ReactNode }) {
+  return (
+    <div className="min-h-screen bg-slate-50 text-slate-900">
+      <div className="mx-auto max-w-7xl px-6 py-6 space-y-5">
+        <AppHeader />
+        <Panel className="p-8 max-w-[520px] mx-auto text-center">
+          {children}
+        </Panel>
+      </div>
+    </div>
+  )
+}
+
+function LoadingWorkspace() {
+  return (
+    <WorkspaceMessage>
+      <p className="text-sm text-slate-500">Loading order…</p>
+    </WorkspaceMessage>
+  )
+}
+
+function ErrorWorkspace({
+  message,
+  onRetry,
+}: {
+  message: string
+  onRetry: () => void
+}) {
+  const navigate = useNavigate()
+  return (
+    <WorkspaceMessage>
+      <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
+        Couldn't load this order
+      </h2>
+      <p className="text-sm text-slate-500 mt-2">{message}</p>
+      <div className="mt-5 flex items-center justify-center gap-3">
+        <Button
+          variant="secondary"
+          size="md"
+          onClick={() => navigate('/dashboard')}
+        >
+          Back to dashboard
+        </Button>
+        <Button variant="success" size="md" onClick={onRetry}>
+          Try again
+        </Button>
+      </div>
+    </WorkspaceMessage>
+  )
+}
+
+function NewOrderNotice() {
+  const navigate = useNavigate()
+  return (
+    <WorkspaceMessage>
+      <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
+        Start a new order
+      </h2>
+      <p className="text-sm text-slate-500 mt-2">
+        Create a new order from the dashboard by choosing Soft flooring or
+        Hard flooring.
+      </p>
+      <div className="mt-5">
+        <Button
+          variant="success"
+          size="md"
+          onClick={() => navigate('/dashboard')}
+        >
+          Back to dashboard
+        </Button>
+      </div>
+    </WorkspaceMessage>
   )
 }
 
 function InvalidWorkspace() {
   const navigate = useNavigate()
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <div className="mx-auto max-w-7xl px-6 py-6 space-y-5">
-        <AppHeader />
-        <Panel className="p-8 max-w-[520px] mx-auto text-center">
-          <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
-            Invalid order type
-          </h2>
-          <p className="text-sm text-slate-500 mt-2">
-            Choose Soft flooring or Hard flooring from the Dashboard to start
-            a new order.
-          </p>
-          <div className="mt-5">
-            <Button
-              variant="success"
-              size="md"
-              onClick={() => navigate('/dashboard')}
-            >
-              Back to dashboard
-            </Button>
-          </div>
-        </Panel>
+    <WorkspaceMessage>
+      <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
+        Invalid order
+      </h2>
+      <p className="text-sm text-slate-500 mt-2">
+        That order link doesn't look right. Choose an order from the
+        dashboard.
+      </p>
+      <div className="mt-5">
+        <Button
+          variant="success"
+          size="md"
+          onClick={() => navigate('/dashboard')}
+        >
+          Back to dashboard
+        </Button>
       </div>
-    </div>
+    </WorkspaceMessage>
   )
 }
 
 function NotFoundWorkspace() {
   const navigate = useNavigate()
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
-      <div className="mx-auto max-w-7xl px-6 py-6 space-y-5">
-        <AppHeader />
-        <Panel className="p-8 max-w-[520px] mx-auto text-center">
-          <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
-            Order not found
-          </h2>
-          <p className="text-sm text-slate-500 mt-2">
-            We couldn't find that order. It may have been removed or the link
-            is incorrect.
-          </p>
-          <div className="mt-5">
-            <Button
-              variant="success"
-              size="md"
-              onClick={() => navigate('/dashboard')}
-            >
-              Back to dashboard
-            </Button>
-          </div>
-        </Panel>
+    <WorkspaceMessage>
+      <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
+        Order not found
+      </h2>
+      <p className="text-sm text-slate-500 mt-2">
+        We couldn't find that order. It may have been removed or the link is
+        incorrect.
+      </p>
+      <div className="mt-5">
+        <Button
+          variant="success"
+          size="md"
+          onClick={() => navigate('/dashboard')}
+        >
+          Back to dashboard
+        </Button>
       </div>
-    </div>
+    </WorkspaceMessage>
   )
 }

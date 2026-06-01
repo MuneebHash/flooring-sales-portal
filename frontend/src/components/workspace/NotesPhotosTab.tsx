@@ -2,10 +2,7 @@ import { useState } from 'react'
 import { Button } from '../ui/Button'
 import { Textarea } from '../ui/Textarea'
 import { ClockIcon, PhotoIcon, PlusIcon, UploadIcon } from '../icons'
-import type {
-  OrderAttachment,
-  OrderNote,
-} from '../../data/mockOrderDetails'
+import type { OrderAttachment, OrderNote } from './types'
 
 type Props = {
   notes?: OrderNote[] | null

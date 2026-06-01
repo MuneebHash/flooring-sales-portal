@@ -4,11 +4,7 @@ import { Button } from '../ui/Button'
 import { Field } from '../ui/Field'
 import { Input } from '../ui/Input'
 import { Select } from '../ui/Select'
-import type {
-  OrderPayment,
-  PaymentMethod,
-  PaymentSummary,
-} from '../../data/mockOrderDetails'
+import type { OrderPayment, PaymentMethod, PaymentSummary } from './types'
 
 type Props = {
   payments?: OrderPayment[] | null

@@ -1,18 +1,17 @@
 import { Button } from '../ui/Button'
 import { ChevronDownIcon } from '../icons'
 import type {
-  Address,
-  CustomerDetails,
-  InvoiceSummary,
-  InvoiceVersion,
-  SaleDetails,
-} from '../../data/mockOrderDetails'
+  DetailsOfSaleFields,
+  OrderAddress,
+  OrderCustomer,
+} from '../../lib/api/orderWorkspaceApi'
+import type { InvoiceSummary, InvoiceVersion } from './types'
 
 type Props = {
   orderNumber?: string
-  customer?: CustomerDetails | null
-  billingAddress?: Address | null
-  saleDetails?: SaleDetails | null
+  customer?: OrderCustomer | null
+  billingAddress?: OrderAddress | null
+  saleDetails?: DetailsOfSaleFields | null
   invoiceSummary?: InvoiceSummary | null
   invoiceVersions?: InvoiceVersion[] | null
 }
@@ -57,7 +56,7 @@ function formatTimestamp(iso: string): string {
   return `${day} ${name} ${year}, ${hours}:${minutes}`
 }
 
-function composeFullName(customer: CustomerDetails | null | undefined): string {
+function composeFullName(customer: OrderCustomer | null | undefined): string {
   if (!customer) return ''
   return [customer.first_name, customer.middle_name, customer.last_name]
     .filter((part) => part && part.trim().length > 0)
@@ -65,7 +64,7 @@ function composeFullName(customer: CustomerDetails | null | undefined): string {
 }
 
 function composeAddressLines(
-  address: Address | null | undefined,
+  address: OrderAddress | null | undefined,
 ): string[] {
   if (!address) return []
   const streetParts: string[] = []

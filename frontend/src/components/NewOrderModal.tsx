@@ -1,6 +1,9 @@
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Modal } from './ui/Modal'
 import { FLOORING_LABELS, type FlooringType } from '../lib/flooring'
+import { ApiError } from '../lib/api/ApiError'
+import { createOrder } from '../lib/api/orderWorkspaceApi'
 
 type Props = {
   open: boolean
@@ -17,15 +20,43 @@ const OPTION_STYLES: Record<FlooringType, string> = {
 
 export function NewOrderModal({ open, onClose, onSelect }: Props) {
   const navigate = useNavigate()
+  const [pending, setPending] = useState<FlooringType | null>(null)
+  const [error, setError] = useState<string | null>(null)
 
-  const handleSelect = (type: FlooringType) => {
-    onSelect?.(type)
+  // Clear any stale error each time the modal is opened.
+  useEffect(() => {
+    if (open) setError(null)
+  }, [open])
+
+  const handleClose = () => {
+    // Don't close mid-create — let the in-flight request resolve and navigate.
+    if (pending !== null) return
+    setError(null)
     onClose()
-    navigate(`/orders/new?flooring_type=${type}`)
+  }
+
+  const handleSelect = async (type: FlooringType) => {
+    if (pending !== null) return
+    setError(null)
+    setPending(type)
+    try {
+      const response = await createOrder(type)
+      onSelect?.(type)
+      onClose()
+      navigate(`/orders/${response.data.order_id}`)
+    } catch (err) {
+      const message =
+        err instanceof ApiError && err.message.length > 0
+          ? err.message
+          : 'Could not create the order. Please try again.'
+      setError(message)
+    } finally {
+      setPending(null)
+    }
   }
 
   return (
-    <Modal open={open} onClose={onClose} labelledBy="new-order-title">
+    <Modal open={open} onClose={handleClose} labelledBy="new-order-title">
       <div className="p-6">
         <div className="mb-5">
           <h3
@@ -45,12 +76,19 @@ export function NewOrderModal({ open, onClose, onSelect }: Props) {
               key={type}
               type="button"
               onClick={() => handleSelect(type)}
-              className={`flex items-center justify-center h-11 px-5 rounded-lg text-white text-sm font-semibold tracking-wide transition-all focus-visible:outline-none focus-visible:ring-2 ${OPTION_STYLES[type]}`}
+              disabled={pending !== null}
+              className={`flex items-center justify-center h-11 px-5 rounded-lg text-white text-sm font-semibold tracking-wide transition-all focus-visible:outline-none focus-visible:ring-2 disabled:opacity-60 disabled:cursor-not-allowed ${OPTION_STYLES[type]}`}
             >
-              {FLOORING_LABELS[type]}
+              {pending === type ? 'Creating…' : FLOORING_LABELS[type]}
             </button>
           ))}
         </div>
+
+        {error !== null && (
+          <p className="mt-4 text-sm text-red-600" role="alert">
+            {error}
+          </p>
+        )}
       </div>
     </Modal>
   )
