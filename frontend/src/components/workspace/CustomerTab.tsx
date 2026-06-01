@@ -5,14 +5,14 @@ import { Input } from '../ui/Input'
 import { Tabs } from '../ui/Tabs'
 import { CheckCircleIcon } from '../icons'
 import type {
-  Address,
-  CustomerDetails,
-} from '../../data/mockOrderDetails'
+  OrderAddress,
+  OrderCustomer,
+} from '../../lib/api/orderWorkspaceApi'
 
 type Props = {
-  customer?: CustomerDetails | null
-  installationAddress?: Address | null
-  billingAddress?: Address | null
+  customer?: OrderCustomer | null
+  installationAddress?: OrderAddress | null
+  billingAddress?: OrderAddress | null
 }
 
 type CustomerForm = {
@@ -44,7 +44,7 @@ const SUB_TABS: Array<{ id: SubTabId; label: string }> = [
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
-function customerFromProps(c?: CustomerDetails | null): CustomerForm {
+function customerFromProps(c?: OrderCustomer | null): CustomerForm {
   return {
     first_name: c?.first_name ?? '',
     middle_name: c?.middle_name ?? '',
@@ -57,7 +57,7 @@ function customerFromProps(c?: CustomerDetails | null): CustomerForm {
   }
 }
 
-function addressFromProps(a?: Address | null): AddressForm {
+function addressFromProps(a?: OrderAddress | null): AddressForm {
   return {
     unit_number: a?.unit_number ?? '',
     street_number: a?.street_number ?? '',

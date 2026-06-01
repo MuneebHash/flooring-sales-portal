@@ -3,10 +3,10 @@ import { Field } from '../ui/Field'
 import { Input } from '../ui/Input'
 import { Select } from '../ui/Select'
 import { Textarea } from '../ui/Textarea'
-import type { SaleDetails } from '../../data/mockOrderDetails'
+import type { DetailsOfSaleFields } from '../../lib/api/orderWorkspaceApi'
 
 type Props = {
-  saleDetails?: SaleDetails | null
+  saleDetails?: DetailsOfSaleFields | null
 }
 
 const QUICK_DESCRIPTIONS = [
