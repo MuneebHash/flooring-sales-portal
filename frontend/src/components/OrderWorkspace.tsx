@@ -5,7 +5,7 @@ import { ArrowLeftIcon } from './icons'
 import { Button } from './ui/Button'
 import { Panel } from './ui/Panel'
 import { Tabs } from './ui/Tabs'
-import { CustomerTab } from './workspace/CustomerTab'
+import { CustomerTab, type CustomerSavedPayload } from './workspace/CustomerTab'
 import { DetailsOfSaleTab } from './workspace/DetailsOfSaleTab'
 import { InvoiceTab } from './workspace/InvoiceTab'
 import { NotesPhotosTab } from './workspace/NotesPhotosTab'
@@ -53,19 +53,23 @@ const TAB_LABELS: Record<TabId, string> = {
 const TABS = TAB_IDS.map((id) => ({ id, label: TAB_LABELS[id] }))
 
 type ShellProps = {
+  orderId: number
   flooringType: FlooringType
   orderNumber: string
   orderStatus: OrderStatus
-  // Threaded for later Phase 10E sub-branches that wire saves and disable
-  // protected edits when locked. 10E.1 only reflects it read-only.
+  // Locked drives the read-only badge here and disables Customer-tab edits/saves.
   locked: boolean
   customer: OrderCustomer | null
   installationAddress: OrderAddress | null
   billingAddress: OrderAddress | null
   saleDetails: DetailsOfSaleFields | null
+  // Lifts confirmed server-saved customer/address data up so workspace state
+  // (and sibling tabs) stay in sync without a refetch.
+  onCustomerSaved: (saved: CustomerSavedPayload) => void
 }
 
 function WorkspaceShell({
+  orderId,
   flooringType,
   orderNumber,
   orderStatus,
@@ -74,6 +78,7 @@ function WorkspaceShell({
   installationAddress,
   billingAddress,
   saleDetails,
+  onCustomerSaved,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
 
@@ -133,9 +138,12 @@ function WorkspaceShell({
           <div className="p-6">
             {activeTab === 'customer' && (
               <CustomerTab
+                orderId={orderId}
+                locked={locked}
                 customer={customer}
                 installationAddress={installationAddress}
                 billingAddress={billingAddress}
+                onSaved={onCustomerSaved}
               />
             )}
             {activeTab === 'products' && (
@@ -242,9 +250,30 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
     details_of_sale: workspace.details_of_sale,
   }
 
+  // Customer-tab saves are confirmed server-side and arrive one section at a
+  // time as each call succeeds. Fold each provided row back into workspace state
+  // in place (leaving unprovided sections untouched) so confirmed customer /
+  // installation rows persist even when a later billing step fails, and sibling
+  // tabs see fresh data without a refetch.
+  function handleCustomerSaved(saved: CustomerSavedPayload) {
+    setWorkspace((prev) => {
+      if (!prev) return prev
+      const next = { ...prev }
+      if (saved.customer !== undefined) next.customer = saved.customer
+      if (saved.installAddress !== undefined) {
+        next.install_address = saved.installAddress
+      }
+      if (saved.billingAddress !== undefined) {
+        next.billing_address = saved.billingAddress
+      }
+      return next
+    })
+  }
+
   return (
     <WorkspaceShell
       key={orderId}
+      orderId={orderId}
       flooringType={workspace.flooring_type}
       orderNumber={workspace.order_number}
       orderStatus={workspace.order_status}
@@ -253,6 +282,7 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
       installationAddress={workspace.install_address}
       billingAddress={workspace.billing_address}
       saleDetails={saleDetails}
+      onCustomerSaved={handleCustomerSaved}
     />
   )
 }

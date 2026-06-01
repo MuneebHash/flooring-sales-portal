@@ -1,7 +1,7 @@
 import type { FlooringType } from '../flooring'
 import type { OrderStatus } from '../statuses'
 import { DEFAULT_BUSINESS_SLUG } from '../tenant'
-import { get, post } from './client'
+import { get, post, put } from './client'
 import { apiPath } from './paths'
 import type { ApiSuccess } from './types'
 
@@ -149,5 +149,57 @@ export function fetchOrderWorkspace(
 ): Promise<ApiSuccess<OrderWorkspace>> {
   return get<ApiSuccess<OrderWorkspace>>(
     apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}`),
+  )
+}
+
+// PUT /api/v1/{slug}/orders/{orderId}/customer — full-replace upsert of the one
+// customer row. Optional fields omitted/null are cleared server-side, so the
+// caller must send the complete field set (see CustomerSaveRequest).
+export function saveCustomer(
+  orderId: number,
+  body: CustomerSaveRequest,
+): Promise<ApiSuccess<CustomerSaveResponse>> {
+  return put<ApiSuccess<CustomerSaveResponse>>(
+    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/customer`),
+    body,
+  )
+}
+
+// PUT /api/v1/{slug}/orders/{orderId}/addresses/installation — full-replace
+// upsert of the installation address row. The path selects address_type.
+export function saveInstallationAddress(
+  orderId: number,
+  body: AddressUpsertRequest,
+): Promise<ApiSuccess<InstallationAddressResponse>> {
+  return put<ApiSuccess<InstallationAddressResponse>>(
+    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/addresses/installation`),
+    body,
+  )
+}
+
+// PUT /api/v1/{slug}/orders/{orderId}/addresses/billing — full-replace upsert of
+// the billing address row. The path selects address_type.
+export function saveBillingAddress(
+  orderId: number,
+  body: AddressUpsertRequest,
+): Promise<ApiSuccess<BillingAddressResponse>> {
+  return put<ApiSuccess<BillingAddressResponse>>(
+    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/addresses/billing`),
+    body,
+  )
+}
+
+// POST /api/v1/{slug}/orders/{orderId}/addresses/billing/copy-from-installation
+// — backend copies the persisted installation row into billing. No request body.
+// Returns 422 INSTALLATION_ADDRESS_REQUIRED when no installation row exists, so
+// the caller must save the installation address first in the same run.
+export function copyBillingFromInstallation(
+  orderId: number,
+): Promise<ApiSuccess<BillingAddressResponse>> {
+  return post<ApiSuccess<BillingAddressResponse>>(
+    apiPath(
+      DEFAULT_BUSINESS_SLUG,
+      `/orders/${orderId}/addresses/billing/copy-from-installation`,
+    ),
   )
 }
