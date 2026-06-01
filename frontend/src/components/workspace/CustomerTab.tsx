@@ -18,13 +18,15 @@ import type {
   OrderCustomer,
 } from '../../lib/api/orderWorkspaceApi'
 
-// Confirmed server-saved data lifted to the parent after a fully successful
-// run. Billing always comes from the billing PUT / copy response, never the
+// Confirmed server-saved data lifted to the parent, one section at a time as
+// each call succeeds (so customer/installation survive even when a later
+// billing step fails). Each field is optional and always sourced from the
+// server response — billing from the billing PUT / copy response, never the
 // local form.
 export type CustomerSavedPayload = {
-  customer: OrderCustomer
-  installAddress: OrderAddress
-  billingAddress: OrderAddress
+  customer?: OrderCustomer
+  installAddress?: OrderAddress
+  billingAddress?: OrderAddress
 }
 
 type Props = {
@@ -476,6 +478,9 @@ export function CustomerTab({
       }
       if (!mountedRef.current) return
       setCustomerForm(customerFromProps(savedCustomer))
+      // Lift the confirmed customer row up immediately — it must survive even if
+      // a later section (installation/billing) fails in this same run.
+      onSaved({ customer: savedCustomer })
 
       // 2. Installation address (must persist before any copy-from-installation).
       let savedInstall: OrderAddress
@@ -488,6 +493,8 @@ export function CustomerTab({
       }
       if (!mountedRef.current) return
       setInstallForm(addressFromProps(savedInstall))
+      // Lift the confirmed installation row up — survives a later billing failure.
+      onSaved({ installAddress: savedInstall })
 
       // 3. Billing — copy-from-installation when "same as installation" is
       //    checked (the installation row exists from step 2), otherwise a full
@@ -504,14 +511,13 @@ export function CustomerTab({
       }
       if (!mountedRef.current) return
       setBillingForm(addressFromProps(savedBilling))
+      // Lift the confirmed billing row up.
+      onSaved({ billingAddress: savedBilling })
 
       // Every required call in this run succeeded — only now a global success.
+      // Parent state was already updated per-section above (per-step only —
+      // never a combined call here as well).
       setSaveRun(FULL_SUCCESS_RUN)
-      onSaved({
-        customer: savedCustomer,
-        installAddress: savedInstall,
-        billingAddress: savedBilling,
-      })
     } finally {
       if (mountedRef.current) setSaving(false)
     }

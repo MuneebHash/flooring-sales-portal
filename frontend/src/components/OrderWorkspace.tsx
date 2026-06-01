@@ -250,20 +250,24 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
     details_of_sale: workspace.details_of_sale,
   }
 
-  // Customer-tab saves are confirmed server-side; fold the returned rows back
-  // into workspace state in place so sibling tabs see fresh data without a
-  // refetch. customer/install/billing are the only sections this tab owns.
+  // Customer-tab saves are confirmed server-side and arrive one section at a
+  // time as each call succeeds. Fold each provided row back into workspace state
+  // in place (leaving unprovided sections untouched) so confirmed customer /
+  // installation rows persist even when a later billing step fails, and sibling
+  // tabs see fresh data without a refetch.
   function handleCustomerSaved(saved: CustomerSavedPayload) {
-    setWorkspace((prev) =>
-      prev
-        ? {
-            ...prev,
-            customer: saved.customer,
-            install_address: saved.installAddress,
-            billing_address: saved.billingAddress,
-          }
-        : prev,
-    )
+    setWorkspace((prev) => {
+      if (!prev) return prev
+      const next = { ...prev }
+      if (saved.customer !== undefined) next.customer = saved.customer
+      if (saved.installAddress !== undefined) {
+        next.install_address = saved.installAddress
+      }
+      if (saved.billingAddress !== undefined) {
+        next.billing_address = saved.billingAddress
+      }
+      return next
+    })
   }
 
   return (
