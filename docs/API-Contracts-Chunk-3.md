@@ -223,6 +223,7 @@ Endpoints 16 and 17 are additions on top of the suggested set; rationale in sect
         "product_name_snapshot": "Plush Carpet Premium",
         "pricing_unit_snapshot": "LM",
         "price_snapshot": 45.00,
+        "cost_snapshot": 28.00,
         "quantity_lm": 8.00,
         "quantity_sqm": 29.28,
         "unit_price": 45.00,
@@ -238,6 +239,7 @@ Endpoints 16 and 17 are additions on top of the suggested set; rationale in sect
         "charge_code_snapshot": "INST-S",
         "charge_name_snapshot": "Carpet Installation",
         "price_snapshot": 15.00,
+        "cost_snapshot": 10.00,
         "quantity": 32.00,
         "unit_price": 15.00,
         "line_total": 480.00,
@@ -252,7 +254,7 @@ Endpoints 16 and 17 are additions on top of the suggested set; rationale in sect
 
 **Field rules**
 - See shared DTOs in section E (`product_line_read`, `charge_line_read`, `order_financial_summary`).
-- **`cost_snapshot` and `line_cost` are NEVER returned per line.** Aggregate `total_cost`, `gp`, `gp_percent` are returned in `order_financial_summary` only (conventions §10 / §12).
+- **`cost_snapshot` IS returned per already-added line** for salesperson display (read-only). **`line_cost` is still NEVER returned per line.** Aggregate `total_cost`, `gp`, `gp_percent` remain in `order_financial_summary` only (conventions §12). The client still cannot send or override any cost field.
 - `order_financial_summary` is computed live from the current persisted lines and the persisted `price_adjustment_inc_gst` on `sales_order`.
 - Pagination is intentionally not applied here — the frontend needs all lines to render the workspace and the financial summary depends on all lines being present.
 
@@ -1114,6 +1116,7 @@ Used in D.3, D.4, D.5 responses.
   "product_name_snapshot": "Plush Carpet Premium",
   "pricing_unit_snapshot": "LM",
   "price_snapshot": 45.00,
+  "cost_snapshot": 28.00,
   "quantity_lm": 8.00,
   "quantity_sqm": 29.28,
   "unit_price": 45.00,
@@ -1124,7 +1127,8 @@ Used in D.3, D.4, D.5 responses.
 ```
 
 **Field rules**
-- All NOT NULL columns from `order_product_line` are exposed except `cost_snapshot` and `line_cost`, which are never returned (conventions §10).
+- All NOT NULL columns from `order_product_line` are exposed except `line_cost`, which is never returned per line.
+- `cost_snapshot` is exposed read-only for salesperson display on already-added lines (the unit cost captured at line creation). The client must never send it.
 - `pricing_unit_snapshot` is `LM` or `SQM` — the value at the moment the line was created; never changes if the catalog changes later.
 - Money formatted with two decimal places.
 
@@ -1139,6 +1143,7 @@ Used in D.3, D.7, D.8 responses.
   "charge_code_snapshot": "INST-S",
   "charge_name_snapshot": "Carpet Installation",
   "price_snapshot": 15.00,
+  "cost_snapshot": 10.00,
   "quantity": 32.00,
   "unit_price": 15.00,
   "line_total": 480.00,
@@ -1148,7 +1153,8 @@ Used in D.3, D.7, D.8 responses.
 ```
 
 **Field rules**
-- All NOT NULL columns from `order_charge_line` exposed except `cost_snapshot` and `line_cost`.
+- All NOT NULL columns from `order_charge_line` exposed except `line_cost`, which is never returned per line.
+- `cost_snapshot` is exposed read-only for salesperson display on already-added lines. The client must never send it.
 
 ### E.4 `attachment_read`
 
@@ -1177,9 +1183,13 @@ Used in D.14, D.15, D.16 responses (D.16 returns just an id).
 - Snapshots are immutable for the life of the line. Catalog changes never propagate to existing lines.
 - `unit_price` is the actual selling price used for `line_total`. It starts at `price_snapshot` and may be overridden by the salesperson (POST or PATCH).
 
-**F.2 Cost is hidden from the frontend (conventions §10).**
-- The frontend cannot send `cost`, `cost_snapshot`, `line_cost`, or any derived cost field. Sending any → 400 `VALIDATION_FAILED`.
-- The frontend never receives `cost`, `cost_snapshot`, or `line_cost` per line. Only the aggregate `total_cost`, `gp`, and `gp_percent` are exposed inside `order_financial_summary` (necessary for GP display).
+**F.2 Cost visibility (conventions §10).**
+- **Send-side ban (unchanged):** the frontend cannot send `cost`, `cost_snapshot`, `line_cost`, or any derived cost field. Sending any → 400 `VALIDATION_FAILED`. The client can never send, edit, or override any cost field.
+- **Return-side:** per-line `cost_snapshot` IS returned on already-added order line read/mutation responses (D.3, D.4, D.5, D.7, D.8) for salesperson display. This is a read-only unit cost snapshot.
+- Catalog search endpoints D.1 (`available-products`) and D.2 (`available-charges`) remain cost-free — no cost field is returned there.
+- Per-line `line_cost` remains backend-only and is never returned per line. The aggregate `total_cost`, `gp`, and `gp_percent` are exposed inside `order_financial_summary` (necessary for GP display).
+
+> The 5-second “i” button cost reveal in the UI is purely a frontend customer-visibility behaviour, not a security control. The salesperson is allowed to see cost; the reveal only avoids the customer seeing cost constantly over the salesperson's shoulder.
 
 **F.3 Quantity conversion (conventions §11).**
 - Fixed MVP conversion: `1 LM = 3.66 SQM`.
@@ -1239,9 +1249,9 @@ Used in D.14, D.15, D.16 responses (D.16 returns just an id).
 - Catalog search results are scoped to `session.store_id`. Products and charges from other stores are never returned (no `?store_id=` override; client never controls store).
 - Cross-tenant / cross-store / cross-order misses always return 404, never 403.
 
-**F.10 Backend-controlled fields.** Client never sends or controls:
+**F.10 Backend-controlled fields.** Client never sends or controls (send-side ban — these are rejected on input regardless of whether they are returned read-only in responses):
 - `business_id`, `store_id`, `user_id`, `order_id` (in body).
-- Any snapshot field (`*_snapshot`).
+- Any snapshot field (`*_snapshot`). Note: `cost_snapshot` is backend-controlled and may be returned read-only on already-added lines (F.2), but the client must never send it.
 - Any cost field (`cost`, `cost_snapshot`, `line_cost`, `total_cost`).
 - Any computed total (`line_total`, `product_subtotal`, `charge_subtotal`, `calculated_total_inc_gst`, `final_sale_price_inc_gst`, `sale_price_ex_gst`, `gp`, `gp_percent`).
 - `price_adjustment_inc_gst` directly — only the GST-inclusive sale price the salesperson typed.
