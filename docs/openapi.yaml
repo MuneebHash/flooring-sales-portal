@@ -546,7 +546,8 @@ paths:
       operationId: getOrderLines
       description: >
         Returns all product lines, charge lines, and live financial summary for
-        the order. Per-line cost fields are never exposed.
+        the order. Per-line cost_snapshot is exposed read-only for salesperson
+        display; per-line line_cost is never exposed.
       parameters:
         - $ref: '#/components/parameters/OrderId'
       responses:
@@ -1858,6 +1859,7 @@ components:
         - product_name_snapshot
         - pricing_unit_snapshot
         - price_snapshot
+        - cost_snapshot
         - quantity_lm
         - quantity_sqm
         - unit_price
@@ -1879,6 +1881,14 @@ components:
           $ref: '#/components/schemas/PricingUnit'
         price_snapshot:
           $ref: '#/components/schemas/Money'
+        cost_snapshot:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: >-
+            Read-only unit cost snapshot, returned on already-added order lines
+            for salesperson display. Captured from the catalog at line creation
+            and immutable thereafter. The client must never send this field.
+            Per-line line_cost is backend-only and is not returned.
         quantity_lm:
           type: number
           format: double
@@ -1903,6 +1913,7 @@ components:
         - charge_code_snapshot
         - charge_name_snapshot
         - price_snapshot
+        - cost_snapshot
         - quantity
         - unit_price
         - line_total
@@ -1921,6 +1932,14 @@ components:
           type: string
         price_snapshot:
           $ref: '#/components/schemas/Money'
+        cost_snapshot:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          description: >-
+            Read-only unit cost snapshot, returned on already-added order lines
+            for salesperson display. Captured from the catalog at line creation
+            and immutable thereafter. The client must never send this field.
+            Per-line line_cost is backend-only and is not returned.
         quantity:
           type: number
           format: double
