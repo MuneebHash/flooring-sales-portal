@@ -73,6 +73,9 @@ public class SalesOrder {
     @Column(name = "gp_percent")
     private BigDecimal gpPercent;
 
+    @Column(name = "price_adjustment_inc_gst")
+    private BigDecimal priceAdjustmentIncGst;
+
     @Column(name = "week_number")
     private Integer weekNumber;
 
