@@ -59,6 +59,12 @@ public class OrderProductLineService {
     private static final String PRICING_UNIT_LM = "LM";
 
     private static final int MONEY_SCALE = 2;
+    // order_product_line / order_charge_line money & quantity columns and the persisted sales_order
+    // sale_price_ex_gst / total_cost / gp are all DECIMAL(10,2) (V2). A value scaled to 2dp fits iff
+    // it has at most (10 - 2) = 8 integer digits, i.e. |value| <= 99999999.99.
+    private static final int MONEY_PRECISION = 10;
+    private static final int MONEY_MAX_INTEGER_DIGITS = MONEY_PRECISION - MONEY_SCALE;
+    private static final String MONEY_MAX_LABEL = "99999999.99";
     private static final RoundingMode ROUNDING = RoundingMode.HALF_UP;
     private static final BigDecimal ZERO = BigDecimal.ZERO;
     // sales_order.gp_percent is DECIMAL(5,2): persist NULL when the true value would overflow
@@ -316,6 +322,7 @@ public class OrderProductLineService {
                                                          BigDecimal priceAdjustmentIncGst,
                                                          LocalDateTime timestamp) {
         OrderFinancialSummaryDto summary = computeSummary(orderId, priceAdjustmentIncGst);
+        requirePersistableHeader(summary);
         salesOrderFinancialWriteRepository.updateHeaderFinancials(
                 orderId,
                 summary.salePriceExGst(),
@@ -324,6 +331,31 @@ public class OrderProductLineService {
                 persistableGpPercent(summary.gpPercent()),
                 timestamp);
         return summary;
+    }
+
+    /**
+     * Guard the persisted {@code sales_order} header scalars against DECIMAL(10,2) overflow. Per-line
+     * values are already range-checked before the write, but a cross-line aggregate (sum of many
+     * lines, or a stored {@code price_adjustment_inc_gst} applied on top) could still exceed the
+     * column range. Throwing here makes that a 400 VALIDATION_FAILED that rolls back the line write in
+     * this {@code @Transactional} method, instead of a PostgreSQL numeric-overflow 500. {@code gp_percent}
+     * is handled separately (persisted NULL on DECIMAL(5,2) overflow), so it is not guarded here.
+     */
+    private static void requirePersistableHeader(OrderFinancialSummaryDto summary) {
+        List<ErrorDetail> errors = new ArrayList<>();
+        if (!fitsMoney(summary.salePriceExGst())) {
+            errors.add(new ErrorDetail(null, null,
+                    "Order sale price exceeds the maximum supported value (" + MONEY_MAX_LABEL + ")."));
+        }
+        if (!fitsMoney(summary.totalCost())) {
+            errors.add(new ErrorDetail(null, null,
+                    "Order total cost exceeds the maximum supported value (" + MONEY_MAX_LABEL + ")."));
+        }
+        if (!fitsMoney(summary.gp())) {
+            errors.add(new ErrorDetail(null, null,
+                    "Order gross profit exceeds the maximum supported value (" + MONEY_MAX_LABEL + ")."));
+        }
+        throwIfErrors(errors);
     }
 
     private static BigDecimal persistableGpPercent(BigDecimal gpPercent) {
@@ -352,16 +384,13 @@ public class OrderProductLineService {
                                          BigDecimal quantityLm,
                                          BigDecimal quantitySqm,
                                          BigDecimal unitPriceUsed) {
+        // Both quantities are already scaled to 2dp here: one is the (already range-checked) supplied
+        // value, the other was derived. Re-validate BOTH > 0 and within DECIMAL(10,2) range so a
+        // derived quantity that rounded to zero or overflowed the column is a clean 400, not a 500.
         List<ErrorDetail> errors = new ArrayList<>();
-        if (quantityLm == null || quantityLm.compareTo(ZERO) <= 0) {
-            errors.add(new ErrorDetail(null, "quantity_lm", "Quantity (LM) must be greater than 0."));
-        }
-        if (quantitySqm == null || quantitySqm.compareTo(ZERO) <= 0) {
-            errors.add(new ErrorDetail(null, "quantity_sqm", "Quantity (SQM) must be greater than 0."));
-        }
-        if (unitPriceUsed == null || unitPriceUsed.compareTo(ZERO) <= 0) {
-            errors.add(new ErrorDetail(null, "unit_price", "Unit price must be greater than 0."));
-        }
+        validatePositiveInRange(quantityLm, "quantity_lm", "Quantity (LM)", errors);
+        validatePositiveInRange(quantitySqm, "quantity_sqm", "Quantity (SQM)", errors);
+        validatePositiveInRange(unitPriceUsed, "unit_price", "Unit price", errors);
         throwIfErrors(errors);
 
         BigDecimal quantityForCalc = PRICING_UNIT_LM.equals(pricingUnit) ? quantityLm : quantitySqm;
@@ -372,7 +401,37 @@ public class OrderProductLineService {
                     List.of(new ErrorDetail(null, null,
                             "Resulting line total must be greater than 0; increase quantity or unit price.")));
         }
+        // line_total and line_cost target DECIMAL(10,2): a product of two in-range values can still
+        // overflow the column, so guard both before the native write to avoid a 500.
+        if (!fitsMoney(lineTotal)) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(),
+                    List.of(new ErrorDetail(null, null,
+                            "Resulting line total exceeds the maximum supported value (" + MONEY_MAX_LABEL
+                                    + "); reduce quantity or unit price.")));
+        }
+        if (!fitsMoney(lineCost)) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(),
+                    List.of(new ErrorDetail(null, null,
+                            "Resulting line cost exceeds the maximum supported value (" + MONEY_MAX_LABEL
+                                    + "); reduce quantity.")));
+        }
         return new LineValues(quantityLm, quantitySqm, unitPriceUsed, lineTotal, lineCost);
+    }
+
+    private static void validatePositiveInRange(BigDecimal value, String field, String label,
+                                                List<ErrorDetail> errors) {
+        if (value == null || value.compareTo(ZERO) <= 0) {
+            errors.add(new ErrorDetail(null, field, label + " must be greater than 0."));
+        } else if (!fitsMoney(value)) {
+            errors.add(new ErrorDetail(null, field, label + " exceeds the maximum supported value ("
+                    + MONEY_MAX_LABEL + ")."));
+        }
+    }
+
+    /** True iff {@code value}, scaled to 2dp, fits a DECIMAL(10,2) column (|value| <= 99999999.99). */
+    private static boolean fitsMoney(BigDecimal value) {
+        BigDecimal scaled = value.setScale(MONEY_SCALE, ROUNDING);
+        return scaled.precision() - scaled.scale() <= MONEY_MAX_INTEGER_DIGITS;
     }
 
     private static BigDecimal scale(BigDecimal value) {
@@ -489,6 +548,12 @@ public class OrderProductLineService {
         BigDecimal parsed = new BigDecimal(value.asText()).setScale(MONEY_SCALE, ROUNDING);
         if (parsed.compareTo(ZERO) <= 0) {
             errors.add(new ErrorDetail(null, field, "Must be greater than 0."));
+            return null;
+        }
+        // Reject values that cannot fit the DECIMAL(10,2) target column, so an oversized but positive
+        // input is a 400 VALIDATION_FAILED rather than a PostgreSQL numeric-overflow 500 on persist.
+        if (!fitsMoney(parsed)) {
+            errors.add(new ErrorDetail(null, field, "Must be at most " + MONEY_MAX_LABEL + "."));
             return null;
         }
         return parsed;

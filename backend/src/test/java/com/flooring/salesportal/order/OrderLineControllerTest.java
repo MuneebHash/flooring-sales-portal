@@ -123,6 +123,18 @@ class OrderLineControllerTest {
                 "SELECT " + column + " FROM sales_order WHERE order_id = ?", BigDecimal.class, orderId);
     }
 
+    private void assertNoProductLines(long orderId) {
+        Integer rows = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM order_product_line WHERE order_id = ?", Integer.class, orderId);
+        Assertions.assertEquals(Integer.valueOf(0), rows, "overflowing input must not create a line");
+    }
+
+    private BigDecimal queryProductLineMoney(String column, long lineId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT " + column + " FROM order_product_line WHERE order_product_line_id = ?",
+                BigDecimal.class, lineId);
+    }
+
     // ================================================================
     // GET /lines
     // ================================================================
@@ -450,6 +462,74 @@ class OrderLineControllerTest {
     }
 
     @Test
+    void addProductLine_hugeQuantityLm_exceedsDbRange_returns400_andAddsNoLine() throws Exception {
+        // 100000000 (1e8) has 9 integer digits — beyond DECIMAL(10,2) max 99999999.99.
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_lm\":100000000}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quantity_lm"));
+        assertNoProductLines(ORDER_HARD_EMPTY);
+    }
+
+    @Test
+    void addProductLine_hugeQuantitySqm_exceedsDbRange_returns400_andAddsNoLine() throws Exception {
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_sqm\":100000000}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quantity_sqm"));
+        assertNoProductLines(ORDER_HARD_EMPTY);
+    }
+
+    @Test
+    void addProductLine_hugeUnitPrice_exceedsDbRange_returns400_andAddsNoLine() throws Exception {
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_sqm\":10,\"unit_price\":100000000}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_price"));
+        assertNoProductLines(ORDER_HARD_EMPTY);
+    }
+
+    @Test
+    void addProductLine_lineTotalOverflowsThoughInputsFit_returns400_andAddsNoLine() throws Exception {
+        // quantity_sqm 10000 and unit_price 99999.99 each fit DECIMAL(10,2), but the product
+        // line_total = round(10000 × 99999.99, 2) = 999999900.00 (9 integer digits) overflows it.
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_sqm\":10000,\"unit_price\":99999.99}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+        assertNoProductLines(ORDER_HARD_EMPTY);
+    }
+
+    @Test
+    void addProductLine_summedHeaderAggregateOverflow_returns400() throws Exception {
+        // Each line fits DECIMAL(10,2) on its own (line_total 99,990,000.00) and as a one-line header
+        // aggregate, but a second identical line pushes the summed sale_price_ex_gst past
+        // 99999999.99 → requirePersistableHeader rejects the mutation with 400 (not a DB 500).
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_sqm\":1000000,\"unit_price\":99.99}"))
+                .andExpect(status().isCreated());
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_sqm\":1000000,\"unit_price\":99.99}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+    }
+
+    @Test
     void addProductLine_bothQuantities_returns400() throws Exception {
         mockMvc.perform(post(productLinesUrl(ORDER_SOFT_FULL))
                         .session(liamStore1Session())
@@ -593,6 +673,45 @@ class OrderLineControllerTest {
     }
 
     @Test
+    void updateProductLine_hugeQuantityLm_returns400_andLeavesLineUnchanged() throws Exception {
+        mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quantity_lm\":100000000}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quantity_lm"));
+        assertMoney("8.00", queryProductLineMoney("quantity_lm", PRODUCT_LINE_1));
+        assertMoney("360.00", queryProductLineMoney("line_total", PRODUCT_LINE_1));
+    }
+
+    @Test
+    void updateProductLine_hugeQuantitySqm_returns400_andLeavesLineUnchanged() throws Exception {
+        mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quantity_sqm\":100000000}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quantity_sqm"));
+        assertMoney("8.00", queryProductLineMoney("quantity_lm", PRODUCT_LINE_1));
+        assertMoney("29.28", queryProductLineMoney("quantity_sqm", PRODUCT_LINE_1));
+    }
+
+    @Test
+    void updateProductLine_hugeUnitPrice_returns400_andLeavesLineUnchanged() throws Exception {
+        mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"unit_price\":100000000}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_price"));
+        assertMoney("45.00", queryProductLineMoney("unit_price", PRODUCT_LINE_1));
+        assertMoney("360.00", queryProductLineMoney("line_total", PRODUCT_LINE_1));
+    }
+
+    @Test
     void updateProductLine_bothQuantities_returns400() throws Exception {
         mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
                         .session(liamStore1Session())
@@ -621,6 +740,32 @@ class OrderLineControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
                 .andExpect(jsonPath("$.error.details[0].field").value("product_id"));
+    }
+
+    @Test
+    void updateProductLine_forbiddenCostSnapshot_returns400_andLeavesLineUnchanged() throws Exception {
+        mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quantity_lm\":10,\"cost_snapshot\":5}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("cost_snapshot"));
+        assertMoney("8.00", queryProductLineMoney("quantity_lm", PRODUCT_LINE_1));
+    }
+
+    @Test
+    void updateProductLine_lineTotalOverflowsThoughInputsFit_returns400_andLeavesLineUnchanged() throws Exception {
+        // quantity_lm 10000000 and unit_price 99.99 each fit DECIMAL(10,2), but the LM-priced
+        // line_total = round(10000000 × 99.99, 2) = 999900000.00 overflows it.
+        mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quantity_lm\":10000000,\"unit_price\":99.99}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+        assertMoney("8.00", queryProductLineMoney("quantity_lm", PRODUCT_LINE_1));
+        assertMoney("360.00", queryProductLineMoney("line_total", PRODUCT_LINE_1));
     }
 
     @Test
