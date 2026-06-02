@@ -451,7 +451,10 @@ public class OrderProductLineService {
             errors.add(new ErrorDetail(null, field, "Required."));
             return null;
         }
-        if (!value.isIntegralNumber()) {
+        // isIntegralNumber() rejects fractional values (e.g. 1.5 DoubleNode); canConvertToLong()
+        // additionally rejects integers outside the signed-long range (e.g. a BigIntegerNode above
+        // Long.MAX_VALUE), which longValue() would otherwise silently truncate/wrap.
+        if (!value.isIntegralNumber() || !value.canConvertToLong()) {
             errors.add(new ErrorDetail(null, field, "Must be a positive integer."));
             return null;
         }

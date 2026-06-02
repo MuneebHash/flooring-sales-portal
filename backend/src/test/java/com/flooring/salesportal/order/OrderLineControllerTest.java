@@ -433,6 +433,23 @@ class OrderLineControllerTest {
     }
 
     @Test
+    void addProductLine_oversizedProductId_returns400_andAddsNoLine() throws Exception {
+        // 18446744073709551617 = 2^64 + 1, parsed by Jackson as a BigIntegerNode beyond Long range.
+        // longValue() would wrap it (to 1) — it must instead be rejected as VALIDATION_FAILED.
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":18446744073709551617,\"quantity_sqm\":10}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("product_id"));
+
+        Integer rows = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM order_product_line WHERE order_id = ?", Integer.class, ORDER_HARD_EMPTY);
+        Assertions.assertEquals(Integer.valueOf(0), rows, "oversized product_id must not create a line");
+    }
+
+    @Test
     void addProductLine_bothQuantities_returns400() throws Exception {
         mockMvc.perform(post(productLinesUrl(ORDER_SOFT_FULL))
                         .session(liamStore1Session())
