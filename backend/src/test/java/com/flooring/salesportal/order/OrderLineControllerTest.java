@@ -769,10 +769,11 @@ class OrderLineControllerTest {
     }
 
     @Test
-    void updateProductLine_wouldMakeSalePriceNegative_returns400_andDoesNotUpdate() throws Exception {
-        // With a stored -600.00 discount, dropping the product line_total to 8.00 (unit_price 1 × 8 LM)
-        // makes calculated (8+480)×1.1 = 536.80 → final -63.20 → sale_ex negative.
-        // Revised R5: reject with 400 field sale_price_ex_gst (not clamp, not DB 500); line unchanged.
+    void updateProductLine_makesSalePriceNegative_succeeds_andPersistsNegative() throws Exception {
+        // Negative sale price is ALLOWED while editing an order. With a stored -600.00 inc-GST
+        // discount, dropping the product line_total to 8.00 (unit_price 1 × 8 LM) makes
+        // calculated (8+480)×1.1 = 536.80 → final 536.80-600 = -63.20 → sale_ex round(-63.20/1.1) = -57.45.
+        // The PATCH succeeds and the real negative value is persisted — not clamped, not a DB 500.
         jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = ? WHERE order_id = ?",
                 new BigDecimal("-600.00"), ORDER_SOFT_FULL);
 
@@ -780,12 +781,26 @@ class OrderLineControllerTest {
                         .session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("{\"unit_price\":1}"))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
-                .andExpect(jsonPath("$.error.details[0].field").value("sale_price_ex_gst"));
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Product line updated."))
+                .andExpect(jsonPath("$.data.product_line.unit_price").value(1.0))
+                .andExpect(jsonPath("$.data.product_line.line_total").value(8.0))
+                .andExpect(jsonPath("$.data.order_financial_summary.calculated_total_inc_gst").value(536.8))
+                .andExpect(jsonPath("$.data.order_financial_summary.price_adjustment_inc_gst").value(-600.0))
+                .andExpect(jsonPath("$.data.order_financial_summary.final_sale_price_inc_gst").value(-63.2))
+                .andExpect(jsonPath("$.data.order_financial_summary.sale_price_ex_gst").value(-57.45))
+                .andExpect(jsonPath("$.data.order_financial_summary.total_cost").value(432.0))
+                .andExpect(jsonPath("$.data.order_financial_summary.gp").value(-489.45))
+                .andExpect(jsonPath("$.data.order_financial_summary.gp_percent").value(nullValue()))
+                .andExpect(jsonPath("$.data.order_financial_summary.gp_warning").value(false));
 
-        assertMoney("45.00", queryProductLineMoney("unit_price", PRODUCT_LINE_1));
-        assertMoney("360.00", queryProductLineMoney("line_total", PRODUCT_LINE_1));
+        // Line updated normally, and the negative header value is persisted as-is.
+        assertMoney("1.00", queryProductLineMoney("unit_price", PRODUCT_LINE_1));
+        assertMoney("8.00", queryProductLineMoney("line_total", PRODUCT_LINE_1));
+        assertMoney("-57.45", queryMoney("sale_price_ex_gst", ORDER_SOFT_FULL));
+        assertMoney("-489.45", queryMoney("gp", ORDER_SOFT_FULL));
+        Assertions.assertNull(queryMoney("gp_percent", ORDER_SOFT_FULL),
+                "gp_percent persists NULL when sale_price_ex_gst <= 0");
     }
 
     @Test
@@ -848,24 +863,36 @@ class OrderLineControllerTest {
     }
 
     @Test
-    void deleteProductLine_wouldMakeSalePriceNegative_returns400_andDoesNotDelete() throws Exception {
-        // A stored -600.00 inc-GST discount is valid while order 1 totals 840 ex-GST
-        // (final 924-600=324, sale_ex 294.55). Deleting the product line drops the calculated total to
-        // 528 inc-GST → final -72 → sale_ex negative, which chk_sales_order_sale_price_gte_zero forbids.
-        // Revised R5: reject with 400 (not clamp, not DB 500), and the line must remain.
+    void deleteProductLine_makesSalePriceNegative_succeeds_andPersistsNegative() throws Exception {
+        // Negative sale price is ALLOWED while editing an order. A stored -600.00 inc-GST discount on
+        // order 1 is valid; deleting the product line drops the calculated total to (0+480)×1.1 =
+        // 528.00 → final 528-600 = -72.00 → sale_ex round(-72.00/1.1) = -65.45. The DELETE succeeds and
+        // the real negative value persists — not clamped, not a DB 500.
         jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = ? WHERE order_id = ?",
                 new BigDecimal("-600.00"), ORDER_SOFT_FULL);
 
         mockMvc.perform(delete(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
                         .session(liamStore1Session()))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
-                .andExpect(jsonPath("$.error.details[0].field").value("sale_price_ex_gst"));
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value("Product line deleted."))
+                .andExpect(jsonPath("$.data.deleted_product_line_id").value(1))
+                .andExpect(jsonPath("$.data.order_financial_summary.product_subtotal").value(0.0))
+                .andExpect(jsonPath("$.data.order_financial_summary.charge_subtotal").value(480.0))
+                .andExpect(jsonPath("$.data.order_financial_summary.calculated_total_inc_gst").value(528.0))
+                .andExpect(jsonPath("$.data.order_financial_summary.final_sale_price_inc_gst").value(-72.0))
+                .andExpect(jsonPath("$.data.order_financial_summary.sale_price_ex_gst").value(-65.45))
+                .andExpect(jsonPath("$.data.order_financial_summary.total_cost").value(256.0))
+                .andExpect(jsonPath("$.data.order_financial_summary.gp").value(-321.45))
+                .andExpect(jsonPath("$.data.order_financial_summary.gp_percent").value(nullValue()))
+                .andExpect(jsonPath("$.data.order_financial_summary.gp_warning").value(false));
 
+        // Line deleted normally, and the negative header value is persisted as-is.
         Integer rows = jdbcTemplate.queryForObject(
                 "SELECT COUNT(*) FROM order_product_line WHERE order_product_line_id = ?",
                 Integer.class, PRODUCT_LINE_1);
-        Assertions.assertEquals(Integer.valueOf(1), rows, "rejected delete must not remove the line");
+        Assertions.assertEquals(Integer.valueOf(0), rows, "the product line must be deleted");
+        assertMoney("-65.45", queryMoney("sale_price_ex_gst", ORDER_SOFT_FULL));
+        assertMoney("-321.45", queryMoney("gp", ORDER_SOFT_FULL));
     }
 
     @Test
