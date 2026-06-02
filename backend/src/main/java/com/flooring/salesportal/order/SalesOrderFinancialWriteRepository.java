@@ -17,9 +17,10 @@ import java.time.LocalDateTime;
  *
  * <p>{@code gp_percent} is bound as the already range-checked value: the service passes NULL when the
  * true computed percent would overflow {@code DECIMAL(5,2)} (locked review decision R4) — the
- * response summary still carries the true value, only the persisted column is nulled. Negative
- * {@code sale_price_ex_gst} is NOT clamped (R5): if illegal upstream data drives it below 0, the
- * {@code chk_sales_order_sale_price_gte_zero} CHECK is allowed to surface it.
+ * response summary still carries the true value, only the persisted column is nulled. A negative
+ * {@code sale_price_ex_gst} is allowed while editing an order and is persisted as-is — never clamped
+ * or floored; the V3 {@code chk_sales_order_sale_price_gte_zero} CHECK was relaxed in V9 so the real
+ * negative value can be stored. (A negative final sale price is blocked only at invoice creation.)
  *
  * <p>Must be invoked from a {@code @Transactional} service method ({@link OrderProductLineService}).
  */

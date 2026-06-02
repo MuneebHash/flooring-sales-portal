@@ -390,10 +390,14 @@ public class OrderProductLineService {
      * mutation writes nothing.
      *
      * <ul>
-     *   <li>{@code sale_price_ex_gst} — DECIMAL(10,2) with {@code chk_sales_order_sale_price_gte_zero}
-     *       (>= 0). A line edit/delete on top of a stored negative {@code price_adjustment_inc_gst}
-     *       can drive it below 0; per the revised R5 decision we REJECT (field {@code sale_price_ex_gst}),
-     *       never clamp/floor. Width is also guarded.</li>
+     *   <li>{@code sale_price_ex_gst} — DECIMAL(10,2). Negative values are ALLOWED while building or
+     *       editing an order (a line edit/delete on top of a stored negative
+     *       {@code price_adjustment_inc_gst} can legitimately drive it below 0). The real value is
+     *       persisted — never clamped, floored, or silently changed — so only its DECIMAL(10,2)
+     *       width is guarded here (an oversized value is a clean 400, not a PostgreSQL 500). A
+     *       negative FINAL sale price is blocked only at invoice creation (conventions §14), not on a
+     *       line mutation. The V3 {@code chk_sales_order_sale_price_gte_zero} CHECK was relaxed in V9
+     *       so the negative value can persist.</li>
      *   <li>{@code total_cost} — DECIMAL(10,2) with {@code chk_sales_order_total_cost_gte_zero} (>= 0).
      *       It is a sum of non-negative line costs so it cannot go negative in practice, but it is
      *       guarded defensively for the same DB-500-avoidance reason.</li>
@@ -404,11 +408,11 @@ public class OrderProductLineService {
      */
     private static void requirePersistableHeader(OrderFinancialSummaryDto summary) {
         List<ErrorDetail> errors = new ArrayList<>();
+        // Negative sale_price_ex_gst is allowed while editing — persist the real value, never clamp
+        // or floor it. Only its DECIMAL(10,2) width is guarded so an oversized value is a clean 400
+        // instead of a DB 500. (A negative final sale price is blocked only at invoice creation.)
         BigDecimal salePrice = summary.salePriceExGst();
-        if (salePrice.compareTo(ZERO) < 0) {
-            errors.add(new ErrorDetail(null, "sale_price_ex_gst",
-                    "This change would make the order sale price negative; adjust the sale price before editing lines."));
-        } else if (!fitsMoney(salePrice)) {
+        if (!fitsMoney(salePrice)) {
             errors.add(new ErrorDetail(null, "sale_price_ex_gst",
                     "Order sale price exceeds the maximum supported value (" + MONEY_MAX_LABEL + ")."));
         }
