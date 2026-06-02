@@ -290,6 +290,29 @@ class OrderChargeLineControllerTest {
     }
 
     @Test
+    void addChargeLine_forbiddenPricingUnitSnapshot_returns400() throws Exception {
+        // Product-only snapshot field must still be rejected on a charge line (any *_snapshot key).
+        mockMvc.perform(post(chargeLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"charge_id\":4,\"quantity\":10,\"pricing_unit_snapshot\":\"LM\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("pricing_unit_snapshot"));
+    }
+
+    @Test
+    void addChargeLine_forbiddenSqmPerLmSnapshot_returns400() throws Exception {
+        mockMvc.perform(post(chargeLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"charge_id\":4,\"quantity\":10,\"sqm_per_lm_snapshot\":3.66}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("sqm_per_lm_snapshot"));
+    }
+
+    @Test
     void addChargeLine_inactiveCharge_returns422() throws Exception {
         jdbcTemplate.update("UPDATE store_charge SET is_active = FALSE WHERE charge_id = ?", CHARGE_UNDR_S);
         mockMvc.perform(post(chargeLinesUrl(ORDER_SOFT_FULL))
@@ -452,6 +475,31 @@ class OrderChargeLineControllerTest {
                 .andExpect(jsonPath("$.error.details[0].field").value("cost_snapshot"));
         assertMoney("32.00", queryChargeLineMoney("quantity", CHARGE_LINE_1));
         assertMoney("480.00", queryChargeLineMoney("line_total", CHARGE_LINE_1));
+    }
+
+    @Test
+    void updateChargeLine_forbiddenPricingUnitSnapshot_returns400_andLeavesLineUnchanged() throws Exception {
+        mockMvc.perform(patch(chargeLineUrl(ORDER_SOFT_FULL, CHARGE_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quantity\":40,\"pricing_unit_snapshot\":\"LM\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("pricing_unit_snapshot"));
+        assertMoney("32.00", queryChargeLineMoney("quantity", CHARGE_LINE_1));
+        assertMoney("480.00", queryChargeLineMoney("line_total", CHARGE_LINE_1));
+    }
+
+    @Test
+    void updateChargeLine_forbiddenSqmPerLmSnapshot_returns400_andLeavesLineUnchanged() throws Exception {
+        mockMvc.perform(patch(chargeLineUrl(ORDER_SOFT_FULL, CHARGE_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quantity\":40,\"sqm_per_lm_snapshot\":3.66}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("sqm_per_lm_snapshot"));
+        assertMoney("32.00", queryChargeLineMoney("quantity", CHARGE_LINE_1));
     }
 
     @Test

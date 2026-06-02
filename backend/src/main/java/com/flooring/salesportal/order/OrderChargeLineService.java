@@ -83,6 +83,9 @@ public class OrderChargeLineService {
             "total_cost", "gp", "gp_percent", "price_adjustment_inc_gst");
     // PATCH cannot change charge_id either (the charge / its snapshots are immutable post-create).
     private static final Set<String> FORBIDDEN_PATCH = buildPatchForbidden();
+    // Every "*_snapshot" column is backend-owned and must be rejected if a client sends it, including
+    // the product-only pricing_unit_snapshot / sqm_per_lm_snapshot (conventions §10, Chunk 3 F.10).
+    private static final String SNAPSHOT_SUFFIX = "_snapshot";
 
     private final RequestContextGuard requestContextGuard;
     private final SalesOrderRepository salesOrderRepository;
@@ -486,10 +489,15 @@ public class OrderChargeLineService {
         if (node == null || !node.isObject()) {
             return;
         }
+        // Scan ONLY the JSON request body keys (never path variables). Reject any explicit
+        // backend-controlled field plus ANY key ending in "_snapshot" — every snapshot column is
+        // backend-owned (charge_code/name/price/cost_snapshot and the product-only
+        // pricing_unit_snapshot / sqm_per_lm_snapshot), and no legitimate input field
+        // (charge_id, quantity, unit_price) ends in "_snapshot", so a blanket suffix reject is safe.
         Iterator<String> names = node.fieldNames();
         while (names.hasNext()) {
             String name = names.next();
-            if (forbidden.contains(name)) {
+            if (forbidden.contains(name) || name.endsWith(SNAPSHOT_SUFFIX)) {
                 errors.add(new ErrorDetail(null, name, "Not allowed."));
             }
         }
