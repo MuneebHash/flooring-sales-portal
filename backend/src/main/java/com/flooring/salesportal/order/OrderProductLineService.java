@@ -183,6 +183,16 @@ public class OrderProductLineService {
         LineValues line = computeLineValues(
                 product.pricingUnit(), product.cost(), quantityLm, quantitySqm, unitPriceUsed);
 
+        // Validate the projected header (width + non-negative sale price / total cost) BEFORE the
+        // insert, so a rejected mutation writes nothing.
+        LineFinancials currentProducts = orderProductLineRepository.sumFinancials(orderId);
+        LineFinancials projectedProducts = new LineFinancials(
+                currentProducts.subtotal().add(line.lineTotal()),
+                currentProducts.cost().add(line.lineCost()));
+        OrderFinancialSummaryDto summary =
+                projectedSummary(orderId, projectedProducts, order.getPriceAdjustmentIncGst());
+        requirePersistableHeader(summary);
+
         LocalDateTime now = LocalDateTime.now();
         ProductLineReadDto created = orderProductLineRepository.insert(
                 orderId,
@@ -199,8 +209,7 @@ public class OrderProductLineService {
                 line.lineTotal(),
                 line.lineCost(),
                 now);
-
-        OrderFinancialSummaryDto summary = recomputeAndPersist(orderId, order.getPriceAdjustmentIncGst(), now);
+        persistHeader(orderId, summary, now);
         return new ProductLineMutationResponse(created, summary);
     }
 
@@ -262,6 +271,17 @@ public class OrderProductLineService {
         LineValues line = computeLineValues(
                 existing.pricingUnitSnapshot(), existing.costSnapshot(), quantityLm, quantitySqm, unitPriceUsed);
 
+        // Validate the projected header (width + non-negative sale price / total cost) BEFORE the
+        // update, so a rejected mutation leaves the line unchanged. Swap the existing line's old
+        // contribution for the new one; old line_cost is reconstructed from the immutable snapshot.
+        LineFinancials currentProducts = orderProductLineRepository.sumFinancials(orderId);
+        LineFinancials projectedProducts = new LineFinancials(
+                currentProducts.subtotal().subtract(existing.lineTotal()).add(line.lineTotal()),
+                currentProducts.cost().subtract(reconstructLineCost(existing)).add(line.lineCost()));
+        OrderFinancialSummaryDto summary =
+                projectedSummary(orderId, projectedProducts, order.getPriceAdjustmentIncGst());
+        requirePersistableHeader(summary);
+
         LocalDateTime now = LocalDateTime.now();
         ProductLineReadDto updated = orderProductLineRepository.update(
                 lineId,
@@ -272,8 +292,7 @@ public class OrderProductLineService {
                 line.lineTotal(),
                 line.lineCost(),
                 now);
-
-        OrderFinancialSummaryDto summary = recomputeAndPersist(orderId, order.getPriceAdjustmentIncGst(), now);
+        persistHeader(orderId, summary, now);
         return new ProductLineMutationResponse(updated, summary);
     }
 
@@ -292,13 +311,23 @@ public class OrderProductLineService {
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
         requireNotLaid(order);
 
-        int deleted = orderProductLineRepository.deleteByLineIdAndOrderId(lineId, orderId);
-        if (deleted == 0) {
-            throw new NotFoundException(ErrorCode.LINE_NOT_FOUND, "Order line not found.");
-        }
+        // Read the line first (404 if not on this order) so its contribution can be removed from the
+        // projected header and validated BEFORE the delete — a rejected mutation deletes nothing.
+        ProductLineReadDto existing = orderProductLineRepository
+                .findByLineIdAndOrderId(lineId, orderId)
+                .orElseThrow(() -> new NotFoundException(ErrorCode.LINE_NOT_FOUND, "Order line not found."));
+
+        LineFinancials currentProducts = orderProductLineRepository.sumFinancials(orderId);
+        LineFinancials projectedProducts = new LineFinancials(
+                currentProducts.subtotal().subtract(existing.lineTotal()),
+                currentProducts.cost().subtract(reconstructLineCost(existing)));
+        OrderFinancialSummaryDto summary =
+                projectedSummary(orderId, projectedProducts, order.getPriceAdjustmentIncGst());
+        requirePersistableHeader(summary);
 
         LocalDateTime now = LocalDateTime.now();
-        OrderFinancialSummaryDto summary = recomputeAndPersist(orderId, order.getPriceAdjustmentIncGst(), now);
+        orderProductLineRepository.deleteByLineIdAndOrderId(lineId, orderId);
+        persistHeader(orderId, summary, now);
         return new ProductLineDeleteResponse(lineId, summary);
     }
 
@@ -314,15 +343,25 @@ public class OrderProductLineService {
     }
 
     /**
-     * Compute the live summary AND persist the {@code sales_order} header scalars (conventions §12).
-     * Returns the summary with the TRUE gp_percent; the persisted column is NULLed when that value
-     * would overflow {@code DECIMAL(5,2)} (R4). Negative sale_price_ex_gst is NOT clamped (R5).
+     * Build the live summary from the PROJECTED post-mutation product totals + the order's current
+     * charge lines + adjustment, WITHOUT touching the DB. Callers validate this (see
+     * {@link #requirePersistableHeader}) BEFORE applying the line write, so a rejected mutation writes
+     * nothing — important because a write-then-rollback would still be visible within an open
+     * transaction. The projected totals equal a post-write recompute (current sums ± this line's delta),
+     * so {@link #persistHeader} can persist this same summary after the write with no re-query.
      */
-    private OrderFinancialSummaryDto recomputeAndPersist(long orderId,
-                                                         BigDecimal priceAdjustmentIncGst,
-                                                         LocalDateTime timestamp) {
-        OrderFinancialSummaryDto summary = computeSummary(orderId, priceAdjustmentIncGst);
-        requirePersistableHeader(summary);
+    private OrderFinancialSummaryDto projectedSummary(long orderId, LineFinancials projectedProducts,
+                                                      BigDecimal priceAdjustmentIncGst) {
+        LineFinancials charges = orderChargeLineReadRepository.sumFinancials(orderId);
+        return financialCalculator.compute(projectedProducts, charges, priceAdjustmentIncGst);
+    }
+
+    /**
+     * Persist the recomputed {@code sales_order} header scalars (conventions §12). The summary carries
+     * the TRUE gp_percent; the persisted column is NULLed when that value would overflow
+     * {@code DECIMAL(5,2)} (R4). Call only after {@link #requirePersistableHeader} has passed.
+     */
+    private void persistHeader(long orderId, OrderFinancialSummaryDto summary, LocalDateTime timestamp) {
         salesOrderFinancialWriteRepository.updateHeaderFinancials(
                 orderId,
                 summary.salePriceExGst(),
@@ -330,25 +369,54 @@ public class OrderProductLineService {
                 summary.gp(),
                 persistableGpPercent(summary.gpPercent()),
                 timestamp);
-        return summary;
     }
 
     /**
-     * Guard the persisted {@code sales_order} header scalars against DECIMAL(10,2) overflow. Per-line
-     * values are already range-checked before the write, but a cross-line aggregate (sum of many
-     * lines, or a stored {@code price_adjustment_inc_gst} applied on top) could still exceed the
-     * column range. Throwing here makes that a 400 VALIDATION_FAILED that rolls back the line write in
-     * this {@code @Transactional} method, instead of a PostgreSQL numeric-overflow 500. {@code gp_percent}
-     * is handled separately (persisted NULL on DECIMAL(5,2) overflow), so it is not guarded here.
+     * Reconstruct a product line's {@code line_cost} from its immutable {@code cost_snapshot} and stored
+     * pricing-unit quantity, so a mutation can adjust the projected {@code total_cost} delta without
+     * exposing per-line cost. Equals the stored value exactly
+     * ({@code line_cost = round(qtyForPricingUnit × cost_snapshot, 2)}).
+     */
+    private static BigDecimal reconstructLineCost(ProductLineReadDto line) {
+        BigDecimal quantityForCalc =
+                PRICING_UNIT_LM.equals(line.pricingUnitSnapshot()) ? line.quantityLm() : line.quantitySqm();
+        return scale(quantityForCalc.multiply(line.costSnapshot()));
+    }
+
+    /**
+     * Guard the persisted {@code sales_order} header scalars against the column CHECK constraints so a
+     * product-line mutation that would violate one becomes a clean 400 VALIDATION_FAILED instead of a
+     * PostgreSQL 500. Callers run this on the PROJECTED summary BEFORE the line write, so a rejected
+     * mutation writes nothing.
+     *
+     * <ul>
+     *   <li>{@code sale_price_ex_gst} — DECIMAL(10,2) with {@code chk_sales_order_sale_price_gte_zero}
+     *       (>= 0). A line edit/delete on top of a stored negative {@code price_adjustment_inc_gst}
+     *       can drive it below 0; per the revised R5 decision we REJECT (field {@code sale_price_ex_gst}),
+     *       never clamp/floor. Width is also guarded.</li>
+     *   <li>{@code total_cost} — DECIMAL(10,2) with {@code chk_sales_order_total_cost_gte_zero} (>= 0).
+     *       It is a sum of non-negative line costs so it cannot go negative in practice, but it is
+     *       guarded defensively for the same DB-500-avoidance reason.</li>
+     *   <li>{@code gp} — has NO non-negative CHECK (negative GP is allowed, conventions §12); only its
+     *       DECIMAL(10,2) width is guarded.</li>
+     *   <li>{@code gp_percent} — handled separately (persisted NULL on DECIMAL(5,2) overflow, R4).</li>
+     * </ul>
      */
     private static void requirePersistableHeader(OrderFinancialSummaryDto summary) {
         List<ErrorDetail> errors = new ArrayList<>();
-        if (!fitsMoney(summary.salePriceExGst())) {
-            errors.add(new ErrorDetail(null, null,
+        BigDecimal salePrice = summary.salePriceExGst();
+        if (salePrice.compareTo(ZERO) < 0) {
+            errors.add(new ErrorDetail(null, "sale_price_ex_gst",
+                    "This change would make the order sale price negative; adjust the sale price before editing lines."));
+        } else if (!fitsMoney(salePrice)) {
+            errors.add(new ErrorDetail(null, "sale_price_ex_gst",
                     "Order sale price exceeds the maximum supported value (" + MONEY_MAX_LABEL + ")."));
         }
-        if (!fitsMoney(summary.totalCost())) {
-            errors.add(new ErrorDetail(null, null,
+        BigDecimal totalCost = summary.totalCost();
+        if (totalCost.compareTo(ZERO) < 0) {
+            errors.add(new ErrorDetail(null, "total_cost", "Order total cost would be negative."));
+        } else if (!fitsMoney(totalCost)) {
+            errors.add(new ErrorDetail(null, "total_cost",
                     "Order total cost exceeds the maximum supported value (" + MONEY_MAX_LABEL + ")."));
         }
         if (!fitsMoney(summary.gp())) {

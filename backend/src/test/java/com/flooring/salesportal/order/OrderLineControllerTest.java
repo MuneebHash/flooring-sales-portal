@@ -769,6 +769,26 @@ class OrderLineControllerTest {
     }
 
     @Test
+    void updateProductLine_wouldMakeSalePriceNegative_returns400_andDoesNotUpdate() throws Exception {
+        // With a stored -600.00 discount, dropping the product line_total to 8.00 (unit_price 1 × 8 LM)
+        // makes calculated (8+480)×1.1 = 536.80 → final -63.20 → sale_ex negative.
+        // Revised R5: reject with 400 field sale_price_ex_gst (not clamp, not DB 500); line unchanged.
+        jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = ? WHERE order_id = ?",
+                new BigDecimal("-600.00"), ORDER_SOFT_FULL);
+
+        mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"unit_price\":1}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("sale_price_ex_gst"));
+
+        assertMoney("45.00", queryProductLineMoney("unit_price", PRODUCT_LINE_1));
+        assertMoney("360.00", queryProductLineMoney("line_total", PRODUCT_LINE_1));
+    }
+
+    @Test
     void updateProductLine_missingLine_returns404() throws Exception {
         mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, LINE_DOES_NOT_EXIST))
                         .session(liamStore1Session())
@@ -825,6 +845,27 @@ class OrderLineControllerTest {
                 "SELECT COUNT(*) FROM order_charge_line WHERE order_id = ?", Integer.class, ORDER_SOFT_FULL);
         Assertions.assertEquals(Integer.valueOf(1), chargeRows);
         assertMoney("480.00", queryMoney("sale_price_ex_gst", ORDER_SOFT_FULL));
+    }
+
+    @Test
+    void deleteProductLine_wouldMakeSalePriceNegative_returns400_andDoesNotDelete() throws Exception {
+        // A stored -600.00 inc-GST discount is valid while order 1 totals 840 ex-GST
+        // (final 924-600=324, sale_ex 294.55). Deleting the product line drops the calculated total to
+        // 528 inc-GST → final -72 → sale_ex negative, which chk_sales_order_sale_price_gte_zero forbids.
+        // Revised R5: reject with 400 (not clamp, not DB 500), and the line must remain.
+        jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = ? WHERE order_id = ?",
+                new BigDecimal("-600.00"), ORDER_SOFT_FULL);
+
+        mockMvc.perform(delete(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
+                        .session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("sale_price_ex_gst"));
+
+        Integer rows = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM order_product_line WHERE order_product_line_id = ?",
+                Integer.class, PRODUCT_LINE_1);
+        Assertions.assertEquals(Integer.valueOf(1), rows, "rejected delete must not remove the line");
     }
 
     @Test
