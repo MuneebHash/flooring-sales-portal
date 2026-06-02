@@ -286,8 +286,8 @@ Backend must:
 1. Load the product from `store_product` by `product_id`
 2. Verify the product belongs to the active store
 3. Verify the product is active
-4. Copy snapshot fields: `product_code_snapshot`, `product_name_snapshot`, `pricing_unit_snapshot`, `price_snapshot`, `cost_snapshot`
-5. Derive quantities using the fixed conversion (see section 11)
+4. Copy snapshot fields: `product_code_snapshot`, `product_name_snapshot`, `pricing_unit_snapshot`, `price_snapshot`, `cost_snapshot`, `sqm_per_lm_snapshot`
+5. Derive quantities using the product's snapshotted conversion factor `sqm_per_lm_snapshot` (see section 11), not a fixed constant
 6. Set `unit_price` = `price_snapshot` initially (can be overridden later)
 7. Calculate `line_total` = quantity × `unit_price` (which quantity depends on pricing unit — see section 11)
 8. Calculate `line_cost` = quantity × `cost_snapshot` (which quantity depends on pricing unit — see section 11)
@@ -316,12 +316,10 @@ Backend must:
 
 ## 11. Quantity Conversion Rules
 
-### Fixed MVP conversion
-```
-1 LM = 3.66 SQM
-```
+### Per-product conversion factor
+Each product carries its own conversion factor `store_product.sqm_per_lm` — "how many SQM are in 1 LM". Default is `3.66` (standard 3.66 m wide roll). Some carpet rolls are 4 m wide and use `4.00`.
 
-This constant lives in one backend location so it can be replaced with a per-product value later.
+When a product line is added, the backend snapshots `store_product.sqm_per_lm` into `order_product_line.sqm_per_lm_snapshot`. All quantity derivation for that line uses the snapshotted factor, never a fixed constant. The snapshot is immutable for the life of the line.
 
 ### Product line request
 Frontend sends exactly one of:
@@ -329,13 +327,14 @@ Frontend sends exactly one of:
 - `quantity_sqm` (nullable)
 
 Exactly one must be provided, the other must be null or absent.
-Backend derives the missing value:
-- if `quantity_lm` is provided: `quantity_sqm = quantity_lm × 3.66`
-- if `quantity_sqm` is provided: `quantity_lm = quantity_sqm / 3.66`
+Backend derives the missing value using `sqm_per_lm_snapshot`:
+- if `quantity_lm` is provided: `quantity_sqm = round(quantity_lm × sqm_per_lm_snapshot, 2)`
+- if `quantity_sqm` is provided: `quantity_lm = round(quantity_sqm / sqm_per_lm_snapshot, 2)`
 
 ### Default starting values by flooring type
-- SOFT flooring (priced per LM): default starting quantity is 1 LM → derived SQM is 3.66
-- HARD flooring (priced per SQM): default starting quantity is 1 SQM → derived LM is 0.27
+Default starting quantities are product-specific (driven by the product's own `sqm_per_lm`), not a hardcoded constant for every product:
+- SOFT flooring (priced per LM): default starting quantity is 1 LM → derived SQM is `sqm_per_lm` (e.g. 3.66, or 4.00 for a 4 m roll)
+- HARD flooring (priced per SQM): default starting quantity is 1 SQM → derived LM is `round(1 / sqm_per_lm, 2)` (e.g. 0.27 at 3.66, 0.25 at 4.00)
 
 ### Which quantity drives calculation
 The pricing unit determines which quantity is used for line_total and line_cost:
