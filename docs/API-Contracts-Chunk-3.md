@@ -106,6 +106,7 @@ Endpoints 16 and 17 are additions on top of the suggested set; rationale in sect
       "flooring_type": "SOFT",
       "pricing_unit": "LM",
       "price": 45.00,
+      "sqm_per_lm": 3.66,
       "stock_quantity": 320.00,
       "stock_unit": "LM"
     }
@@ -121,6 +122,7 @@ Endpoints 16 and 17 are additions on top of the suggested set; rationale in sect
 
 **Field rules**
 - All fields sourced directly from `store_product`. NOT NULL columns are always present.
+- `sqm_per_lm` — product conversion factor (SQM per 1 LM), returned from `store_product.sqm_per_lm`. Default `3.66`; 4 m roll products may be `4.00`.
 - `stock_quantity` and `stock_unit` may be `null` (DB allows; paired by `chk_store_product_stock_pair`).
 - **`cost` is NEVER returned** (conventions §10 — backend-only).
 
@@ -224,6 +226,7 @@ Endpoints 16 and 17 are additions on top of the suggested set; rationale in sect
         "pricing_unit_snapshot": "LM",
         "price_snapshot": 45.00,
         "cost_snapshot": 28.00,
+        "sqm_per_lm_snapshot": 3.66,
         "quantity_lm": 8.00,
         "quantity_sqm": 29.28,
         "unit_price": 45.00,
@@ -321,10 +324,10 @@ Endpoints 16 and 17 are additions on top of the suggested set; rationale in sect
 2. Verify `store_product.store_id = session.store_id`. Otherwise → 404 `PRODUCT_NOT_FOUND` (no cross-store leak).
 3. Verify `store_product.is_active = true`. Otherwise → 422 `PRODUCT_INACTIVE`.
 4. Verify `store_product.flooring_type = sales_order.flooring_type`. Otherwise → 422 `FLOORING_TYPE_MISMATCH` (conventions §17).
-5. Snapshot: `product_code_snapshot`, `product_name_snapshot`, `pricing_unit_snapshot`, `price_snapshot`, `cost_snapshot` (all from current `store_product`).
-6. Derive missing quantity using fixed conversion `1 LM = 3.66 SQM` (conventions §11):
-   - if `quantity_lm` given → `quantity_sqm = round(quantity_lm × 3.66, 2)`
-   - if `quantity_sqm` given → `quantity_lm = round(quantity_sqm / 3.66, 2)`
+5. Snapshot: `product_code_snapshot`, `product_name_snapshot`, `pricing_unit_snapshot`, `price_snapshot`, `cost_snapshot`, `sqm_per_lm_snapshot` (all from current `store_product`).
+6. Derive missing quantity using the product's snapshotted factor `sqm_per_lm_snapshot` (conventions §11), not a fixed constant:
+   - if `quantity_lm` given → `quantity_sqm = round(quantity_lm × sqm_per_lm_snapshot, 2)`
+   - if `quantity_sqm` given → `quantity_lm = round(quantity_sqm / sqm_per_lm_snapshot, 2)`
 7. `unit_price_used = unit_price` (if provided) else `price_snapshot`.
 8. Calculation per `pricing_unit_snapshot` (conventions §11):
    - `LM`: `line_total = round(quantity_lm × unit_price_used, 2)`, `line_cost = round(quantity_lm × cost_snapshot, 2)`
@@ -409,8 +412,9 @@ Endpoints 16 and 17 are additions on top of the suggested set; rationale in sect
 2. Verify the line belongs to the order in the path. Otherwise → 404 `LINE_NOT_FOUND` (no cross-order or cross-store leak).
 3. Determine new quantities:
    - Both quantity fields absent → quantities unchanged.
-   - `quantity_lm` provided → recompute `quantity_sqm = round(quantity_lm × 3.66, 2)`.
-   - `quantity_sqm` provided → recompute `quantity_lm = round(quantity_sqm / 3.66, 2)`.
+   - `quantity_lm` provided → recompute `quantity_sqm = round(quantity_lm × sqm_per_lm_snapshot, 2)` using the line's existing `sqm_per_lm_snapshot`.
+   - `quantity_sqm` provided → recompute `quantity_lm = round(quantity_sqm / sqm_per_lm_snapshot, 2)` using the line's existing `sqm_per_lm_snapshot`.
+   - The `sqm_per_lm_snapshot` is never changed by PATCH; it stays as captured at line creation.
 4. Determine new `unit_price`: provided value, else existing.
 5. Recompute `line_total` and `line_cost` using `pricing_unit_snapshot` (snapshot stays as it was at line creation) — same rule as D.4.
 6. Persist updated row.
@@ -1117,6 +1121,7 @@ Used in D.3, D.4, D.5 responses.
   "pricing_unit_snapshot": "LM",
   "price_snapshot": 45.00,
   "cost_snapshot": 28.00,
+  "sqm_per_lm_snapshot": 3.66,
   "quantity_lm": 8.00,
   "quantity_sqm": 29.28,
   "unit_price": 45.00,
@@ -1129,6 +1134,7 @@ Used in D.3, D.4, D.5 responses.
 **Field rules**
 - All NOT NULL columns from `order_product_line` are exposed except `line_cost`, which is never returned per line.
 - `cost_snapshot` is exposed read-only for salesperson display on already-added lines (the unit cost captured at line creation). The client must never send it.
+- `sqm_per_lm_snapshot` is the read-only product conversion factor (SQM per 1 LM) captured at line creation; immutable for the life of the line. The client must never send it.
 - `pricing_unit_snapshot` is `LM` or `SQM` — the value at the moment the line was created; never changes if the catalog changes later.
 - Money formatted with two decimal places.
 
@@ -1179,7 +1185,7 @@ Used in D.14, D.15, D.16 responses (D.16 returns just an id).
 ## F. Global Chunk 3 Rules
 
 **F.1 Snapshot rules (conventions §10).**
-- Backend snapshots catalog values when a line is added: `product_code_snapshot`, `product_name_snapshot`, `pricing_unit_snapshot`, `price_snapshot`, `cost_snapshot` for product lines; `charge_code_snapshot`, `charge_name_snapshot`, `price_snapshot`, `cost_snapshot` for charge lines.
+- Backend snapshots catalog values when a line is added: `product_code_snapshot`, `product_name_snapshot`, `pricing_unit_snapshot`, `price_snapshot`, `cost_snapshot`, `sqm_per_lm_snapshot` for product lines; `charge_code_snapshot`, `charge_name_snapshot`, `price_snapshot`, `cost_snapshot` for charge lines.
 - Snapshots are immutable for the life of the line. Catalog changes never propagate to existing lines.
 - `unit_price` is the actual selling price used for `line_total`. It starts at `price_snapshot` and may be overridden by the salesperson (POST or PATCH).
 
@@ -1192,12 +1198,14 @@ Used in D.14, D.15, D.16 responses (D.16 returns just an id).
 > The 5-second “i” button cost reveal in the UI is purely a frontend customer-visibility behaviour, not a security control. The salesperson is allowed to see cost; the reveal only avoids the customer seeing cost constantly over the salesperson's shoulder.
 
 **F.3 Quantity conversion (conventions §11).**
-- Fixed MVP conversion: `1 LM = 3.66 SQM`.
-- For product lines, the frontend sends exactly one of `quantity_lm` or `quantity_sqm`. Backend derives the other.
+- Per-product conversion factor: each product has `store_product.sqm_per_lm` (SQM per 1 LM), default `3.66`; 4 m roll products may be `4.00`. The factor is snapshotted into `order_product_line.sqm_per_lm_snapshot` at line creation and is immutable thereafter.
+- For product lines, the frontend sends exactly one of `quantity_lm` or `quantity_sqm`. Backend derives the other using `sqm_per_lm_snapshot`:
+  - if `quantity_lm` given → `quantity_sqm = round(quantity_lm × sqm_per_lm_snapshot, 2)`
+  - if `quantity_sqm` given → `quantity_lm = round(quantity_sqm / sqm_per_lm_snapshot, 2)`
 - `pricing_unit_snapshot` decides which quantity drives calculation:
   - `LM`: `line_total = quantity_lm × unit_price`, `line_cost = quantity_lm × cost_snapshot`
   - `SQM`: `line_total = quantity_sqm × unit_price`, `line_cost = quantity_sqm × cost_snapshot`
-- Charge lines use a single `quantity` field; the conversion does not apply.
+- Charge lines use a single `quantity` field; the conversion does not apply (charges are unaffected by the per-product factor).
 
 **F.4 Flooring type lock (conventions §17).**
 - A product or charge can be added to an order only if its `flooring_type` matches the order's `flooring_type`. Mismatch → 422 `FLOORING_TYPE_MISMATCH`.

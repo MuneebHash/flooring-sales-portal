@@ -576,9 +576,10 @@ paths:
       operationId: addProductLine
       description: >
         Adds a product line and returns the updated financial summary. Backend
-        snapshots product_code, product_name, pricing_unit, price, and cost.
-        Backend derives the missing quantity using 1 LM = 3.66 SQM and
-        calculates line_total and line_cost internally. Cost fields are never
+        snapshots product_code, product_name, pricing_unit, price, cost, and
+        sqm_per_lm. Backend derives the missing quantity using the product
+        line's snapshotted sqm_per_lm_snapshot and calculates line_total and
+        line_cost internally. Cost fields are never
         accepted from the client. Product must belong to the active store, be
         active, and match the order flooring_type. Blocked when order is LAID
         with 422 ORDER_LOCKED.
@@ -1525,6 +1526,7 @@ components:
         - flooring_type
         - pricing_unit
         - price
+        - sqm_per_lm
         - stock_quantity
         - stock_unit
       properties:
@@ -1541,6 +1543,13 @@ components:
           $ref: '#/components/schemas/PricingUnit'
         price:
           $ref: '#/components/schemas/Money'
+        sqm_per_lm:
+          type: number
+          format: double
+          example: 3.66
+          description: >-
+            Product conversion factor, SQM per 1 LM. Default 3.66; 4 m rolls may
+            use 4.00.
         stock_quantity:
           type: number
           format: double
@@ -1860,6 +1869,7 @@ components:
         - pricing_unit_snapshot
         - price_snapshot
         - cost_snapshot
+        - sqm_per_lm_snapshot
         - quantity_lm
         - quantity_sqm
         - unit_price
@@ -1889,6 +1899,14 @@ components:
             for salesperson display. Captured from the catalog at line creation
             and immutable thereafter. The client must never send this field.
             Per-line line_cost is backend-only and is not returned.
+        sqm_per_lm_snapshot:
+          type: number
+          format: double
+          example: 3.66
+          description: >-
+            Read-only conversion factor snapshot (SQM per 1 LM) captured at line
+            creation and immutable thereafter. The client must never send this
+            field.
         quantity_lm:
           type: number
           format: double
