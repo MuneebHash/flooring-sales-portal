@@ -811,9 +811,11 @@ Endpoints 16 and 17 are additions on top of the suggested set; rationale in sect
 ```json
 {
   "data": {
-    "order_note_id": 1,
-    "note_text": "Customer prefers Saturday morning installation.",
-    "created_at": "2026-04-14T10:05:00"
+    "note": {
+      "order_note_id": 1,
+      "note_text": "Customer prefers Saturday morning installation.",
+      "created_at": "2026-04-14T10:05:00"
+    }
   },
   "message": "Note added."
 }
