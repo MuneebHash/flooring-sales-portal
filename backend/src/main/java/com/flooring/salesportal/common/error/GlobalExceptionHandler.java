@@ -18,6 +18,7 @@ import org.springframework.web.bind.MissingServletRequestParameterException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
 
 import java.util.List;
 
@@ -71,6 +72,23 @@ public class GlobalExceptionHandler {
     public ResponseEntity<ErrorResponse> handleMissingParam(MissingServletRequestParameterException ex) {
         ErrorDetail detail = new ErrorDetail(null, ex.getParameterName(), "Required parameter is missing.");
         return badRequest(ErrorCode.VALIDATION_FAILED, List.of(detail));
+    }
+
+    /**
+     * Safety net for an upload that exceeds the container-level multipart limit
+     * ({@code spring.servlet.multipart.max-file-size} / {@code max-request-size}, set above the
+     * contract's 10 MB rule). The service-level size check normally produces 400 {@code FILE_TOO_LARGE}
+     * first; this maps the rare resolver-thrown case to the same 400 + JSON wrapper rather than letting
+     * it fall through to a generic 500. Chunk 3 D.15 uses 400 (not 413) for an oversized file.
+     */
+    @ExceptionHandler(MaxUploadSizeExceededException.class)
+    public ResponseEntity<ErrorResponse> handleMaxUploadSize(MaxUploadSizeExceededException ex) {
+        ErrorBody body = new ErrorBody(
+                ErrorCode.FILE_TOO_LARGE.name(),
+                ErrorCode.FILE_TOO_LARGE.defaultMessage(),
+                null
+        );
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(new ErrorResponse(body));
     }
 
     @ExceptionHandler(Exception.class)
