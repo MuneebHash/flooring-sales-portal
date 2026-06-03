@@ -6,6 +6,8 @@ public enum ErrorCode {
 
     VALIDATION_FAILED(HttpStatus.BAD_REQUEST, "One or more fields are invalid."),
     MALFORMED_JSON(HttpStatus.BAD_REQUEST, "Request body is malformed."),
+    UNSUPPORTED_FILE_TYPE(HttpStatus.BAD_REQUEST, "File type is not allowed for attachments."),
+    FILE_TOO_LARGE(HttpStatus.BAD_REQUEST, "File exceeds the 10 MB maximum size."),
     UNAUTHORIZED(HttpStatus.UNAUTHORIZED, "Authentication required."),
     INVALID_CREDENTIALS(HttpStatus.UNAUTHORIZED, "Invalid salesperson code or password."),
     FORBIDDEN(HttpStatus.FORBIDDEN, "Access denied."),
@@ -15,6 +17,7 @@ public enum ErrorCode {
     PRODUCT_NOT_FOUND(HttpStatus.NOT_FOUND, "Product not found."),
     CHARGE_NOT_FOUND(HttpStatus.NOT_FOUND, "Charge not found."),
     LINE_NOT_FOUND(HttpStatus.NOT_FOUND, "Order line not found."),
+    ATTACHMENT_NOT_FOUND(HttpStatus.NOT_FOUND, "Attachment not found."),
     CONFLICT(HttpStatus.CONFLICT, "Conflict."),
     STORE_ALREADY_SELECTED(HttpStatus.CONFLICT, "A different store is already selected in this session. Log out to switch stores."),
     BUSINESS_RULE_VIOLATION(HttpStatus.UNPROCESSABLE_ENTITY, "Business rule violation."),
