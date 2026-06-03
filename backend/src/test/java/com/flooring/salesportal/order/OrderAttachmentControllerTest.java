@@ -392,6 +392,53 @@ class OrderAttachmentControllerTest {
     }
 
     @Test
+    void uploadAttachment_transactionRollback_removesDiskFileAndRollsBackRows() throws Exception {
+        // The file is written before the DB rows; if the transaction rolls back after the upload
+        // returns, the rows are undone and the file must NOT be left orphaned on disk.
+        long attachmentId = uploadJpeg(ORDER_EMPTY, "rollback-upload.jpg");
+        long storedFileId = storedFileIdOf(attachmentId);
+        String storagePath = storagePathOf(storedFileId);
+        // Within the still-open transaction the row + file both exist (upload succeeded).
+        Assertions.assertEquals(1, countAttachments(ORDER_EMPTY), "row present within the open tx");
+        Assertions.assertTrue(diskFileExists(storagePath), "file written by the upload");
+
+        // Roll the transaction back — the upload's rollback-cleanup hook (afterCompletion, status !=
+        // committed) must delete the just-written file.
+        TestTransaction.flagForRollback();
+        TestTransaction.end();
+
+        Assertions.assertEquals(0, countAttachments(ORDER_EMPTY), "order_attachment row rolled back");
+        Assertions.assertEquals(0, countStoredFile(storedFileId), "stored_file row rolled back");
+        Assertions.assertFalse(diskFileExists(storagePath), "disk file removed on rollback (no orphan)");
+    }
+
+    @Test
+    void uploadAttachment_commit_keepsDiskFile() throws Exception {
+        // On a successful commit the rollback-cleanup hook must NOT fire — the file is kept.
+        long attachmentId = uploadJpeg(ORDER_EMPTY, "commit-keep.jpg");
+        long storedFileId = storedFileIdOf(attachmentId);
+        String storagePath = storagePathOf(storedFileId);
+        try {
+            TestTransaction.flagForCommit();
+            TestTransaction.end();
+
+            Assertions.assertEquals(1, countAttachments(ORDER_EMPTY), "row committed");
+            Assertions.assertEquals(1, countStoredFile(storedFileId), "stored_file committed");
+            Assertions.assertTrue(diskFileExists(storagePath), "disk file kept after commit");
+        } finally {
+            // The upload was committed; remove the rows + file so the shared seed DB is left clean.
+            jdbcTemplate.update("DELETE FROM order_attachment WHERE order_attachment_id = ?", attachmentId);
+            jdbcTemplate.update("DELETE FROM stored_file WHERE stored_file_id = ?", storedFileId);
+            try {
+                Files.deleteIfExists(tempStorageDir.resolve(
+                        storagePath.startsWith("/") ? storagePath.substring(1) : storagePath));
+            } catch (Exception ignore) {
+                // best-effort temp cleanup; @TempDir removes the whole dir after the class anyway.
+            }
+        }
+    }
+
+    @Test
     void uploadAttachment_response_noStoragePath_noFinancialSummary() throws Exception {
         mockMvc.perform(multipart(attachmentsUrl(ORDER_EMPTY))
                         .file(filePart("lounge.jpg", "image/jpeg", JPEG_BYTES))

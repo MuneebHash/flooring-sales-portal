@@ -166,10 +166,17 @@ public class OrderAttachmentService {
             throw new UncheckedIOException("Failed to read uploaded file", e);
         }
 
-        // Write the file FIRST. A disk-write failure throws before any DB row is inserted (the
-        // transaction has written nothing yet). If the DB inserts then fail, best-effort delete the
-        // orphan file and rethrow so no orphan DB row OR orphan file remains (Chunk 3 D.15 / §10).
+        // Write the file FIRST (a disk-write failure throws before any DB row is inserted). The file
+        // now exists on disk but the stored_file / order_attachment rows do not yet, so BOTH failure
+        // paths are guarded:
+        //   - register a rollback-cleanup hook that removes the file if this transaction does NOT
+        //     commit (commit-time failure, or rollback of an outer transaction this upload joined) —
+        //     without it the rows would roll back while the file is orphaned on disk;
+        //   - keep the in-method catch for an exception thrown before this method returns (prompt
+        //     cleanup). Both may run on the same failure; deleteQuietly is idempotent (deleteIfExists),
+        //     so the double delete is safe (Chunk 3 D.15 / §10).
         String storagePath = fileStorageService.store(bytes, ctx.businessId(), orderId, EXTENSION_BY_MIME.get(mimeType));
+        deleteFileOnRollback(storagePath);
         try {
             long storedFileId = attachmentWriteRepository.insertStoredFile(safeFileName, storagePath, mimeType, fileSize);
             AttachmentInsert inserted =
@@ -243,6 +250,33 @@ public class OrderAttachmentService {
         } else {
             fileStorageService.deleteQuietly(storagePath);
         }
+    }
+
+    /**
+     * Register cleanup that deletes a just-written upload file IFF the surrounding transaction does
+     * NOT commit. On upload the file is written before the DB rows, so a rollback (commit-time
+     * failure, or rollback of an outer transaction this upload joined under {@code REQUIRED}) would
+     * undo the {@code stored_file} / {@code order_attachment} rows while leaving the file orphaned on
+     * disk. {@code afterCompletion} fires on BOTH commit and rollback; the file is removed only when
+     * {@code status != STATUS_COMMITTED}, so a successful commit keeps it.
+     *
+     * <p>Fallback: if no transaction synchronization is active there is no rollback boundary to hook —
+     * each DB insert auto-commits individually, and the in-method catch already cleans up a mid-method
+     * failure — so nothing is registered. {@link FileStorageService#deleteQuietly} is best-effort and
+     * idempotent (deleteIfExists), so it is safe even when the in-method catch already removed the file.
+     */
+    private void deleteFileOnRollback(String storagePath) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCompletion(int status) {
+                    if (status != TransactionSynchronization.STATUS_COMMITTED) {
+                        fileStorageService.deleteQuietly(storagePath);
+                    }
+                }
+            });
+        }
+        // else: no active transaction → no deferred rollback to clean up after (see Javadoc).
     }
 
     // ------------------------------------------------------------------
