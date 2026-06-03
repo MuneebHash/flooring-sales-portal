@@ -6,6 +6,7 @@ import com.flooring.salesportal.order.dto.AttachmentDeleteResponse;
 import com.flooring.salesportal.order.dto.AttachmentReadDto;
 import com.flooring.salesportal.order.dto.AttachmentUploadResponse;
 import jakarta.servlet.http.HttpServletRequest;
+import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -20,6 +21,7 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 import org.springframework.web.multipart.MultipartHttpServletRequest;
 
+import java.nio.charset.StandardCharsets;
 import java.util.List;
 
 /**
@@ -92,11 +94,18 @@ public class OrderAttachmentController {
                 orderAttachmentService.downloadAttachment(slug, orderId, attachmentId, httpRequest);
 
         // Raw binary (NOT ApiResponse): stored MIME type, stored size, inline disposition with the
-        // safe display filename (Chunk 3 D.17). filename has no quotes/CR/LF (sanitised in the service).
+        // safe display filename (Chunk 3 D.17). Spring's ContentDisposition RFC 5987-encodes the
+        // filename with UTF-8, so a non-ISO-8859-1 / Unicode name (e.g. "測量.jpg") is transmitted
+        // safely as filename*=UTF-8''... rather than placed raw in the header (which would break
+        // header encoding). The display name is already path/quote/CR-LF sanitised in the service.
+        String contentDisposition = ContentDisposition.inline()
+                .filename(download.fileName(), StandardCharsets.UTF_8)
+                .build()
+                .toString();
         return ResponseEntity.ok()
                 .contentType(MediaType.parseMediaType(download.mimeType()))
                 .contentLength(download.fileSize())
-                .header(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"" + download.fileName() + "\"")
+                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition)
                 .body(download.bytes());
     }
 }

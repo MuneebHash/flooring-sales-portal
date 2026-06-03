@@ -648,12 +648,56 @@ class OrderAttachmentControllerTest {
                         .session(liamStore1Session()))
                 .andExpect(status().isOk())
                 .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "image/jpeg"))
-                .andExpect(header().string(HttpHeaders.CONTENT_DISPOSITION, "inline; filename=\"lounge.jpg\""))
                 .andReturn();
 
         Assertions.assertArrayEquals(JPEG_BYTES, result.getResponse().getContentAsByteArray());
         Assertions.assertEquals(JPEG_BYTES.length, result.getResponse().getContentLength(),
                 "Content-Length matches stored file_size");
+
+        // Content-Disposition is built via Spring's ContentDisposition (UTF-8 encoded). For an ASCII
+        // name it still carries the filename inline; assert robustly (the exact token form — quoted
+        // vs RFC 5987 filename* — is Spring's concern, not ours).
+        String contentDisposition = result.getResponse().getHeader(HttpHeaders.CONTENT_DISPOSITION);
+        Assertions.assertNotNull(contentDisposition, "Content-Disposition present");
+        Assertions.assertTrue(contentDisposition.startsWith("inline"),
+                () -> "starts with inline: " + contentDisposition);
+        Assertions.assertTrue(contentDisposition.contains("lounge.jpg"),
+                () -> "carries the filename: " + contentDisposition);
+    }
+
+    @Test
+    void downloadAttachment_unicodeFilename_encodesContentDispositionSafely() throws Exception {
+        // Codex fix: a non-ISO-8859-1 / Unicode filename must be RFC 5987-encoded, not placed raw in
+        // the header (which is an ISO-8859-1 channel and would break / mangle the value).
+        long attachmentId = uploadJpeg(ORDER_EMPTY, "測量.jpg");
+
+        MvcResult result = mockMvc.perform(get(attachmentFileUrl(ORDER_EMPTY, attachmentId))
+                        .session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "image/jpeg"))
+                .andReturn();
+
+        // Download still succeeds and streams the exact bytes.
+        Assertions.assertArrayEquals(JPEG_BYTES, result.getResponse().getContentAsByteArray());
+        Assertions.assertEquals(JPEG_BYTES.length, result.getResponse().getContentLength());
+
+        String contentDisposition = result.getResponse().getHeader(HttpHeaders.CONTENT_DISPOSITION);
+        Assertions.assertNotNull(contentDisposition, "Content-Disposition present");
+        Assertions.assertTrue(contentDisposition.startsWith("inline"),
+                () -> "starts with inline: " + contentDisposition);
+        // RFC 5987 form, with UTF-8 percent-encoding of 測量 = %E6%B8%AC%E9%87%8F (".jpg" left as-is).
+        Assertions.assertTrue(contentDisposition.contains("filename*="),
+                () -> "uses RFC 5987 filename*: " + contentDisposition);
+        Assertions.assertTrue(contentDisposition.toUpperCase().contains("UTF-8"),
+                () -> "declares UTF-8 charset: " + contentDisposition);
+        Assertions.assertTrue(contentDisposition.contains("%E6%B8%AC%E9%87%8F"),
+                () -> "percent-encodes the Unicode filename: " + contentDisposition);
+        // The raw multi-byte characters must NOT appear unencoded — that is the bug being fixed.
+        Assertions.assertFalse(contentDisposition.contains("測量"),
+                () -> "raw Unicode must not appear in the header: " + contentDisposition);
+        // The whole header value must be transmittable on the ISO-8859-1 HTTP header channel.
+        Assertions.assertTrue(StandardCharsets.ISO_8859_1.newEncoder().canEncode(contentDisposition),
+                () -> "header must be ISO-8859-1 encodable: " + contentDisposition);
     }
 
     @Test
