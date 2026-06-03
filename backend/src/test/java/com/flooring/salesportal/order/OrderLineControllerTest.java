@@ -499,6 +499,63 @@ class OrderLineControllerTest {
     }
 
     @Test
+    void addProductLine_extremeNonFiniteUnitPrice_returns400_andAddsNoLine() throws Exception {
+        // 1e309 exceeds Double.MAX_VALUE: Jackson keeps it as a numeric DoubleNode (isNumber() == true)
+        // whose textual form is "Infinity", which is not a valid BigDecimal. Must be a clean 400
+        // VALIDATION_FAILED on unit_price, never a 500. No line persisted.
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_sqm\":10,\"unit_price\":1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_price"));
+        assertNoProductLines(ORDER_HARD_EMPTY);
+    }
+
+    @Test
+    void addProductLine_extremeNegativeNonFiniteUnitPrice_returns400_andAddsNoLine() throws Exception {
+        // -1e309 → numeric DoubleNode whose textual form is "-Infinity" (not a valid BigDecimal).
+        // Same clean-400 guard from the negative side; no 500, no line persisted.
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_sqm\":10,\"unit_price\":-1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_price"));
+        assertNoProductLines(ORDER_HARD_EMPTY);
+    }
+
+    @Test
+    void addProductLine_extremeNonFiniteQuantityLm_returns400_andAddsNoLine() throws Exception {
+        // quantity_lm 1e309 → numeric DoubleNode "Infinity" → clean 400 VALIDATION_FAILED on
+        // quantity_lm, never a NumberFormatException 500. No line persisted.
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_lm\":1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quantity_lm"));
+        assertNoProductLines(ORDER_HARD_EMPTY);
+    }
+
+    @Test
+    void addProductLine_extremeNonFiniteQuantitySqm_returns400_andAddsNoLine() throws Exception {
+        // quantity_sqm 1e309 → numeric DoubleNode "Infinity" → clean 400 VALIDATION_FAILED on
+        // quantity_sqm, never a 500. No line persisted.
+        mockMvc.perform(post(productLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"product_id\":3,\"quantity_sqm\":1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quantity_sqm"));
+        assertNoProductLines(ORDER_HARD_EMPTY);
+    }
+
+    @Test
     void addProductLine_lineTotalOverflowsThoughInputsFit_returns400_andAddsNoLine() throws Exception {
         // quantity_sqm 10000 and unit_price 99999.99 each fit DECIMAL(10,2), but the product
         // line_total = round(10000 × 99999.99, 2) = 999999900.00 (9 integer digits) overflows it.
@@ -708,6 +765,36 @@ class OrderLineControllerTest {
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
                 .andExpect(jsonPath("$.error.details[0].field").value("unit_price"));
         assertMoney("45.00", queryProductLineMoney("unit_price", PRODUCT_LINE_1));
+        assertMoney("360.00", queryProductLineMoney("line_total", PRODUCT_LINE_1));
+    }
+
+    @Test
+    void updateProductLine_extremeNonFiniteUnitPrice_returns400_andLeavesLineUnchanged() throws Exception {
+        // 1e309 → numeric DoubleNode "Infinity" (not a valid BigDecimal). Clean 400 VALIDATION_FAILED
+        // on unit_price, never a NumberFormatException 500; the existing line is left unchanged.
+        mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"unit_price\":1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_price"));
+        assertMoney("45.00", queryProductLineMoney("unit_price", PRODUCT_LINE_1));
+        assertMoney("360.00", queryProductLineMoney("line_total", PRODUCT_LINE_1));
+    }
+
+    @Test
+    void updateProductLine_extremeNonFiniteQuantityLm_returns400_andLeavesLineUnchanged() throws Exception {
+        // quantity_lm -1e309 → numeric DoubleNode "-Infinity" → clean 400 VALIDATION_FAILED on
+        // quantity_lm, never a 500; the existing line is left unchanged.
+        mockMvc.perform(patch(productLineUrl(ORDER_SOFT_FULL, PRODUCT_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quantity_lm\":-1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quantity_lm"));
+        assertMoney("8.00", queryProductLineMoney("quantity_lm", PRODUCT_LINE_1));
         assertMoney("360.00", queryProductLineMoney("line_total", PRODUCT_LINE_1));
     }
 

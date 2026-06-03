@@ -564,8 +564,18 @@ public class OrderChargeLineService {
             return null;
         }
         // Parse via the textual form so a JSON decimal is captured exactly, avoiding the binary
-        // floating-point drift of JsonNode.decimalValue() on DoubleNode. Validate the SCALED value.
-        BigDecimal parsed = new BigDecimal(value.asText()).setScale(MONEY_SCALE, ROUNDING);
+        // floating-point drift of JsonNode.decimalValue() on DoubleNode. A non-finite numeric token
+        // still reports isNumber() == true on a DoubleNode (e.g. 1e309 → "Infinity", -1e309 →
+        // "-Infinity", or "NaN") but is NOT a valid BigDecimal, so guard the parse/scale and turn it
+        // into a clean 400 VALIDATION_FAILED rather than letting NumberFormatException escape as a 500.
+        // Validate the SCALED value.
+        BigDecimal parsed;
+        try {
+            parsed = new BigDecimal(value.asText()).setScale(MONEY_SCALE, ROUNDING);
+        } catch (NumberFormatException | ArithmeticException ex) {
+            errors.add(new ErrorDetail(null, field, "Must be a number greater than 0."));
+            return null;
+        }
         if (parsed.compareTo(ZERO) <= 0) {
             errors.add(new ErrorDetail(null, field, "Must be greater than 0."));
             return null;

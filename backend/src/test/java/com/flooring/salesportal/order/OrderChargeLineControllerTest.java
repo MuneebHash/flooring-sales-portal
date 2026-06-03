@@ -268,6 +268,49 @@ class OrderChargeLineControllerTest {
     }
 
     @Test
+    void addChargeLine_extremeNonFiniteUnitPrice_returns400_andDoesNotInsertLine() throws Exception {
+        // 1e309 exceeds Double.MAX_VALUE: Jackson keeps it as a numeric DoubleNode (isNumber() == true)
+        // whose textual form is "Infinity", which is not a valid BigDecimal. Must be a clean 400
+        // VALIDATION_FAILED on unit_price, never a 500. No row inserted.
+        mockMvc.perform(post(chargeLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"charge_id\":4,\"quantity\":10,\"unit_price\":1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_price"));
+        Assertions.assertEquals(0, countChargeLines(ORDER_HARD_EMPTY));
+    }
+
+    @Test
+    void addChargeLine_extremeNegativeNonFiniteUnitPrice_returns400_andDoesNotInsertLine() throws Exception {
+        // -1e309 → numeric DoubleNode whose textual form is "-Infinity" (not a valid BigDecimal).
+        // Same clean-400 guard from the negative side; no 500, no row inserted.
+        mockMvc.perform(post(chargeLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"charge_id\":4,\"quantity\":10,\"unit_price\":-1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_price"));
+        Assertions.assertEquals(0, countChargeLines(ORDER_HARD_EMPTY));
+    }
+
+    @Test
+    void addChargeLine_extremeNonFiniteQuantity_returns400_andDoesNotInsertLine() throws Exception {
+        // quantity 1e309 → numeric DoubleNode "Infinity" → clean 400 VALIDATION_FAILED on quantity,
+        // never a NumberFormatException 500. No row inserted.
+        mockMvc.perform(post(chargeLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"charge_id\":4,\"quantity\":1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quantity"));
+        Assertions.assertEquals(0, countChargeLines(ORDER_HARD_EMPTY));
+    }
+
+    @Test
     void addChargeLine_forbiddenCostSnapshot_returns400() throws Exception {
         mockMvc.perform(post(chargeLinesUrl(ORDER_HARD_EMPTY))
                         .session(liamStore1Session())
@@ -454,6 +497,36 @@ class OrderChargeLineControllerTest {
                 .andExpect(jsonPath("$.data.charge_line.quantity").value(40.0))
                 .andExpect(jsonPath("$.data.charge_line.unit_price").value(15.0))
                 .andExpect(jsonPath("$.data.charge_line.line_total").value(600.0));
+    }
+
+    @Test
+    void updateChargeLine_extremeNonFiniteUnitPrice_returns400_andLeavesLineUnchanged() throws Exception {
+        // 1e309 → numeric DoubleNode "Infinity" (not a valid BigDecimal). Clean 400 VALIDATION_FAILED
+        // on unit_price, never a NumberFormatException 500; the existing line is left unchanged.
+        mockMvc.perform(patch(chargeLineUrl(ORDER_SOFT_FULL, CHARGE_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"unit_price\":1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unit_price"));
+        assertMoney("32.00", queryChargeLineMoney("quantity", CHARGE_LINE_1));
+        assertMoney("480.00", queryChargeLineMoney("line_total", CHARGE_LINE_1));
+    }
+
+    @Test
+    void updateChargeLine_extremeNonFiniteQuantity_returns400_andLeavesLineUnchanged() throws Exception {
+        // quantity -1e309 → numeric DoubleNode "-Infinity" → clean 400 VALIDATION_FAILED on quantity,
+        // never a 500; the existing line is left unchanged.
+        mockMvc.perform(patch(chargeLineUrl(ORDER_SOFT_FULL, CHARGE_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quantity\":-1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quantity"));
+        assertMoney("32.00", queryChargeLineMoney("quantity", CHARGE_LINE_1));
+        assertMoney("480.00", queryChargeLineMoney("line_total", CHARGE_LINE_1));
     }
 
     @Test
