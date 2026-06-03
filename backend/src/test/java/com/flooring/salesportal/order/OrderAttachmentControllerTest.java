@@ -14,6 +14,7 @@ import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.junit.jupiter.SpringExtension;
+import org.springframework.test.context.transaction.TestTransaction;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
@@ -545,6 +546,8 @@ class OrderAttachmentControllerTest {
 
     @Test
     void deleteAttachment_removesBothRowsAndDiskFile() throws Exception {
+        // The disk delete is deferred to afterCommit, which only fires on a real commit. This test
+        // therefore drives an actual commit via TestTransaction so the disk-delete assertion holds.
         long attachmentId = uploadJpeg(ORDER_EMPTY, "to-delete.jpg");
         long storedFileId = storedFileIdOf(attachmentId);
         String storagePath = storagePathOf(storedFileId);
@@ -554,9 +557,56 @@ class OrderAttachmentControllerTest {
                         .session(liamStore1Session()))
                 .andExpect(status().isOk());
 
+        // Within the still-open transaction the rows are gone, but the file is deferred to afterCommit.
         Assertions.assertEquals(0, countAttachments(ORDER_EMPTY), "order_attachment row removed");
         Assertions.assertEquals(0, countStoredFile(storedFileId), "stored_file row removed");
-        Assertions.assertFalse(diskFileExists(storagePath), "disk file removed (best-effort)");
+        Assertions.assertTrue(diskFileExists(storagePath), "disk file NOT yet deleted before commit (deferred)");
+
+        // Commit so the deferred afterCommit disk-delete fires. Net DB effect is zero (upload + delete
+        // cancel out), so committing leaves the shared seed DB unchanged.
+        TestTransaction.flagForCommit();
+        TestTransaction.end();
+
+        Assertions.assertFalse(diskFileExists(storagePath), "disk file removed after commit (afterCommit hook)");
+    }
+
+    @Test
+    void deleteAttachment_rollbackAfterDelete_keepsRowAndDiskFile() throws Exception {
+        // Upload and COMMIT it so the rows + file are durable and the delete below acts on real data.
+        long attachmentId = uploadJpeg(ORDER_EMPTY, "rollback.jpg");
+        long storedFileId = storedFileIdOf(attachmentId);
+        String storagePath = storagePathOf(storedFileId);
+        TestTransaction.flagForCommit();
+        TestTransaction.end();
+        try {
+            Assertions.assertTrue(diskFileExists(storagePath), "file exists after the committed upload");
+
+            // New transaction: request the delete, then ROLL BACK — simulating a post-delete rollback
+            // (delete requested, commit never happens).
+            TestTransaction.start();
+            mockMvc.perform(delete(attachmentUrl(ORDER_EMPTY, attachmentId))
+                            .session(liamStore1Session()))
+                    .andExpect(status().isOk());
+            TestTransaction.flagForRollback();
+            TestTransaction.end();
+
+            // Rollback restored the DB rows, and the deferred afterCommit disk-delete never fired, so
+            // the database does NOT end up pointing at a missing file.
+            Assertions.assertEquals(1, countAttachments(ORDER_EMPTY), "rolled-back delete restores the attachment row");
+            Assertions.assertEquals(1, countStoredFile(storedFileId), "rolled-back delete restores the stored_file row");
+            Assertions.assertTrue(diskFileExists(storagePath), "disk file NOT deleted when the delete transaction rolls back");
+        } finally {
+            // The upload was committed; remove the rows + file so the shared seed DB is left clean
+            // (other tests in this class rely on the seeded state).
+            jdbcTemplate.update("DELETE FROM order_attachment WHERE order_attachment_id = ?", attachmentId);
+            jdbcTemplate.update("DELETE FROM stored_file WHERE stored_file_id = ?", storedFileId);
+            try {
+                Files.deleteIfExists(tempStorageDir.resolve(
+                        storagePath.startsWith("/") ? storagePath.substring(1) : storagePath));
+            } catch (Exception ignore) {
+                // best-effort temp cleanup; @TempDir removes the whole dir after the class anyway.
+            }
+        }
     }
 
     @Test

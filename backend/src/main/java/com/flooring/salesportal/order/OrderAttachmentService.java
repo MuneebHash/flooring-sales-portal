@@ -19,6 +19,8 @@ import com.flooring.salesportal.order.dto.AttachmentUploadResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.web.multipart.MultipartFile;
 import org.springframework.web.multipart.MultipartHttpServletRequest;
 
@@ -209,13 +211,38 @@ public class OrderAttachmentService {
         AttachmentRow row = attachmentReadRepository.findByAttachmentIdAndOrderId(attachmentId, orderId)
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ATTACHMENT_NOT_FOUND, "Attachment not found."));
 
-        // order_attachment first (FK references stored_file), then the 1-to-1 stored_file row, then the
-        // disk file (best-effort — must not roll back the committed DB deletes). No financial change.
+        // order_attachment first (FK references stored_file), then the 1-to-1 stored_file row. The disk
+        // file is deleted ONLY AFTER this transaction commits (see deleteFileAfterCommit): deleting it
+        // inline would orphan the DB if the transaction later rolled back (rows return, file gone). No
+        // financial change.
         attachmentWriteRepository.deleteOrderAttachment(attachmentId, orderId);
         attachmentWriteRepository.deleteStoredFile(row.storedFileId());
-        fileStorageService.deleteQuietly(row.storagePath());
+        deleteFileAfterCommit(row.storagePath());
 
         return ApiResponse.ok(new AttachmentDeleteResponse(attachmentId), "Attachment removed.");
+    }
+
+    /**
+     * Defer the best-effort disk delete to AFTER the surrounding DB transaction commits. If the
+     * transaction rolls back, the {@code order_attachment} + {@code stored_file} rows are restored, so
+     * the file MUST survive — deleting it inline would leave the DB pointing at a missing file. The
+     * delete is therefore registered as an {@code afterCommit} synchronization callback.
+     *
+     * <p>Fallback: if no transaction synchronization is active (e.g. this method is ever invoked
+     * outside a transaction), there is no commit boundary to wait for, so delete immediately.
+     * {@link FileStorageService#deleteQuietly} is best-effort and never throws in either path.
+     */
+    private void deleteFileAfterCommit(String storagePath) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    fileStorageService.deleteQuietly(storagePath);
+                }
+            });
+        } else {
+            fileStorageService.deleteQuietly(storagePath);
+        }
     }
 
     // ------------------------------------------------------------------
