@@ -86,6 +86,11 @@ public class OrderChargeLineService {
     // Every "*_snapshot" column is backend-owned and must be rejected if a client sends it, including
     // the product-only pricing_unit_snapshot / sqm_per_lm_snapshot (conventions §10, Chunk 3 F.10).
     private static final String SNAPSHOT_SUFFIX = "_snapshot";
+    // The ONLY request-body keys a client may send. Anything else (unknown / misspelled / backend-
+    // controlled) is rejected — OpenAPI ChargeLineCreateRequest / ChargeLinePatchRequest both declare
+    // additionalProperties: false.
+    private static final Set<String> POST_ALLOWED_FIELDS = Set.of("charge_id", "quantity", "unit_price");
+    private static final Set<String> PATCH_ALLOWED_FIELDS = Set.of("quantity", "unit_price");
 
     private final RequestContextGuard requestContextGuard;
     private final SalesOrderRepository salesOrderRepository;
@@ -135,7 +140,7 @@ public class OrderChargeLineService {
 
         // Body validation (400) — collected so details[0] is the first offending field.
         List<ErrorDetail> errors = new ArrayList<>();
-        rejectForbiddenFields(node, FORBIDDEN_BASE, errors);
+        rejectDisallowedFields(node, FORBIDDEN_BASE, POST_ALLOWED_FIELDS, errors);
         Long chargeId = readRequiredPositiveLong(node, "charge_id", errors);
         BigDecimal suppliedQuantity = readRequiredPositiveDecimal(node, "quantity", errors);
         BigDecimal suppliedUnitPrice = readOptionalPositiveDecimal(node, "unit_price", errors);
@@ -207,7 +212,7 @@ public class OrderChargeLineService {
         JsonNode node = parseBodyAfterGates(body);
 
         List<ErrorDetail> errors = new ArrayList<>();
-        rejectForbiddenFields(node, FORBIDDEN_PATCH, errors);
+        rejectDisallowedFields(node, FORBIDDEN_PATCH, PATCH_ALLOWED_FIELDS, errors);
         boolean hasQuantity = presentNonNull(node, "quantity");
         boolean hasUnitPrice = presentNonNull(node, "unit_price");
         BigDecimal suppliedQuantity = readOptionalPositiveDecimal(node, "quantity", errors);
@@ -485,19 +490,21 @@ public class OrderChargeLineService {
         }
     }
 
-    private static void rejectForbiddenFields(JsonNode node, Set<String> forbidden, List<ErrorDetail> errors) {
+    private static void rejectDisallowedFields(JsonNode node, Set<String> forbidden, Set<String> allowed,
+                                               List<ErrorDetail> errors) {
         if (node == null || !node.isObject()) {
             return;
         }
-        // Scan ONLY the JSON request body keys (never path variables). Reject any explicit
-        // backend-controlled field plus ANY key ending in "_snapshot" — every snapshot column is
-        // backend-owned (charge_code/name/price/cost_snapshot and the product-only
-        // pricing_unit_snapshot / sqm_per_lm_snapshot), and no legitimate input field
-        // (charge_id, quantity, unit_price) ends in "_snapshot", so a blanket suffix reject is safe.
+        // Scan ONLY the JSON request body keys (never path variables). A key is rejected when it is an
+        // explicit backend-controlled field, ends in "_snapshot" (every snapshot column is backend-
+        // owned, incl. the product-only pricing_unit_snapshot / sqm_per_lm_snapshot), OR is simply not
+        // in the allowed set (OpenAPI additionalProperties: false — unknown/misspelled keys are 400).
+        // One "Not allowed." detail per offending key, so a key that is both unknown and forbidden is
+        // reported once.
         Iterator<String> names = node.fieldNames();
         while (names.hasNext()) {
             String name = names.next();
-            if (forbidden.contains(name) || name.endsWith(SNAPSHOT_SUFFIX)) {
+            if (forbidden.contains(name) || name.endsWith(SNAPSHOT_SUFFIX) || !allowed.contains(name)) {
                 errors.add(new ErrorDetail(null, name, "Not allowed."));
             }
         }

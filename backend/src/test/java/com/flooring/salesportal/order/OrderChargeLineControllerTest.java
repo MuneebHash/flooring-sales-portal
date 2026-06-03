@@ -313,6 +313,19 @@ class OrderChargeLineControllerTest {
     }
 
     @Test
+    void addChargeLine_unknownField_returns400_andDoesNotInsertLine() throws Exception {
+        // Unknown body key (OpenAPI additionalProperties: false) → 400, no row inserted.
+        mockMvc.perform(post(chargeLinesUrl(ORDER_HARD_EMPTY))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"charge_id\":4,\"quantity\":10,\"foo\":1}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("foo"));
+        Assertions.assertEquals(0, countChargeLines(ORDER_HARD_EMPTY));
+    }
+
+    @Test
     void addChargeLine_inactiveCharge_returns422() throws Exception {
         jdbcTemplate.update("UPDATE store_charge SET is_active = FALSE WHERE charge_id = ?", CHARGE_UNDR_S);
         mockMvc.perform(post(chargeLinesUrl(ORDER_SOFT_FULL))
@@ -500,6 +513,20 @@ class OrderChargeLineControllerTest {
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
                 .andExpect(jsonPath("$.error.details[0].field").value("sqm_per_lm_snapshot"));
         assertMoney("32.00", queryChargeLineMoney("quantity", CHARGE_LINE_1));
+    }
+
+    @Test
+    void updateChargeLine_unknownField_returns400_andLeavesLineUnchanged() throws Exception {
+        // Unknown body key (OpenAPI additionalProperties: false) → 400, line unchanged.
+        mockMvc.perform(patch(chargeLineUrl(ORDER_SOFT_FULL, CHARGE_LINE_1))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quantity\":40,\"foo\":1}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("foo"));
+        assertMoney("32.00", queryChargeLineMoney("quantity", CHARGE_LINE_1));
+        assertMoney("480.00", queryChargeLineMoney("line_total", CHARGE_LINE_1));
     }
 
     @Test
