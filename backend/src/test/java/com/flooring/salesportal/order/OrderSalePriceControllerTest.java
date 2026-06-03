@@ -410,6 +410,39 @@ class OrderSalePriceControllerTest {
     }
 
     @Test
+    void overrideSalePrice_extremeNonFiniteNumber_returns400Validation() throws Exception {
+        // 1e309 exceeds Double.MAX_VALUE: Jackson keeps it as a numeric DoubleNode (isNumber() == true)
+        // whose textual form is "Infinity", which is not a valid BigDecimal. Must be a clean 400
+        // VALIDATION_FAILED, never a 500. No adjustment persisted.
+        mockMvc.perform(put(salePriceUrl(ORDER_SOFT_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"final_sale_price_inc_gst\":1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("final_sale_price_inc_gst"));
+
+        Assertions.assertNull(queryMoney("price_adjustment_inc_gst", ORDER_SOFT_FULL),
+                "a non-finite override must not persist an adjustment");
+    }
+
+    @Test
+    void overrideSalePrice_extremeNegativeNonFiniteNumber_returns400Validation() throws Exception {
+        // -1e309 → numeric DoubleNode whose textual form is "-Infinity" (not a valid BigDecimal).
+        // Same clean-400 guard from the negative side; no 500, no adjustment persisted.
+        mockMvc.perform(put(salePriceUrl(ORDER_SOFT_FULL))
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"final_sale_price_inc_gst\":-1e309}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("final_sale_price_inc_gst"));
+
+        Assertions.assertNull(queryMoney("price_adjustment_inc_gst", ORDER_SOFT_FULL),
+                "a non-finite override must not persist an adjustment");
+    }
+
+    @Test
     void overrideSalePrice_storedAdjustment_reappliedAfterLaterChargeLineMutation() throws Exception {
         // Proves §12 reapply: a stored adjustment is reapplied on a subsequent line mutation. The
         // adjustment is seeded via SQL (not a chained API override) so the first JPA load in this single
