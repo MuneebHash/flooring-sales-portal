@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { AppHeader } from './AppHeader'
 import { ArrowLeftIcon } from './icons'
@@ -29,6 +29,8 @@ import type {
   OrderCustomer,
   OrderWorkspace as OrderWorkspaceData,
 } from '../lib/api/orderWorkspaceApi'
+import { fetchOrderLines } from '../lib/api/orderLinesApi'
+import type { OrderFinancialSummary } from '../lib/api/orderLinesApi'
 
 const TAB_IDS = [
   'customer',
@@ -51,6 +53,11 @@ const TAB_LABELS: Record<TabId, string> = {
 }
 
 const TABS = TAB_IDS.map((id) => ({ id, label: TAB_LABELS[id] }))
+
+const SALE_TOTAL_FORMATTER = new Intl.NumberFormat('en-AU', {
+  style: 'currency',
+  currency: 'AUD',
+})
 
 type ShellProps = {
   orderId: number
@@ -88,6 +95,48 @@ function WorkspaceShell({
   onDetailsSaved,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
+  // Live order financial summary that backs the always-visible header Sale total.
+  // Sourced from the Chunk 3 order_financial_summary, never from the nullable
+  // persisted_financials. Kept fresh by Products & Charges mutations via
+  // applyFinancialSummary (onFinancialSummary), and seeded independently below so
+  // the header is correct even before that tab is opened.
+  const [financialSummary, setFinancialSummary] =
+    useState<OrderFinancialSummary | null>(null)
+
+  // Monotonic version shared by every summary update (seed fetch + lifted
+  // mutations). Each apply bumps it; the seed fetch captures it before its
+  // request and discards its response if anything updated the summary meanwhile,
+  // so an in-flight seed can never clobber a newer mutation result.
+  const summaryVersionRef = useRef(0)
+  const applyFinancialSummary = useCallback((summary: OrderFinancialSummary) => {
+    summaryVersionRef.current += 1
+    setFinancialSummary(summary)
+  }, [])
+
+  // Seed the header summary without waiting for the Products & Charges tab to be
+  // mounted (it only mounts when its tab is active). The header is non-critical,
+  // so a failed fetch is swallowed and the placeholder remains. ProductsChargesTab
+  // still fetches its own lines when opened and keeps this summary fresh on every
+  // mutation through the same applyFinancialSummary callback.
+  useEffect(() => {
+    let cancelled = false
+    setFinancialSummary(null)
+    const seedVersion = summaryVersionRef.current
+    fetchOrderLines(orderId)
+      .then((res) => {
+        if (cancelled) return
+        // Drop a stale seed: if any apply (e.g. a mutation lift) bumped the
+        // version since this request began, it already set a newer summary.
+        if (summaryVersionRef.current !== seedVersion) return
+        applyFinancialSummary(res.data.order_financial_summary)
+      })
+      .catch(() => {
+        // Header summary is best-effort; keep the placeholder on failure.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId, applyFinancialSummary])
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -127,15 +176,31 @@ function WorkspaceShell({
               <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
                 Sale total
               </div>
-              {/* Sale total is produced by the backend financial summary in
-                  Chunk 3. Phase 10E.1 wires no financial logic, so show a
-                  non-financial placeholder rather than a money value. */}
-              <div className="text-2xl font-bold tabular-nums text-slate-400 mt-0.5">
-                —
-              </div>
-              <div className="mt-0.5 text-[11px] text-slate-500">
-                Not priced yet
-              </div>
+              {/* Sale total comes from the Chunk 3 order_financial_summary,
+                  lifted from the Products & Charges tab once its lines load.
+                  Until a summary is available, show a non-financial placeholder
+                  rather than a stale/zero money value. */}
+              {financialSummary ? (
+                <>
+                  <div className="text-2xl font-bold tabular-nums text-slate-900 mt-0.5">
+                    {SALE_TOTAL_FORMATTER.format(
+                      financialSummary.final_sale_price_inc_gst,
+                    )}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-slate-500">
+                    Inc GST
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="text-2xl font-bold tabular-nums text-slate-400 mt-0.5">
+                    —
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-slate-500">
+                    Not priced yet
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </Panel>
@@ -154,7 +219,12 @@ function WorkspaceShell({
               />
             )}
             {activeTab === 'products' && (
-              <ProductsChargesTab flooringType={flooringType} />
+              <ProductsChargesTab
+                orderId={orderId}
+                flooringType={flooringType}
+                locked={locked}
+                onFinancialSummary={applyFinancialSummary}
+              />
             )}
             {activeTab === 'details' && (
               <DetailsOfSaleTab

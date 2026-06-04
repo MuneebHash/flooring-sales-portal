@@ -14,3 +14,32 @@ export type {
   RequestOptions,
 } from './client'
 export { apiPath } from './paths'
+export {
+  fetchAvailableProducts,
+  fetchAvailableCharges,
+  fetchOrderLines,
+  addProductLine,
+  updateProductLine,
+  deleteProductLine,
+  addChargeLine,
+  updateChargeLine,
+  deleteChargeLine,
+} from './orderLinesApi'
+export type {
+  PricingUnit,
+  AvailableProduct,
+  AvailableCharge,
+  ProductLineRead,
+  ChargeLineRead,
+  OrderFinancialSummary,
+  OrderLinesResponse,
+  AddProductLineRequest,
+  PatchProductLineRequest,
+  ProductLineMutationResponse,
+  ProductLineDeleteResponse,
+  AddChargeLineRequest,
+  PatchChargeLineRequest,
+  ChargeLineMutationResponse,
+  ChargeLineDeleteResponse,
+  CatalogSearchQuery,
+} from './orderLinesApi'
