@@ -24,6 +24,8 @@ export {
   addChargeLine,
   updateChargeLine,
   deleteChargeLine,
+  overrideSalePrice,
+  resetSalePrice,
 } from './orderLinesApi'
 export type {
   PricingUnit,
@@ -42,4 +44,6 @@ export type {
   ChargeLineMutationResponse,
   ChargeLineDeleteResponse,
   CatalogSearchQuery,
+  SalePriceOverrideRequest,
+  SalePriceMutationResponse,
 } from './orderLinesApi'

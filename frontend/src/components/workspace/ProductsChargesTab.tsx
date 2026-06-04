@@ -32,9 +32,18 @@ type Props = {
   // Locked is true when the order is LAID. It disables all product/charge
   // mutations while still allowing the lines to be read/displayed.
   locked: boolean
-  // Lifts the backend-confirmed order_financial_summary up to OrderWorkspace so
-  // the workspace header Sale total stays in sync without a refetch.
-  onFinancialSummary: (summary: OrderFinancialSummary) => void
+  // Financial-summary recency from OrderWorkspace, split into reads vs mutations.
+  // The initial/tab GET /lines is a READ: claim a version at issue time
+  // (beginFinancialSummaryRead) and apply via applyReadFinancialSummary, which the
+  // parent discards if a mutation applied meanwhile. Product/charge add/edit/delete
+  // are MUTATIONS: applyMutationFinancialSummary always applies and bumps the
+  // version, so a later read can never discard a mutation response.
+  beginFinancialSummaryRead: () => number
+  applyReadFinancialSummary: (
+    readVersion: number,
+    summary: OrderFinancialSummary,
+  ) => boolean
+  applyMutationFinancialSummary: (summary: OrderFinancialSummary) => void
 }
 
 // Editable string mirror of a product line's three editable fields. quantity_sqm
@@ -152,7 +161,9 @@ export function ProductsChargesTab({
   orderId,
   flooringType,
   locked,
-  onFinancialSummary,
+  beginFinancialSummaryRead,
+  applyReadFinancialSummary,
+  applyMutationFinancialSummary,
 }: Props) {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -222,26 +233,47 @@ export function ProductsChargesTab({
     }
   }, [])
 
-  // Keep the lift callback in a ref so the load effect never resubscribes on it.
-  const onSummaryRef = useRef(onFinancialSummary)
+  // Keep the parent guard callbacks in refs so the load effect never resubscribes
+  // on them.
+  const beginReadRef = useRef(beginFinancialSummaryRead)
+  const applyReadRef = useRef(applyReadFinancialSummary)
+  const applyMutationRef = useRef(applyMutationFinancialSummary)
   useEffect(() => {
-    onSummaryRef.current = onFinancialSummary
-  }, [onFinancialSummary])
+    beginReadRef.current = beginFinancialSummaryRead
+    applyReadRef.current = applyReadFinancialSummary
+    applyMutationRef.current = applyMutationFinancialSummary
+  }, [
+    beginFinancialSummaryRead,
+    applyReadFinancialSummary,
+    applyMutationFinancialSummary,
+  ])
 
-  // Monotonic sequence for summary-bearing operations (load + every mutation).
-  // Guards against an out-of-order response overwriting a newer summary.
+  // Per-tab monotonic sequence for the LOCAL summary mirror only (B7). Guards the
+  // child-local subtotal mirror against an out-of-order response. The workspace
+  // header uses the parent's read-vs-mutation recency guard.
   const reqSeqRef = useRef(0)
   const appliedSummarySeqRef = useRef(0)
-  function applySummary(seq: number, next: OrderFinancialSummary) {
-    if (seq < appliedSummarySeqRef.current) return
-    appliedSummarySeqRef.current = seq
-    // Always lift to the workspace header — even if this tab has since unmounted.
-    // The backend already persisted the change, and the parent (workspace shell)
-    // is still mounted, so dropping this would leave the Sale total stale.
-    onSummaryRef.current(next)
-    // The child-local mirror only updates while mounted, to avoid a
-    // setState-on-unmounted warning.
+  // Child-local subtotal mirror only (mounted-guarded, per-tab seq).
+  function applyLocalMirror(localSeq: number, next: OrderFinancialSummary) {
+    if (localSeq < appliedSummarySeqRef.current) return
+    appliedSummarySeqRef.current = localSeq
     if (mountedRef.current) setSummary(next)
+  }
+  // Mutation response (add/edit/delete): ALWAYS applies to the workspace header —
+  // a later read can never discard it. Runs even if this tab has since unmounted.
+  function applyMutationSummary(localSeq: number, next: OrderFinancialSummary) {
+    applyMutationRef.current(next)
+    applyLocalMirror(localSeq, next)
+  }
+  // Read response (load): applies to the header only if no mutation has applied
+  // since the read began (the parent discards it otherwise).
+  function applyReadSummary(
+    localSeq: number,
+    readVersion: number,
+    next: OrderFinancialSummary,
+  ) {
+    applyReadRef.current(readVersion, next)
+    applyLocalMirror(localSeq, next)
   }
 
   // Stale-search guards: only the latest issued search applies its results.
@@ -256,6 +288,7 @@ export function ProductsChargesTab({
     setLoadError(null)
     setMutationError(null)
     const seq = ++reqSeqRef.current
+    const readVersion = beginReadRef.current()
     fetchOrderLines(orderId)
       .then((res) => {
         if (cancelled) return
@@ -264,7 +297,7 @@ export function ProductsChargesTab({
         setChargeLines(data.charge_lines)
         setProductDrafts(buildProductDrafts(data.product_lines))
         setChargeDrafts(buildChargeDrafts(data.charge_lines))
-        applySummary(seq, data.order_financial_summary)
+        applyReadSummary(seq, readVersion, data.order_financial_summary)
       })
       .catch((err: unknown) => {
         if (cancelled) return
@@ -438,7 +471,7 @@ export function ProductsChargesTab({
       )
       const updated = res.data.product_line
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applyMutationSummary(seq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setProductLines((prev) =>
         prev.map((l) =>
@@ -477,7 +510,7 @@ export function ProductsChargesTab({
       const res = await deleteProductLine(orderId, line.order_product_line_id)
       const removedId = res.data.deleted_product_line_id
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applyMutationSummary(seq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setProductLines((prev) =>
         prev.filter((l) => l.order_product_line_id !== removedId),
@@ -556,7 +589,7 @@ export function ProductsChargesTab({
       )
       const updated = res.data.charge_line
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applyMutationSummary(seq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setChargeLines((prev) =>
         prev.map((l) =>
@@ -592,7 +625,7 @@ export function ProductsChargesTab({
       const res = await deleteChargeLine(orderId, line.order_charge_line_id)
       const removedId = res.data.deleted_charge_line_id
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applyMutationSummary(seq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setChargeLines((prev) =>
         prev.filter((l) => l.order_charge_line_id !== removedId),
@@ -713,7 +746,7 @@ export function ProductsChargesTab({
       const res = await addProductLine(orderId, body)
       const line = res.data.product_line
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applyMutationSummary(seq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setProductLines((prev) => [...prev, line])
       setProductDrafts((prev) => ({
@@ -792,7 +825,7 @@ export function ProductsChargesTab({
       const res = await addChargeLine(orderId, body)
       const line = res.data.charge_line
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applyMutationSummary(seq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setChargeLines((prev) => [...prev, line])
       setChargeDrafts((prev) => ({
@@ -1687,33 +1720,6 @@ export function ProductsChargesTab({
             </div>
           )}
         </section>
-
-        {summary && (
-          <div className="flex justify-end">
-            <dl className="w-full sm:w-72 rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1.5 text-sm">
-              <div className="flex items-center justify-between">
-                <dt className="text-slate-500">Product subtotal</dt>
-                <dd className="font-medium tabular-nums text-slate-900">
-                  {formatMoney(summary.product_subtotal)}
-                </dd>
-              </div>
-              <div className="flex items-center justify-between">
-                <dt className="text-slate-500">Charge subtotal</dt>
-                <dd className="font-medium tabular-nums text-slate-900">
-                  {formatMoney(summary.charge_subtotal)}
-                </dd>
-              </div>
-              <div className="flex items-center justify-between border-t border-slate-200 pt-1.5">
-                <dt className="font-semibold text-slate-700">
-                  Calculated total (inc GST)
-                </dt>
-                <dd className="font-bold tabular-nums text-slate-900">
-                  {formatMoney(summary.calculated_total_inc_gst)}
-                </dd>
-              </div>
-            </dl>
-          </div>
-        )}
       </div>
     </div>
   )

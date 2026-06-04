@@ -6,7 +6,11 @@ import { Button } from './ui/Button'
 import { Panel } from './ui/Panel'
 import { Tabs } from './ui/Tabs'
 import { CustomerTab, type CustomerSavedPayload } from './workspace/CustomerTab'
-import { DetailsOfSaleTab } from './workspace/DetailsOfSaleTab'
+import {
+  DetailsOfSaleTab,
+  buildDetailsBody,
+  formFromProps,
+} from './workspace/DetailsOfSaleTab'
 import { InvoiceTab } from './workspace/InvoiceTab'
 import { NotesPhotosTab } from './workspace/NotesPhotosTab'
 import { PaymentsTab } from './workspace/PaymentsTab'
@@ -22,15 +26,24 @@ import {
   type OrderStatus,
 } from '../lib/statuses'
 import { ApiError } from '../lib/api/ApiError'
-import { fetchOrderWorkspace } from '../lib/api/orderWorkspaceApi'
+import { fetchOrderWorkspace, saveDetailsOfSale } from '../lib/api/orderWorkspaceApi'
 import type {
   DetailsOfSaleFields,
+  DetailsOfSaleSaveRequest,
   OrderAddress,
   OrderCustomer,
   OrderWorkspace as OrderWorkspaceData,
 } from '../lib/api/orderWorkspaceApi'
 import { fetchOrderLines } from '../lib/api/orderLinesApi'
 import type { OrderFinancialSummary } from '../lib/api/orderLinesApi'
+
+// Friendly message for a failed details autosave. The autosave single-flight
+// lock/loop lives in the always-mounted WorkspaceShell (below) so it survives the
+// Details tab unmounting on a tab switch.
+function detailsAutosaveErrorMessage(err: unknown): string {
+  if (err instanceof ApiError && err.message.length > 0) return err.message
+  return 'Could not save details. Please try again.'
+}
 
 const TAB_IDS = [
   'customer',
@@ -97,38 +110,167 @@ function WorkspaceShell({
   const [activeTab, setActiveTab] = useState<TabId>('customer')
   // Live order financial summary that backs the always-visible header Sale total.
   // Sourced from the Chunk 3 order_financial_summary, never from the nullable
-  // persisted_financials. Kept fresh by Products & Charges mutations via
-  // applyFinancialSummary (onFinancialSummary), and seeded independently below so
-  // the header is correct even before that tab is opened.
+  // persisted_financials.
   const [financialSummary, setFinancialSummary] =
     useState<OrderFinancialSummary | null>(null)
 
-  // Monotonic version shared by every summary update (seed fetch + lifted
-  // mutations). Each apply bumps it; the seed fetch captures it before its
-  // request and discards its response if anything updated the summary meanwhile,
-  // so an in-flight seed can never clobber a newer mutation result.
-  const summaryVersionRef = useRef(0)
-  const applyFinancialSummary = useCallback((summary: OrderFinancialSummary) => {
-    summaryVersionRef.current += 1
-    setFinancialSummary(summary)
+  // Read-vs-mutation recency for order_financial_summary applies. KEY RULE: a
+  // read-only GET /lines must never make a mutation summary stale. A MUTATION
+  // response (sale-price override/reset, product/charge add/edit/delete) is the
+  // newest persisted state, so it ALWAYS applies and bumps the mutation version.
+  // A READ (seed / ProductsChargesTab load) captures the mutation version at issue
+  // time and applies only if no mutation has applied since — so a later read can
+  // neither overwrite a mutation nor cause an in-flight mutation response to be
+  // discarded. (True cross-surface mutation commit-ordering needs backend summary
+  // versioning and is intentionally out of scope here.) The ref survives tab
+  // remounts because this shell stays mounted across tab switches.
+  const financialSummaryMutationVersionRef = useRef(0)
+  const applyMutationFinancialSummary = useCallback(
+    (summary: OrderFinancialSummary) => {
+      financialSummaryMutationVersionRef.current += 1
+      setFinancialSummary(summary)
+    },
+    [],
+  )
+  const beginFinancialSummaryRead = useCallback(
+    () => financialSummaryMutationVersionRef.current,
+    [],
+  )
+  const applyReadFinancialSummary = useCallback(
+    (readVersion: number, summary: OrderFinancialSummary) => {
+      // Discard the read if any mutation applied after this read began.
+      if (readVersion !== financialSummaryMutationVersionRef.current) return false
+      setFinancialSummary(summary)
+      return true
+    },
+    [],
+  )
+
+  // Sale-price override/reset IN-FLIGHT serialization — SEPARATE from the recency
+  // guard above. It lives here (the always-mounted shell) so it survives
+  // DetailsOfSaleTab unmount/remount and prevents a second override/reset while
+  // one is still in flight. Recency = "is this the newest summary across all
+  // sources"; in-flight = "can the user fire another sale-price action / are the
+  // controls disabled". Both are wired; neither replaces the other.
+  const [salePriceMutationInFlight, setSalePriceMutationInFlight] =
+    useState(false)
+  const beginSalePriceMutation = useCallback(() => {
+    setSalePriceMutationInFlight(true)
   }, [])
+  const finishSalePriceMutation = useCallback(() => {
+    setSalePriceMutationInFlight(false)
+  }, [])
+
+  // --- Details-of-sale autosave single-flight (Codex P1). ---
+  // The lock + queue + last-persisted key live HERE in the always-mounted shell
+  // (DetailsOfSaleTab unmounts on tab switch), so switching away and back can never
+  // start a second concurrent saveDetailsOfSale PUT. Only one PUT is ever in
+  // flight; concurrent autosaves collapse to the latest body and drain afterwards.
+  // PER-ORDER: WorkspaceShell is keyed by orderId (see render), so all of this is
+  // recreated fresh on every order switch and lastSavedDetailsRef is initialised
+  // from THIS order's persisted details — nothing bleeds across orders.
+  // Details-of-sale DRAFT form state is hoisted HERE so the latest unsaved/in-flight
+  // draft survives DetailsOfSaleTab unmount/remount (the tab is a controlled view
+  // over it). The initialiser runs once per WorkspaceShell instance, and the shell
+  // is keyed by orderId, so the draft seeds from THIS order's saved details and
+  // resets per order. It is intentionally NOT re-synced from saleDetails after mount,
+  // so a save that settles later (lifting onDetailsSaved → saleDetails) cannot clobber
+  // newer local edits the user has made in the meantime.
+  const [detailsDraft, setDetailsDraft] = useState(() =>
+    formFromProps(saleDetails),
+  )
+  const detailsSavingRef = useRef(false)
+  const pendingDetailsBodyRef = useRef<DetailsOfSaleSaveRequest | null>(null)
+  const lastSavedDetailsRef = useRef<string>(
+    JSON.stringify(buildDetailsBody(formFromProps(saleDetails))),
+  )
+  const [detailsAutosaveSaving, setDetailsAutosaveSaving] = useState(false)
+  const [detailsAutosaveSaved, setDetailsAutosaveSaved] = useState(false)
+  const [detailsAutosaveError, setDetailsAutosaveError] = useState<string | null>(
+    null,
+  )
+
+  // Tracks whether the SHELL (not the tab) is still mounted, so a save that settles
+  // after an order switch does not lift stale fields into a different order's
+  // workspace. The PUT itself still completes (the edit is persisted); only the
+  // lift + status setState are skipped. A tab switch keeps the shell mounted, so
+  // the lift still happens — which is the whole point of hoisting the lock here.
+  const detailsShellMountedRef = useRef(true)
+  useEffect(() => {
+    detailsShellMountedRef.current = true
+    return () => {
+      detailsShellMountedRef.current = false
+    }
+  }, [])
+
+  // Single-flight save loop (mirrors the sale-price drain). Sends exactly one PUT;
+  // on settle, drains the latest queued body only if it differs from what is now
+  // persisted. lastSavedDetailsRef is set ONLY after a successful response.
+  async function runDetailsSave(body: DetailsOfSaleSaveRequest) {
+    detailsSavingRef.current = true
+    if (detailsShellMountedRef.current) {
+      setDetailsAutosaveSaving(true)
+      setDetailsAutosaveSaved(false)
+      setDetailsAutosaveError(null)
+    }
+    try {
+      const res = await saveDetailsOfSale(orderId, body)
+      // Mark persisted ONLY after a successful backend response.
+      lastSavedDetailsRef.current = JSON.stringify(body)
+      if (detailsShellMountedRef.current) {
+        onDetailsSaved({
+          fields: res.data.details_of_sale_fields,
+          updated_at: res.data.updated_at,
+        })
+        setDetailsAutosaveSaved(true)
+      }
+    } catch (err) {
+      // Do NOT mark this body persisted on failure.
+      if (detailsShellMountedRef.current) {
+        setDetailsAutosaveError(detailsAutosaveErrorMessage(err))
+      }
+    } finally {
+      detailsSavingRef.current = false
+      const pending = pendingDetailsBodyRef.current
+      pendingDetailsBodyRef.current = null
+      if (
+        pending !== null &&
+        JSON.stringify(pending) !== lastSavedDetailsRef.current
+      ) {
+        void runDetailsSave(pending)
+      } else if (detailsShellMountedRef.current) {
+        setDetailsAutosaveSaving(false)
+      }
+    }
+  }
+
+  // Parent-level autosave entry point passed to DetailsOfSaleTab. The tab still
+  // validates and builds the full body; this owns the single-flight lock/queue so
+  // it survives the tab's unmount/remount.
+  function queueDetailsAutosave(body: DetailsOfSaleSaveRequest) {
+    if (detailsSavingRef.current) {
+      // A save is in flight — queue ONLY the latest body (collapse to latest).
+      pendingDetailsBodyRef.current = body
+      return
+    }
+    // Nothing changed since the last persisted save — skip the network call.
+    if (JSON.stringify(body) === lastSavedDetailsRef.current) return
+    void runDetailsSave(body)
+  }
 
   // Seed the header summary without waiting for the Products & Charges tab to be
   // mounted (it only mounts when its tab is active). The header is non-critical,
-  // so a failed fetch is swallowed and the placeholder remains. ProductsChargesTab
-  // still fetches its own lines when opened and keeps this summary fresh on every
-  // mutation through the same applyFinancialSummary callback.
+  // so a failed fetch is swallowed and the placeholder remains. The seed is a READ:
+  // it captures the mutation version at issue time and is discarded if a mutation
+  // applied meanwhile, so a slow seed can never clobber a newer mutation summary.
   useEffect(() => {
     let cancelled = false
     setFinancialSummary(null)
-    const seedVersion = summaryVersionRef.current
+    const readVersion = beginFinancialSummaryRead()
     fetchOrderLines(orderId)
       .then((res) => {
         if (cancelled) return
-        // Drop a stale seed: if any apply (e.g. a mutation lift) bumped the
-        // version since this request began, it already set a newer summary.
-        if (summaryVersionRef.current !== seedVersion) return
-        applyFinancialSummary(res.data.order_financial_summary)
+        applyReadFinancialSummary(readVersion, res.data.order_financial_summary)
       })
       .catch(() => {
         // Header summary is best-effort; keep the placeholder on failure.
@@ -136,7 +278,7 @@ function WorkspaceShell({
     return () => {
       cancelled = true
     }
-  }, [orderId, applyFinancialSummary])
+  }, [orderId, beginFinancialSummaryRead, applyReadFinancialSummary])
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -223,15 +365,26 @@ function WorkspaceShell({
                 orderId={orderId}
                 flooringType={flooringType}
                 locked={locked}
-                onFinancialSummary={applyFinancialSummary}
+                beginFinancialSummaryRead={beginFinancialSummaryRead}
+                applyReadFinancialSummary={applyReadFinancialSummary}
+                applyMutationFinancialSummary={applyMutationFinancialSummary}
               />
             )}
             {activeTab === 'details' && (
               <DetailsOfSaleTab
                 orderId={orderId}
                 locked={locked}
-                saleDetails={saleDetails}
-                onSaved={onDetailsSaved}
+                detailsDraft={detailsDraft}
+                setDetailsDraft={setDetailsDraft}
+                financialSummary={financialSummary}
+                salePriceMutationInFlight={salePriceMutationInFlight}
+                beginSalePriceMutation={beginSalePriceMutation}
+                finishSalePriceMutation={finishSalePriceMutation}
+                applyMutationFinancialSummary={applyMutationFinancialSummary}
+                queueDetailsAutosave={queueDetailsAutosave}
+                detailsAutosaveSaving={detailsAutosaveSaving}
+                detailsAutosaveSaved={detailsAutosaveSaved}
+                detailsAutosaveError={detailsAutosaveError}
               />
             )}
             {activeTab === 'notes' && <NotesPhotosTab />}
