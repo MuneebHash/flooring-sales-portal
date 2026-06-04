@@ -29,6 +29,7 @@ import type {
   OrderCustomer,
   OrderWorkspace as OrderWorkspaceData,
 } from '../lib/api/orderWorkspaceApi'
+import type { OrderFinancialSummary } from '../lib/api/orderLinesApi'
 
 const TAB_IDS = [
   'customer',
@@ -51,6 +52,11 @@ const TAB_LABELS: Record<TabId, string> = {
 }
 
 const TABS = TAB_IDS.map((id) => ({ id, label: TAB_LABELS[id] }))
+
+const SALE_TOTAL_FORMATTER = new Intl.NumberFormat('en-AU', {
+  style: 'currency',
+  currency: 'AUD',
+})
 
 type ShellProps = {
   orderId: number
@@ -88,6 +94,11 @@ function WorkspaceShell({
   onDetailsSaved,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
+  // Live order financial summary, lifted from the Products & Charges tab once its
+  // lines load (and on every line mutation). Sourced from the Chunk 3
+  // order_financial_summary, never from the nullable persisted_financials.
+  const [financialSummary, setFinancialSummary] =
+    useState<OrderFinancialSummary | null>(null)
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -127,15 +138,31 @@ function WorkspaceShell({
               <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
                 Sale total
               </div>
-              {/* Sale total is produced by the backend financial summary in
-                  Chunk 3. Phase 10E.1 wires no financial logic, so show a
-                  non-financial placeholder rather than a money value. */}
-              <div className="text-2xl font-bold tabular-nums text-slate-400 mt-0.5">
-                —
-              </div>
-              <div className="mt-0.5 text-[11px] text-slate-500">
-                Not priced yet
-              </div>
+              {/* Sale total comes from the Chunk 3 order_financial_summary,
+                  lifted from the Products & Charges tab once its lines load.
+                  Until a summary is available, show a non-financial placeholder
+                  rather than a stale/zero money value. */}
+              {financialSummary ? (
+                <>
+                  <div className="text-2xl font-bold tabular-nums text-slate-900 mt-0.5">
+                    {SALE_TOTAL_FORMATTER.format(
+                      financialSummary.final_sale_price_inc_gst,
+                    )}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-slate-500">
+                    Inc GST
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="text-2xl font-bold tabular-nums text-slate-400 mt-0.5">
+                    —
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-slate-500">
+                    Not priced yet
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </Panel>
@@ -154,7 +181,12 @@ function WorkspaceShell({
               />
             )}
             {activeTab === 'products' && (
-              <ProductsChargesTab flooringType={flooringType} />
+              <ProductsChargesTab
+                orderId={orderId}
+                flooringType={flooringType}
+                locked={locked}
+                onFinancialSummary={setFinancialSummary}
+              />
             )}
             {activeTab === 'details' && (
               <DetailsOfSaleTab
