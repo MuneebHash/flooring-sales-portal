@@ -39,14 +39,10 @@ type Props = {
   salePriceMutationInFlight: boolean
   beginSalePriceMutation: () => void
   finishSalePriceMutation: () => void
-  // Single shared financial-summary recency guard (same one ProductsChargesTab and
-  // the seed use). Claim a sequence at issue time, then apply the response only if
-  // it is still the latest across all sources.
-  beginFinancialSummaryRequest: () => number
-  applyFinancialSummaryFromRequest: (
-    seq: number,
-    summary: OrderFinancialSummary,
-  ) => boolean
+  // Sale-price override/reset responses are MUTATIONS: applying one bumps the
+  // shared mutation version in OrderWorkspace, so a later read-only GET /lines can
+  // never discard it. Applied before the mountedRef child-local guard.
+  applyMutationFinancialSummary: (summary: OrderFinancialSummary) => void
   // Details autosave single-flight lives in OrderWorkspace (the always-mounted
   // shell) so it survives this tab's unmount/remount. The tab validates + builds
   // the full body and hands it to queueDetailsAutosave; the status props drive the
@@ -251,8 +247,7 @@ export function DetailsOfSaleTab({
   salePriceMutationInFlight,
   beginSalePriceMutation,
   finishSalePriceMutation,
-  beginFinancialSummaryRequest,
-  applyFinancialSummaryFromRequest,
+  applyMutationFinancialSummary,
   queueDetailsAutosave,
   detailsAutosaveSaving,
   detailsAutosaveSaved,
@@ -315,25 +310,20 @@ export function DetailsOfSaleTab({
     }
 
     setSalePriceError(null)
-    // In-flight lock (parent) survives this tab unmounting; the recency sequence
-    // is claimed at issue time from the single shared guard.
+    // In-flight lock (parent) survives this tab unmounting.
     beginSalePriceMutation()
-    const seq = beginFinancialSummaryRequest()
     try {
       const res = await overrideSalePrice(orderId, {
         final_sale_price_inc_gst: parsed,
       })
       const summary = res.data.order_financial_summary
-      // Apply to the workspace header FIRST — before the mountedRef guard, and
-      // even if this tab has unmounted. The shared guard returns false (and skips
-      // the apply) if a newer summary request from any source has been issued.
-      const applied = applyFinancialSummaryFromRequest(seq, summary)
+      // A mutation response is the newest persisted state — apply it to the
+      // workspace header FIRST (before the mountedRef guard, and even if this tab
+      // has since unmounted). A later read-only GET /lines can never discard it.
+      applyMutationFinancialSummary(summary)
       if (!mountedRef.current) return
-      // Do not re-seed the input from a stale (discarded) response.
-      if (applied) {
-        setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
-        setSalePriceDirty(false)
-      }
+      setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
+      setSalePriceDirty(false)
     } catch (err) {
       if (!mountedRef.current) return
       setSalePriceError(salePriceErrorMessage(err))
@@ -348,23 +338,18 @@ export function DetailsOfSaleTab({
     // Reset is idempotent on the backend (clears price_adjustment_inc_gst to
     // NULL), so it is safe to call even when there is no current adjustment.
     setSalePriceError(null)
-    // In-flight lock (parent) survives this tab unmounting; the recency sequence
-    // is claimed at issue time from the single shared guard.
+    // In-flight lock (parent) survives this tab unmounting.
     beginSalePriceMutation()
-    const seq = beginFinancialSummaryRequest()
     try {
       const res = await resetSalePrice(orderId)
       const summary = res.data.order_financial_summary
-      // Apply to the workspace header FIRST — before the mountedRef guard, and
-      // even if this tab has unmounted. The shared guard returns false (and skips
-      // the apply) if a newer summary request from any source has been issued.
-      const applied = applyFinancialSummaryFromRequest(seq, summary)
+      // A mutation response is the newest persisted state — apply it to the
+      // workspace header FIRST (before the mountedRef guard, and even if this tab
+      // has since unmounted). A later read-only GET /lines can never discard it.
+      applyMutationFinancialSummary(summary)
       if (!mountedRef.current) return
-      // Do not re-seed the input from a stale (discarded) response.
-      if (applied) {
-        setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
-        setSalePriceDirty(false)
-      }
+      setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
+      setSalePriceDirty(false)
     } catch (err) {
       if (!mountedRef.current) return
       setSalePriceError(salePriceErrorMessage(err))

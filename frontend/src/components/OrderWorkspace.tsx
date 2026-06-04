@@ -114,22 +114,32 @@ function WorkspaceShell({
   const [financialSummary, setFinancialSummary] =
     useState<OrderFinancialSummary | null>(null)
 
-  // SINGLE shared recency guard for EVERY order_financial_summary apply — the
-  // seed fetch, ProductsChargesTab line load/mutations, and DetailsOfSaleTab
-  // sale-price override/reset all go through it. Each source calls
-  // beginFinancialSummaryRequest() at issue time to claim a sequence, then
-  // applyFinancialSummaryFromRequest(seq, summary) on response. Only the latest
-  // issued request is accepted; a stale response (e.g. an older line mutation or
-  // seed landing after a newer override) is discarded with no setState. The ref
-  // survives tab remounts because this shell stays mounted across tab switches.
-  const financialSummarySeqRef = useRef(0)
-  const beginFinancialSummaryRequest = useCallback(() => {
-    financialSummarySeqRef.current += 1
-    return financialSummarySeqRef.current
-  }, [])
-  const applyFinancialSummaryFromRequest = useCallback(
-    (seq: number, summary: OrderFinancialSummary) => {
-      if (seq !== financialSummarySeqRef.current) return false
+  // Read-vs-mutation recency for order_financial_summary applies. KEY RULE: a
+  // read-only GET /lines must never make a mutation summary stale. A MUTATION
+  // response (sale-price override/reset, product/charge add/edit/delete) is the
+  // newest persisted state, so it ALWAYS applies and bumps the mutation version.
+  // A READ (seed / ProductsChargesTab load) captures the mutation version at issue
+  // time and applies only if no mutation has applied since — so a later read can
+  // neither overwrite a mutation nor cause an in-flight mutation response to be
+  // discarded. (True cross-surface mutation commit-ordering needs backend summary
+  // versioning and is intentionally out of scope here.) The ref survives tab
+  // remounts because this shell stays mounted across tab switches.
+  const financialSummaryMutationVersionRef = useRef(0)
+  const applyMutationFinancialSummary = useCallback(
+    (summary: OrderFinancialSummary) => {
+      financialSummaryMutationVersionRef.current += 1
+      setFinancialSummary(summary)
+    },
+    [],
+  )
+  const beginFinancialSummaryRead = useCallback(
+    () => financialSummaryMutationVersionRef.current,
+    [],
+  )
+  const applyReadFinancialSummary = useCallback(
+    (readVersion: number, summary: OrderFinancialSummary) => {
+      // Discard the read if any mutation applied after this read began.
+      if (readVersion !== financialSummaryMutationVersionRef.current) return false
       setFinancialSummary(summary)
       return true
     },
@@ -250,17 +260,17 @@ function WorkspaceShell({
 
   // Seed the header summary without waiting for the Products & Charges tab to be
   // mounted (it only mounts when its tab is active). The header is non-critical,
-  // so a failed fetch is swallowed and the placeholder remains. The seed claims a
-  // recency sequence like any other source, so a slow seed cannot clobber a newer
-  // line mutation or sale-price override.
+  // so a failed fetch is swallowed and the placeholder remains. The seed is a READ:
+  // it captures the mutation version at issue time and is discarded if a mutation
+  // applied meanwhile, so a slow seed can never clobber a newer mutation summary.
   useEffect(() => {
     let cancelled = false
     setFinancialSummary(null)
-    const seq = beginFinancialSummaryRequest()
+    const readVersion = beginFinancialSummaryRead()
     fetchOrderLines(orderId)
       .then((res) => {
         if (cancelled) return
-        applyFinancialSummaryFromRequest(seq, res.data.order_financial_summary)
+        applyReadFinancialSummary(readVersion, res.data.order_financial_summary)
       })
       .catch(() => {
         // Header summary is best-effort; keep the placeholder on failure.
@@ -268,7 +278,7 @@ function WorkspaceShell({
     return () => {
       cancelled = true
     }
-  }, [orderId, beginFinancialSummaryRequest, applyFinancialSummaryFromRequest])
+  }, [orderId, beginFinancialSummaryRead, applyReadFinancialSummary])
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -355,8 +365,9 @@ function WorkspaceShell({
                 orderId={orderId}
                 flooringType={flooringType}
                 locked={locked}
-                beginFinancialSummaryRequest={beginFinancialSummaryRequest}
-                applyFinancialSummaryFromRequest={applyFinancialSummaryFromRequest}
+                beginFinancialSummaryRead={beginFinancialSummaryRead}
+                applyReadFinancialSummary={applyReadFinancialSummary}
+                applyMutationFinancialSummary={applyMutationFinancialSummary}
               />
             )}
             {activeTab === 'details' && (
@@ -369,8 +380,7 @@ function WorkspaceShell({
                 salePriceMutationInFlight={salePriceMutationInFlight}
                 beginSalePriceMutation={beginSalePriceMutation}
                 finishSalePriceMutation={finishSalePriceMutation}
-                beginFinancialSummaryRequest={beginFinancialSummaryRequest}
-                applyFinancialSummaryFromRequest={applyFinancialSummaryFromRequest}
+                applyMutationFinancialSummary={applyMutationFinancialSummary}
                 queueDetailsAutosave={queueDetailsAutosave}
                 detailsAutosaveSaving={detailsAutosaveSaving}
                 detailsAutosaveSaved={detailsAutosaveSaved}
