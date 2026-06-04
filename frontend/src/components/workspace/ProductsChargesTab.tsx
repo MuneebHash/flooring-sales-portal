@@ -32,9 +32,15 @@ type Props = {
   // Locked is true when the order is LAID. It disables all product/charge
   // mutations while still allowing the lines to be read/displayed.
   locked: boolean
-  // Lifts the backend-confirmed order_financial_summary up to OrderWorkspace so
-  // the workspace header Sale total stays in sync without a refetch.
-  onFinancialSummary: (summary: OrderFinancialSummary) => void
+  // Single shared financial-summary recency guard from OrderWorkspace. Each
+  // summary-bearing op claims a sequence via beginFinancialSummaryRequest() at
+  // issue time and applies the response via applyFinancialSummaryFromRequest(),
+  // so a stale (older) response cannot overwrite a newer one in the header.
+  beginFinancialSummaryRequest: () => number
+  applyFinancialSummaryFromRequest: (
+    seq: number,
+    summary: OrderFinancialSummary,
+  ) => boolean
 }
 
 // Editable string mirror of a product line's three editable fields. quantity_sqm
@@ -152,7 +158,8 @@ export function ProductsChargesTab({
   orderId,
   flooringType,
   locked,
-  onFinancialSummary,
+  beginFinancialSummaryRequest,
+  applyFinancialSummaryFromRequest,
 }: Props) {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -222,25 +229,32 @@ export function ProductsChargesTab({
     }
   }, [])
 
-  // Keep the lift callback in a ref so the load effect never resubscribes on it.
-  const onSummaryRef = useRef(onFinancialSummary)
+  // Keep the parent guard callbacks in refs so the load effect never resubscribes
+  // on them.
+  const beginRequestRef = useRef(beginFinancialSummaryRequest)
+  const applyRequestRef = useRef(applyFinancialSummaryFromRequest)
   useEffect(() => {
-    onSummaryRef.current = onFinancialSummary
-  }, [onFinancialSummary])
+    beginRequestRef.current = beginFinancialSummaryRequest
+    applyRequestRef.current = applyFinancialSummaryFromRequest
+  }, [beginFinancialSummaryRequest, applyFinancialSummaryFromRequest])
 
-  // Monotonic sequence for summary-bearing operations (load + every mutation).
-  // Guards against an out-of-order response overwriting a newer summary.
+  // Per-tab monotonic sequence for the LOCAL summary mirror only (B7). Guards the
+  // child-local subtotal mirror against an out-of-order response. The workspace
+  // header uses the parent's single shared recency guard (applyRequestRef).
   const reqSeqRef = useRef(0)
   const appliedSummarySeqRef = useRef(0)
-  function applySummary(seq: number, next: OrderFinancialSummary) {
-    if (seq < appliedSummarySeqRef.current) return
-    appliedSummarySeqRef.current = seq
-    // Always lift to the workspace header — even if this tab has since unmounted.
-    // The backend already persisted the change, and the parent (workspace shell)
-    // is still mounted, so dropping this would leave the Sale total stale.
-    onSummaryRef.current(next)
-    // The child-local mirror only updates while mounted, to avoid a
-    // setState-on-unmounted warning.
+  function applySummary(
+    localSeq: number,
+    parentSeq: number,
+    next: OrderFinancialSummary,
+  ) {
+    // Workspace header: single shared recency guard across ALL summary sources.
+    // Runs even if this tab has since unmounted (the shell is still mounted); the
+    // parent discards it if a newer request from any source has been issued.
+    applyRequestRef.current(parentSeq, next)
+    // Child-local mirror: per-tab out-of-order guard; only updates while mounted.
+    if (localSeq < appliedSummarySeqRef.current) return
+    appliedSummarySeqRef.current = localSeq
     if (mountedRef.current) setSummary(next)
   }
 
@@ -256,6 +270,7 @@ export function ProductsChargesTab({
     setLoadError(null)
     setMutationError(null)
     const seq = ++reqSeqRef.current
+    const parentSeq = beginRequestRef.current()
     fetchOrderLines(orderId)
       .then((res) => {
         if (cancelled) return
@@ -264,7 +279,7 @@ export function ProductsChargesTab({
         setChargeLines(data.charge_lines)
         setProductDrafts(buildProductDrafts(data.product_lines))
         setChargeDrafts(buildChargeDrafts(data.charge_lines))
-        applySummary(seq, data.order_financial_summary)
+        applySummary(seq, parentSeq, data.order_financial_summary)
       })
       .catch((err: unknown) => {
         if (cancelled) return
@@ -430,6 +445,7 @@ export function ProductsChargesTab({
     setMutationError(null)
     setMutatingProductIds((prev) => addMutating(prev, line.order_product_line_id))
     const seq = ++reqSeqRef.current
+    const parentSeq = beginRequestRef.current()
     try {
       const res = await updateProductLine(
         orderId,
@@ -438,7 +454,7 @@ export function ProductsChargesTab({
       )
       const updated = res.data.product_line
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applySummary(seq, parentSeq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setProductLines((prev) =>
         prev.map((l) =>
@@ -473,11 +489,12 @@ export function ProductsChargesTab({
     setMutationError(null)
     setMutatingProductIds((prev) => addMutating(prev, line.order_product_line_id))
     const seq = ++reqSeqRef.current
+    const parentSeq = beginRequestRef.current()
     try {
       const res = await deleteProductLine(orderId, line.order_product_line_id)
       const removedId = res.data.deleted_product_line_id
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applySummary(seq, parentSeq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setProductLines((prev) =>
         prev.filter((l) => l.order_product_line_id !== removedId),
@@ -548,6 +565,7 @@ export function ProductsChargesTab({
     setMutationError(null)
     setMutatingChargeIds((prev) => addMutating(prev, line.order_charge_line_id))
     const seq = ++reqSeqRef.current
+    const parentSeq = beginRequestRef.current()
     try {
       const res = await updateChargeLine(
         orderId,
@@ -556,7 +574,7 @@ export function ProductsChargesTab({
       )
       const updated = res.data.charge_line
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applySummary(seq, parentSeq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setChargeLines((prev) =>
         prev.map((l) =>
@@ -588,11 +606,12 @@ export function ProductsChargesTab({
     setMutationError(null)
     setMutatingChargeIds((prev) => addMutating(prev, line.order_charge_line_id))
     const seq = ++reqSeqRef.current
+    const parentSeq = beginRequestRef.current()
     try {
       const res = await deleteChargeLine(orderId, line.order_charge_line_id)
       const removedId = res.data.deleted_charge_line_id
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applySummary(seq, parentSeq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setChargeLines((prev) =>
         prev.filter((l) => l.order_charge_line_id !== removedId),
@@ -709,11 +728,12 @@ export function ProductsChargesTab({
     setAddProductError(null)
     setMutationError(null)
     const seq = ++reqSeqRef.current
+    const parentSeq = beginRequestRef.current()
     try {
       const res = await addProductLine(orderId, body)
       const line = res.data.product_line
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applySummary(seq, parentSeq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setProductLines((prev) => [...prev, line])
       setProductDrafts((prev) => ({
@@ -788,11 +808,12 @@ export function ProductsChargesTab({
     setAddChargeError(null)
     setMutationError(null)
     const seq = ++reqSeqRef.current
+    const parentSeq = beginRequestRef.current()
     try {
       const res = await addChargeLine(orderId, body)
       const line = res.data.charge_line
       // Lift the summary to the header first (runs even if the tab unmounted).
-      applySummary(seq, res.data.order_financial_summary)
+      applySummary(seq, parentSeq, res.data.order_financial_summary)
       if (!mountedRef.current) return
       setChargeLines((prev) => [...prev, line])
       setChargeDrafts((prev) => ({

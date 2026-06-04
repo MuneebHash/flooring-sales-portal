@@ -97,70 +97,60 @@ function WorkspaceShell({
   const [activeTab, setActiveTab] = useState<TabId>('customer')
   // Live order financial summary that backs the always-visible header Sale total.
   // Sourced from the Chunk 3 order_financial_summary, never from the nullable
-  // persisted_financials. Kept fresh by Products & Charges mutations via
-  // applyFinancialSummary (onFinancialSummary), and seeded independently below so
-  // the header is correct even before that tab is opened.
+  // persisted_financials.
   const [financialSummary, setFinancialSummary] =
     useState<OrderFinancialSummary | null>(null)
 
-  // Monotonic version shared by every summary update (seed fetch + lifted
-  // mutations). Each apply bumps it; the seed fetch captures it before its
-  // request and discards its response if anything updated the summary meanwhile,
-  // so an in-flight seed can never clobber a newer mutation result.
-  const summaryVersionRef = useRef(0)
-  const applyFinancialSummary = useCallback((summary: OrderFinancialSummary) => {
-    summaryVersionRef.current += 1
-    setFinancialSummary(summary)
+  // SINGLE shared recency guard for EVERY order_financial_summary apply — the
+  // seed fetch, ProductsChargesTab line load/mutations, and DetailsOfSaleTab
+  // sale-price override/reset all go through it. Each source calls
+  // beginFinancialSummaryRequest() at issue time to claim a sequence, then
+  // applyFinancialSummaryFromRequest(seq, summary) on response. Only the latest
+  // issued request is accepted; a stale response (e.g. an older line mutation or
+  // seed landing after a newer override) is discarded with no setState. The ref
+  // survives tab remounts because this shell stays mounted across tab switches.
+  const financialSummarySeqRef = useRef(0)
+  const beginFinancialSummaryRequest = useCallback(() => {
+    financialSummarySeqRef.current += 1
+    return financialSummarySeqRef.current
   }, [])
-
-  // Sale-price override/reset tracking lives HERE (in the always-mounted shell)
-  // rather than in DetailsOfSaleTab, which unmounts on tab switch. This keeps the
-  // in-flight serialization alive across a Details-tab unmount/remount and lets a
-  // stale (older) sale-price response be discarded once a newer one has begun.
-  const [salePriceMutationInFlight, setSalePriceMutationInFlight] =
-    useState(false)
-  const salePriceMutationSeqRef = useRef(0)
-
-  const beginSalePriceMutation = useCallback(() => {
-    const seq = salePriceMutationSeqRef.current + 1
-    salePriceMutationSeqRef.current = seq
-    setSalePriceMutationInFlight(true)
-    return seq
-  }, [])
-
-  const applySalePriceMutationSummary = useCallback(
+  const applyFinancialSummaryFromRequest = useCallback(
     (seq: number, summary: OrderFinancialSummary) => {
-      // Ignore a stale (older) sale-price response — only the latest applies.
-      if (seq !== salePriceMutationSeqRef.current) return
-      applyFinancialSummary(summary)
+      if (seq !== financialSummarySeqRef.current) return false
+      setFinancialSummary(summary)
+      return true
     },
-    [applyFinancialSummary],
+    [],
   )
 
-  const finishSalePriceMutation = useCallback((seq: number) => {
-    // Only the latest mutation clears in-flight, so an older response resolving
-    // after a newer begin cannot prematurely re-enable the sale-price controls.
-    if (seq === salePriceMutationSeqRef.current) {
-      setSalePriceMutationInFlight(false)
-    }
+  // Sale-price override/reset IN-FLIGHT serialization — SEPARATE from the recency
+  // guard above. It lives here (the always-mounted shell) so it survives
+  // DetailsOfSaleTab unmount/remount and prevents a second override/reset while
+  // one is still in flight. Recency = "is this the newest summary across all
+  // sources"; in-flight = "can the user fire another sale-price action / are the
+  // controls disabled". Both are wired; neither replaces the other.
+  const [salePriceMutationInFlight, setSalePriceMutationInFlight] =
+    useState(false)
+  const beginSalePriceMutation = useCallback(() => {
+    setSalePriceMutationInFlight(true)
+  }, [])
+  const finishSalePriceMutation = useCallback(() => {
+    setSalePriceMutationInFlight(false)
   }, [])
 
   // Seed the header summary without waiting for the Products & Charges tab to be
   // mounted (it only mounts when its tab is active). The header is non-critical,
-  // so a failed fetch is swallowed and the placeholder remains. ProductsChargesTab
-  // still fetches its own lines when opened and keeps this summary fresh on every
-  // mutation through the same applyFinancialSummary callback.
+  // so a failed fetch is swallowed and the placeholder remains. The seed claims a
+  // recency sequence like any other source, so a slow seed cannot clobber a newer
+  // line mutation or sale-price override.
   useEffect(() => {
     let cancelled = false
     setFinancialSummary(null)
-    const seedVersion = summaryVersionRef.current
+    const seq = beginFinancialSummaryRequest()
     fetchOrderLines(orderId)
       .then((res) => {
         if (cancelled) return
-        // Drop a stale seed: if any apply (e.g. a mutation lift) bumped the
-        // version since this request began, it already set a newer summary.
-        if (summaryVersionRef.current !== seedVersion) return
-        applyFinancialSummary(res.data.order_financial_summary)
+        applyFinancialSummaryFromRequest(seq, res.data.order_financial_summary)
       })
       .catch(() => {
         // Header summary is best-effort; keep the placeholder on failure.
@@ -168,7 +158,7 @@ function WorkspaceShell({
     return () => {
       cancelled = true
     }
-  }, [orderId, applyFinancialSummary])
+  }, [orderId, beginFinancialSummaryRequest, applyFinancialSummaryFromRequest])
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -255,7 +245,8 @@ function WorkspaceShell({
                 orderId={orderId}
                 flooringType={flooringType}
                 locked={locked}
-                onFinancialSummary={applyFinancialSummary}
+                beginFinancialSummaryRequest={beginFinancialSummaryRequest}
+                applyFinancialSummaryFromRequest={applyFinancialSummaryFromRequest}
               />
             )}
             {activeTab === 'details' && (
@@ -266,8 +257,9 @@ function WorkspaceShell({
                 financialSummary={financialSummary}
                 salePriceMutationInFlight={salePriceMutationInFlight}
                 beginSalePriceMutation={beginSalePriceMutation}
-                applySalePriceMutationSummary={applySalePriceMutationSummary}
                 finishSalePriceMutation={finishSalePriceMutation}
+                beginFinancialSummaryRequest={beginFinancialSummaryRequest}
+                applyFinancialSummaryFromRequest={applyFinancialSummaryFromRequest}
                 onSaved={onDetailsSaved}
               />
             )}

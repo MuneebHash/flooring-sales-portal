@@ -23,16 +23,20 @@ type Props = {
   // Live order financial summary (Chunk 3 order_financial_summary), seeded and
   // kept fresh by OrderWorkspace. Null until the order has been priced.
   financialSummary: OrderFinancialSummary | null
-  // Sale-price override/reset state + handlers live in OrderWorkspace (the
-  // always-mounted shell) so the in-flight serialization survives this tab's
-  // unmount/remount and stale (older) responses are discarded by sequence.
+  // Sale-price IN-FLIGHT serialization lives in OrderWorkspace (the always-mounted
+  // shell) so it survives this tab's unmount/remount and prevents a second
+  // override/reset while one is in flight.
   salePriceMutationInFlight: boolean
-  beginSalePriceMutation: () => number
-  applySalePriceMutationSummary: (
+  beginSalePriceMutation: () => void
+  finishSalePriceMutation: () => void
+  // Single shared financial-summary recency guard (same one ProductsChargesTab and
+  // the seed use). Claim a sequence at issue time, then apply the response only if
+  // it is still the latest across all sources.
+  beginFinancialSummaryRequest: () => number
+  applyFinancialSummaryFromRequest: (
     seq: number,
     summary: OrderFinancialSummary,
-  ) => void
-  finishSalePriceMutation: (seq: number) => void
+  ) => boolean
   // Lifts the server-confirmed details fields (and refreshed updated_at) up so
   // workspace state — and sibling tabs that read it — stay in sync without a
   // refetch.
@@ -266,8 +270,9 @@ export function DetailsOfSaleTab({
   financialSummary,
   salePriceMutationInFlight,
   beginSalePriceMutation,
-  applySalePriceMutationSummary,
   finishSalePriceMutation,
+  beginFinancialSummaryRequest,
+  applyFinancialSummaryFromRequest,
   onSaved,
 }: Props) {
   const [form, setForm] = useState<DetailsForm>(() => formFromProps(saleDetails))
@@ -300,11 +305,14 @@ export function DetailsOfSaleTab({
     }
   }, [])
 
-  // Autosave bookkeeping for the details-of-sale fields. detailsSeqRef discards
-  // out-of-order responses; lastSavedDetailsRef holds the last persisted body so
-  // a blur with no change does not re-hit the API.
-  const detailsSeqRef = useRef(0)
-  const lastSavedDetailsRef = useRef<string | null>(
+  // Autosave bookkeeping for the details-of-sale fields. SINGLE-FLIGHT: only ONE
+  // saveDetailsOfSale PUT is ever in flight. detailsSavingRef is the in-flight
+  // lock; pendingDetailsBodyRef holds ONLY the latest queued body (multiple edits
+  // collapse to one, latest wins); lastSavedDetailsRef holds the last body the
+  // backend has CONFIRMED persisted (set only AFTER a successful response).
+  const detailsSavingRef = useRef(false)
+  const pendingDetailsBodyRef = useRef<DetailsOfSaleSaveRequest | null>(null)
+  const lastSavedDetailsRef = useRef<string>(
     JSON.stringify(buildDetailsBody(formFromProps(saleDetails))),
   )
 
@@ -339,25 +347,31 @@ export function DetailsOfSaleTab({
     }
 
     setSalePriceError(null)
-    // Begin in the parent so the in-flight flag survives this tab unmounting.
-    const seq = beginSalePriceMutation()
+    // In-flight lock (parent) survives this tab unmounting; the recency sequence
+    // is claimed at issue time from the single shared guard.
+    beginSalePriceMutation()
+    const seq = beginFinancialSummaryRequest()
     try {
       const res = await overrideSalePrice(orderId, {
         final_sale_price_inc_gst: parsed,
       })
       const summary = res.data.order_financial_summary
-      // Lift to the workspace header FIRST — runs even if this tab has unmounted;
-      // the parent discards it if a newer sale-price mutation has begun.
-      applySalePriceMutationSummary(seq, summary)
+      // Apply to the workspace header FIRST — before the mountedRef guard, and
+      // even if this tab has unmounted. The shared guard returns false (and skips
+      // the apply) if a newer summary request from any source has been issued.
+      const applied = applyFinancialSummaryFromRequest(seq, summary)
       if (!mountedRef.current) return
-      setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
-      setSalePriceDirty(false)
+      // Do not re-seed the input from a stale (discarded) response.
+      if (applied) {
+        setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
+        setSalePriceDirty(false)
+      }
     } catch (err) {
       if (!mountedRef.current) return
       setSalePriceError(salePriceErrorMessage(err))
     } finally {
-      // Always clear in-flight in the parent (latest-seq only), even after unmount.
-      finishSalePriceMutation(seq)
+      // Always release the in-flight lock in the parent, even after unmount.
+      finishSalePriceMutation()
     }
   }
 
@@ -366,23 +380,29 @@ export function DetailsOfSaleTab({
     // Reset is idempotent on the backend (clears price_adjustment_inc_gst to
     // NULL), so it is safe to call even when there is no current adjustment.
     setSalePriceError(null)
-    // Begin in the parent so the in-flight flag survives this tab unmounting.
-    const seq = beginSalePriceMutation()
+    // In-flight lock (parent) survives this tab unmounting; the recency sequence
+    // is claimed at issue time from the single shared guard.
+    beginSalePriceMutation()
+    const seq = beginFinancialSummaryRequest()
     try {
       const res = await resetSalePrice(orderId)
       const summary = res.data.order_financial_summary
-      // Lift to the workspace header FIRST — runs even if this tab has unmounted;
-      // the parent discards it if a newer sale-price mutation has begun.
-      applySalePriceMutationSummary(seq, summary)
+      // Apply to the workspace header FIRST — before the mountedRef guard, and
+      // even if this tab has unmounted. The shared guard returns false (and skips
+      // the apply) if a newer summary request from any source has been issued.
+      const applied = applyFinancialSummaryFromRequest(seq, summary)
       if (!mountedRef.current) return
-      setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
-      setSalePriceDirty(false)
+      // Do not re-seed the input from a stale (discarded) response.
+      if (applied) {
+        setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
+        setSalePriceDirty(false)
+      }
     } catch (err) {
       if (!mountedRef.current) return
       setSalePriceError(salePriceErrorMessage(err))
     } finally {
-      // Always clear in-flight in the parent (latest-seq only), even after unmount.
-      finishSalePriceMutation(seq)
+      // Always release the in-flight lock in the parent, even after unmount.
+      finishSalePriceMutation()
     }
   }
 
@@ -424,7 +444,10 @@ export function DetailsOfSaleTab({
   // Autosave the details-of-sale fields (full-replace PUT). Triggered on blur /
   // change — never on every keystroke and never debounced. Reuses the existing
   // saveDetailsOfSale + onSaved flow; only the trigger changed from a button.
-  async function commitDetails(formToSave: DetailsForm) {
+  // SINGLE-FLIGHT: at most one PUT is ever in flight. While one runs, the latest
+  // requested body is queued (collapsing multiple edits, latest wins) and sent
+  // after the current save settles, so a stale older body never reaches the server.
+  function commitDetails(formToSave: DetailsForm) {
     if (locked) return
 
     // Strict client validation first — never autosave an invalid form.
@@ -436,36 +459,61 @@ export function DetailsOfSaleTab({
     setErrors({})
 
     const body = buildDetailsBody(formToSave)
-    const key = JSON.stringify(body)
+    // A save is already in flight: queue ONLY this (latest) body. The drain after
+    // the current save settles decides whether to send it (vs the persisted body).
+    if (detailsSavingRef.current) {
+      pendingDetailsBodyRef.current = body
+      return
+    }
     // Nothing changed since the last persisted save — skip the network call.
-    if (key === lastSavedDetailsRef.current) return
-    lastSavedDetailsRef.current = key
-    const seq = ++detailsSeqRef.current
+    if (JSON.stringify(body) === lastSavedDetailsRef.current) return
+    void runDetailsSave(body)
+  }
 
-    setSaving(true)
-    setSaved(false)
-    setSaveError(null)
+  // Single-flight save loop. Sends exactly one PUT; on settle, drains the latest
+  // queued body (if it differs from what is now persisted) so the newest body
+  // always wins and two PUTs never overlap.
+  async function runDetailsSave(body: DetailsOfSaleSaveRequest) {
+    detailsSavingRef.current = true
+    if (mountedRef.current) {
+      setSaving(true)
+      setSaved(false)
+      setSaveError(null)
+    }
     try {
       const res = await saveDetailsOfSale(orderId, body)
-      if (!mountedRef.current) return
-      if (seq !== detailsSeqRef.current) return // superseded by a newer autosave
-      setSaved(true)
+      // Mark persisted ONLY after a successful backend response.
+      lastSavedDetailsRef.current = JSON.stringify(body)
+      // Lift to the workspace (parent) regardless of this tab's mount state.
       onSaved({
         fields: res.data.details_of_sale_fields,
         updated_at: res.data.updated_at,
       })
+      if (mountedRef.current) setSaved(true)
     } catch (err) {
-      lastSavedDetailsRef.current = null // allow a retry on the next blur/change
-      if (!mountedRef.current) return
-      if (seq !== detailsSeqRef.current) return
-      const fieldErrors = mapDetailsToFieldErrors(err)
-      if (Object.keys(fieldErrors).length > 0) {
-        setErrors(fieldErrors)
+      // Do NOT mark this body as persisted on failure.
+      if (mountedRef.current) {
+        const fieldErrors = mapDetailsToFieldErrors(err)
+        if (Object.keys(fieldErrors).length > 0) {
+          setErrors(fieldErrors)
+        }
+        // Surfaces VALIDATION_FAILED, ORDER_LOCKED, and network/server errors.
+        setSaveError(apiErrorMessage(err))
       }
-      // Surfaces VALIDATION_FAILED, ORDER_LOCKED, and network/server errors.
-      setSaveError(apiErrorMessage(err))
     } finally {
-      if (mountedRef.current && seq === detailsSeqRef.current) setSaving(false)
+      // Release the in-flight lock, then drain the latest queued body (single
+      // flight): send it next only if it differs from what is now persisted.
+      detailsSavingRef.current = false
+      const pending = pendingDetailsBodyRef.current
+      pendingDetailsBodyRef.current = null
+      if (
+        pending !== null &&
+        JSON.stringify(pending) !== lastSavedDetailsRef.current
+      ) {
+        void runDetailsSave(pending)
+      } else if (mountedRef.current) {
+        setSaving(false)
+      }
     }
   }
 
