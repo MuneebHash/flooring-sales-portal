@@ -23,10 +23,16 @@ type Props = {
   // Live order financial summary (Chunk 3 order_financial_summary), seeded and
   // kept fresh by OrderWorkspace. Null until the order has been priced.
   financialSummary: OrderFinancialSummary | null
-  // Lifts the backend-confirmed order_financial_summary up to OrderWorkspace
-  // after a sale-price override/reset so the header Sale total stays in sync
-  // without a refetch. Same callback ProductsChargesTab uses.
-  onFinancialSummary: (summary: OrderFinancialSummary) => void
+  // Sale-price override/reset state + handlers live in OrderWorkspace (the
+  // always-mounted shell) so the in-flight serialization survives this tab's
+  // unmount/remount and stale (older) responses are discarded by sequence.
+  salePriceMutationInFlight: boolean
+  beginSalePriceMutation: () => number
+  applySalePriceMutationSummary: (
+    seq: number,
+    summary: OrderFinancialSummary,
+  ) => void
+  finishSalePriceMutation: (seq: number) => void
   // Lifts the server-confirmed details fields (and refreshed updated_at) up so
   // workspace state — and sibling tabs that read it — stay in sync without a
   // refetch.
@@ -258,7 +264,10 @@ export function DetailsOfSaleTab({
   locked,
   saleDetails,
   financialSummary,
-  onFinancialSummary,
+  salePriceMutationInFlight,
+  beginSalePriceMutation,
+  applySalePriceMutationSummary,
+  finishSalePriceMutation,
   onSaved,
 }: Props) {
   const [form, setForm] = useState<DetailsForm>(() => formFromProps(saleDetails))
@@ -270,11 +279,11 @@ export function DetailsOfSaleTab({
   // --- Sale price override / reset (independent of the details-of-sale save). ---
   // The input mirrors the GST-inclusive final sale price. `salePriceDirty` tracks
   // whether the user has edited it since the last server value, so an incoming
-  // summary update never clobbers an active edit. salePriceSaving serializes the
-  // override and reset requests (both disable the input + both buttons).
+  // summary update never clobbers an active edit. The in-flight serialization
+  // lives in OrderWorkspace (salePriceMutationInFlight) so it survives this tab's
+  // unmount/remount; both buttons + the input disable while it is true.
   const [salePriceInput, setSalePriceInput] = useState('')
   const [salePriceDirty, setSalePriceDirty] = useState(false)
-  const [salePriceSaving, setSalePriceSaving] = useState(false)
   const [salePriceError, setSalePriceError] = useState<string | null>(null)
   // Toggles the compact GP / financial info modal (full breakdown hidden by default).
   const [salePriceInfoOpen, setSalePriceInfoOpen] = useState(false)
@@ -320,7 +329,7 @@ export function DetailsOfSaleTab({
   }
 
   async function handleOverrideSalePrice() {
-    if (locked || salePriceSaving) return
+    if (locked || salePriceMutationInFlight) return
     const parsed = parseSalePrice(salePriceInput)
     // Client-side guard mirrors the backend: required, finite, > 0, <= max.
     // Blank / zero / negative / non-finite never reaches the API.
@@ -329,16 +338,17 @@ export function DetailsOfSaleTab({
       return
     }
 
-    setSalePriceSaving(true)
     setSalePriceError(null)
+    // Begin in the parent so the in-flight flag survives this tab unmounting.
+    const seq = beginSalePriceMutation()
     try {
       const res = await overrideSalePrice(orderId, {
         final_sale_price_inc_gst: parsed,
       })
       const summary = res.data.order_financial_summary
-      // Lift to the workspace header FIRST — the backend has persisted the
-      // change, so the header must update even if this tab has since unmounted.
-      onFinancialSummary(summary)
+      // Lift to the workspace header FIRST — runs even if this tab has unmounted;
+      // the parent discards it if a newer sale-price mutation has begun.
+      applySalePriceMutationSummary(seq, summary)
       if (!mountedRef.current) return
       setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
       setSalePriceDirty(false)
@@ -346,22 +356,24 @@ export function DetailsOfSaleTab({
       if (!mountedRef.current) return
       setSalePriceError(salePriceErrorMessage(err))
     } finally {
-      if (mountedRef.current) setSalePriceSaving(false)
+      // Always clear in-flight in the parent (latest-seq only), even after unmount.
+      finishSalePriceMutation(seq)
     }
   }
 
   async function handleResetSalePrice() {
-    if (locked || salePriceSaving) return
+    if (locked || salePriceMutationInFlight) return
     // Reset is idempotent on the backend (clears price_adjustment_inc_gst to
     // NULL), so it is safe to call even when there is no current adjustment.
-
-    setSalePriceSaving(true)
     setSalePriceError(null)
+    // Begin in the parent so the in-flight flag survives this tab unmounting.
+    const seq = beginSalePriceMutation()
     try {
       const res = await resetSalePrice(orderId)
       const summary = res.data.order_financial_summary
-      // Lift to the workspace header FIRST (runs even if the tab unmounted).
-      onFinancialSummary(summary)
+      // Lift to the workspace header FIRST — runs even if this tab has unmounted;
+      // the parent discards it if a newer sale-price mutation has begun.
+      applySalePriceMutationSummary(seq, summary)
       if (!mountedRef.current) return
       setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
       setSalePriceDirty(false)
@@ -369,7 +381,8 @@ export function DetailsOfSaleTab({
       if (!mountedRef.current) return
       setSalePriceError(salePriceErrorMessage(err))
     } finally {
-      if (mountedRef.current) setSalePriceSaving(false)
+      // Always clear in-flight in the parent (latest-seq only), even after unmount.
+      finishSalePriceMutation(seq)
     }
   }
 
@@ -461,12 +474,13 @@ export function DetailsOfSaleTab({
   // Whether the order has a live financial summary yet (priced).
   const priced = financialSummary !== null
   // Sale-price input + Update are disabled when locked, mid-request, or unpriced.
-  // (Independent of the details-save `saving` flag.)
-  const salePriceControlsDisabled = locked || salePriceSaving || !priced
+  // The in-flight flag comes from the parent so it survives this tab's remount.
+  const salePriceControlsDisabled =
+    locked || salePriceMutationInFlight || !priced
   // Reset is idempotent on the backend (clearing an already-NULL adjustment is a
   // no-op), so it only depends on the order being editable and no request being
   // in flight — never on the input state or whether an adjustment exists.
-  const resetDisabled = locked || salePriceSaving
+  const resetDisabled = locked || salePriceMutationInFlight
 
   return (
     <div>
@@ -679,7 +693,7 @@ export function DetailsOfSaleTab({
               onClick={handleOverrideSalePrice}
               disabled={salePriceControlsDisabled}
             >
-              {salePriceSaving ? 'Saving…' : 'Update Sale Price'}
+              {salePriceMutationInFlight ? 'Saving…' : 'Update Sale Price'}
             </Button>
             <Button
               type="button"

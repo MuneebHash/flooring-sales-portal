@@ -113,6 +113,38 @@ function WorkspaceShell({
     setFinancialSummary(summary)
   }, [])
 
+  // Sale-price override/reset tracking lives HERE (in the always-mounted shell)
+  // rather than in DetailsOfSaleTab, which unmounts on tab switch. This keeps the
+  // in-flight serialization alive across a Details-tab unmount/remount and lets a
+  // stale (older) sale-price response be discarded once a newer one has begun.
+  const [salePriceMutationInFlight, setSalePriceMutationInFlight] =
+    useState(false)
+  const salePriceMutationSeqRef = useRef(0)
+
+  const beginSalePriceMutation = useCallback(() => {
+    const seq = salePriceMutationSeqRef.current + 1
+    salePriceMutationSeqRef.current = seq
+    setSalePriceMutationInFlight(true)
+    return seq
+  }, [])
+
+  const applySalePriceMutationSummary = useCallback(
+    (seq: number, summary: OrderFinancialSummary) => {
+      // Ignore a stale (older) sale-price response — only the latest applies.
+      if (seq !== salePriceMutationSeqRef.current) return
+      applyFinancialSummary(summary)
+    },
+    [applyFinancialSummary],
+  )
+
+  const finishSalePriceMutation = useCallback((seq: number) => {
+    // Only the latest mutation clears in-flight, so an older response resolving
+    // after a newer begin cannot prematurely re-enable the sale-price controls.
+    if (seq === salePriceMutationSeqRef.current) {
+      setSalePriceMutationInFlight(false)
+    }
+  }, [])
+
   // Seed the header summary without waiting for the Products & Charges tab to be
   // mounted (it only mounts when its tab is active). The header is non-critical,
   // so a failed fetch is swallowed and the placeholder remains. ProductsChargesTab
@@ -232,7 +264,10 @@ function WorkspaceShell({
                 locked={locked}
                 saleDetails={saleDetails}
                 financialSummary={financialSummary}
-                onFinancialSummary={applyFinancialSummary}
+                salePriceMutationInFlight={salePriceMutationInFlight}
+                beginSalePriceMutation={beginSalePriceMutation}
+                applySalePriceMutationSummary={applySalePriceMutationSummary}
+                finishSalePriceMutation={finishSalePriceMutation}
                 onSaved={onDetailsSaved}
               />
             )}
