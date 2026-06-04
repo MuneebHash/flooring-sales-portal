@@ -4,7 +4,8 @@ import { Field } from '../ui/Field'
 import { Input } from '../ui/Input'
 import { Select } from '../ui/Select'
 import { Textarea } from '../ui/Textarea'
-import { CheckCircleIcon } from '../icons'
+import { Modal } from '../ui/Modal'
+import { CheckCircleIcon, InfoIcon } from '../icons'
 import { ApiError } from '../../lib/api/ApiError'
 import { saveDetailsOfSale } from '../../lib/api/orderWorkspaceApi'
 import type {
@@ -12,11 +13,20 @@ import type {
   DetailsOfSaleSaveRequest,
   LayDateStatus,
 } from '../../lib/api/orderWorkspaceApi'
+import { overrideSalePrice, resetSalePrice } from '../../lib/api/orderLinesApi'
+import type { OrderFinancialSummary } from '../../lib/api/orderLinesApi'
 
 type Props = {
   orderId: number
   locked: boolean
   saleDetails?: DetailsOfSaleFields | null
+  // Live order financial summary (Chunk 3 order_financial_summary), seeded and
+  // kept fresh by OrderWorkspace. Null until the order has been priced.
+  financialSummary: OrderFinancialSummary | null
+  // Lifts the backend-confirmed order_financial_summary up to OrderWorkspace
+  // after a sale-price override/reset so the header Sale total stays in sync
+  // without a refetch. Same callback ProductsChargesTab uses.
+  onFinancialSummary: (summary: OrderFinancialSummary) => void
   // Lifts the server-confirmed details fields (and refreshed updated_at) up so
   // workspace state — and sibling tabs that read it — stay in sync without a
   // refetch.
@@ -126,6 +136,102 @@ function apiErrorMessage(err: unknown): string {
   return 'Something went wrong while saving. Please try again.'
 }
 
+// Largest GST-inclusive sale price the backend accepts (DECIMAL(10,2)).
+const SALE_PRICE_MAX = 99999999.99
+
+const MONEY_FORMATTER = new Intl.NumberFormat('en-AU', {
+  style: 'currency',
+  currency: 'AUD',
+})
+
+// Formats money including negatives (Intl renders -$1,234.56). Derived values
+// like GP and price adjustment can be negative and must never be clamped.
+function formatMoney(value: number): string {
+  return MONEY_FORMATTER.format(value)
+}
+
+// gp_percent is nullable (null when sale_price_ex_gst <= 0); render null as a
+// dash. Negative percentages are shown verbatim.
+function formatPercent(value: number | null): string {
+  if (value === null) return '—'
+  return `${value.toFixed(2)}%`
+}
+
+// GP health tone for the info modal — VISUAL ONLY. Does not affect the backend
+// GP/GP% calculation or the backend gp_warning threshold; it only colours the
+// modal's GP rows so a salesperson can read the result at a glance.
+// >15 green · 10–15 amber · <10 (incl. negative) red · null neutral.
+function gpTone(
+  gpPercent: number | null,
+): 'success' | 'warning' | 'danger' | 'neutral' {
+  if (gpPercent === null) return 'neutral'
+  if (gpPercent > 15) return 'success'
+  if (gpPercent >= 10) return 'warning'
+  return 'danger'
+}
+
+const GP_TONE_ROW: Record<ReturnType<typeof gpTone>, string> = {
+  success: 'bg-emerald-50 border border-emerald-200',
+  warning: 'bg-amber-50 border border-amber-200',
+  danger: 'bg-rose-50 border border-rose-200',
+  neutral: 'border border-transparent',
+}
+
+const GP_TONE_TEXT: Record<ReturnType<typeof gpTone>, string> = {
+  success: 'text-emerald-700',
+  warning: 'text-amber-800',
+  danger: 'text-rose-700',
+  neutral: 'text-slate-900',
+}
+
+// GP + GP% rows for the Sale Information modal, colour-highlighted by GP health.
+function GpInfoRows({ summary }: { summary: OrderFinancialSummary }) {
+  const tone = gpTone(summary.gp_percent)
+  const text = GP_TONE_TEXT[tone]
+  return (
+    <div className={`rounded-lg px-2.5 py-2 space-y-1 ${GP_TONE_ROW[tone]}`}>
+      <div className="flex items-center justify-between">
+        <dt className={`font-semibold ${text}`}>Gross profit (GP)</dt>
+        <dd className={`font-bold tabular-nums ${text}`}>
+          {formatMoney(summary.gp)}
+        </dd>
+      </div>
+      <div className="flex items-center justify-between">
+        <dt className={`font-medium ${text}`}>GP %</dt>
+        <dd className={`font-bold tabular-nums ${text}`}>
+          {formatPercent(summary.gp_percent)}
+        </dd>
+      </div>
+    </div>
+  )
+}
+
+function toFixed2(value: number): string {
+  return value.toFixed(2)
+}
+
+// Parse the sale-price input. Returns null for blank / non-finite input. Never
+// clamps — the > 0 and <= max rules are applied by the caller before the API call.
+function parseSalePrice(value: string): number | null {
+  const trimmed = value.trim()
+  if (trimmed === '') return null
+  const n = Number(trimmed)
+  return Number.isFinite(n) ? n : null
+}
+
+// Surfaces a friendly message for sale-price override/reset failures. A LAID
+// order returns 422 ORDER_LOCKED; everything else falls back to the backend
+// message (e.g. VALIDATION_FAILED) or a generic line.
+function salePriceErrorMessage(err: unknown): string {
+  if (err instanceof ApiError) {
+    if (err.code === 'ORDER_LOCKED') {
+      return 'This order is laid and locked. The sale price can no longer be changed.'
+    }
+    if (err.message.length > 0) return err.message
+  }
+  return 'Something went wrong while updating the sale price. Please try again.'
+}
+
 // Best-effort map of a backend VALIDATION_FAILED details[] onto this tab's
 // field error keys (the snake_case field names). Anything that does not line up
 // with a known field still surfaces via the top-level error message.
@@ -147,12 +253,31 @@ function mapDetailsToFieldErrors(err: unknown): Record<string, string> {
   return result
 }
 
-export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Props) {
+export function DetailsOfSaleTab({
+  orderId,
+  locked,
+  saleDetails,
+  financialSummary,
+  onFinancialSummary,
+  onSaved,
+}: Props) {
   const [form, setForm] = useState<DetailsForm>(() => formFromProps(saleDetails))
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
+
+  // --- Sale price override / reset (independent of the details-of-sale save). ---
+  // The input mirrors the GST-inclusive final sale price. `salePriceDirty` tracks
+  // whether the user has edited it since the last server value, so an incoming
+  // summary update never clobbers an active edit. salePriceSaving serializes the
+  // override and reset requests (both disable the input + both buttons).
+  const [salePriceInput, setSalePriceInput] = useState('')
+  const [salePriceDirty, setSalePriceDirty] = useState(false)
+  const [salePriceSaving, setSalePriceSaving] = useState(false)
+  const [salePriceError, setSalePriceError] = useState<string | null>(null)
+  // Toggles the compact GP / financial info modal (full breakdown hidden by default).
+  const [salePriceInfoOpen, setSalePriceInfoOpen] = useState(false)
 
   // Guards setState after the tab unmounts (e.g. the order route changes, or the
   // user switches tabs, while a save is still in flight).
@@ -165,6 +290,88 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
       mountedRef.current = false
     }
   }, [])
+
+  // Autosave bookkeeping for the details-of-sale fields. detailsSeqRef discards
+  // out-of-order responses; lastSavedDetailsRef holds the last persisted body so
+  // a blur with no change does not re-hit the API.
+  const detailsSeqRef = useRef(0)
+  const lastSavedDetailsRef = useRef<string | null>(
+    JSON.stringify(buildDetailsBody(formFromProps(saleDetails))),
+  )
+
+  // Seed the sale-price input from the live summary, but never overwrite an
+  // active edit. After a successful override/reset we clear `salePriceDirty` and
+  // re-seed from the returned summary, so this also re-seeds then. When the order
+  // is not yet priced (summary null) the input is cleared and the panel shows a
+  // neutral empty state instead.
+  useEffect(() => {
+    if (salePriceDirty) return
+    if (financialSummary) {
+      setSalePriceInput(toFixed2(financialSummary.final_sale_price_inc_gst))
+    } else {
+      setSalePriceInput('')
+    }
+  }, [financialSummary, salePriceDirty])
+
+  function handleSalePriceChange(value: string) {
+    setSalePriceInput(value)
+    setSalePriceDirty(true)
+    setSalePriceError(null)
+  }
+
+  async function handleOverrideSalePrice() {
+    if (locked || salePriceSaving) return
+    const parsed = parseSalePrice(salePriceInput)
+    // Client-side guard mirrors the backend: required, finite, > 0, <= max.
+    // Blank / zero / negative / non-finite never reaches the API.
+    if (parsed === null || parsed <= 0 || parsed > SALE_PRICE_MAX) {
+      setSalePriceError('Enter a sale price greater than 0 and at most 99,999,999.99.')
+      return
+    }
+
+    setSalePriceSaving(true)
+    setSalePriceError(null)
+    try {
+      const res = await overrideSalePrice(orderId, {
+        final_sale_price_inc_gst: parsed,
+      })
+      const summary = res.data.order_financial_summary
+      // Lift to the workspace header FIRST — the backend has persisted the
+      // change, so the header must update even if this tab has since unmounted.
+      onFinancialSummary(summary)
+      if (!mountedRef.current) return
+      setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
+      setSalePriceDirty(false)
+    } catch (err) {
+      if (!mountedRef.current) return
+      setSalePriceError(salePriceErrorMessage(err))
+    } finally {
+      if (mountedRef.current) setSalePriceSaving(false)
+    }
+  }
+
+  async function handleResetSalePrice() {
+    if (locked || salePriceSaving) return
+    // Reset is idempotent on the backend (clears price_adjustment_inc_gst to
+    // NULL), so it is safe to call even when there is no current adjustment.
+
+    setSalePriceSaving(true)
+    setSalePriceError(null)
+    try {
+      const res = await resetSalePrice(orderId)
+      const summary = res.data.order_financial_summary
+      // Lift to the workspace header FIRST (runs even if the tab unmounted).
+      onFinancialSummary(summary)
+      if (!mountedRef.current) return
+      setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
+      setSalePriceDirty(false)
+    } catch (err) {
+      if (!mountedRef.current) return
+      setSalePriceError(salePriceErrorMessage(err))
+    } finally {
+      if (mountedRef.current) setSalePriceSaving(false)
+    }
+  }
 
   function clearError(key: string) {
     setErrors((prev) => {
@@ -188,47 +395,56 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
   }
 
   function appendSnippet(snippet: string) {
-    setForm((prev) => ({
-      ...prev,
-      details_of_sale: prev.details_of_sale.trim()
-        ? `${prev.details_of_sale.trimEnd()}\n${snippet}`
-        : snippet,
-    }))
+    const nextDescription = form.details_of_sale.trim()
+      ? `${form.details_of_sale.trimEnd()}\n${snippet}`
+      : snippet
+    const next = { ...form, details_of_sale: nextDescription }
+    setForm(next)
     clearError('details_of_sale')
     setSaved(false)
     setSaveError(null)
+    // Quick-add is a deliberate action; autosave the appended description now.
+    // (The + button preventDefaults mousedown so the textarea is not blurred.)
+    void commitDetails(next)
   }
 
-  async function handleSave() {
-    if (locked || saving) return
+  // Autosave the details-of-sale fields (full-replace PUT). Triggered on blur /
+  // change — never on every keystroke and never debounced. Reuses the existing
+  // saveDetailsOfSale + onSaved flow; only the trigger changed from a button.
+  async function commitDetails(formToSave: DetailsForm) {
+    if (locked) return
 
-    // Strict client validation first — no network call when the form is invalid.
-    const validationErrors = validateForm(form)
+    // Strict client validation first — never autosave an invalid form.
+    const validationErrors = validateForm(formToSave)
     if (Object.keys(validationErrors).length > 0) {
       setErrors(validationErrors)
-      setSaved(false)
-      setSaveError(null)
       return
     }
     setErrors({})
 
-    // Always send the complete field set (full-replace PUT).
-    const body = buildDetailsBody(form)
+    const body = buildDetailsBody(formToSave)
+    const key = JSON.stringify(body)
+    // Nothing changed since the last persisted save — skip the network call.
+    if (key === lastSavedDetailsRef.current) return
+    lastSavedDetailsRef.current = key
+    const seq = ++detailsSeqRef.current
 
     setSaving(true)
     setSaved(false)
     setSaveError(null)
-
     try {
       const res = await saveDetailsOfSale(orderId, body)
       if (!mountedRef.current) return
-      const fields = res.data.details_of_sale_fields
-      // Re-seed the form from the server-confirmed values, then lift them up.
-      setForm(formFromProps(fields))
+      if (seq !== detailsSeqRef.current) return // superseded by a newer autosave
       setSaved(true)
-      onSaved({ fields, updated_at: res.data.updated_at })
+      onSaved({
+        fields: res.data.details_of_sale_fields,
+        updated_at: res.data.updated_at,
+      })
     } catch (err) {
+      lastSavedDetailsRef.current = null // allow a retry on the next blur/change
       if (!mountedRef.current) return
+      if (seq !== detailsSeqRef.current) return
       const fieldErrors = mapDetailsToFieldErrors(err)
       if (Object.keys(fieldErrors).length > 0) {
         setErrors(fieldErrors)
@@ -236,22 +452,52 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
       // Surfaces VALIDATION_FAILED, ORDER_LOCKED, and network/server errors.
       setSaveError(apiErrorMessage(err))
     } finally {
-      if (mountedRef.current) setSaving(false)
+      if (mountedRef.current && seq === detailsSeqRef.current) setSaving(false)
     }
   }
 
-  const editingDisabled = locked || saving
+  // Fields stay editable during a background autosave; only LAID locks them.
+  const editingDisabled = locked
+  // Whether the order has a live financial summary yet (priced).
+  const priced = financialSummary !== null
+  // Sale-price input + Update are disabled when locked, mid-request, or unpriced.
+  // (Independent of the details-save `saving` flag.)
+  const salePriceControlsDisabled = locked || salePriceSaving || !priced
+  // Reset is idempotent on the backend (clearing an already-NULL adjustment is a
+  // no-op), so it only depends on the order being editable and no request being
+  // in flight — never on the input state or whether an adjustment exists.
+  const resetDisabled = locked || salePriceSaving
 
   return (
     <div>
-      <div className="mb-6">
-        <h2 className="text-lg font-semibold text-slate-900 tracking-tight">
-          Details of Sale
-        </h2>
-        <p className="text-sm text-slate-500 mt-1">
-          Record description, lay date and supply terms for this order.
-        </p>
+      <div className="mb-6 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold text-slate-900 tracking-tight">
+            Details of Sale
+          </h2>
+          <p className="text-sm text-slate-500 mt-1">
+            Changes are saved automatically.
+          </p>
+        </div>
+        <div className="shrink-0 pt-0.5 text-xs">
+          {saving ? (
+            <span className="text-slate-500">Saving…</span>
+          ) : saveError ? (
+            <span className="text-red-600">{saveError}</span>
+          ) : saved ? (
+            <span className="inline-flex items-center gap-1 text-teal-700">
+              <CheckCircleIcon className="w-3.5 h-3.5" />
+              Saved
+            </span>
+          ) : null}
+        </div>
       </div>
+
+      {locked && (
+        <div className="mb-5 rounded-lg border border-slate-200 bg-slate-50 px-4 py-2.5 text-xs text-slate-600">
+          This order is laid and locked. Fields are read-only.
+        </div>
+      )}
 
       <div className="space-y-6">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
@@ -266,6 +512,7 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
                 rows={10}
                 value={form.details_of_sale}
                 onChange={(e) => update('details_of_sale', e.target.value)}
+                onBlur={() => commitDetails(form)}
                 invalid={!!errors.details_of_sale}
                 disabled={editingDisabled}
                 placeholder="Describe the supply, installation and any site notes for this order."
@@ -292,6 +539,7 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
                     </span>
                     <button
                       type="button"
+                      onMouseDown={(e) => e.preventDefault()}
                       onClick={() => appendSnippet(snippet)}
                       disabled={editingDisabled}
                       aria-label={`Add snippet: ${snippet}`}
@@ -319,6 +567,7 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
               type="date"
               value={form.proposed_lay_date}
               onChange={(e) => update('proposed_lay_date', e.target.value)}
+              onBlur={() => commitDetails(form)}
               invalid={!!errors.proposed_lay_date}
               disabled={editingDisabled}
             />
@@ -337,6 +586,7 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
               onChange={(e) =>
                 update('lay_date_status', e.target.value as '' | LayDateStatus)
               }
+              onBlur={() => commitDetails(form)}
               invalid={!!errors.lay_date_status}
               disabled={editingDisabled}
             >
@@ -358,6 +608,7 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
               type="text"
               value={form.plan_numbers}
               onChange={(e) => update('plan_numbers', e.target.value)}
+              onBlur={() => commitDetails(form)}
               invalid={!!errors.plan_numbers}
               disabled={editingDisabled}
             />
@@ -369,7 +620,12 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
             id="supply_only"
             type="checkbox"
             checked={form.supply_only}
-            onChange={(e) => update('supply_only', e.target.checked)}
+            onChange={(e) => {
+              const checked = e.target.checked
+              const next = { ...form, supply_only: checked }
+              update('supply_only', checked)
+              void commitDetails(next)
+            }}
             disabled={editingDisabled}
             className="h-4 w-4 rounded border-slate-300 text-teal-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/30 disabled:opacity-50 disabled:cursor-not-allowed"
           />
@@ -377,42 +633,165 @@ export function DetailsOfSaleTab({ orderId, locked, saleDetails, onSaved }: Prop
         </label>
       </div>
 
-      <div className="mt-8 pt-5 border-t border-slate-200 space-y-4">
-        {locked && (
-          <p className="text-xs text-slate-500">
-            This order is laid and locked. Editing is disabled.
-          </p>
-        )}
-
-        {saved && (
-          <div className="inline-flex items-center gap-1.5 text-xs text-teal-700">
-            <CheckCircleIcon className="w-3.5 h-3.5" />
-            Details of sale saved.
-          </div>
-        )}
-
-        {saveError && (
-          <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-3 text-xs text-red-800">
-            {saveError}
-          </div>
-        )}
-
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <p className="text-[11px] text-slate-500">
-            Save description, supply terms, plan numbers and lay date details
-            for this order.
-          </p>
-          <Button
-            type="button"
-            variant="success"
-            size="md"
-            onClick={handleSave}
-            disabled={editingDisabled}
+      <div className="mt-8">
+        <div className="max-w-md">
+          <label
+            htmlFor="final_sale_price_inc_gst"
+            className="block text-sm font-medium text-slate-700 mb-1.5"
           >
-            {saving ? 'Saving…' : 'Save details'}
-          </Button>
+            Sale Price
+          </label>
+          <Input
+            id="final_sale_price_inc_gst"
+            type="text"
+            inputMode="decimal"
+            value={salePriceInput}
+            onChange={(e) => handleSalePriceChange(e.target.value)}
+            invalid={!!salePriceError}
+            disabled={salePriceControlsDisabled}
+            placeholder={priced ? '0.00' : 'Not priced yet'}
+            className="font-semibold tabular-nums"
+          />
+          {salePriceError && (
+            <p className="mt-1.5 text-xs text-red-600" role="alert">
+              {salePriceError}
+            </p>
+          )}
+          {!priced && !salePriceError && (
+            <p className="mt-1.5 text-xs text-slate-400">
+              Add products and charges to set a sale price.
+            </p>
+          )}
+          {financialSummary?.gp_warning && (
+            <p className="mt-1.5 text-xs font-medium text-red-600">
+              Warning: This sales price is below approved sales persons costings.
+            </p>
+          )}
+        </div>
+
+        {/* Sale price controls (left) + visual-only Create Invoice (right). */}
+        <div className="mt-4 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button
+              type="button"
+              variant="success"
+              size="md"
+              onClick={handleOverrideSalePrice}
+              disabled={salePriceControlsDisabled}
+            >
+              {salePriceSaving ? 'Saving…' : 'Update Sale Price'}
+            </Button>
+            <Button
+              type="button"
+              variant="success-outline"
+              size="md"
+              onClick={handleResetSalePrice}
+              disabled={resetDisabled}
+            >
+              Reset Price
+            </Button>
+            <button
+              type="button"
+              onClick={() => setSalePriceInfoOpen(true)}
+              disabled={!priced}
+              aria-label="Show sale information"
+              className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-sky-500 text-white hover:bg-sky-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              <InfoIcon className="w-4 h-4" />
+            </button>
+          </div>
+
+          <div className="flex flex-col items-start sm:items-end gap-1">
+            {/* Visual only in B8 — no invoice API/logic is wired. */}
+            <button
+              type="button"
+              disabled
+              aria-disabled="true"
+              title="Visual only — invoice creation is not available yet"
+              className="inline-flex items-center justify-center h-10 px-4 rounded-lg text-sm font-medium bg-violet-200 text-violet-700 border border-violet-300 cursor-not-allowed"
+            >
+              Create Invoice
+            </button>
+            {financialSummary?.gp_warning && (
+              <span className="text-xs font-medium text-red-600">
+                Manager approval required!
+              </span>
+            )}
+          </div>
         </div>
       </div>
+
+      {/* Compact GP / financial info — hidden by default, opened by the "i" button. */}
+      <Modal
+        open={salePriceInfoOpen}
+        onClose={() => setSalePriceInfoOpen(false)}
+        labelledBy="sale-information-title"
+      >
+        <div className="p-6">
+          <div className="flex flex-col items-center text-center">
+            <span className="inline-flex h-12 w-12 items-center justify-center rounded-full border-2 border-sky-300 text-sky-500">
+              <InfoIcon className="w-6 h-6" />
+            </span>
+            <h3
+              id="sale-information-title"
+              className="mt-3 text-lg font-semibold text-slate-900 tracking-tight"
+            >
+              Sale Information
+            </h3>
+          </div>
+
+          {financialSummary && (
+            <dl className="mt-4 space-y-1.5 text-sm">
+              <div className="flex items-center justify-between">
+                <dt className="text-slate-500">Calculated total (inc GST)</dt>
+                <dd className="font-medium tabular-nums text-slate-900">
+                  {formatMoney(financialSummary.calculated_total_inc_gst)}
+                </dd>
+              </div>
+              <div className="flex items-center justify-between">
+                <dt className="text-slate-500">Price adjustment (inc GST)</dt>
+                <dd className="font-medium tabular-nums text-slate-900">
+                  {financialSummary.price_adjustment_inc_gst === null
+                    ? 'None'
+                    : formatMoney(financialSummary.price_adjustment_inc_gst)}
+                </dd>
+              </div>
+              <div className="flex items-center justify-between border-t border-slate-200 pt-1.5">
+                <dt className="font-semibold text-slate-700">
+                  Final sale price (inc GST)
+                </dt>
+                <dd className="font-bold tabular-nums text-slate-900">
+                  {formatMoney(financialSummary.final_sale_price_inc_gst)}
+                </dd>
+              </div>
+              <div className="flex items-center justify-between">
+                <dt className="text-slate-500">Sale price (ex GST)</dt>
+                <dd className="font-medium tabular-nums text-slate-900">
+                  {formatMoney(financialSummary.sale_price_ex_gst)}
+                </dd>
+              </div>
+              <div className="flex items-center justify-between">
+                <dt className="text-slate-500">Total cost</dt>
+                <dd className="font-medium tabular-nums text-slate-900">
+                  {formatMoney(financialSummary.total_cost)}
+                </dd>
+              </div>
+              <GpInfoRows summary={financialSummary} />
+            </dl>
+          )}
+
+          <div className="mt-5 flex justify-center">
+            <Button
+              type="button"
+              variant="primary"
+              size="md"
+              onClick={() => setSalePriceInfoOpen(false)}
+            >
+              OK
+            </Button>
+          </div>
+        </div>
+      </Modal>
     </div>
   )
 }

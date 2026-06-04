@@ -127,9 +127,7 @@ export function PaymentsTab({ payments, paymentSummary }: Props) {
             )}
           </div>
           <div className="mt-1.5 text-[11px] text-slate-500 leading-snug">
-            {invoiceIssued
-              ? 'Required deposit: 40% of invoice total = $400.00'
-              : 'Required deposit will appear once invoice total is available.'}
+            Deposit requirements will appear once payments are wired.
           </div>
         </div>
       </div>

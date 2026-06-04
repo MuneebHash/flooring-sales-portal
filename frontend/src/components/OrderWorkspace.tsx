@@ -231,6 +231,8 @@ function WorkspaceShell({
                 orderId={orderId}
                 locked={locked}
                 saleDetails={saleDetails}
+                financialSummary={financialSummary}
+                onFinancialSummary={applyFinancialSummary}
                 onSaved={onDetailsSaved}
               />
             )}

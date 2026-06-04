@@ -1687,33 +1687,6 @@ export function ProductsChargesTab({
             </div>
           )}
         </section>
-
-        {summary && (
-          <div className="flex justify-end">
-            <dl className="w-full sm:w-72 rounded-xl border border-slate-200 bg-white p-4 shadow-sm space-y-1.5 text-sm">
-              <div className="flex items-center justify-between">
-                <dt className="text-slate-500">Product subtotal</dt>
-                <dd className="font-medium tabular-nums text-slate-900">
-                  {formatMoney(summary.product_subtotal)}
-                </dd>
-              </div>
-              <div className="flex items-center justify-between">
-                <dt className="text-slate-500">Charge subtotal</dt>
-                <dd className="font-medium tabular-nums text-slate-900">
-                  {formatMoney(summary.charge_subtotal)}
-                </dd>
-              </div>
-              <div className="flex items-center justify-between border-t border-slate-200 pt-1.5">
-                <dt className="font-semibold text-slate-700">
-                  Calculated total (inc GST)
-                </dt>
-                <dd className="font-bold tabular-nums text-slate-900">
-                  {formatMoney(summary.calculated_total_inc_gst)}
-                </dd>
-              </div>
-            </dl>
-          </div>
-        )}
       </div>
     </div>
   )

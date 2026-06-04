@@ -1,6 +1,6 @@
 import type { FlooringType } from '../flooring'
 import { DEFAULT_BUSINESS_SLUG } from '../tenant'
-import { del, get, patch, post } from './client'
+import { del, get, patch, post, put } from './client'
 import { apiPath } from './paths'
 import type { ApiCollection, ApiSuccess } from './types'
 
@@ -79,7 +79,7 @@ export type ChargeLineRead = {
 
 // Live order financial summary returned by GET /lines and every line mutation.
 // price_adjustment_inc_gst and gp_percent are nullable; negatives are never
-// clamped. GP / GP% / gp_warning are NOT rendered in this branch.
+// clamped. GP / GP% / gp_warning are rendered in the Details of Sale tab (B8).
 export type OrderFinancialSummary = {
   product_subtotal: number
   charge_subtotal: number
@@ -257,5 +257,42 @@ export function deleteChargeLine(
 ): Promise<ApiSuccess<ChargeLineDeleteResponse>> {
   return del<ApiSuccess<ChargeLineDeleteResponse>>(
     apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/charge-lines/${lineId}`),
+  )
+}
+
+// --- Sale price override / reset (Chunk 3 D.10 / D.11). ---
+// The client sends ONLY the GST-inclusive final sale price; the backend derives
+// and persists price_adjustment_inc_gst (never sent by the client). Both
+// endpoints return the recomputed live order_financial_summary — the same shape
+// the line endpoints return — and are blocked on LAID orders (422 ORDER_LOCKED).
+
+export type SalePriceOverrideRequest = {
+  final_sale_price_inc_gst: number
+}
+
+export type SalePriceMutationResponse = {
+  order_financial_summary: OrderFinancialSummary
+}
+
+// PUT /api/v1/{slug}/orders/{orderId}/sale-price — manual GST-inclusive sale
+// price override. final_sale_price_inc_gst must be > 0 and <= 99999999.99; the
+// backend rounds extra decimals HALF_UP and derives the price adjustment.
+export function overrideSalePrice(
+  orderId: number,
+  body: SalePriceOverrideRequest,
+): Promise<ApiSuccess<SalePriceMutationResponse>> {
+  return put<ApiSuccess<SalePriceMutationResponse>>(
+    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/sale-price`),
+    body,
+  )
+}
+
+// POST /api/v1/{slug}/orders/{orderId}/sale-price/reset — clear the manual
+// adjustment (price_adjustment_inc_gst -> null). No request body; idempotent.
+export function resetSalePrice(
+  orderId: number,
+): Promise<ApiSuccess<SalePriceMutationResponse>> {
+  return post<ApiSuccess<SalePriceMutationResponse>>(
+    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/sale-price/reset`),
   )
 }
