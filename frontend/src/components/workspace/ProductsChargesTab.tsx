@@ -683,12 +683,18 @@ export function ProductsChargesTab({
       setAddProductError('Enter an LM or SQM quantity greater than 0.')
       return
     }
+    const price = parseNumber(productPanelPrice)
+    // Reject a blank / invalid / non-positive override instead of silently
+    // omitting it (which the backend would treat as "use the catalog price").
+    if (price === null || price <= 0) {
+      setAddProductError('Enter a unit price greater than 0.')
+      return
+    }
     const body: AddProductLineRequest = {
       product_id: selectedProduct.product_id,
       [quantity.field]: quantity.value,
+      unit_price: price,
     }
-    const price = parseNumber(productPanelPrice)
-    if (price !== null && price > 0) body.unit_price = price
 
     setAddingProduct(true)
     setAddProductError(null)
@@ -755,12 +761,18 @@ export function ProductsChargesTab({
       setAddChargeError('Enter a quantity greater than 0.')
       return
     }
+    const price = parseNumber(chargePanelPrice)
+    // Reject a blank / invalid / non-positive override instead of silently
+    // omitting it (which the backend would treat as "use the catalog price").
+    if (price === null || price <= 0) {
+      setAddChargeError('Enter a unit price greater than 0.')
+      return
+    }
     const body: AddChargeLineRequest = {
       charge_id: selectedCharge.charge_id,
       quantity: qty,
+      unit_price: price,
     }
-    const price = parseNumber(chargePanelPrice)
-    if (price !== null && price > 0) body.unit_price = price
 
     setAddingCharge(true)
     setAddChargeError(null)
@@ -823,11 +835,24 @@ export function ProductsChargesTab({
 
   const productSubtotal = summary ? summary.product_subtotal : 0
   const chargeSubtotal = summary ? summary.charge_subtotal : 0
+  const productPanelPriceValue = parseNumber(productPanelPrice)
+  const productPriceValid =
+    productPanelPriceValue !== null && productPanelPriceValue > 0
   const canAddProduct =
-    !!selectedProduct && chooseProductQuantity() !== null && !addingProduct
+    !!selectedProduct &&
+    chooseProductQuantity() !== null &&
+    productPriceValid &&
+    !addingProduct
   const chargeQty = parseNumber(chargePanelQty)
+  const chargePanelPriceValue = parseNumber(chargePanelPrice)
+  const chargePriceValid =
+    chargePanelPriceValue !== null && chargePanelPriceValue > 0
   const canAddCharge =
-    !!selectedCharge && chargeQty !== null && chargeQty > 0 && !addingCharge
+    !!selectedCharge &&
+    chargeQty !== null &&
+    chargeQty > 0 &&
+    chargePriceValid &&
+    !addingCharge
 
   return (
     <div>
@@ -1003,6 +1028,11 @@ export function ProductsChargesTab({
                         className={PANEL_INPUT_CLASS}
                         disabled={addingProduct}
                       />
+                      {!productPriceValid && (
+                        <p className="mt-1 text-[11px] text-red-700">
+                          Enter a unit price greater than 0.
+                        </p>
+                      )}
                     </div>
                   </div>
                 </>
@@ -1409,6 +1439,11 @@ export function ProductsChargesTab({
                         className={PANEL_INPUT_CLASS}
                         disabled={addingCharge}
                       />
+                      {!chargePriceValid && (
+                        <p className="mt-1 text-[11px] text-red-700">
+                          Enter a unit price greater than 0.
+                        </p>
+                      )}
                     </div>
                   </div>
                 </>

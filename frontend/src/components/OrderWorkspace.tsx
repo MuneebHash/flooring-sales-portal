@@ -29,6 +29,7 @@ import type {
   OrderCustomer,
   OrderWorkspace as OrderWorkspaceData,
 } from '../lib/api/orderWorkspaceApi'
+import { fetchOrderLines } from '../lib/api/orderLinesApi'
 import type { OrderFinancialSummary } from '../lib/api/orderLinesApi'
 
 const TAB_IDS = [
@@ -94,11 +95,34 @@ function WorkspaceShell({
   onDetailsSaved,
 }: ShellProps) {
   const [activeTab, setActiveTab] = useState<TabId>('customer')
-  // Live order financial summary, lifted from the Products & Charges tab once its
-  // lines load (and on every line mutation). Sourced from the Chunk 3
-  // order_financial_summary, never from the nullable persisted_financials.
+  // Live order financial summary that backs the always-visible header Sale total.
+  // Sourced from the Chunk 3 order_financial_summary, never from the nullable
+  // persisted_financials. Kept fresh by Products & Charges mutations via
+  // setFinancialSummary (onFinancialSummary), and seeded independently below so
+  // the header is correct even before that tab is opened.
   const [financialSummary, setFinancialSummary] =
     useState<OrderFinancialSummary | null>(null)
+
+  // Seed the header summary without waiting for the Products & Charges tab to be
+  // mounted (it only mounts when its tab is active). The header is non-critical,
+  // so a failed fetch is swallowed and the placeholder remains. ProductsChargesTab
+  // still fetches its own lines when opened and keeps this summary fresh on every
+  // mutation through the same setFinancialSummary callback.
+  useEffect(() => {
+    let cancelled = false
+    setFinancialSummary(null)
+    fetchOrderLines(orderId)
+      .then((res) => {
+        if (cancelled) return
+        setFinancialSummary(res.data.order_financial_summary)
+      })
+      .catch(() => {
+        // Header summary is best-effort; keep the placeholder on failure.
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId])
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
