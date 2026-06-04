@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 import { AppHeader } from './AppHeader'
 import { ArrowLeftIcon } from './icons'
@@ -98,23 +98,37 @@ function WorkspaceShell({
   // Live order financial summary that backs the always-visible header Sale total.
   // Sourced from the Chunk 3 order_financial_summary, never from the nullable
   // persisted_financials. Kept fresh by Products & Charges mutations via
-  // setFinancialSummary (onFinancialSummary), and seeded independently below so
+  // applyFinancialSummary (onFinancialSummary), and seeded independently below so
   // the header is correct even before that tab is opened.
   const [financialSummary, setFinancialSummary] =
     useState<OrderFinancialSummary | null>(null)
+
+  // Monotonic version shared by every summary update (seed fetch + lifted
+  // mutations). Each apply bumps it; the seed fetch captures it before its
+  // request and discards its response if anything updated the summary meanwhile,
+  // so an in-flight seed can never clobber a newer mutation result.
+  const summaryVersionRef = useRef(0)
+  const applyFinancialSummary = useCallback((summary: OrderFinancialSummary) => {
+    summaryVersionRef.current += 1
+    setFinancialSummary(summary)
+  }, [])
 
   // Seed the header summary without waiting for the Products & Charges tab to be
   // mounted (it only mounts when its tab is active). The header is non-critical,
   // so a failed fetch is swallowed and the placeholder remains. ProductsChargesTab
   // still fetches its own lines when opened and keeps this summary fresh on every
-  // mutation through the same setFinancialSummary callback.
+  // mutation through the same applyFinancialSummary callback.
   useEffect(() => {
     let cancelled = false
     setFinancialSummary(null)
+    const seedVersion = summaryVersionRef.current
     fetchOrderLines(orderId)
       .then((res) => {
         if (cancelled) return
-        setFinancialSummary(res.data.order_financial_summary)
+        // Drop a stale seed: if any apply (e.g. a mutation lift) bumped the
+        // version since this request began, it already set a newer summary.
+        if (summaryVersionRef.current !== seedVersion) return
+        applyFinancialSummary(res.data.order_financial_summary)
       })
       .catch(() => {
         // Header summary is best-effort; keep the placeholder on failure.
@@ -122,7 +136,7 @@ function WorkspaceShell({
     return () => {
       cancelled = true
     }
-  }, [orderId])
+  }, [orderId, applyFinancialSummary])
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -209,7 +223,7 @@ function WorkspaceShell({
                 orderId={orderId}
                 flooringType={flooringType}
                 locked={locked}
-                onFinancialSummary={setFinancialSummary}
+                onFinancialSummary={applyFinancialSummary}
               />
             )}
             {activeTab === 'details' && (

@@ -235,8 +235,13 @@ export function ProductsChargesTab({
   function applySummary(seq: number, next: OrderFinancialSummary) {
     if (seq < appliedSummarySeqRef.current) return
     appliedSummarySeqRef.current = seq
-    setSummary(next)
+    // Always lift to the workspace header — even if this tab has since unmounted.
+    // The backend already persisted the change, and the parent (workspace shell)
+    // is still mounted, so dropping this would leave the Sale total stale.
     onSummaryRef.current(next)
+    // The child-local mirror only updates while mounted, to avoid a
+    // setState-on-unmounted warning.
+    if (mountedRef.current) setSummary(next)
   }
 
   // Stale-search guards: only the latest issued search applies its results.
@@ -431,8 +436,10 @@ export function ProductsChargesTab({
         line.order_product_line_id,
         body,
       )
-      if (!mountedRef.current) return
       const updated = res.data.product_line
+      // Lift the summary to the header first (runs even if the tab unmounted).
+      applySummary(seq, res.data.order_financial_summary)
+      if (!mountedRef.current) return
       setProductLines((prev) =>
         prev.map((l) =>
           l.order_product_line_id === updated.order_product_line_id
@@ -444,7 +451,6 @@ export function ProductsChargesTab({
         ...prev,
         [updated.order_product_line_id]: productDraftFrom(updated),
       }))
-      applySummary(seq, res.data.order_financial_summary)
     } catch (err) {
       if (!mountedRef.current) return
       setMutationError(apiErrorMessage(err))
@@ -469,8 +475,10 @@ export function ProductsChargesTab({
     const seq = ++reqSeqRef.current
     try {
       const res = await deleteProductLine(orderId, line.order_product_line_id)
-      if (!mountedRef.current) return
       const removedId = res.data.deleted_product_line_id
+      // Lift the summary to the header first (runs even if the tab unmounted).
+      applySummary(seq, res.data.order_financial_summary)
+      if (!mountedRef.current) return
       setProductLines((prev) =>
         prev.filter((l) => l.order_product_line_id !== removedId),
       )
@@ -479,7 +487,6 @@ export function ProductsChargesTab({
         delete next[removedId]
         return next
       })
-      applySummary(seq, res.data.order_financial_summary)
     } catch (err) {
       if (!mountedRef.current) return
       setMutationError(apiErrorMessage(err))
@@ -547,8 +554,10 @@ export function ProductsChargesTab({
         line.order_charge_line_id,
         body,
       )
-      if (!mountedRef.current) return
       const updated = res.data.charge_line
+      // Lift the summary to the header first (runs even if the tab unmounted).
+      applySummary(seq, res.data.order_financial_summary)
+      if (!mountedRef.current) return
       setChargeLines((prev) =>
         prev.map((l) =>
           l.order_charge_line_id === updated.order_charge_line_id ? updated : l,
@@ -558,7 +567,6 @@ export function ProductsChargesTab({
         ...prev,
         [updated.order_charge_line_id]: chargeDraftFrom(updated),
       }))
-      applySummary(seq, res.data.order_financial_summary)
     } catch (err) {
       if (!mountedRef.current) return
       setMutationError(apiErrorMessage(err))
@@ -582,8 +590,10 @@ export function ProductsChargesTab({
     const seq = ++reqSeqRef.current
     try {
       const res = await deleteChargeLine(orderId, line.order_charge_line_id)
-      if (!mountedRef.current) return
       const removedId = res.data.deleted_charge_line_id
+      // Lift the summary to the header first (runs even if the tab unmounted).
+      applySummary(seq, res.data.order_financial_summary)
+      if (!mountedRef.current) return
       setChargeLines((prev) =>
         prev.filter((l) => l.order_charge_line_id !== removedId),
       )
@@ -592,7 +602,6 @@ export function ProductsChargesTab({
         delete next[removedId]
         return next
       })
-      applySummary(seq, res.data.order_financial_summary)
     } catch (err) {
       if (!mountedRef.current) return
       setMutationError(apiErrorMessage(err))
@@ -702,14 +711,15 @@ export function ProductsChargesTab({
     const seq = ++reqSeqRef.current
     try {
       const res = await addProductLine(orderId, body)
-      if (!mountedRef.current) return
       const line = res.data.product_line
+      // Lift the summary to the header first (runs even if the tab unmounted).
+      applySummary(seq, res.data.order_financial_summary)
+      if (!mountedRef.current) return
       setProductLines((prev) => [...prev, line])
       setProductDrafts((prev) => ({
         ...prev,
         [line.order_product_line_id]: productDraftFrom(line),
       }))
-      applySummary(seq, res.data.order_financial_summary)
       resetProductPanel()
       setProductPanelOpen(false)
     } catch (err) {
@@ -780,14 +790,15 @@ export function ProductsChargesTab({
     const seq = ++reqSeqRef.current
     try {
       const res = await addChargeLine(orderId, body)
-      if (!mountedRef.current) return
       const line = res.data.charge_line
+      // Lift the summary to the header first (runs even if the tab unmounted).
+      applySummary(seq, res.data.order_financial_summary)
+      if (!mountedRef.current) return
       setChargeLines((prev) => [...prev, line])
       setChargeDrafts((prev) => ({
         ...prev,
         [line.order_charge_line_id]: chargeDraftFrom(line),
       }))
-      applySummary(seq, res.data.order_financial_summary)
       resetChargePanel()
       setChargePanelOpen(false)
     } catch (err) {
