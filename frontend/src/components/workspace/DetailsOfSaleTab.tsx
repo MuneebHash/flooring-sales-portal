@@ -7,7 +7,6 @@ import { Textarea } from '../ui/Textarea'
 import { Modal } from '../ui/Modal'
 import { CheckCircleIcon, InfoIcon } from '../icons'
 import { ApiError } from '../../lib/api/ApiError'
-import { saveDetailsOfSale } from '../../lib/api/orderWorkspaceApi'
 import type {
   DetailsOfSaleFields,
   DetailsOfSaleSaveRequest,
@@ -37,10 +36,15 @@ type Props = {
     seq: number,
     summary: OrderFinancialSummary,
   ) => boolean
-  // Lifts the server-confirmed details fields (and refreshed updated_at) up so
-  // workspace state — and sibling tabs that read it — stay in sync without a
-  // refetch.
-  onSaved: (saved: { fields: DetailsOfSaleFields; updated_at: string }) => void
+  // Details autosave single-flight lives in OrderWorkspace (the always-mounted
+  // shell) so it survives this tab's unmount/remount. The tab validates + builds
+  // the full body and hands it to queueDetailsAutosave; the status props drive the
+  // minimal Saving… / Saved / error indicator. The parent owns the lift to
+  // workspace state on success.
+  queueDetailsAutosave: (body: DetailsOfSaleSaveRequest) => void
+  detailsAutosaveSaving: boolean
+  detailsAutosaveSaved: boolean
+  detailsAutosaveError: string | null
 }
 
 // Local form mirror of the five details-of-sale fields. lay_date_status keeps the
@@ -77,16 +81,6 @@ const MONTH_NAMES = [
   'Dec',
 ]
 
-// Backend VALIDATION_FAILED details[].field values this tab can surface inline.
-// Anything outside this set falls back to the top-level error message.
-const DETAILS_FIELD_KEYS = new Set([
-  'supply_only',
-  'plan_numbers',
-  'proposed_lay_date',
-  'lay_date_status',
-  'details_of_sale',
-])
-
 function formatIsoDate(iso: string | null | undefined): string {
   if (!iso) return ''
   const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso)
@@ -97,7 +91,7 @@ function formatIsoDate(iso: string | null | undefined): string {
   return `${day} ${name} ${year}`
 }
 
-function formFromProps(d?: DetailsOfSaleFields | null): DetailsForm {
+export function formFromProps(d?: DetailsOfSaleFields | null): DetailsForm {
   return {
     supply_only: d?.supply_only ?? false,
     plan_numbers: d?.plan_numbers ?? '',
@@ -117,7 +111,7 @@ function optionalField(value: string): string | null {
 // Always build the complete 5-field body (full-replace). Optionals collapse to
 // null; supply_only is always a boolean; the <input type="date"> already yields
 // either '' or a strict YYYY-MM-DD string, matching the backend's strict parse.
-function buildDetailsBody(form: DetailsForm): DetailsOfSaleSaveRequest {
+export function buildDetailsBody(form: DetailsForm): DetailsOfSaleSaveRequest {
   return {
     supply_only: form.supply_only,
     plan_numbers: optionalField(form.plan_numbers),
@@ -139,11 +133,6 @@ function validateForm(form: DetailsForm): Record<string, string> {
       'Proposed lay date and lay date status must both be set or both be cleared.'
   }
   return newErrors
-}
-
-function apiErrorMessage(err: unknown): string {
-  if (err instanceof ApiError && err.message.length > 0) return err.message
-  return 'Something went wrong while saving. Please try again.'
 }
 
 // Largest GST-inclusive sale price the backend accepts (DECIMAL(10,2)).
@@ -242,27 +231,6 @@ function salePriceErrorMessage(err: unknown): string {
   return 'Something went wrong while updating the sale price. Please try again.'
 }
 
-// Best-effort map of a backend VALIDATION_FAILED details[] onto this tab's
-// field error keys (the snake_case field names). Anything that does not line up
-// with a known field still surfaces via the top-level error message.
-function mapDetailsToFieldErrors(err: unknown): Record<string, string> {
-  const result: Record<string, string> = {}
-  if (!(err instanceof ApiError) || err.code !== 'VALIDATION_FAILED') return result
-  const details = err.details
-  if (!Array.isArray(details)) return result
-  for (const detail of details) {
-    if (!detail || typeof detail !== 'object') continue
-    const field = (detail as { field?: unknown }).field
-    const message = (detail as { message?: unknown }).message
-    if (typeof field !== 'string' || !DETAILS_FIELD_KEYS.has(field)) continue
-    result[field] =
-      typeof message === 'string' && message.length > 0
-        ? message
-        : 'Invalid value.'
-  }
-  return result
-}
-
 export function DetailsOfSaleTab({
   orderId,
   locked,
@@ -273,13 +241,13 @@ export function DetailsOfSaleTab({
   finishSalePriceMutation,
   beginFinancialSummaryRequest,
   applyFinancialSummaryFromRequest,
-  onSaved,
+  queueDetailsAutosave,
+  detailsAutosaveSaving,
+  detailsAutosaveSaved,
+  detailsAutosaveError,
 }: Props) {
   const [form, setForm] = useState<DetailsForm>(() => formFromProps(saleDetails))
   const [errors, setErrors] = useState<Record<string, string>>({})
-  const [saving, setSaving] = useState(false)
-  const [saveError, setSaveError] = useState<string | null>(null)
-  const [saved, setSaved] = useState(false)
 
   // --- Sale price override / reset (independent of the details-of-sale save). ---
   // The input mirrors the GST-inclusive final sale price. `salePriceDirty` tracks
@@ -304,17 +272,6 @@ export function DetailsOfSaleTab({
       mountedRef.current = false
     }
   }, [])
-
-  // Autosave bookkeeping for the details-of-sale fields. SINGLE-FLIGHT: only ONE
-  // saveDetailsOfSale PUT is ever in flight. detailsSavingRef is the in-flight
-  // lock; pendingDetailsBodyRef holds ONLY the latest queued body (multiple edits
-  // collapse to one, latest wins); lastSavedDetailsRef holds the last body the
-  // backend has CONFIRMED persisted (set only AFTER a successful response).
-  const detailsSavingRef = useRef(false)
-  const pendingDetailsBodyRef = useRef<DetailsOfSaleSaveRequest | null>(null)
-  const lastSavedDetailsRef = useRef<string>(
-    JSON.stringify(buildDetailsBody(formFromProps(saleDetails))),
-  )
 
   // Seed the sale-price input from the live summary, but never overwrite an
   // active edit. After a successful override/reset we clear `salePriceDirty` and
@@ -423,8 +380,6 @@ export function DetailsOfSaleTab({
     if (key === 'proposed_lay_date' || key === 'lay_date_status') {
       clearError('lay_date_status')
     }
-    setSaved(false)
-    setSaveError(null)
   }
 
   function appendSnippet(snippet: string) {
@@ -434,19 +389,16 @@ export function DetailsOfSaleTab({
     const next = { ...form, details_of_sale: nextDescription }
     setForm(next)
     clearError('details_of_sale')
-    setSaved(false)
-    setSaveError(null)
     // Quick-add is a deliberate action; autosave the appended description now.
     // (The + button preventDefaults mousedown so the textarea is not blurred.)
-    void commitDetails(next)
+    commitDetails(next)
   }
 
-  // Autosave the details-of-sale fields (full-replace PUT). Triggered on blur /
-  // change — never on every keystroke and never debounced. Reuses the existing
-  // saveDetailsOfSale + onSaved flow; only the trigger changed from a button.
-  // SINGLE-FLIGHT: at most one PUT is ever in flight. While one runs, the latest
-  // requested body is queued (collapsing multiple edits, latest wins) and sent
-  // after the current save settles, so a stale older body never reaches the server.
+  // Autosave the details-of-sale fields. Triggered on blur / change — never on
+  // every keystroke and never debounced. The tab validates and builds the full
+  // body, then hands it to the parent's single-flight queue (which lives in the
+  // always-mounted shell, so the in-flight lock survives this tab's unmount/remount
+  // and two concurrent full-replace PUTs can never overlap).
   function commitDetails(formToSave: DetailsForm) {
     if (locked) return
 
@@ -458,63 +410,7 @@ export function DetailsOfSaleTab({
     }
     setErrors({})
 
-    const body = buildDetailsBody(formToSave)
-    // A save is already in flight: queue ONLY this (latest) body. The drain after
-    // the current save settles decides whether to send it (vs the persisted body).
-    if (detailsSavingRef.current) {
-      pendingDetailsBodyRef.current = body
-      return
-    }
-    // Nothing changed since the last persisted save — skip the network call.
-    if (JSON.stringify(body) === lastSavedDetailsRef.current) return
-    void runDetailsSave(body)
-  }
-
-  // Single-flight save loop. Sends exactly one PUT; on settle, drains the latest
-  // queued body (if it differs from what is now persisted) so the newest body
-  // always wins and two PUTs never overlap.
-  async function runDetailsSave(body: DetailsOfSaleSaveRequest) {
-    detailsSavingRef.current = true
-    if (mountedRef.current) {
-      setSaving(true)
-      setSaved(false)
-      setSaveError(null)
-    }
-    try {
-      const res = await saveDetailsOfSale(orderId, body)
-      // Mark persisted ONLY after a successful backend response.
-      lastSavedDetailsRef.current = JSON.stringify(body)
-      // Lift to the workspace (parent) regardless of this tab's mount state.
-      onSaved({
-        fields: res.data.details_of_sale_fields,
-        updated_at: res.data.updated_at,
-      })
-      if (mountedRef.current) setSaved(true)
-    } catch (err) {
-      // Do NOT mark this body as persisted on failure.
-      if (mountedRef.current) {
-        const fieldErrors = mapDetailsToFieldErrors(err)
-        if (Object.keys(fieldErrors).length > 0) {
-          setErrors(fieldErrors)
-        }
-        // Surfaces VALIDATION_FAILED, ORDER_LOCKED, and network/server errors.
-        setSaveError(apiErrorMessage(err))
-      }
-    } finally {
-      // Release the in-flight lock, then drain the latest queued body (single
-      // flight): send it next only if it differs from what is now persisted.
-      detailsSavingRef.current = false
-      const pending = pendingDetailsBodyRef.current
-      pendingDetailsBodyRef.current = null
-      if (
-        pending !== null &&
-        JSON.stringify(pending) !== lastSavedDetailsRef.current
-      ) {
-        void runDetailsSave(pending)
-      } else if (mountedRef.current) {
-        setSaving(false)
-      }
-    }
+    queueDetailsAutosave(buildDetailsBody(formToSave))
   }
 
   // Fields stay editable during a background autosave; only LAID locks them.
@@ -542,11 +438,11 @@ export function DetailsOfSaleTab({
           </p>
         </div>
         <div className="shrink-0 pt-0.5 text-xs">
-          {saving ? (
+          {detailsAutosaveSaving ? (
             <span className="text-slate-500">Saving…</span>
-          ) : saveError ? (
-            <span className="text-red-600">{saveError}</span>
-          ) : saved ? (
+          ) : detailsAutosaveError ? (
+            <span className="text-red-600">{detailsAutosaveError}</span>
+          ) : detailsAutosaveSaved ? (
             <span className="inline-flex items-center gap-1 text-teal-700">
               <CheckCircleIcon className="w-3.5 h-3.5" />
               Saved
@@ -686,7 +582,7 @@ export function DetailsOfSaleTab({
               const checked = e.target.checked
               const next = { ...form, supply_only: checked }
               update('supply_only', checked)
-              void commitDetails(next)
+              commitDetails(next)
             }}
             disabled={editingDisabled}
             className="h-4 w-4 rounded border-slate-300 text-teal-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/30 disabled:opacity-50 disabled:cursor-not-allowed"

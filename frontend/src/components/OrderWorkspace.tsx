@@ -6,7 +6,11 @@ import { Button } from './ui/Button'
 import { Panel } from './ui/Panel'
 import { Tabs } from './ui/Tabs'
 import { CustomerTab, type CustomerSavedPayload } from './workspace/CustomerTab'
-import { DetailsOfSaleTab } from './workspace/DetailsOfSaleTab'
+import {
+  DetailsOfSaleTab,
+  buildDetailsBody,
+  formFromProps,
+} from './workspace/DetailsOfSaleTab'
 import { InvoiceTab } from './workspace/InvoiceTab'
 import { NotesPhotosTab } from './workspace/NotesPhotosTab'
 import { PaymentsTab } from './workspace/PaymentsTab'
@@ -22,15 +26,24 @@ import {
   type OrderStatus,
 } from '../lib/statuses'
 import { ApiError } from '../lib/api/ApiError'
-import { fetchOrderWorkspace } from '../lib/api/orderWorkspaceApi'
+import { fetchOrderWorkspace, saveDetailsOfSale } from '../lib/api/orderWorkspaceApi'
 import type {
   DetailsOfSaleFields,
+  DetailsOfSaleSaveRequest,
   OrderAddress,
   OrderCustomer,
   OrderWorkspace as OrderWorkspaceData,
 } from '../lib/api/orderWorkspaceApi'
 import { fetchOrderLines } from '../lib/api/orderLinesApi'
 import type { OrderFinancialSummary } from '../lib/api/orderLinesApi'
+
+// Friendly message for a failed details autosave. The autosave single-flight
+// lock/loop lives in the always-mounted WorkspaceShell (below) so it survives the
+// Details tab unmounting on a tab switch.
+function detailsAutosaveErrorMessage(err: unknown): string {
+  if (err instanceof ApiError && err.message.length > 0) return err.message
+  return 'Could not save details. Please try again.'
+}
 
 const TAB_IDS = [
   'customer',
@@ -137,6 +150,93 @@ function WorkspaceShell({
   const finishSalePriceMutation = useCallback(() => {
     setSalePriceMutationInFlight(false)
   }, [])
+
+  // --- Details-of-sale autosave single-flight (Codex P1). ---
+  // The lock + queue + last-persisted key live HERE in the always-mounted shell
+  // (DetailsOfSaleTab unmounts on tab switch), so switching away and back can never
+  // start a second concurrent saveDetailsOfSale PUT. Only one PUT is ever in
+  // flight; concurrent autosaves collapse to the latest body and drain afterwards.
+  // PER-ORDER: WorkspaceShell is keyed by orderId (see render), so all of this is
+  // recreated fresh on every order switch and lastSavedDetailsRef is initialised
+  // from THIS order's persisted details — nothing bleeds across orders.
+  const detailsSavingRef = useRef(false)
+  const pendingDetailsBodyRef = useRef<DetailsOfSaleSaveRequest | null>(null)
+  const lastSavedDetailsRef = useRef<string>(
+    JSON.stringify(buildDetailsBody(formFromProps(saleDetails))),
+  )
+  const [detailsAutosaveSaving, setDetailsAutosaveSaving] = useState(false)
+  const [detailsAutosaveSaved, setDetailsAutosaveSaved] = useState(false)
+  const [detailsAutosaveError, setDetailsAutosaveError] = useState<string | null>(
+    null,
+  )
+
+  // Tracks whether the SHELL (not the tab) is still mounted, so a save that settles
+  // after an order switch does not lift stale fields into a different order's
+  // workspace. The PUT itself still completes (the edit is persisted); only the
+  // lift + status setState are skipped. A tab switch keeps the shell mounted, so
+  // the lift still happens — which is the whole point of hoisting the lock here.
+  const detailsShellMountedRef = useRef(true)
+  useEffect(() => {
+    detailsShellMountedRef.current = true
+    return () => {
+      detailsShellMountedRef.current = false
+    }
+  }, [])
+
+  // Single-flight save loop (mirrors the sale-price drain). Sends exactly one PUT;
+  // on settle, drains the latest queued body only if it differs from what is now
+  // persisted. lastSavedDetailsRef is set ONLY after a successful response.
+  async function runDetailsSave(body: DetailsOfSaleSaveRequest) {
+    detailsSavingRef.current = true
+    if (detailsShellMountedRef.current) {
+      setDetailsAutosaveSaving(true)
+      setDetailsAutosaveSaved(false)
+      setDetailsAutosaveError(null)
+    }
+    try {
+      const res = await saveDetailsOfSale(orderId, body)
+      // Mark persisted ONLY after a successful backend response.
+      lastSavedDetailsRef.current = JSON.stringify(body)
+      if (detailsShellMountedRef.current) {
+        onDetailsSaved({
+          fields: res.data.details_of_sale_fields,
+          updated_at: res.data.updated_at,
+        })
+        setDetailsAutosaveSaved(true)
+      }
+    } catch (err) {
+      // Do NOT mark this body persisted on failure.
+      if (detailsShellMountedRef.current) {
+        setDetailsAutosaveError(detailsAutosaveErrorMessage(err))
+      }
+    } finally {
+      detailsSavingRef.current = false
+      const pending = pendingDetailsBodyRef.current
+      pendingDetailsBodyRef.current = null
+      if (
+        pending !== null &&
+        JSON.stringify(pending) !== lastSavedDetailsRef.current
+      ) {
+        void runDetailsSave(pending)
+      } else if (detailsShellMountedRef.current) {
+        setDetailsAutosaveSaving(false)
+      }
+    }
+  }
+
+  // Parent-level autosave entry point passed to DetailsOfSaleTab. The tab still
+  // validates and builds the full body; this owns the single-flight lock/queue so
+  // it survives the tab's unmount/remount.
+  function queueDetailsAutosave(body: DetailsOfSaleSaveRequest) {
+    if (detailsSavingRef.current) {
+      // A save is in flight — queue ONLY the latest body (collapse to latest).
+      pendingDetailsBodyRef.current = body
+      return
+    }
+    // Nothing changed since the last persisted save — skip the network call.
+    if (JSON.stringify(body) === lastSavedDetailsRef.current) return
+    void runDetailsSave(body)
+  }
 
   // Seed the header summary without waiting for the Products & Charges tab to be
   // mounted (it only mounts when its tab is active). The header is non-critical,
@@ -260,7 +360,10 @@ function WorkspaceShell({
                 finishSalePriceMutation={finishSalePriceMutation}
                 beginFinancialSummaryRequest={beginFinancialSummaryRequest}
                 applyFinancialSummaryFromRequest={applyFinancialSummaryFromRequest}
-                onSaved={onDetailsSaved}
+                queueDetailsAutosave={queueDetailsAutosave}
+                detailsAutosaveSaving={detailsAutosaveSaving}
+                detailsAutosaveSaved={detailsAutosaveSaved}
+                detailsAutosaveError={detailsAutosaveError}
               />
             )}
             {activeTab === 'notes' && <NotesPhotosTab />}
