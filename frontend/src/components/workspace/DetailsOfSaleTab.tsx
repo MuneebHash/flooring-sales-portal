@@ -1,4 +1,10 @@
-import { useEffect, useRef, useState } from 'react'
+import {
+  useEffect,
+  useRef,
+  useState,
+  type Dispatch,
+  type SetStateAction,
+} from 'react'
 import { Button } from '../ui/Button'
 import { Field } from '../ui/Field'
 import { Input } from '../ui/Input'
@@ -18,7 +24,12 @@ import type { OrderFinancialSummary } from '../../lib/api/orderLinesApi'
 type Props = {
   orderId: number
   locked: boolean
-  saleDetails?: DetailsOfSaleFields | null
+  // Details-of-sale draft form state is HOISTED to OrderWorkspace (the always-
+  // mounted shell) so the latest unsaved/in-flight draft survives this tab's
+  // unmount/remount. The tab is a controlled view over this draft and must NOT
+  // re-seed from stale saved props on remount.
+  detailsDraft: DetailsForm
+  setDetailsDraft: Dispatch<SetStateAction<DetailsForm>>
   // Live order financial summary (Chunk 3 order_financial_summary), seeded and
   // kept fresh by OrderWorkspace. Null until the order has been priced.
   financialSummary: OrderFinancialSummary | null
@@ -111,23 +122,23 @@ function optionalField(value: string): string | null {
 // Always build the complete 5-field body (full-replace). Optionals collapse to
 // null; supply_only is always a boolean; the <input type="date"> already yields
 // either '' or a strict YYYY-MM-DD string, matching the backend's strict parse.
-export function buildDetailsBody(form: DetailsForm): DetailsOfSaleSaveRequest {
+export function buildDetailsBody(detailsDraft: DetailsForm): DetailsOfSaleSaveRequest {
   return {
-    supply_only: form.supply_only,
-    plan_numbers: optionalField(form.plan_numbers),
-    proposed_lay_date: form.proposed_lay_date ? form.proposed_lay_date : null,
-    lay_date_status: form.lay_date_status || null,
-    details_of_sale: optionalField(form.details_of_sale),
+    supply_only: detailsDraft.supply_only,
+    plan_numbers: optionalField(detailsDraft.plan_numbers),
+    proposed_lay_date: detailsDraft.proposed_lay_date ? detailsDraft.proposed_lay_date : null,
+    lay_date_status: detailsDraft.lay_date_status || null,
+    details_of_sale: optionalField(detailsDraft.details_of_sale),
   }
 }
 
 // Client-side validation before any network call. The lay-date pair rule mirrors
 // the backend (chk_sales_order_lay_date_pair) and is reported on lay_date_status,
 // the same field the backend attaches it to.
-function validateForm(form: DetailsForm): Record<string, string> {
+function validateForm(detailsDraft: DetailsForm): Record<string, string> {
   const newErrors: Record<string, string> = {}
-  const hasDate = form.proposed_lay_date.trim().length > 0
-  const hasStatus = form.lay_date_status.length > 0
+  const hasDate = detailsDraft.proposed_lay_date.trim().length > 0
+  const hasStatus = detailsDraft.lay_date_status.length > 0
   if (hasDate !== hasStatus) {
     newErrors.lay_date_status =
       'Proposed lay date and lay date status must both be set or both be cleared.'
@@ -234,7 +245,8 @@ function salePriceErrorMessage(err: unknown): string {
 export function DetailsOfSaleTab({
   orderId,
   locked,
-  saleDetails,
+  detailsDraft,
+  setDetailsDraft,
   financialSummary,
   salePriceMutationInFlight,
   beginSalePriceMutation,
@@ -246,7 +258,6 @@ export function DetailsOfSaleTab({
   detailsAutosaveSaved,
   detailsAutosaveError,
 }: Props) {
-  const [form, setForm] = useState<DetailsForm>(() => formFromProps(saleDetails))
   const [errors, setErrors] = useState<Record<string, string>>({})
 
   // --- Sale price override / reset (independent of the details-of-sale save). ---
@@ -373,7 +384,7 @@ export function DetailsOfSaleTab({
   }
 
   function update<K extends keyof DetailsForm>(key: K, value: DetailsForm[K]) {
-    setForm((prev) => ({ ...prev, [key]: value }))
+    setDetailsDraft((prev) => ({ ...prev, [key]: value }))
     clearError(key)
     // The pair error spans both lay-date fields and is keyed on lay_date_status,
     // so editing either field should clear it.
@@ -383,11 +394,11 @@ export function DetailsOfSaleTab({
   }
 
   function appendSnippet(snippet: string) {
-    const nextDescription = form.details_of_sale.trim()
-      ? `${form.details_of_sale.trimEnd()}\n${snippet}`
+    const nextDescription = detailsDraft.details_of_sale.trim()
+      ? `${detailsDraft.details_of_sale.trimEnd()}\n${snippet}`
       : snippet
-    const next = { ...form, details_of_sale: nextDescription }
-    setForm(next)
+    const next = { ...detailsDraft, details_of_sale: nextDescription }
+    setDetailsDraft(next)
     clearError('details_of_sale')
     // Quick-add is a deliberate action; autosave the appended description now.
     // (The + button preventDefaults mousedown so the textarea is not blurred.)
@@ -402,7 +413,7 @@ export function DetailsOfSaleTab({
   function commitDetails(formToSave: DetailsForm) {
     if (locked) return
 
-    // Strict client validation first — never autosave an invalid form.
+    // Strict client validation first — never autosave an invalid detailsDraft.
     const validationErrors = validateForm(formToSave)
     if (Object.keys(validationErrors).length > 0) {
       setErrors(validationErrors)
@@ -468,9 +479,9 @@ export function DetailsOfSaleTab({
               <Textarea
                 id="details_of_sale"
                 rows={10}
-                value={form.details_of_sale}
+                value={detailsDraft.details_of_sale}
                 onChange={(e) => update('details_of_sale', e.target.value)}
-                onBlur={() => commitDetails(form)}
+                onBlur={() => commitDetails(detailsDraft)}
                 invalid={!!errors.details_of_sale}
                 disabled={editingDisabled}
                 placeholder="Describe the supply, installation and any site notes for this order."
@@ -523,14 +534,14 @@ export function DetailsOfSaleTab({
             <Input
               id="proposed_lay_date"
               type="date"
-              value={form.proposed_lay_date}
+              value={detailsDraft.proposed_lay_date}
               onChange={(e) => update('proposed_lay_date', e.target.value)}
-              onBlur={() => commitDetails(form)}
+              onBlur={() => commitDetails(detailsDraft)}
               invalid={!!errors.proposed_lay_date}
               disabled={editingDisabled}
             />
             <p className="mt-1.5 text-xs text-slate-500">
-              {formatIsoDate(form.proposed_lay_date) || 'No date selected'}
+              {formatIsoDate(detailsDraft.proposed_lay_date) || 'No date selected'}
             </p>
           </Field>
           <Field
@@ -540,11 +551,11 @@ export function DetailsOfSaleTab({
           >
             <Select
               id="lay_date_status"
-              value={form.lay_date_status}
+              value={detailsDraft.lay_date_status}
               onChange={(e) =>
                 update('lay_date_status', e.target.value as '' | LayDateStatus)
               }
-              onBlur={() => commitDetails(form)}
+              onBlur={() => commitDetails(detailsDraft)}
               invalid={!!errors.lay_date_status}
               disabled={editingDisabled}
             >
@@ -564,9 +575,9 @@ export function DetailsOfSaleTab({
             <Input
               id="plan_numbers"
               type="text"
-              value={form.plan_numbers}
+              value={detailsDraft.plan_numbers}
               onChange={(e) => update('plan_numbers', e.target.value)}
-              onBlur={() => commitDetails(form)}
+              onBlur={() => commitDetails(detailsDraft)}
               invalid={!!errors.plan_numbers}
               disabled={editingDisabled}
             />
@@ -577,10 +588,10 @@ export function DetailsOfSaleTab({
           <input
             id="supply_only"
             type="checkbox"
-            checked={form.supply_only}
+            checked={detailsDraft.supply_only}
             onChange={(e) => {
               const checked = e.target.checked
-              const next = { ...form, supply_only: checked }
+              const next = { ...detailsDraft, supply_only: checked }
               update('supply_only', checked)
               commitDetails(next)
             }}

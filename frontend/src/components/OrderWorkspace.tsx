@@ -159,6 +159,16 @@ function WorkspaceShell({
   // PER-ORDER: WorkspaceShell is keyed by orderId (see render), so all of this is
   // recreated fresh on every order switch and lastSavedDetailsRef is initialised
   // from THIS order's persisted details — nothing bleeds across orders.
+  // Details-of-sale DRAFT form state is hoisted HERE so the latest unsaved/in-flight
+  // draft survives DetailsOfSaleTab unmount/remount (the tab is a controlled view
+  // over it). The initialiser runs once per WorkspaceShell instance, and the shell
+  // is keyed by orderId, so the draft seeds from THIS order's saved details and
+  // resets per order. It is intentionally NOT re-synced from saleDetails after mount,
+  // so a save that settles later (lifting onDetailsSaved → saleDetails) cannot clobber
+  // newer local edits the user has made in the meantime.
+  const [detailsDraft, setDetailsDraft] = useState(() =>
+    formFromProps(saleDetails),
+  )
   const detailsSavingRef = useRef(false)
   const pendingDetailsBodyRef = useRef<DetailsOfSaleSaveRequest | null>(null)
   const lastSavedDetailsRef = useRef<string>(
@@ -353,7 +363,8 @@ function WorkspaceShell({
               <DetailsOfSaleTab
                 orderId={orderId}
                 locked={locked}
-                saleDetails={saleDetails}
+                detailsDraft={detailsDraft}
+                setDetailsDraft={setDetailsDraft}
                 financialSummary={financialSummary}
                 salePriceMutationInFlight={salePriceMutationInFlight}
                 beginSalePriceMutation={beginSalePriceMutation}
