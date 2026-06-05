@@ -1,12 +1,17 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Button } from '../ui/Button'
 import { Textarea } from '../ui/Textarea'
 import { ClockIcon, PhotoIcon, PlusIcon, UploadIcon } from '../icons'
-import type { OrderAttachment, OrderNote } from './types'
+import { ApiError } from '../../lib/api/ApiError'
+import {
+  addOrderNote,
+  fetchOrderNotes,
+  type OrderNote,
+} from '../../lib/api/orderNotesApi'
+import type { OrderAttachment } from './types'
 
 type Props = {
-  notes?: OrderNote[] | null
-  attachments?: OrderAttachment[] | null
+  orderId: number
 }
 
 const MONTH_NAMES = [
@@ -39,30 +44,104 @@ function formatFileSize(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function nowIsoLocal(): string {
-  const now = new Date()
-  const pad = (n: number) => String(n).padStart(2, '0')
-  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`
+function apiErrorMessage(err: unknown, fallback: string): string {
+  if (err instanceof ApiError && err.message.length > 0) return err.message
+  return fallback
 }
 
-export function NotesPhotosTab({ notes, attachments }: Props) {
-  const [noteList, setNoteList] = useState<OrderNote[]>(notes ?? [])
+export function NotesPhotosTab({ orderId }: Props) {
+  const [notes, setNotes] = useState<OrderNote[]>([])
+  // Real total from the GET pagination (pagination.total_items), separate from
+  // the displayed count: page 1 shows at most 20 newest notes, so the server may
+  // hold more than are rendered.
+  const [totalItems, setTotalItems] = useState(0)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [reloadToken, setReloadToken] = useState(0)
   const [draft, setDraft] = useState('')
-  const trimmedDraft = draft.trim()
-  const canAdd = trimmedDraft.length > 0
+  const [adding, setAdding] = useState(false)
+  const [addError, setAddError] = useState<string | null>(null)
 
-  function handleAddNote() {
-    if (!canAdd) return
-    const next: OrderNote = {
-      order_note_id: Date.now(),
-      note_text: trimmedDraft,
-      created_at: nowIsoLocal(),
+  const trimmedDraft = draft.trim()
+  // Add is allowed only with a non-blank draft, no add already in flight, AND not
+  // while the initial list is still loading. The `!loading` guard closes a race:
+  // if an add POST resolved before the in-flight GET, the GET's setNotes could
+  // overwrite the just-prepended note with its older (pre-add) snapshot. Notes
+  // stay allowed on LAID orders — this gates on load/in-flight state only, never
+  // on order status.
+  const canAdd = trimmedDraft.length > 0 && !adding && !loading
+
+  // Guard a setState after the tab unmounts. The Notes tab is conditionally
+  // rendered in OrderWorkspace, so it unmounts on every tab switch — an add that
+  // settles afterwards must not setState on an unmounted component (same pattern
+  // as ProductsChargesTab / DetailsOfSaleTab).
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
     }
-    setNoteList((prev) => [next, ...prev])
-    setDraft('')
+  }, [])
+
+  // Load page 1 of notes (newest 20) whenever the order changes or a retry is
+  // requested. Notes are allowed on LAID orders, so there is no status gate. The
+  // `cancelled` flag prevents a stale fetch from applying after unmount/reload.
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setLoadError(null)
+    fetchOrderNotes(orderId)
+      .then((res) => {
+        if (cancelled) return
+        setNotes(res.data)
+        setTotalItems(res.pagination.total_items)
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        setLoadError(
+          apiErrorMessage(err, 'Could not load notes. Please try again.'),
+        )
+      })
+      .finally(() => {
+        if (cancelled) return
+        setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId, reloadToken])
+
+  async function handleAddNote() {
+    if (!canAdd) return // blank draft, an add already in flight, OR list still loading
+    setAdding(true)
+    setAddError(null)
+    try {
+      const res = await addOrderNote(orderId, { note_text: trimmedDraft })
+      if (!mountedRef.current) return
+      // Prepend the server-confirmed note. NOTE: the created note is
+      // res.data.note — res.data is the AddNoteResponse wrapper, not the note
+      // itself. Prepend (not refetch) is correct because the backend orders
+      // notes created_at DESC, order_note_id DESC (newest first), and a freshly
+      // created note always has the latest created_at + highest id, so it belongs
+      // at index 0. Prepending therefore matches server order exactly — no page-1
+      // refetch is needed.
+      setNotes((prev) => [res.data.note, ...prev])
+      setTotalItems((prev) => prev + 1)
+      setDraft('')
+    } catch (err) {
+      if (!mountedRef.current) return
+      setAddError(apiErrorMessage(err, 'Could not add note. Please try again.'))
+    } finally {
+      if (mountedRef.current) setAdding(false)
+    }
   }
 
-  const attachmentList = attachments ?? []
+  // Photos stay mock/non-functional in B9 (attachments are wired in a later
+  // branch). Render an empty local list so the section is visually unchanged.
+  const attachmentList: OrderAttachment[] = []
+
+  // True when the server holds more notes than this page-1 view shows.
+  const notesTruncated = totalItems > notes.length
 
   return (
     <div>
@@ -79,9 +158,11 @@ export function NotesPhotosTab({ notes, attachments }: Props) {
         <section className="rounded-xl border border-slate-200 bg-slate-50/60 p-5">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold text-slate-900">Notes</h3>
-            <span className="text-[11px] font-medium text-slate-500">
-              {noteList.length} {noteList.length === 1 ? 'note' : 'notes'}
-            </span>
+            {!loading && loadError === null && (
+              <span className="text-[11px] font-medium text-slate-500">
+                {totalItems} {totalItems === 1 ? 'note' : 'notes'}
+              </span>
+            )}
           </div>
 
           <div className="rounded-lg border border-slate-200 bg-white p-3 shadow-sm">
@@ -92,6 +173,9 @@ export function NotesPhotosTab({ notes, attachments }: Props) {
               placeholder="Add a note for this order…"
               aria-label="New note"
             />
+            {addError !== null && (
+              <p className="mt-2 text-xs text-red-600">{addError}</p>
+            )}
             <div className="mt-2 flex justify-end">
               <Button
                 type="button"
@@ -101,37 +185,60 @@ export function NotesPhotosTab({ notes, attachments }: Props) {
                 onClick={handleAddNote}
               >
                 <PlusIcon className="w-3.5 h-3.5" />
-                Add note
+                {adding ? 'Adding…' : 'Add note'}
               </Button>
             </div>
           </div>
 
           <div className="mt-4">
-            {noteList.length === 0 ? (
+            {loading ? (
+              <div className="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-10 text-center">
+                <p className="text-sm text-slate-500">Loading notes…</p>
+              </div>
+            ) : loadError !== null ? (
+              <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-6 text-center space-y-3">
+                <p className="text-sm text-red-800">{loadError}</p>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setReloadToken((token) => token + 1)}
+                >
+                  Try again
+                </Button>
+              </div>
+            ) : notes.length === 0 ? (
               <div className="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-6 text-center">
                 <p className="text-sm text-slate-500">
                   No notes yet. Add the first note above.
                 </p>
               </div>
             ) : (
-              <ul className="space-y-2.5">
-                {noteList.map((note) => (
-                  <li
-                    key={note.order_note_id}
-                    className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-sm"
-                  >
-                    <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
-                      {note.note_text}
-                    </p>
-                    <div className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-slate-500">
-                      <ClockIcon className="w-3 h-3" />
-                      <span className="tabular-nums">
-                        {formatTimestamp(note.created_at)}
-                      </span>
-                    </div>
-                  </li>
-                ))}
-              </ul>
+              <>
+                {notesTruncated && (
+                  <p className="mb-2.5 text-[11px] font-medium text-slate-500">
+                    Showing latest {notes.length} of {totalItems} notes
+                  </p>
+                )}
+                <ul className="space-y-2.5">
+                  {notes.map((note) => (
+                    <li
+                      key={note.order_note_id}
+                      className="rounded-lg border border-slate-200 bg-white px-4 py-3 shadow-sm"
+                    >
+                      <p className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
+                        {note.note_text}
+                      </p>
+                      <div className="mt-2 flex items-center gap-1.5 text-[11px] font-medium text-slate-500">
+                        <ClockIcon className="w-3 h-3" />
+                        <span className="tabular-nums">
+                          {formatTimestamp(note.created_at)}
+                        </span>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              </>
             )}
           </div>
         </section>

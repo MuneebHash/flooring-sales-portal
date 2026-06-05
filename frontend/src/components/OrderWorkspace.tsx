@@ -387,7 +387,10 @@ function WorkspaceShell({
                 detailsAutosaveError={detailsAutosaveError}
               />
             )}
-            {activeTab === 'notes' && <NotesPhotosTab />}
+            {/* Notes are LAID-exempt (add allowed on a locked order), so the tab
+                deliberately receives orderId only — NOT locked — making it
+                structurally impossible to disable note-add on a LAID order. */}
+            {activeTab === 'notes' && <NotesPhotosTab orderId={orderId} />}
             {activeTab === 'payments' && <PaymentsTab />}
             {activeTab === 'invoice' && (
               <InvoiceTab
