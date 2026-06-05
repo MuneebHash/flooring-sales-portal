@@ -47,3 +47,9 @@ export type {
   SalePriceOverrideRequest,
   SalePriceMutationResponse,
 } from './orderLinesApi'
+export { fetchOrderNotes, addOrderNote } from './orderNotesApi'
+export type {
+  OrderNote,
+  AddNoteRequest,
+  AddNoteResponse,
+} from './orderNotesApi'
