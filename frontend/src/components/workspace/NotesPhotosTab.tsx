@@ -14,6 +14,11 @@ type Props = {
   orderId: number
 }
 
+// Backend default first-page size for GET /notes. The client mirrors it so the
+// visible list never grows past one server page after a local prepend (a fresh
+// GET would still only return the latest NOTES_PAGE_SIZE notes).
+const NOTES_PAGE_SIZE = 20
+
 const MONTH_NAMES = [
   'Jan',
   'Feb',
@@ -123,9 +128,11 @@ export function NotesPhotosTab({ orderId }: Props) {
       // itself. Prepend (not refetch) is correct because the backend orders
       // notes created_at DESC, order_note_id DESC (newest first), and a freshly
       // created note always has the latest created_at + highest id, so it belongs
-      // at index 0. Prepending therefore matches server order exactly — no page-1
-      // refetch is needed.
-      setNotes((prev) => [res.data.note, ...prev])
+      // at index 0. The list is then capped to NOTES_PAGE_SIZE so it mirrors one
+      // server page: a fresh GET would only return the latest NOTES_PAGE_SIZE
+      // notes, so the oldest visible note drops off and the truncation caption
+      // ("Showing latest N of M notes") stays accurate. No page-1 refetch needed.
+      setNotes((prev) => [res.data.note, ...prev].slice(0, NOTES_PAGE_SIZE))
       setTotalItems((prev) => prev + 1)
       setDraft('')
     } catch (err) {
