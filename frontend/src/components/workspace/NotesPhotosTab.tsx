@@ -382,6 +382,12 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
       )
       setPhotosTotal((prev) => prev + 1)
       setUploadError(null)
+      // Clear a stale list-load error on SUCCESS ONLY: the render checks
+      // photosError before photos.length, so a prior failed GET would otherwise
+      // keep the error panel up and hide the just-uploaded photo. Not cleared at
+      // upload start — a later upload failure must not mask that the list load
+      // failed (Codex issue: clear stale photo load errors after successful upload).
+      setPhotosError(null)
     } catch (err) {
       if (!mountedRef.current) return
       setUploadError(
