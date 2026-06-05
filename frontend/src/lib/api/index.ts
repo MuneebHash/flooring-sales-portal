@@ -53,3 +53,17 @@ export type {
   AddNoteRequest,
   AddNoteResponse,
 } from './orderNotesApi'
+export {
+  fetchOrderAttachments,
+  uploadOrderAttachment,
+  deleteOrderAttachment,
+  fetchAttachmentBlob,
+  PHOTO_ALLOWED_MIME,
+  PHOTO_MAX_BYTES,
+  ATTACHMENTS_PAGE_SIZE,
+} from './orderAttachmentsApi'
+export type {
+  OrderAttachment,
+  AttachmentUploadResponse,
+  AttachmentDeleteResponse,
+} from './orderAttachmentsApi'

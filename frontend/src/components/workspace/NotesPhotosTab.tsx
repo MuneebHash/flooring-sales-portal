@@ -1,17 +1,29 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ChangeEvent } from 'react'
 import { Button } from '../ui/Button'
 import { Textarea } from '../ui/Textarea'
-import { ClockIcon, PhotoIcon, PlusIcon, UploadIcon } from '../icons'
+import { ClockIcon, PhotoIcon, PlusIcon, TrashIcon, UploadIcon } from '../icons'
 import { ApiError } from '../../lib/api/ApiError'
 import {
   addOrderNote,
   fetchOrderNotes,
   type OrderNote,
 } from '../../lib/api/orderNotesApi'
-import type { OrderAttachment } from './types'
+import {
+  ATTACHMENTS_PAGE_SIZE,
+  PHOTO_ALLOWED_MIME,
+  PHOTO_MAX_BYTES,
+  deleteOrderAttachment,
+  fetchAttachmentBlob,
+  fetchOrderAttachments,
+  uploadOrderAttachment,
+  type OrderAttachment,
+} from '../../lib/api/orderAttachmentsApi'
 
 type Props = {
   orderId: number
+  // `locked` (order is LAID) gates the photo DELETE control ONLY. It must never
+  // disable notes (LAID-exempt) or photo list/upload/preview (all allowed on LAID).
+  locked: boolean
 }
 
 // Backend default first-page size for GET /notes. The client mirrors it so the
@@ -54,7 +66,7 @@ function apiErrorMessage(err: unknown, fallback: string): string {
   return fallback
 }
 
-export function NotesPhotosTab({ orderId }: Props) {
+export function NotesPhotosTab({ orderId, locked }: Props) {
   const [notes, setNotes] = useState<OrderNote[]>([])
   // Real total from the GET pagination (pagination.total_items), separate from
   // the displayed count: page 1 shows at most 20 newest notes, so the server may
@@ -143,12 +155,263 @@ export function NotesPhotosTab({ orderId }: Props) {
     }
   }
 
-  // Photos stay mock/non-functional in B9 (attachments are wired in a later
-  // branch). Render an empty local list so the section is visually unchanged.
-  const attachmentList: OrderAttachment[] = []
+  // ---------------------------------------------------------------------------
+  // Photos / attachments (B10). State is FULLY independent from notes, so a
+  // photos failure never breaks notes (and vice versa). LAID rule: list, upload
+  // and preview are allowed on a locked order — only DELETE is gated by `locked`.
+  // ---------------------------------------------------------------------------
+  const [photos, setPhotos] = useState<OrderAttachment[]>([])
+  // Real total from the GET pagination (separate from the displayed count: page 1
+  // shows at most 20 newest photos, so the server may hold more than are rendered).
+  const [photosTotal, setPhotosTotal] = useState(0)
+  const [photosLoading, setPhotosLoading] = useState(true)
+  const [photosError, setPhotosError] = useState<string | null>(null)
+  const [photosReloadToken, setPhotosReloadToken] = useState(0)
+  const [uploading, setUploading] = useState(false)
+  const [uploadError, setUploadError] = useState<string | null>(null)
+  const [deletingId, setDeletingId] = useState<number | null>(null)
+  const [deleteError, setDeleteError] = useState<string | null>(null)
+  // attachment id → object URL for the credentialed preview, and ids whose
+  // preview fetch failed. previewUrlsRef is the AUTHORITATIVE set used for
+  // revocation (so unmount cleanup can revoke without depending on render state);
+  // previewUrls mirrors it for rendering.
+  const [previewUrls, setPreviewUrls] = useState<Record<number, string>>({})
+  const [previewErrors, setPreviewErrors] = useState<Record<number, boolean>>({})
+  // Refs mirror the preview maps so the loader effect can dedupe WITHOUT taking
+  // them as dependencies (depending on them would re-run the effect on every
+  // preview result and double-fetch the ones still loading). previewUrlsRef is
+  // also the authoritative set revoked on unmount.
+  const previewUrlsRef = useRef<Record<number, string>>({})
+  const previewErrorsRef = useRef<Record<number, boolean>>({})
+  const previewInFlightRef = useRef<Set<number>>(new Set())
+  // Bumped on every list (re)load; an async preview resolution from a previous
+  // load is discarded when its captured epoch no longer matches.
+  const previewEpochRef = useRef(0)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  // Latest photos list for async preview resolvers (the effect closure's `photos`
+  // would be stale): a blob that resolves AFTER its photo was deleted must not
+  // re-create a URL for a gone attachment.
+  const photosRef = useRef<OrderAttachment[]>(photos)
+  useEffect(() => {
+    photosRef.current = photos
+  }, [photos])
+
+  // Revoke EVERY preview object URL on unmount. NotesPhotosTab unmounts on every
+  // tab switch, and WorkspaceShell is keyed by orderId (an order switch remounts
+  // it), so this one cleanup covers both tab-switch and order-switch leaks.
+  useEffect(() => {
+    return () => {
+      for (const url of Object.values(previewUrlsRef.current)) {
+        URL.revokeObjectURL(url)
+      }
+      previewUrlsRef.current = {}
+    }
+  }, [])
+
+  // Load page 1 of photos (newest 20) whenever the order changes or a retry is
+  // requested. A fresh list invalidates prior previews, so revoke them first.
+  // The `cancelled` flag prevents a stale fetch from applying after unmount/reload.
+  useEffect(() => {
+    let cancelled = false
+    setPhotosLoading(true)
+    setPhotosError(null)
+    fetchOrderAttachments(orderId)
+      .then((res) => {
+        if (cancelled) return
+        // A fresh list invalidates prior previews: bump the epoch (discards any
+        // in-flight preview from the previous load), revoke existing object URLs,
+        // and reset the preview maps before the new list renders.
+        previewEpochRef.current += 1
+        for (const url of Object.values(previewUrlsRef.current)) {
+          URL.revokeObjectURL(url)
+        }
+        previewUrlsRef.current = {}
+        previewErrorsRef.current = {}
+        previewInFlightRef.current = new Set()
+        setPreviewUrls({})
+        setPreviewErrors({})
+        setPhotos(res.data)
+        setPhotosTotal(res.pagination.total_items)
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        setPhotosError(
+          apiErrorMessage(err, 'Could not load photos. Please try again.'),
+        )
+      })
+      .finally(() => {
+        if (cancelled) return
+        setPhotosLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId, photosReloadToken])
+
+  // Build a credentialed object-URL preview for each photo that doesn't have one
+  // yet. A direct <img src={download_path}> can't be used (the file endpoint is
+  // session-protected AND cross-origin to the dev server), so fetch the bytes
+  // with the cookie and wrap them in an object URL. Guards skip a resolve after
+  // unmount or after the photo was deleted, so no orphan URL is ever created.
+  useEffect(() => {
+    const epoch = previewEpochRef.current
+    photos.forEach((photo) => {
+      const id = photo.order_attachment_id
+      // Skip photos that already have a preview, already failed, or are mid-fetch.
+      // The maps are refs so this effect depends only on `photos`; that also means
+      // it does NOT cancel in-flight previews on an upload/delete re-run (existing
+      // previews keep loading and apply via the guards below).
+      if (
+        previewUrlsRef.current[id] ||
+        previewErrorsRef.current[id] ||
+        previewInFlightRef.current.has(id)
+      ) {
+        return
+      }
+      previewInFlightRef.current.add(id)
+      fetchAttachmentBlob(photo.download_path)
+        .then((blob) => {
+          // Discard if unmounted, the list reloaded (epoch changed), or the photo
+          // was deleted while its blob loaded — so no orphan URL is ever created.
+          if (!mountedRef.current || previewEpochRef.current !== epoch) return
+          const stillPresent = photosRef.current.some(
+            (p) => p.order_attachment_id === id,
+          )
+          if (!stillPresent) return
+          const url = URL.createObjectURL(blob)
+          previewUrlsRef.current[id] = url
+          setPreviewUrls((prev) => ({ ...prev, [id]: url }))
+        })
+        .catch(() => {
+          if (!mountedRef.current || previewEpochRef.current !== epoch) return
+          previewErrorsRef.current[id] = true
+          setPreviewErrors((prev) => ({ ...prev, [id]: true }))
+        })
+        .finally(() => {
+          if (previewEpochRef.current === epoch) {
+            previewInFlightRef.current.delete(id)
+          }
+        })
+    })
+  }, [photos])
+
+  // Reconcile previews against the visible list: revoke + drop any preview URL
+  // whose photo is no longer shown (it fell off the capped page after an upload,
+  // or was deleted). Keeps the object-URL set in lockstep with `photos`.
+  useEffect(() => {
+    const visibleIds = new Set(photos.map((p) => p.order_attachment_id))
+    let changed = false
+    for (const [idStr, url] of Object.entries(previewUrlsRef.current)) {
+      if (!visibleIds.has(Number(idStr))) {
+        URL.revokeObjectURL(url)
+        delete previewUrlsRef.current[Number(idStr)]
+        changed = true
+      }
+    }
+    if (!changed) return
+    setPreviewUrls((prev) => {
+      const next: Record<number, string> = {}
+      for (const [idStr, url] of Object.entries(prev)) {
+        if (visibleIds.has(Number(idStr))) next[Number(idStr)] = url
+      }
+      return next
+    })
+    setPreviewErrors((prev) => {
+      const next: Record<number, boolean> = {}
+      for (const [idStr, failed] of Object.entries(prev)) {
+        if (visibleIds.has(Number(idStr))) next[Number(idStr)] = failed
+      }
+      return next
+    })
+  }, [photos])
+
+  function openFilePicker() {
+    if (uploading) return // one upload in flight at a time
+    fileInputRef.current?.click()
+  }
+
+  async function handleFileSelected(event: ChangeEvent<HTMLInputElement>) {
+    const input = event.target
+    const file = input.files?.[0] ?? null
+    // Reset immediately so picking the SAME file again still fires onChange.
+    input.value = ''
+    if (file === null || uploading) return
+
+    setUploadError(null)
+    // Client-side pre-validation (single file). The backend still enforces both;
+    // this just avoids an obviously-doomed round trip.
+    if (!(PHOTO_ALLOWED_MIME as readonly string[]).includes(file.type)) {
+      setUploadError('Unsupported file type. Use JPG, PNG or WEBP.')
+      return
+    }
+    if (file.size > PHOTO_MAX_BYTES) {
+      setUploadError('That file is too large. The maximum size is 10 MB.')
+      return
+    }
+
+    setUploading(true)
+    try {
+      const res = await uploadOrderAttachment(orderId, file)
+      if (!mountedRef.current) return
+      // Prepend the server-confirmed attachment (list is newest-first) and cap to
+      // one server page, mirroring notes; any photo that drops off the page is
+      // revoked by the reconcile effect above.
+      setPhotos((prev) =>
+        [res.data.attachment, ...prev].slice(0, ATTACHMENTS_PAGE_SIZE),
+      )
+      setPhotosTotal((prev) => prev + 1)
+      setUploadError(null)
+    } catch (err) {
+      if (!mountedRef.current) return
+      setUploadError(
+        apiErrorMessage(err, 'Could not upload photo. Please try again.'),
+      )
+    } finally {
+      if (mountedRef.current) setUploading(false)
+    }
+  }
+
+  async function handleDeletePhoto(attachmentId: number) {
+    // Delete is blocked on LAID; the control is hidden when locked — this is a
+    // belt-and-suspenders guard. One delete at a time.
+    if (locked || deletingId !== null) return
+    setDeletingId(attachmentId)
+    setDeleteError(null)
+    try {
+      await deleteOrderAttachment(orderId, attachmentId)
+      if (!mountedRef.current) return
+      // Revoke this photo's preview eagerly, then remove it from the list (the
+      // reconcile effect also revokes orphans, but do it promptly here).
+      const url = previewUrlsRef.current[attachmentId]
+      if (url) {
+        URL.revokeObjectURL(url)
+        delete previewUrlsRef.current[attachmentId]
+      }
+      setPreviewUrls((prev) => {
+        const next = { ...prev }
+        delete next[attachmentId]
+        return next
+      })
+      setPhotos((prev) =>
+        prev.filter((p) => p.order_attachment_id !== attachmentId),
+      )
+      setPhotosTotal((prev) => Math.max(0, prev - 1))
+      setDeleteError(null)
+    } catch (err) {
+      if (!mountedRef.current) return
+      setDeleteError(
+        apiErrorMessage(err, 'Could not remove photo. Please try again.'),
+      )
+    } finally {
+      if (mountedRef.current) setDeletingId(null)
+    }
+  }
 
   // True when the server holds more notes than this page-1 view shows.
   const notesTruncated = totalItems > notes.length
+  // True when the server holds more photos than this page-1 view shows.
+  const photosTruncated = photosTotal > photos.length
 
   return (
     <div>
@@ -253,55 +516,129 @@ export function NotesPhotosTab({ orderId }: Props) {
         <section className="rounded-xl border border-slate-200 bg-slate-50/60 p-5">
           <div className="flex items-center justify-between mb-3">
             <h3 className="text-sm font-semibold text-slate-900">Photos</h3>
-            <span className="text-[11px] font-medium text-slate-500">
-              {attachmentList.length}{' '}
-              {attachmentList.length === 1 ? 'photo' : 'photos'}
-            </span>
+            {!photosLoading && photosError === null && (
+              <span className="text-[11px] font-medium text-slate-500">
+                {photosTotal} {photosTotal === 1 ? 'photo' : 'photos'}
+              </span>
+            )}
           </div>
 
-          <div
-            role="button"
-            tabIndex={0}
-            aria-disabled="true"
-            className="flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-slate-300 bg-white px-4 py-8 text-center"
+          {/* Upload is allowed on LAID orders — never gated by `locked`. Single
+              file per upload. */}
+          <button
+            type="button"
+            onClick={openFilePicker}
+            disabled={uploading}
+            className="flex w-full flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-slate-300 bg-white px-4 py-8 text-center transition-colors hover:border-slate-400 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
           >
             <UploadIcon className="w-7 h-7 text-slate-400" />
             <div className="text-sm font-medium text-slate-700">
-              Click to upload photos
+              {uploading ? 'Uploading…' : 'Click to upload a photo'}
             </div>
             <div className="text-[11px] text-slate-500">
               JPG, PNG or WEBP, up to 10 MB each
             </div>
-          </div>
+          </button>
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/jpeg,image/png,image/webp"
+            className="hidden"
+            onChange={handleFileSelected}
+          />
+          {uploadError !== null && (
+            <p className="mt-2 text-xs text-red-600">{uploadError}</p>
+          )}
 
           <div className="mt-4">
-            {attachmentList.length === 0 ? (
-              <p className="text-sm text-slate-500">No photos yet.</p>
+            {photosLoading ? (
+              <div className="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-10 text-center">
+                <p className="text-sm text-slate-500">Loading photos…</p>
+              </div>
+            ) : photosError !== null ? (
+              <div className="rounded-lg border border-red-300 bg-red-50 px-4 py-6 text-center space-y-3">
+                <p className="text-sm text-red-800">{photosError}</p>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => setPhotosReloadToken((token) => token + 1)}
+                >
+                  Try again
+                </Button>
+              </div>
+            ) : photos.length === 0 ? (
+              <div className="rounded-lg border border-dashed border-slate-300 bg-white px-4 py-6 text-center">
+                <p className="text-sm text-slate-500">No photos yet.</p>
+              </div>
             ) : (
-              <ul className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-                {attachmentList.map((photo) => (
-                  <li
-                    key={photo.order_attachment_id}
-                    className="rounded-lg border border-slate-200 bg-white p-2 shadow-sm"
-                  >
-                    <div className="aspect-square w-full rounded-md bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center">
-                      <PhotoIcon className="w-8 h-8 text-slate-400" />
-                    </div>
-                    <div className="mt-2 px-0.5">
-                      <div
-                        className="text-xs font-medium text-slate-800 truncate"
-                        title={photo.file_name}
+              <>
+                {deleteError !== null && (
+                  <p className="mb-2.5 text-xs text-red-600">{deleteError}</p>
+                )}
+                {photosTruncated && (
+                  <p className="mb-2.5 text-[11px] font-medium text-slate-500">
+                    Showing latest {photos.length} of {photosTotal} photos
+                  </p>
+                )}
+                <ul className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+                  {photos.map((photo) => {
+                    const id = photo.order_attachment_id
+                    const previewUrl = previewUrls[id]
+                    const previewFailed = previewErrors[id] === true
+                    return (
+                      <li
+                        key={id}
+                        className="relative rounded-lg border border-slate-200 bg-white p-2 shadow-sm"
                       >
-                        {photo.file_name}
-                      </div>
-                      <div className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
-                        {formatFileSize(photo.file_size)} ·{' '}
-                        {formatTimestamp(photo.created_at)}
-                      </div>
-                    </div>
-                  </li>
-                ))}
-              </ul>
+                        <div className="aspect-square w-full overflow-hidden rounded-md bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center">
+                          {previewUrl ? (
+                            <img
+                              src={previewUrl}
+                              alt={photo.file_name}
+                              className="h-full w-full object-cover"
+                            />
+                          ) : (
+                            <div className="flex flex-col items-center gap-1">
+                              <PhotoIcon className="w-8 h-8 text-slate-400" />
+                              {previewFailed && (
+                                <span className="text-[10px] text-slate-400">
+                                  Preview unavailable
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                        {/* Delete is the ONLY photo control gated by LAID: render
+                            it only when the order is not locked. */}
+                        {!locked && (
+                          <button
+                            type="button"
+                            onClick={() => handleDeletePhoto(id)}
+                            disabled={deletingId === id}
+                            aria-label={`Remove ${photo.file_name}`}
+                            className="absolute right-1.5 top-1.5 inline-flex h-7 w-7 items-center justify-center rounded-md border border-slate-200 bg-white/90 text-slate-500 shadow-sm transition-colors hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <TrashIcon className="w-4 h-4" />
+                          </button>
+                        )}
+                        <div className="mt-2 px-0.5">
+                          <div
+                            className="text-xs font-medium text-slate-800 truncate"
+                            title={photo.file_name}
+                          >
+                            {photo.file_name}
+                          </div>
+                          <div className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
+                            {formatFileSize(photo.file_size)} ·{' '}
+                            {formatTimestamp(photo.created_at)}
+                          </div>
+                        </div>
+                      </li>
+                    )
+                  })}
+                </ul>
+              </>
             )}
           </div>
         </section>

@@ -1,18 +1,11 @@
 // Workspace tab UI types that are NOT yet backed by a Phase 10 Chunk 2
-// endpoint. Attachments, payments and invoices are wired in later chunks; these
-// shapes describe the local/prototype data their tabs render until then. The
-// Chunk 2 contract types (customer, address, details, header, financials) live
-// in src/lib/api/orderWorkspaceApi.ts; the wired notes contract type (OrderNote)
-// now lives in src/lib/api/orderNotesApi.ts (Phase 11 Chunk 3, B9).
-
-export type OrderAttachment = {
-  order_attachment_id: number
-  attachment_kind: 'PHOTO'
-  file_name: string
-  mime_type: string
-  file_size: number
-  created_at: string
-}
+// endpoint. Payments and invoices are wired in later chunks; these shapes
+// describe the local/prototype data their tabs render until then. The Chunk 2
+// contract types (customer, address, details, header, financials) live in
+// src/lib/api/orderWorkspaceApi.ts; the wired notes contract type (OrderNote)
+// lives in src/lib/api/orderNotesApi.ts (Phase 11 Chunk 3, B9); the wired
+// attachment contract type (OrderAttachment) lives in
+// src/lib/api/orderAttachmentsApi.ts (Phase 11 Chunk 3, B10).
 
 export type PaymentMethod =
   | 'CASH'

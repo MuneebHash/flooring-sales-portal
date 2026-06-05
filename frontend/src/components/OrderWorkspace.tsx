@@ -387,10 +387,13 @@ function WorkspaceShell({
                 detailsAutosaveError={detailsAutosaveError}
               />
             )}
-            {/* Notes are LAID-exempt (add allowed on a locked order), so the tab
-                deliberately receives orderId only — NOT locked — making it
-                structurally impossible to disable note-add on a LAID order. */}
-            {activeTab === 'notes' && <NotesPhotosTab orderId={orderId} />}
+            {/* `locked` (LAID) is passed for PHOTO-DELETE gating ONLY. Notes are
+                LAID-exempt and photo list/upload/preview are all allowed on a
+                LAID order, so the tab must never use `locked` to disable note-add
+                or photo upload — only the photo delete control is gated by it. */}
+            {activeTab === 'notes' && (
+              <NotesPhotosTab orderId={orderId} locked={locked} />
+            )}
             {activeTab === 'payments' && <PaymentsTab />}
             {activeTab === 'invoice' && (
               <InvoiceTab
