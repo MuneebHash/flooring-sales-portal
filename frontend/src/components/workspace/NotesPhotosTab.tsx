@@ -188,6 +188,11 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
   // load is discarded when its captured epoch no longer matches.
   const previewEpochRef = useRef(0)
   const fileInputRef = useRef<HTMLInputElement>(null)
+  // Bumped when a photos GET starts AND when an upload prepends a photo, so a GET
+  // that resolves AFTER an upload completed is discarded rather than overwriting
+  // the just-uploaded photo (Codex issue 1) — belt-and-suspenders behind the
+  // canUploadPhoto disable.
+  const photosFetchEpochRef = useRef(0)
 
   // Latest photos list for async preview resolvers (the effect closure's `photos`
   // would be stale): a blob that resolves AFTER its photo was deleted must not
@@ -214,11 +219,17 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
   // The `cancelled` flag prevents a stale fetch from applying after unmount/reload.
   useEffect(() => {
     let cancelled = false
+    // Capture this GET's fetch epoch. An upload that completes while this GET is in
+    // flight bumps the epoch (so does a later reload), so a stale GET resolution is
+    // DISCARDED instead of overwriting a just-uploaded photo (Codex issue 1). The
+    // GET still ends the loading state in `finally` regardless.
+    photosFetchEpochRef.current += 1
+    const fetchEpoch = photosFetchEpochRef.current
     setPhotosLoading(true)
     setPhotosError(null)
     fetchOrderAttachments(orderId)
       .then((res) => {
-        if (cancelled) return
+        if (cancelled || photosFetchEpochRef.current !== fetchEpoch) return
         // A fresh list invalidates prior previews: bump the epoch (discards any
         // in-flight preview from the previous load), revoke existing object URLs,
         // and reset the preview maps before the new list renders.
@@ -235,7 +246,7 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
         setPhotosTotal(res.pagination.total_items)
       })
       .catch((err: unknown) => {
-        if (cancelled) return
+        if (cancelled || photosFetchEpochRef.current !== fetchEpoch) return
         setPhotosError(
           apiErrorMessage(err, 'Could not load photos. Please try again.'),
         )
@@ -326,8 +337,14 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
     })
   }, [photos])
 
+  // Upload is disabled while the initial/refresh GET is loading (so an upload can't
+  // race the list fetch and then be overwritten by the older GET — Codex issue 1)
+  // AND while another upload is in flight. NEVER gated by `locked`: upload is
+  // allowed on LAID orders.
+  const canUploadPhoto = !photosLoading && !uploading
+
   function openFilePicker() {
-    if (uploading) return // one upload in flight at a time
+    if (!canUploadPhoto) return
     fileInputRef.current?.click()
   }
 
@@ -336,7 +353,7 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
     const file = input.files?.[0] ?? null
     // Reset immediately so picking the SAME file again still fires onChange.
     input.value = ''
-    if (file === null || uploading) return
+    if (file === null || !canUploadPhoto) return
 
     setUploadError(null)
     // Client-side pre-validation (single file). The backend still enforces both;
@@ -354,6 +371,9 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
     try {
       const res = await uploadOrderAttachment(orderId, file)
       if (!mountedRef.current) return
+      // Invalidate any photos GET still in flight so its older snapshot cannot
+      // overwrite this just-uploaded photo when it resolves (Codex issue 1).
+      photosFetchEpochRef.current += 1
       // Prepend the server-confirmed attachment (list is newest-first) and cap to
       // one server page, mirroring notes; any photo that drops off the page is
       // revoked by the reconcile effect above.
@@ -381,8 +401,10 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
     try {
       await deleteOrderAttachment(orderId, attachmentId)
       if (!mountedRef.current) return
-      // Revoke this photo's preview eagerly, then remove it from the list (the
-      // reconcile effect also revokes orphans, but do it promptly here).
+      setDeleteError(null)
+      // Revoke the deleted photo's preview eagerly so the brief pre-reload render
+      // shows the placeholder, not a dangling blob URL. (The reload below revokes
+      // every remaining preview URL as well.)
       const url = previewUrlsRef.current[attachmentId]
       if (url) {
         URL.revokeObjectURL(url)
@@ -393,11 +415,12 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
         delete next[attachmentId]
         return next
       })
-      setPhotos((prev) =>
-        prev.filter((p) => p.order_attachment_id !== attachmentId),
-      )
-      setPhotosTotal((prev) => Math.max(0, prev - 1))
-      setDeleteError(null)
+      // Refetch page 1 from backend truth instead of only filtering locally, so a
+      // truncated page backfills (e.g. 21 total / 20 shown → still 20 after a
+      // delete) rather than showing a stale 19-of-20 (Codex issue 2). The reload
+      // flow revokes ALL remaining preview URLs and its epoch guard discards any
+      // late preview fetch, so no deleted-photo preview can be re-added.
+      setPhotosReloadToken((token) => token + 1)
     } catch (err) {
       if (!mountedRef.current) return
       setDeleteError(
@@ -528,7 +551,7 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
           <button
             type="button"
             onClick={openFilePicker}
-            disabled={uploading}
+            disabled={!canUploadPhoto}
             className="flex w-full flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed border-slate-300 bg-white px-4 py-8 text-center transition-colors hover:border-slate-400 hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
           >
             <UploadIcon className="w-7 h-7 text-slate-400" />
