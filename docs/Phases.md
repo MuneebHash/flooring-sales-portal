@@ -30,14 +30,21 @@
   * frontend order shell create + workspace read complete (PR #38)
   * frontend customer + address saves complete (PR #39)
   * frontend details-of-sale save complete (PR #40)
+* Phase 11 Chunk 3 complete:
+
+  * backend products, charges, lines, notes, attachments, sale price, numeric validation (PRs #41–#50)
+  * frontend products & charges wiring (PR #51)
+  * frontend sale price + GP + details autosave (PR #52)
+  * frontend notes wiring (PR #53)
+  * frontend photos/attachments wiring (PR #54)
+  * frontend photo preview modal (PR #56)
 
 **Current next phase:**
 
-* Phase 11: Chunk 3 — Products, Charges, Lines, Notes, Photos
+* Phase 12: Chunk 4 — Invoices + Payments
 
 **Not started:**
 
-* Phase 11 Chunk 3 backend/frontend implementation
 * Phase 12 Chunk 4 backend/frontend implementation
 * Stripe
 * Deployment
@@ -499,7 +506,7 @@ Smoke/build:
 
 Review:
 
-* Codex lay-date “required” comment resolved by clarifying intended pair-rule requirement
+* Codex lay-date "required" comment resolved by clarifying intended pair-rule requirement
 * final Codex review clean
 
 Done when:
@@ -513,50 +520,281 @@ Status:
 
 * Done and merged to `main`
 
-### Phase 11: Chunk 3 — Products, Charges, Lines, Notes, Photos — ⏭ NEXT
+### Phase 11: Chunk 3 — Products, Charges, Lines, Notes, Photos — ✅ DONE
 
-Backend endpoints:
+Goal achieved:
+A salesperson can search products/charges from catalog, add/edit/delete product and charge lines, see financial summary and GP, override/reset sale price, add notes, upload/preview/delete photos — all on real backend endpoints. Full priced order with products, charges, totals, GP, notes, and photos works end-to-end.
 
-* available products search
-* available charges search
-* get order lines + financial summary
-* add/edit/delete product lines
-* add/edit/delete charge lines
-* sale price override
-* reset price
-* notes list/add
-* attachments list/upload/delete/download
+#### Phase 11 Backend + Contract Prep — ✅ DONE (PRs #41–#50)
 
-Frontend wiring:
+##### PR #41: Cost Snapshot on Line DTOs — ✅ DONE
 
-* catalog search modals → real APIs
-* product line CRUD → real APIs
-* charge line CRUD → real APIs
-* financial summary panel
-* sale price override/reset
-* GP display and GP warning in Details of Sale area, not Dashboard
-* notes add/list
-* photo upload/view/delete
+* Already-added line read DTOs return `cost_snapshot` for read-only salesperson visibility
+* Catalog search stays cost-free
+* Client cannot send `cost`/`cost_snapshot`/`line_cost`
 
-Known frontend cleanup:
+##### PR #42: Per-Product LM/SQM Factor — ✅ DONE
 
-* Remove hardcoded "Required deposit: 40% of invoice total = $400.00" text.
+* V8 migration added `sqm_per_lm` column to `store_product`
+* 3.66 default remains for most carpets
+* 4.00 supported for 4m roll carpets
+* Conversion must use snapshotted factor per line, not hardcoded 3.66
 
-Important Phase 11 reminders:
+##### PR #43: Catalog Search — ✅ DONE
 
-* Product/charge line work must follow the locked order charge/product workflow.
-* Costing fields remain hidden from frontend users unless explicitly needed for manager/admin views later.
-* Stock allocation and installer/laybook workflows remain outside current Sales Portal scope.
-* Financial summary belongs to Chunk 3 mutation/read responses, not Chunk 2.
-* GP warning appears in Details of Sale / financial area, not Dashboard.
-* Sale price override/reset belongs to Chunk 3, not Chunk 2.
-* No invoice/payment work in Phase 11.
+* `GET /orders/{orderId}/available-products` — search available products
+* `GET /orders/{orderId}/available-charges` — search available charges
 
-Done when:
+##### PR #44: Product Lines + Financial Summary — ✅ DONE
 
-* full priced order with products, charges, totals, GP, notes, and photos works end-to-end
+* `GET /orders/{orderId}/lines` — order lines + financial summary
+* `POST /orders/{orderId}/product-lines` — add product line
+* `PATCH /orders/{orderId}/product-lines/{lineId}` — edit product line
+* `DELETE /orders/{orderId}/product-lines/{lineId}` — delete product line
+* Financial summary foundation: recomputation on mutations, header field persistence
 
-### Phase 12: Chunk 4 — Invoices + Payments
+##### PR #45: Negative Sale Price Rule — ✅ DONE
+
+* V9 migration dropped `sale_price_gte_zero` CHECK constraint
+* Product line PATCH/DELETE can persist and return negative `sale_price_ex_gst`
+* Negative sale price blocking lives at invoice creation (Phase 12), not line CRUD
+
+##### PR #46: Charge Lines — ✅ DONE
+
+* `POST /orders/{orderId}/charge-lines` — add charge line
+* `PATCH /orders/{orderId}/charge-lines/{lineId}` — edit charge line
+* `DELETE /orders/{orderId}/charge-lines/{lineId}` — delete charge line
+* `OrderChargeLineWriteRepository` write-split pattern
+* Snapshot capture for charge code/name/price/cost
+* Financial summary recomputation on mutations
+* Strict `additionalProperties: false` unknown-field rejection
+* All `*_snapshot` fields rejected from client input
+
+##### PR #47: Notes — ✅ DONE
+
+* `GET /orders/{orderId}/notes` — list notes (DESC ordering)
+* `POST /orders/{orderId}/notes` — add note
+* Append-only in MVP, no edit/delete
+* Notes allowed when LAID (no ORDER_LOCKED)
+* No financial summary recomputation on note add
+* POST response shape: `data.note` (nested)
+* No `created_by_user_id` column (future Store Portal scope)
+* Strict unknown-field rejection
+* Ordering test inserts 3 rows to genuinely verify DESC sort
+
+##### PR #48: Attachments/Photos — ✅ DONE
+
+* `GET /orders/{orderId}/attachments` — list attachments
+* `POST /orders/{orderId}/attachments` — upload photo (multipart)
+* `DELETE /orders/{orderId}/attachments/{attachmentId}` — delete attachment
+* `GET /orders/{orderId}/attachments/{attachmentId}/file` — download file
+* Local disk storage (S3 later)
+* PHOTO only in Chunk 3; SIGNATURE rejected
+* Allowed MIME: `image/jpeg`, `image/png`, `image/webp`
+* Max 10 MB
+* `storage_path` never exposed
+* Upload/list/download allowed when LAID
+* Delete blocked when LAID
+* Unicode download filenames encoded safely with Spring ContentDisposition
+* Delete disk cleanup after successful DB commit
+* Upload disk cleanup on transaction rollback
+* Upload response shape: `data.attachment` (nested, intentional)
+
+##### PR #49: Sale Price Override/Reset — ✅ DONE
+
+* `PUT /orders/{orderId}/sale-price` — override sale price
+* `POST /orders/{orderId}/sale-price/reset` — reset to calculated
+* `final_sale_price_inc_gst` is GST-inclusive input
+* Backend derives and stores `price_adjustment_inc_gst`
+* Zero adjustment stored as `0.00`, not NULL
+* Reset clears `price_adjustment_inc_gst` to NULL
+* Financial summary recomputed and persisted
+* LAID blocked with ORDER_LOCKED
+* Forbidden/unknown fields rejected
+* Non-finite values (1e309) return 400 VALIDATION_FAILED, not 500
+* >2dp input rounded HALF_UP to 2dp (locked decision, consistent with sibling line endpoints)
+
+##### PR #50: Numeric Validation Hardening — ✅ DONE
+
+* Non-finite guard mirrored into `OrderProductLineService` and `OrderChargeLineService`
+* Covers `unit_price`, `quantity`, `quantity_lm`, `quantity_sqm`
+* Targeted line tests and full backend test suite passed
+* Codex review clean
+
+#### Phase 11 Frontend — ✅ DONE (PRs #51–#54, #56)
+
+##### B7: Products & Charges Wiring — ✅ DONE
+
+Merged in PR #51.
+
+Branch: `feature/frontend-products-charges-wiring`
+
+Implemented:
+
+* `orderLinesApi.ts` — catalog search, GET lines, product/charge line CRUD
+* Catalog search modals wired to real backend
+* GET `/lines` on Products & Charges tab
+* Product line add/edit/delete on real endpoints
+* Charge line add/edit/delete on real endpoints
+* Backend financial summary lifting into OrderWorkspace
+* Header Sale total from `order_financial_summary.final_sale_price_inc_gst`
+* Product-specific `sqm_per_lm` / `sqm_per_lm_snapshot` instead of hardcoded 3.66
+* LAID lock disables product/charge mutations
+* Product subtotal and charge subtotal section lines remain
+
+Important B7 fixes:
+
+* Header Sale total loads before Products tab is opened
+* Invalid add-panel unit prices blocked
+* Mutation summaries still lift after tab unmount
+* Stale seed fetch cannot overwrite mutation summary
+
+##### B8: Sale Price + GP + Details Autosave — ✅ DONE
+
+Merged in PR #52.
+
+Branch: `feature/frontend-sale-price-gp-wiring`
+
+Implemented:
+
+* Sale price override/reset API functions in `orderLinesApi`
+* Sale price controls in Details of Sale
+* Final sale price input is GST-inclusive
+* Reset Price calls reset endpoint with no body
+* Reset Price remains available unless order is locked or sale-price request is in flight
+* GP/GP%/financial info hidden behind info button
+* GP info traffic-light style:
+
+  * green if GP% > 15
+  * amber/yellow if GP% 10–15
+  * red if GP% < 10, including negative
+* GP warning wording: "Warning: This sales price is below approved sales persons costings."
+* Manager approval required appears only when `gp_warning === true`
+* Create Invoice button is visual-only (no invoice API wiring)
+* Sale price success message removed completely
+* Required deposit text neutralised: "Deposit requirements will appear once payments are wired."
+* Details of Sale manual Save panel removed
+* Details fields autosave on blur/change (no keystroke, no debounce)
+
+Important B8 fixes:
+
+* Sale-price in-flight lock hoisted to WorkspaceShell (survives tab remount)
+* Details autosave single-flight lock/queue hoisted to WorkspaceShell
+* Details draft state hoisted to WorkspaceShell (survives Details tab unmount/remount)
+* WorkspaceShell keyed by `orderId` — draft/queue/autosave refs reset per order
+* Read vs mutation financial summary handling:
+
+  * GET `/lines` treated as read
+  * Reads guarded if mutation activity happened after read began
+  * Product/charge mutations and sale-price override/reset treated as mutations
+  * Mutation summaries apply and bump mutation version
+
+Concurrent mutation note:
+
+* True cross-surface mutation commit-order correctness cannot be fully solved in frontend without backend financial-summary versioning (tracked in issue #55)
+
+##### B9: Notes Wiring — ✅ DONE
+
+Merged in PR #53.
+
+Branch: `feature/frontend-notes-wiring`
+
+Implemented:
+
+* `orderNotesApi.ts` — GET notes, POST note
+* Notes loading/error/empty states
+* Add note from server-confirmed `data.note`
+* Notes remain allowed when LAID
+* No `created_by` UI
+* No financial summary interaction
+* Photos left separate for B10
+
+Important B9 Codex fix:
+
+* After prepending a new note, cap visible list to backend page size 20 so UI does not show 21 notes when backend page 1 would show 20
+
+##### B10: Photos/Attachments Wiring — ✅ DONE
+
+Merged in PR #54.
+
+Branch: `feature/frontend-attachments-wiring`
+
+Implemented:
+
+* `orderAttachmentsApi.ts` — list, upload, delete, download
+* List photo attachments from real endpoint
+* Single-file photo upload via multipart FormData
+* Authenticated blob preview thumbnails (fetch → object URL, not direct `<img src>`)
+* Delete photo attachment
+* LAID split:
+
+  * list allowed
+  * upload allowed
+  * preview/download allowed
+  * delete gated/blocked
+* Object URL cleanup for thumbnail previews (unmount, reload, delete, cap-drop)
+* Photos independent from notes
+
+Important B10 Codex fixes:
+
+* Upload disabled while initial photo list is loading
+* Stale GET guarded so upload cannot be overwritten by older fetch
+* Delete refetches page 1 to backfill truncated pages
+* Stale `photosError` cleared on successful upload only
+
+##### B11: Photo Preview Modal — ✅ DONE
+
+Merged in PR #56.
+
+Branch: `feature/frontend-photo-preview-polish`
+
+Implemented:
+
+* Large in-app photo preview modal/lightbox
+* Thumbnail click opens modal
+* Modal uses existing `Modal` component
+* X close, backdrop close, Escape close
+* Keyboard-openable thumbnail button
+* Modal uses separate authenticated blob object URL (not thumbnail reuse)
+* Object URL cleanup on modal close/unmount
+* Large preview size fixed after manual smoke showed it was initially too small
+* Notes unchanged, upload/list/delete unchanged
+* LAID preview allowed, delete still gated when locked
+
+Important B11 Codex fix:
+
+* If currently previewed photo is deleted, successful delete clears `selectedPhotoId` immediately so modal cannot stay open if follow-up attachments refetch fails
+
+#### Phase 11 Smoke Test
+
+Manual smoke test passed before B11 docs:
+
+* Products/charges: OK
+* Sale price/GP: OK
+* Notes: OK
+* Photos upload/preview/delete: OK
+* LAID behavior: upload/preview allowed, delete hidden/disabled on LAID, delete worked after unlocking
+* DevTools: current requests showed 200/201
+* B11 large preview visually worked after size fix
+
+#### Phase 11 Locked Decisions
+
+* Negative `sale_price_ex_gst` persists through all mutation layers; never clamped/floored/rejected; invoice creation (Phase 12) is where blocking lives
+* `gp_percent` out-of-range: persist NULL in DB where required; API response may still expose the calculated value when available
+* Unknown-field rejection (`additionalProperties: false`): enforced on charge/notes/attachments/sale-price endpoints; product-line backfill planned as standalone cleanup
+* POST mutation responses use nested `data.<entity>` shape matching OpenAPI
+* Ordering tests insert ≥3 rows to genuinely exercise sort behavior
+* `attachment` upload response nested as `data.attachment` (intentional, not a bug)
+* >2dp numeric input rounded HALF_UP (consistent across all sibling endpoints)
+* Camera capture deferred (native file upload sufficient for MVP including iPad)
+* HEIC/HEIF conversion deferred (JPG/PNG/WEBP only for MVP)
+* Quick-add descriptions are hardcoded frontend array; store-customisable versions require backend/Operations Portal later
+
+Status:
+
+* Done and merged to `main`
+
+### Phase 12: Chunk 4 — Invoices + Payments — ⏭ NEXT
 
 Backend endpoints:
 
@@ -581,7 +819,7 @@ Frontend wiring:
 
 Known frontend cleanup:
 
-* Replace hardcoded "Aussie Floors Group / Sydney CBD" invoice header with API-driven data.
+* Replace hardcoded "Aussie Floors Group / Sydney CBD" invoice header with API-driven data
 
 Done when:
 
@@ -664,6 +902,7 @@ These are known and accepted. They do not block the next phase.
 * #29 Add CSRF protection before production
 * #30 Configure production CORS origins
 * #31 Move shared auth types out of `auth.tsx`
+* #55 Add backend financial summary versioning for concurrent order mutations
 
 ### Security / Production Hardening
 
@@ -692,6 +931,9 @@ These are known and accepted. They do not block the next phase.
 * Dashboard count/list are not wrapped in read-only transaction
 
   * acceptable for MVP scale
+* Planned standalone cleanup: backfill strict unknown-field rejection on product-line endpoints for consistency with charge/notes/attachments/sale-price endpoints
+
+  * not blocking Phase 12; can be done as a standalone cleanup
 
 ### Frontend
 
@@ -701,6 +943,9 @@ These are known and accepted. They do not block the next phase.
   * server-side search + pagination to be added when order volume requires it
 * Move shared auth types (`User`, `Store`) out of `auth.tsx` to break the type-only import cycle with `authApi.ts` (issue #31)
 * Replace `DEFAULT_BUSINESS_SLUG` constant with dynamic business resolution (issue #27)
+* Camera capture support (deferred from Phase 11)
+* HEIC/HEIF upload conversion (deferred from Phase 11; JPG/PNG/WEBP only for MVP)
+* Store-customisable quick-add descriptions (requires backend/Operations Portal)
 
 ### Data / Business Rules
 
@@ -715,6 +960,12 @@ These are known and accepted. They do not block the next phase.
   * both set is valid
   * one set without the other is invalid
   * backend and frontend both protect the pair rule
+* Concurrent financial summary mutation ordering (issue #55):
+
+  * theoretical edge when two financial-changing mutations overlap across different surfaces
+  * frontend cannot reliably determine backend commit order from response order
+  * correct fix: backend summary versioning (etag/version on order_financial_summary responses)
+  * not blocking MVP
 
 ### Test / Build Hygiene
 
