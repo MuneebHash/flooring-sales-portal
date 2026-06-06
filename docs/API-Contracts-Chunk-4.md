@@ -17,15 +17,29 @@
 
 ---
 
-## A. Chunk 4 Scope — Included
+## A. Chunk 4 Scope — Included (MVP)
 
-- Invoice creation (version 1).
-- Manual Rewrite Invoice (next official version, snapshots current live order state).
-- Invoice list / version history per order.
-- Invoice detail / snapshot metadata.
-- Invoice PDF binary download.
+**MVP exposes only the current/latest invoice.** The `invoice` table keeps its
+`version_number` and may hold multiple rows per order internally, but the MVP API and
+frontend expose a single **current invoice** — no history list, no revision dropdown, and
+no access to older versions. See A.1 for what is deferred. No migration is added and no
+schema field is removed for this simplification.
+
+- Invoice creation (creates the current invoice).
+- Rewrite Invoice (regenerates/updates the current invoice from current live order state).
+- Read the current invoice snapshot (metadata).
+- Current invoice PDF binary download.
 - Payment list per order with current official payment summary.
-- Payment recording (records money against the **latest official invoice**, atomically creates a payment-driven invoice version that updates `total_paid` / `balance_due` only).
+- Payment recording (records money against the **current/latest invoice**, atomically regenerates the current invoice updating `total_paid` / `balance_due` only, without making unsent live order edits official).
+
+### A.1 Deferred to post-MVP (schema kept, API not exposed)
+
+Reserved in the schema (`invoice.version_number`, multiple `invoice` rows per order) but
+NOT exposed by the MVP API or frontend:
+- Invoice history / version list per order.
+- Invoice detail by `invoiceId`.
+- Download of an older invoice version's PDF.
+- Signed / accepted invoice revision history, the invoice-page revision dropdown, viewing old signed PDFs, and the signed-invoice acceptance workflow.
 
 ---
 
@@ -39,6 +53,8 @@ Already locked in earlier chunks — not reopened:
 Out of MVP scope or deferred:
 - **Operations Portal catalog management is deferred to a separate future Operations Portal API contract. For the Sales Portal MVP, product and charge catalog data will be manually loaded into `store_product` and `store_charge` during onboarding/admin setup. Sales Portal consumes that catalog only through the locked Chunk 3 `available-products` and `available-charges` endpoints.** Operations Portal will have its own login/auth flow, its own users (owners / managers / catalog admins), and its own contract; it is not a sub-path of the Sales Portal API.
 - Payment edit / delete (conventions §13: not allowed in MVP).
+- **Invoice history / revision access (deferred post-MVP).** The MVP exposes only the current/latest invoice. Invoice history listing, invoice detail by `invoiceId`, and downloading an older invoice version's PDF are deferred. The schema (`invoice.version_number`, multiple rows per order) is kept and reserved; no migration is added (see A.1 and D.5).
+- **Signed / accepted invoice revision history (deferred post-MVP):** the signed-invoice acceptance workflow, the invoice-page revision dropdown, and viewing old signed PDFs. No signed-invoice fields are invented now.
 - Refunds, surcharges, finance products, cheque, partial reversals.
 - Stripe / gateway-driven flows (`gateway_transaction_id`, `response_status`, `response_message` remain nullable backend fields for manual MVP payments).
 - Invoice email / send-to-customer endpoints (not yet locked in conventions).
@@ -49,17 +65,22 @@ Out of MVP scope or deferred:
 
 ## C. Chunk 4 Endpoint List
 
-All endpoints are **Standard protected** (all 7 checks from conventions §9). Every order-level endpoint additionally enforces `sales_order.business_id = session.business_id` AND `sales_order.store_id = session.store_id`. Every invoice-level endpoint additionally enforces `invoice.order_id = path.orderId`. Payment-level reads/writes additionally enforce `payment_transaction.order_id = path.orderId`.
+All endpoints are **Standard protected** (all 7 checks from conventions §9). Every order-level endpoint additionally enforces `sales_order.business_id = session.business_id` AND `sales_order.store_id = session.store_id`. The current-invoice endpoints (D.3, D.4) resolve the current invoice as the latest `invoice` row for the order in scope (it always belongs to the order). Payment-level reads/writes additionally enforce `payment_transaction.order_id = path.orderId`.
 
-| # | Method | Path | Purpose |
-|---|--------|------|---------|
-| 1 | POST | `/api/v1/{slug}/orders/{orderId}/invoices` | Create invoice version 1 |
-| 2 | POST | `/api/v1/{slug}/orders/{orderId}/invoices/rewrite` | Manually create the next official invoice version from current live order state |
-| 3 | GET  | `/api/v1/{slug}/orders/{orderId}/invoices` | List all invoice versions for the order |
-| 4 | GET  | `/api/v1/{slug}/orders/{orderId}/invoices/{invoiceId}` | Read a single invoice snapshot's metadata |
-| 5 | GET  | `/api/v1/{slug}/orders/{orderId}/invoices/{invoiceId}/file` | Download the PDF binary |
-| 6 | GET  | `/api/v1/{slug}/orders/{orderId}/payments` | List payments + current official payment summary |
-| 7 | POST | `/api/v1/{slug}/orders/{orderId}/payments` | Record a payment against the latest official invoice; atomically auto-create the next invoice version |
+**MVP endpoint list (current invoice only):**
+
+| Method | Path | Purpose | Contract |
+|--------|------|---------|----------|
+| POST | `/api/v1/{slug}/orders/{orderId}/invoices` | Create the current invoice | D.1 |
+| POST | `/api/v1/{slug}/orders/{orderId}/invoices/rewrite` | Rewrite/regenerate the current invoice from current live order state | D.2 |
+| GET  | `/api/v1/{slug}/orders/{orderId}/invoices/current` | Read the current invoice snapshot | D.3 |
+| GET  | `/api/v1/{slug}/orders/{orderId}/invoices/current/file` | Download the current invoice PDF binary | D.4 |
+| GET  | `/api/v1/{slug}/orders/{orderId}/payments` | List payments + current official payment summary | D.6 |
+| POST | `/api/v1/{slug}/orders/{orderId}/payments` | Record a payment against the current invoice; atomically regenerate the current invoice | D.7 |
+
+**Deferred to post-MVP (NOT implemented in MVP — see D.5):** `GET .../invoices` (history
+list), `GET .../invoices/{invoiceId}` (detail by id), `GET .../invoices/{invoiceId}/file`
+(older-version PDF). The schema supports these; they can be added later without a migration.
 
 ---
 
@@ -159,7 +180,7 @@ All endpoints are **Standard protected** (all 7 checks from conventions §9). Ev
 
 ### D.2 POST /api/v1/{slug}/orders/{orderId}/invoices/rewrite
 
-**Purpose.** Manually create the next **official** invoice version. Re-snapshots the current live order state as the new official sale snapshot, plus current total payments.
+**Purpose.** Regenerate the **current invoice** from the current live order state (internally the next `version_number`). Re-snapshots the current live order state as the new sale snapshot, plus current total payments. MVP exposes only the resulting current invoice (no history).
 
 **Scope class.** Standard protected.
 
@@ -229,79 +250,14 @@ All endpoints are **Standard protected** (all 7 checks from conventions §9). Ev
 
 ---
 
-### D.3 GET /api/v1/{slug}/orders/{orderId}/invoices
+### D.3 GET /api/v1/{slug}/orders/{orderId}/invoices/current
 
-**Purpose.** Return the order's invoice version history.
+**Purpose.** Return the **current (latest) invoice** snapshot for the order. MVP exposes
+only the current invoice; there is no history list and no per-version detail (deferred — see D.5).
 
 **Scope class.** Standard protected.
 
 **Path params.** `orderId` — positive integer.
-
-**Query params**
-
-| Name | Type | Required | Default | Notes |
-|------|------|----------|---------|-------|
-| `page` | int | no | 1 | Min 1 |
-| `page_size` | int | no | 20 | Min 1, max 100 |
-
-**Request DTO.** None.
-
-**Response DTO — 200 OK**
-```json
-{
-  "data": [
-    {
-      "invoice_id": 4,
-      "version_number": 3,
-      "invoice_date": "2026-04-22",
-      "due_date": "2026-05-06",
-      "sale_price_inc_gst": 924.00,
-      "total_paid": 500.00,
-      "balance_due": 424.00,
-      "created_by_user_id": 1,
-      "created_at": "2026-04-22T14:30:00",
-      "pdf_download_path": "/api/v1/aussiefloors/orders/1/invoices/4/file"
-    }
-  ],
-  "pagination": {
-    "page": 1,
-    "page_size": 20,
-    "total_items": 3,
-    "total_pages": 1
-  }
-}
-```
-
-Each row uses the shared DTO `invoice_history_row` (see E.1).
-
-**Business rules / scoping**
-- Invoices scoped to the order (and via the order, to session's store).
-- **Default ordering:** `version_number` descending (newest version first).
-- Empty result → 200 with `"data": []`.
-
-**Validation.** `orderId` positive integer; `page` ≥ 1; `page_size` ∈ [1, 100].
-
-**LAID lock.** GET allowed regardless of order status.
-
-**Status codes**
-| Code | When |
-|------|------|
-| 200 | OK |
-| 400 | Invalid `orderId` format, invalid pagination |
-| 401 | No session |
-| 403 | Session has no active store / user does not have access |
-| 404 | Order not in scope, or business slug not found / inactive |
-| 500 | Unexpected |
-
----
-
-### D.4 GET /api/v1/{slug}/orders/{orderId}/invoices/{invoiceId}
-
-**Purpose.** Return the snapshot metadata for a specific invoice version.
-
-**Scope class.** Standard protected.
-
-**Path params.** `orderId`, `invoiceId` — positive integers.
 
 **Query params.** None.
 
@@ -316,11 +272,16 @@ Each row uses the shared DTO `invoice_history_row` (see E.1).
 }
 ```
 
-**Business rules / scoping**
-- Verify invoice belongs to the order. Otherwise → 404 `INVOICE_NOT_FOUND` (no cross-order leak).
-- Order belongs to session's `(business_id, store_id)`. Otherwise → 404.
+The current invoice is the `invoice` row with the highest `version_number` for the order.
+`version_number` is an internal field returned in the snapshot; the MVP frontend does not
+surface it (no revision dropdown).
 
-**Validation.** `orderId`, `invoiceId` positive integers.
+**Business rules / scoping**
+- Resolve the current invoice = `max(version_number)` row in `invoice` for this order.
+- Order belongs to session's `(business_id, store_id)`. Otherwise → 404.
+- If no invoice exists yet for this order → 404 `INVOICE_NOT_FOUND`.
+
+**Validation.** `orderId` positive integer.
 
 **LAID lock.** GET allowed regardless of order status.
 
@@ -328,21 +289,22 @@ Each row uses the shared DTO `invoice_history_row` (see E.1).
 | Code | When |
 |------|------|
 | 200 | OK |
-| 400 | Invalid `orderId` / `invoiceId` format |
+| 400 | Invalid `orderId` format |
 | 401 | No session |
 | 403 | Session has no active store / user does not have access |
-| 404 | Order not in scope, or invoice not on this order, or business slug not found / inactive |
+| 404 | Order not in scope, no invoice exists yet (`INVOICE_NOT_FOUND`), or business slug not found / inactive |
 | 500 | Unexpected |
 
 ---
 
-### D.5 GET /api/v1/{slug}/orders/{orderId}/invoices/{invoiceId}/file
+### D.4 GET /api/v1/{slug}/orders/{orderId}/invoices/current/file
 
-**Purpose.** Stream the PDF binary for the invoice version.
+**Purpose.** Stream the PDF binary for the **current (latest) invoice**. Runs under the
+file-binary exception to conventions §3.
 
 **Scope class.** Standard protected. Runs under the file-binary exception to conventions §3.
 
-**Path params.** `orderId`, `invoiceId` — positive integers.
+**Path params.** `orderId` — positive integer.
 
 **Query params.** None.
 
@@ -351,17 +313,18 @@ Each row uses the shared DTO `invoice_history_row` (see E.1).
 **Response — 200 OK**
 - Body: raw PDF bytes.
 - `Content-Type: application/pdf`.
-- `Content-Disposition: inline; filename="invoice-{order_number}-v{version_number}.pdf"` — backend builds the filename using the locked order_number format (e.g. `invoice-SYD-CBD.LC1.00042-v3.pdf`).
+- `Content-Disposition: inline; filename="invoice-{order_number}-v{version_number}.pdf"` — backend builds the filename from the locked order_number and the current invoice's `version_number` (e.g. `invoice-SYD-CBD.LC1.00042-v3.pdf`).
 - `Content-Length`: file size.
 
 This is **not** a JSON response (file-binary exception). Errors at this endpoint use the standard JSON error wrapper.
 
 **Business rules**
-- Verify invoice belongs to the order, order belongs to session's store.
+- Resolve the current invoice = `max(version_number)` row for the order; stream its linked `stored_file`.
+- Order belongs to session's store; if no invoice exists yet → 404 `INVOICE_NOT_FOUND`.
 - `stored_file.storage_path` is internal and never returned in any field.
 - Stream from the configured storage location. If the file row exists but the underlying file is missing on disk → 500.
 
-**Validation.** `orderId`, `invoiceId` positive integers.
+**Validation.** `orderId` positive integer.
 
 **LAID lock.** GET allowed regardless of order status.
 
@@ -369,11 +332,29 @@ This is **not** a JSON response (file-binary exception). Errors at this endpoint
 | Code | When |
 |------|------|
 | 200 | PDF streamed |
-| 400 | Invalid `orderId` / `invoiceId` format |
+| 400 | Invalid `orderId` format |
 | 401 | No session |
 | 403 | Session has no active store / user does not have access |
-| 404 | Order not in scope, or invoice not on this order, or business slug not found / inactive |
+| 404 | Order not in scope, no invoice exists yet (`INVOICE_NOT_FOUND`), or business slug not found / inactive |
 | 500 | Unexpected (including file missing on disk) |
+
+---
+
+### D.5 Deferred to post-MVP — invoice history & old-version access
+
+The following endpoints are **deferred to post-MVP** and are NOT implemented in the MVP.
+The schema supports them (multiple `invoice` rows per order with `version_number`), so they
+can be added later **without a migration**:
+
+- `GET /api/v1/{slug}/orders/{orderId}/invoices` — list all invoice versions (history).
+- `GET /api/v1/{slug}/orders/{orderId}/invoices/{invoiceId}` — read a specific invoice version.
+- `GET /api/v1/{slug}/orders/{orderId}/invoices/{invoiceId}/file` — download a specific older version's PDF.
+
+Also deferred (no schema invented now): the signed / accepted invoice revision history, the
+invoice-page revision dropdown, viewing old signed PDFs, and the signed-invoice acceptance
+workflow.
+
+MVP clients use only **D.3** (current invoice) and **D.4** (current invoice PDF).
 
 ---
 
@@ -450,7 +431,7 @@ This is **not** a JSON response (file-binary exception). Errors at this endpoint
 
 ### D.7 POST /api/v1/{slug}/orders/{orderId}/payments
 
-**Purpose.** Record a payment against the **latest official invoice's balance** and atomically create the next invoice version reflecting the updated payment state. The auto-created version is a payment-receipt snapshot — it carries forward the latest official sale snapshot fields and updates only `total_paid` and `balance_due`. It must NOT silently make unsent live order edits official.
+**Purpose.** Record a payment against the **current invoice's balance** and atomically regenerate the current invoice reflecting the updated payment state. The regenerated current invoice is a payment-receipt snapshot — it carries forward the current invoice's sale snapshot fields and updates only `total_paid` and `balance_due`. It must NOT silently make unsent live order edits official. (Internally the backend appends a new `invoice` row / `version_number`; the MVP exposes this only as the updated current invoice — no history.)
 
 **Scope class.** Standard protected.
 
@@ -486,9 +467,9 @@ This is **not** a JSON response (file-binary exception). Errors at this endpoint
       "total_paid": 500.00,
       "balance_due": 424.00
     },
-    "auto_invoice_version": { "...see E.1 invoice_history_row..." }
+    "current_invoice": { "...see E.1 current_invoice_summary..." }
   },
-  "message": "Payment recorded. Invoice version created."
+  "message": "Payment recorded. Current invoice updated."
 }
 ```
 
@@ -500,7 +481,7 @@ This is **not** a JSON response (file-binary exception). Errors at this endpoint
    - DB CHECK requires `balance_due ≥ 0`; MVP does not support overpayment.
 4. Persist `payment_transaction` row with the supplied values. Backend leaves `gateway_transaction_id`, `response_status`, `response_message` as `null`.
 5. Compute new `total_paid_after = round(sum(payment_transaction.amount for this order), 2)` (including the just-added row).
-6. Snapshot a new payment-driven invoice version. **Sale snapshot fields are carried forward from the latest official invoice — not re-derived from current live order state.** This is the key correction to prevent unsent live edits from being silently made official.
+6. Regenerate the current invoice (internally a new `invoice` row with `version_number = max + 1`). **Sale snapshot fields are carried forward from the current invoice — not re-derived from current live order state.** This is the key rule that prevents unsent live edits from being silently made official.
    - `version_number = max(existing version_number) + 1`
    - `invoice_date = current date`
    - `due_date = latest_invoice.due_date` (carried forward)
@@ -551,9 +532,10 @@ This is **not** a JSON response (file-binary exception). Errors at this endpoint
 
 ## E. Shared DTOs
 
-### E.1 `invoice_history_row`
+### E.1 `current_invoice_summary`
 
-Used in D.3 list responses and inside D.7's `auto_invoice_version`.
+Used inside D.7's `current_invoice`. (This same row shape is reserved for the deferred
+post-MVP invoice-history list — see D.5.)
 
 ```json
 {
@@ -566,19 +548,19 @@ Used in D.3 list responses and inside D.7's `auto_invoice_version`.
   "balance_due": 424.00,
   "created_by_user_id": 1,
   "created_at": "2026-04-22T14:30:00",
-  "pdf_download_path": "/api/v1/aussiefloors/orders/1/invoices/4/file"
+  "pdf_download_path": "/api/v1/aussiefloors/orders/1/invoices/current/file"
 }
 ```
 
 **Field rules**
-- All fields sourced from `invoice` except `pdf_download_path`, which is the relative URL to D.5 (built backend-side).
+- All fields sourced from `invoice` except `pdf_download_path`, which is the relative URL to D.4 (the current invoice PDF, built backend-side).
 - Money fields with two decimal places. `due_date` may be `null` only if the invoice was created before the due-date rule was applied; new invoices always have a non-null `due_date`.
 - `due_date` semantics: for manual versions (D.1, D.2) it is `proposed_lay_date − 2 calendar days`. For payment-driven versions (D.7) it is carried forward from the latest official invoice. It may be earlier than `invoice_date` — see G.2.
 - `stored_file.storage_path` is never exposed; only the API download path is.
 
 ### E.2 `invoice_detail`
 
-Used in D.1 / D.2 / D.4 responses (single invoice snapshot).
+Used in D.1 / D.2 / D.3 responses (the current invoice snapshot).
 
 ```json
 {
@@ -594,7 +576,7 @@ Used in D.1 / D.2 / D.4 responses (single invoice snapshot).
   "balance_due": 424.00,
   "created_by_user_id": 1,
   "created_at": "2026-04-22T14:30:00",
-  "pdf_download_path": "/api/v1/aussiefloors/orders/1/invoices/4/file"
+  "pdf_download_path": "/api/v1/aussiefloors/orders/1/invoices/current/file"
 }
 ```
 
@@ -655,15 +637,20 @@ The 9 preconditions:
 
 Failure response: 422 with `error.code = "INVOICE_PRECONDITIONS_NOT_MET"` and `error.details[]` listing every failing item with `section`, `field`, and `message`.
 
-**F.2 Invoice versioning — three creation paths.**
-- **D.1 first invoice** = `version_number = 1`. Snapshots current live order state. Allowed when LAID (if no prior invoice).
-- **D.2 manual Rewrite Invoice** = next `version_number`. Snapshots current live order state — this is what makes new live edits official. Blocked when LAID.
-- **D.7 payment auto-version** = next `version_number`. **Carries forward sale snapshot fields from the latest official invoice**, updates only `total_paid` / `balance_due`. Allowed when LAID.
+**F.2 Invoice creation — current invoice (MVP).**
 
-In all three paths:
-- Old invoice rows are never modified.
-- Each version has its own `stored_file_id` (UNIQUE constraint).
-- New versions are never built from a previous PDF; they always rebuild the `invoice` row and the file.
+MVP exposes only the current/latest invoice. Internally the backend still writes `invoice`
+rows with an incrementing `version_number` (schema unchanged), but clients only ever see the
+current invoice (D.3 / D.4). History listing and old-version access are deferred (see D.5).
+
+- **D.1 Create Invoice** = first invoice, `version_number = 1`. Snapshots current live order state. Allowed when LAID (if no prior invoice).
+- **D.2 Rewrite Invoice** = regenerates the current invoice (internally next `version_number`). Snapshots current live order state — this is what makes new live edits official. Blocked when LAID.
+- **D.7 payment** = regenerates the current invoice (internally next `version_number`). **Carries forward sale snapshot fields from the current invoice**, updates only `total_paid` / `balance_due`. Allowed when LAID.
+
+In all paths:
+- Older internal invoice rows are never modified (and are simply not exposed in MVP).
+- Each invoice row has its own `stored_file_id` (UNIQUE constraint).
+- The current invoice is always rebuilt fresh (new `invoice` row + new PDF); it is never built from a previous PDF.
 - Invoice rows do not store `order_number`. The PDF and the download filename use `sales_order.order_number` (locked format `{store_code}.{salesperson_code}.{seq_padded_5}`).
 
 **F.3 Payment rules (conventions §13, with corrected balance semantics).**
@@ -675,11 +662,11 @@ In all three paths:
 - Payments are immutable: no edit, no delete in MVP.
 - Adding a payment does not change product lines, charge lines, sale price, GP, costs, or any unsent live order edits. It only updates `total_paid` and `balance_due` via the auto-created invoice version (which carries the sale snapshot forward).
 
-**F.4 Auto invoice version on payment.**
-- D.7 atomically: inserts the `payment_transaction` row, snapshots a new `invoice` version that carries the latest official sale snapshot forward and updates payment fields, generates and stores its PDF.
-- The auto version must not silently make unsent live order edits official. Sale snapshot fields (`details_of_sale_snapshot`, `sale_price_ex_gst`, `sale_price_inc_gst`, `due_date`) are copied from `latest_invoice`. To make new live edits official, the salesperson must use D.2 manual Rewrite Invoice first.
+**F.4 Payment regenerates the current invoice.**
+- D.7 atomically: inserts the `payment_transaction` row, regenerates the current `invoice` (internally a new row / `version_number`) that carries the current sale snapshot forward and updates payment fields, generates and stores its PDF.
+- The regenerated current invoice must not silently make unsent live order edits official. Sale snapshot fields (`details_of_sale_snapshot`, `sale_price_ex_gst`, `sale_price_inc_gst`, `due_date`) are copied from the current invoice. To make new live edits official, the salesperson must use D.2 Rewrite Invoice first.
 - All side effects in a single DB transaction. Any failure → full rollback. The salesperson must retry; partial state is never persisted.
-- D.7 response includes the created payment, the updated `payment_summary`, and the auto invoice version metadata (E.1 shape).
+- D.7 response includes the created payment, the updated `payment_summary`, and the updated `current_invoice` metadata (E.1 shape).
 
 **F.5 Invoice due_date rule.**
 - Manual invoice versions (D.1 Create, D.2 Manual Rewrite) derive `due_date = sales_order.proposed_lay_date − 2 calendar days`. The frontend never sends `due_date`.
@@ -687,17 +674,18 @@ In all three paths:
 - `due_date` is independent of payment date. A customer may pay after `due_date`.
 - `due_date` may be earlier than `invoice_date` (e.g. a payment-driven version is generated after the original due date). This is valid — see G.2.
 
-**F.6 PDF / file download rule.**
-- D.5 streams `application/pdf` raw bytes under the file-binary exception (conventions §3).
-- `Content-Disposition: inline; filename="invoice-{order_number}-v{version_number}.pdf"` (backend-built; uses the locked order number format).
-- `stored_file.storage_path` is server-internal and never exposed. The only field clients see is `pdf_download_path`, which is the relative URL to D.5.
+**F.6 PDF / file download rule (current invoice).**
+- D.4 streams the current invoice's `application/pdf` raw bytes under the file-binary exception (conventions §3).
+- `Content-Disposition: inline; filename="invoice-{order_number}-v{version_number}.pdf"` (backend-built; uses the locked order number format and the current invoice's version number).
+- `stored_file.storage_path` is server-internal and never exposed. The only field clients see is `pdf_download_path`, which is the relative URL to D.4.
 - File-missing-on-disk → 500 (operational error).
-- Errors at D.5 use the standard JSON error wrapper.
+- Errors at D.4 use the standard JSON error wrapper.
+- Downloading older invoice versions is deferred to post-MVP (see D.5).
 
 **F.7 Tenant / store / order / resource scoping (conventions §9).**
 - Every Chunk 4 endpoint enforces the 7 checks from §9.
 - Order-level endpoints additionally enforce `sales_order.business_id = session.business_id` AND `sales_order.store_id = session.store_id`.
-- Invoice-level endpoints additionally enforce `invoice.order_id = path.orderId`.
+- The current-invoice endpoints (D.3, D.4) resolve the current invoice as the latest `invoice` row for the order in scope; it always belongs to the order. If no invoice exists → 404 `INVOICE_NOT_FOUND`.
 - Payment writes additionally enforce that the order in the path belongs to session's `(business_id, store_id)`. Payment reads in D.6 are scoped through the order.
 - Cross-tenant / cross-store / cross-order / cross-resource misses always return 404, never 403.
 
@@ -706,12 +694,11 @@ In all three paths:
 | Endpoint | Allowed when LAID? |
 |----------|--------------------|
 | D.1 POST invoices (Create v1) | **Yes** if no invoice exists yet AND preconditions pass (rationale in D.1) |
-| D.2 POST invoices/rewrite | No → 422 `ORDER_LOCKED` (conventions §16: manual Rewrite Invoice is blocked) |
-| D.3 GET invoices (history) | Yes |
-| D.4 GET invoices/{id} (detail) | Yes |
-| D.5 GET invoices/{id}/file (PDF) | Yes |
+| D.2 POST invoices/rewrite | No → 422 `ORDER_LOCKED` (conventions §16: Rewrite Invoice is blocked) |
+| D.3 GET invoices/current (current detail) | Yes |
+| D.4 GET invoices/current/file (current PDF) | Yes |
 | D.6 GET payments | Yes |
-| D.7 POST payments | **Yes** (conventions §16: add payment is allowed; auto invoice version is the side effect of allowed payments) |
+| D.7 POST payments | **Yes** (conventions §16: add payment is allowed; the current invoice is regenerated as the side effect of allowed payments) |
 
 **F.9 Backend-controlled fields.** Client never sends or controls:
 - `business_id`, `store_id`, `user_id`, `order_id`, `invoice_id`, `payment_transaction_id` in any body.
@@ -730,6 +717,7 @@ Chunk 4 follows the locked conventions rule that manual invoice versions and pay
 - Manual versions created by Create Invoice or Rewrite Invoice snapshot the current live order state and make live edits official.
 - Payment-driven versions created by Add Payment carry forward the latest official invoice sale snapshot and update only `total_paid` and `balance_due`.
 - Payment-driven versions must not silently include unsent live order edits.
+- MVP note: these distinctions are internal. The MVP exposes only the current/latest invoice (no history list, no version selection — see A.1).
 
 **G.2 Invoice due_date rule.**
 
