@@ -26,6 +26,14 @@ public enum ErrorCode {
     CHARGE_INACTIVE(HttpStatus.UNPROCESSABLE_ENTITY, "Charge is inactive."),
     FLOORING_TYPE_MISMATCH(HttpStatus.UNPROCESSABLE_ENTITY, "Product flooring type does not match the order's flooring type."),
     INSTALLATION_ADDRESS_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "Installation address must exist before copying it to billing."),
+    // Phase 12 invoice / payment codes (Chunk 4 D.1/D.2/D.3/D.7). INVOICE_ALREADY_EXISTS and
+    // INVOICE_PRECONDITIONS_NOT_MET are used by Branch A (create); INVOICE_REQUIRED, INVOICE_NOT_FOUND,
+    // and PAYMENT_EXCEEDS_BALANCE are foundation codes wired by later Phase 12 branches.
+    INVOICE_ALREADY_EXISTS(HttpStatus.CONFLICT, "An invoice already exists for this order. Use Rewrite Invoice to create a new version."),
+    INVOICE_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "An invoice is required for this action."),
+    INVOICE_NOT_FOUND(HttpStatus.NOT_FOUND, "Invoice not found."),
+    INVOICE_PRECONDITIONS_NOT_MET(HttpStatus.UNPROCESSABLE_ENTITY, "Complete required fields before creating invoice."),
+    PAYMENT_EXCEEDS_BALANCE(HttpStatus.UNPROCESSABLE_ENTITY, "Payment amount cannot exceed the current balance due."),
     INTERNAL_SERVER_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
 
     private final HttpStatus status;
