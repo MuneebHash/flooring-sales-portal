@@ -15,6 +15,7 @@ import com.flooring.salesportal.common.session.RequestContext;
 import com.flooring.salesportal.common.session.RequestContextGuard;
 import com.flooring.salesportal.common.storage.FileStorageService;
 import com.flooring.salesportal.order.InvoicePdfGenerator.InvoicePdfModel;
+import com.flooring.salesportal.order.InvoiceRepository.InvoiceFile;
 import com.flooring.salesportal.order.InvoiceRepository.InvoiceRow;
 import com.flooring.salesportal.order.dto.InvoiceDetailDto;
 import com.flooring.salesportal.order.dto.InvoiceResponse;
@@ -34,9 +35,10 @@ import java.util.Iterator;
 import java.util.List;
 
 /**
- * Phase 12 Chunk 4 Branch A — create the current invoice (D.1 POST /orders/{orderId}/invoices).
- * Only the create path is implemented here; rewrite (D.2), read/file (D.3/D.4), and payments
- * (D.6/D.7) are later branches.
+ * Phase 12 Chunk 4 invoice endpoints: Branch A — create the current invoice (D.1 POST
+ * /orders/{orderId}/invoices); Branch B — read the current invoice (D.3 GET
+ * /orders/{orderId}/invoices/current) and stream its PDF (D.4 GET
+ * /orders/{orderId}/invoices/current/file). Rewrite (D.2) and payments (D.6/D.7) are later branches.
  *
  * <p>Gate ordering mirrors the sibling order endpoints: standard-protected guard -> manual
  * {@code orderId} parse (VALIDATION_FAILED on {@code order_id}) -> scoped {@code FOR UPDATE} order
@@ -210,6 +212,72 @@ public class OrderInvoiceService {
     }
 
     // ------------------------------------------------------------------
+    // D.3 GET /orders/{orderId}/invoices/current — read the current invoice (no message field)
+    // ------------------------------------------------------------------
+
+    /**
+     * Return the current (highest {@code version_number}) invoice for the scoped order. Read-only;
+     * allowed regardless of LAID. Gate order: guard -> orderId parse (400) -> scoped order lookup
+     * (404 {@code ORDER_NOT_FOUND}, no existence leak) -> current invoice lookup (404
+     * {@code INVOICE_NOT_FOUND} when none). The response is the E.2 invoice_detail with NO top-level
+     * {@code message} (D.3), so {@link ApiResponse#ok(Object)} is used (message stays null/omitted).
+     */
+    @Transactional(readOnly = true)
+    public ApiResponse<InvoiceResponse> getCurrentInvoice(String slug,
+                                                          String orderIdRaw,
+                                                          HttpServletRequest httpRequest) {
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+        long orderId = parsePositiveLong(orderIdRaw, "order_id");
+        requireOrderInScope(orderId, ctx);
+
+        InvoiceRow row = invoiceRepository.findCurrentByOrderId(orderId)
+                .orElseThrow(() -> new NotFoundException(ErrorCode.INVOICE_NOT_FOUND,
+                        ErrorCode.INVOICE_NOT_FOUND.defaultMessage()));
+
+        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, row)));
+    }
+
+    // ------------------------------------------------------------------
+    // D.4 GET /orders/{orderId}/invoices/current/file — stream the current invoice PDF
+    // ------------------------------------------------------------------
+
+    /**
+     * Resolve the current invoice's linked {@code stored_file} and read its bytes for streaming (D.4).
+     * Read-only; allowed regardless of LAID. Same gates as D.3. No invoice -> 404
+     * {@code INVOICE_NOT_FOUND}; a file row whose bytes are missing/unreadable on disk ->
+     * {@link java.io.UncheckedIOException} from {@link FileStorageService#read} -> generic 500 via the
+     * standard JSON error wrapper (the controller never gets a body to stream, so the error is JSON).
+     * {@code storage_path} is used only to read the bytes and is never returned.
+     */
+    @Transactional(readOnly = true)
+    public InvoiceFileDownload downloadCurrentInvoiceFile(String slug,
+                                                          String orderIdRaw,
+                                                          HttpServletRequest httpRequest) {
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+        long orderId = parsePositiveLong(orderIdRaw, "order_id");
+        requireOrderInScope(orderId, ctx);
+
+        InvoiceFile file = invoiceRepository.findCurrentFileByOrderId(orderId)
+                .orElseThrow(() -> new NotFoundException(ErrorCode.INVOICE_NOT_FOUND,
+                        ErrorCode.INVOICE_NOT_FOUND.defaultMessage()));
+
+        // Missing-on-disk -> UncheckedIOException -> generic 500 with the standard JSON wrapper (D.4).
+        byte[] bytes = fileStorageService.read(file.storagePath());
+        return new InvoiceFileDownload(bytes, file.mimeType(), file.fileName(), file.fileSize());
+    }
+
+    // ------------------------------------------------------------------
+    // Scoping (read)
+    // ------------------------------------------------------------------
+
+    /** Read scope (no lock). 404 ORDER_NOT_FOUND when out of the session's (business, store). */
+    private void requireOrderInScope(long orderId, RequestContext ctx) {
+        salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+    }
+
+    // ------------------------------------------------------------------
     // Body / id validation
     // ------------------------------------------------------------------
 
@@ -358,5 +426,9 @@ public class OrderInvoiceService {
                 .filter(a -> ADDRESS_BILLING.equals(a.getAddressType()))
                 .findFirst()
                 .orElse(null);
+    }
+
+    /** Carrier for the D.4 binary response — the controller turns this into a raw {@code ResponseEntity}. */
+    public record InvoiceFileDownload(byte[] bytes, String mimeType, String fileName, long fileSize) {
     }
 }

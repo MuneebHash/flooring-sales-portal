@@ -7,6 +7,7 @@ import org.junit.jupiter.api.extension.ExtendWith;
 import org.junit.jupiter.api.io.TempDir;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.mock.web.MockHttpSession;
@@ -15,19 +16,24 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.context.junit.jupiter.SpringExtension;
 import org.springframework.test.context.transaction.TestTransaction;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.context.WebApplicationContext;
 
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasItems;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.startsWith;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -498,5 +504,302 @@ class OrderInvoiceControllerTest {
                         .contentType(MediaType.APPLICATION_JSON).content("{\"due_date\":\"2026-01-01\"}"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // ================================================================
+    // Branch B helpers
+    // ================================================================
+
+    private static String currentInvoiceUrl(Object orderId) {
+        return invoicesUrl(orderId) + "/current";
+    }
+
+    private static String currentInvoiceUrl(String slug, Object orderId) {
+        return invoicesUrl(slug, orderId) + "/current";
+    }
+
+    private static String currentFileUrl(Object orderId) {
+        return invoicesUrl(orderId) + "/current/file";
+    }
+
+    /** Insert a stored_file row (application/pdf) and return its id. */
+    private long insertStoredFileRow(String fileName, String storagePath, long fileSize) {
+        return jdbcTemplate.queryForObject(
+                "INSERT INTO stored_file (file_name, storage_path, mime_type, file_size) "
+                        + "VALUES (?, ?, 'application/pdf', ?) RETURNING stored_file_id",
+                Long.class, fileName, storagePath, fileSize);
+    }
+
+    /** Insert an extra invoice version for the order (so current = MAX(version_number) can be exercised). */
+    private long insertInvoiceVersion(long orderId, int version, long storedFileId,
+                                      String exGst, String incGst, String paid, String balance) {
+        return jdbcTemplate.queryForObject(
+                "INSERT INTO invoice (order_id, version_number, invoice_date, due_date, "
+                        + "details_of_sale_snapshot, sale_price_ex_gst, sale_price_inc_gst, total_paid, "
+                        + "balance_due, stored_file_id, created_by_user_id) "
+                        + "VALUES (?, ?, CURRENT_DATE, CURRENT_DATE, ?, ?, ?, ?, ?, ?, ?) RETURNING invoice_id",
+                Long.class, orderId, version, "snapshot v" + version,
+                new BigDecimal(exGst), new BigDecimal(incGst), new BigDecimal(paid), new BigDecimal(balance),
+                storedFileId, USER_LIAM);
+    }
+
+    private void writeStorageFile(String storagePath, byte[] bytes) throws IOException {
+        Path target = tempStorageDir.resolve(storagePath.startsWith("/") ? storagePath.substring(1) : storagePath);
+        Files.createDirectories(target.getParent());
+        Files.write(target, bytes);
+    }
+
+    private void createInvoiceOnFullOrder() throws Exception {
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated());
+    }
+
+    // ================================================================
+    // D.3 GET /invoices/current
+    // ================================================================
+
+    @Test
+    void getCurrent_returnsInvoiceDetail() throws Exception {
+        // Order 1 has the seeded invoice (id 1, v1): ex 840.00 / inc 924.00 / paid 500.00 / balance 424.00.
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.invoice.invoice_id").isNumber())
+                .andExpect(jsonPath("$.data.invoice.order_id").value(1))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(1))
+                .andExpect(jsonPath("$.data.invoice.invoice_date").value("2026-04-14"))
+                // Seed invoice due_date: V4 inserts 2026-04-28, then V5 updates it to
+                // proposed_lay_date (2026-05-01) - 2 days = 2026-04-29 (locked due-date rule).
+                .andExpect(jsonPath("$.data.invoice.due_date").value("2026-04-29"))
+                .andExpect(jsonPath("$.data.invoice.details_of_sale_snapshot",
+                        startsWith("Supply and install plush carpet")))
+                .andExpect(jsonPath("$.data.invoice.sale_price_ex_gst").value(840.00))
+                .andExpect(jsonPath("$.data.invoice.sale_price_inc_gst").value(924.00))
+                .andExpect(jsonPath("$.data.invoice.total_paid").value(500.00))
+                .andExpect(jsonPath("$.data.invoice.balance_due").value(424.00))
+                .andExpect(jsonPath("$.data.invoice.created_by_user_id").value(1))
+                .andExpect(jsonPath("$.data.invoice.created_at").exists())
+                .andExpect(jsonPath("$.data.invoice.pdf_download_path").value(EXPECTED_PDF_PATH));
+    }
+
+    @Test
+    void getCurrent_responseHasNoTopLevelMessageField() throws Exception {
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.invoice").exists())
+                .andExpect(jsonPath("$.message").doesNotExist());
+    }
+
+    @Test
+    void getCurrent_choosesHighestVersionNumber() throws Exception {
+        // Order 1 already has v1 (seed). Add a v2 with distinct totals; current must resolve to v2.
+        long sf2 = insertStoredFileRow("invoice-" + ORDER_FULL_NUMBER + "-v2.pdf",
+                "/uploads/1/orders/1/v2-detail.pdf", 2222);
+        insertInvoiceVersion(ORDER_FULL, 2, sf2, "1000.00", "1100.00", "0.00", "1100.00");
+
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2))
+                .andExpect(jsonPath("$.data.invoice.sale_price_ex_gst").value(1000.00))
+                .andExpect(jsonPath("$.data.invoice.sale_price_inc_gst").value(1100.00))
+                .andExpect(jsonPath("$.data.invoice.balance_due").value(1100.00));
+    }
+
+    @Test
+    void getCurrent_noInvoice_returns404InvoiceNotFound() throws Exception {
+        clearSeededInvoice();
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_NOT_FOUND"));
+    }
+
+    @Test
+    void getCurrent_doesNotExposeStoredFileIdOrStoragePath() throws Exception {
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.invoice.stored_file_id").doesNotExist())
+                .andExpect(jsonPath("$.data.invoice.storage_path").doesNotExist())
+                .andExpect(jsonPath("$.data.invoice.business_id").doesNotExist())
+                .andExpect(jsonPath("$.data.invoice.store_id").doesNotExist());
+    }
+
+    @Test
+    void getCurrent_noSession_returns401() throws Exception {
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_FULL)))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void getCurrent_sessionWithoutStore_returns403() throws Exception {
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_FULL)).session(liamSessionNoStore()))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void getCurrent_invalidOrderId_returns400() throws Exception {
+        mockMvc.perform(get(currentInvoiceUrl("abc")).session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    @Test
+    void getCurrent_crossStoreOrder_returns404OrderNotFound() throws Exception {
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_OTHER_STORE)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void getCurrent_crossBusinessOrder_returns404OrderNotFound() throws Exception {
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_OTHER_BUSINESS)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void getCurrent_nonexistentOrder_returns404OrderNotFound() throws Exception {
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_DOES_NOT_EXIST)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void getCurrent_crossBusinessSlug_returns404NotFound() throws Exception {
+        mockMvc.perform(get(currentInvoiceUrl(SLUG_PREMIER, ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    // ================================================================
+    // D.4 GET /invoices/current/file
+    // ================================================================
+
+    @Test
+    void getCurrentFile_returns200WithPdfBytes() throws Exception {
+        // Create a fresh invoice so its PDF actually exists on disk (the seed only inserts a DB row).
+        clearSeededInvoice();
+        createInvoiceOnFullOrder();
+
+        MvcResult result = mockMvc.perform(get(currentFileUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "application/pdf"))
+                .andReturn();
+
+        byte[] body = result.getResponse().getContentAsByteArray();
+        Assertions.assertTrue(body.length > 0, "PDF body must be non-empty");
+        Assertions.assertEquals("%PDF-", new String(body, 0, 5, StandardCharsets.US_ASCII), "valid PDF header");
+        Assertions.assertEquals(body.length, result.getResponse().getContentLength(),
+                "Content-Length matches the streamed bytes");
+    }
+
+    @Test
+    void getCurrentFile_contentDispositionHasSafePdfFilename() throws Exception {
+        clearSeededInvoice();
+        createInvoiceOnFullOrder();
+
+        MvcResult result = mockMvc.perform(get(currentFileUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CONTENT_DISPOSITION, containsString(EXPECTED_PDF_NAME)))
+                .andReturn();
+
+        String cd = result.getResponse().getHeader(HttpHeaders.CONTENT_DISPOSITION);
+        Assertions.assertNotNull(cd);
+        Assertions.assertTrue(cd.startsWith("inline"), () -> "disposition: " + cd);
+    }
+
+    @Test
+    void getCurrentFile_choosesHighestVersionNumber() throws Exception {
+        // v1 (real PDF written by create) + a v2 with its own real file; current/file must stream v2.
+        clearSeededInvoice();
+        createInvoiceOnFullOrder();
+
+        byte[] v2Bytes = "%PDF-1.4 fake-v2-invoice-bytes".getBytes(StandardCharsets.US_ASCII);
+        String v2Path = "/uploads/1/orders/1/v2-real.pdf";
+        writeStorageFile(v2Path, v2Bytes);
+        long sf2 = insertStoredFileRow("invoice-" + ORDER_FULL_NUMBER + "-v2.pdf", v2Path, v2Bytes.length);
+        insertInvoiceVersion(ORDER_FULL, 2, sf2, "1000.00", "1100.00", "0.00", "1100.00");
+
+        MvcResult result = mockMvc.perform(get(currentFileUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "application/pdf"))
+                .andExpect(header().string(HttpHeaders.CONTENT_DISPOSITION,
+                        containsString("invoice-" + ORDER_FULL_NUMBER + "-v2.pdf")))
+                .andReturn();
+
+        Assertions.assertArrayEquals(v2Bytes, result.getResponse().getContentAsByteArray(),
+                "must stream the highest-version (v2) PDF bytes");
+    }
+
+    @Test
+    void getCurrentFile_noInvoice_returns404InvoiceNotFound() throws Exception {
+        clearSeededInvoice();
+        mockMvc.perform(get(currentFileUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_NOT_FOUND"));
+    }
+
+    @Test
+    void getCurrentFile_missingOnDisk_returns500JsonError_noStoragePathLeak() throws Exception {
+        // The seeded invoice's stored_file points to a path that is NOT present under the test temp dir.
+        MvcResult result = mockMvc.perform(get(currentFileUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isInternalServerError())
+                .andExpect(jsonPath("$.error.code").value("INTERNAL_SERVER_ERROR"))
+                .andReturn();
+
+        String body = result.getResponse().getContentAsString();
+        Assertions.assertFalse(body.contains("storage_path"), () -> "must not leak storage_path: " + body);
+        Assertions.assertFalse(body.contains("/uploads/"), () -> "must not leak the on-disk path: " + body);
+    }
+
+    @Test
+    void getCurrentFile_noSession_returns401() throws Exception {
+        mockMvc.perform(get(currentFileUrl(ORDER_FULL)))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void getCurrentFile_sessionWithoutStore_returns403() throws Exception {
+        mockMvc.perform(get(currentFileUrl(ORDER_FULL)).session(liamSessionNoStore()))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void getCurrentFile_crossStoreOrder_returns404OrderNotFound() throws Exception {
+        mockMvc.perform(get(currentFileUrl(ORDER_OTHER_STORE)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void getCurrentFile_invalidOrderId_returns400() throws Exception {
+        mockMvc.perform(get(currentFileUrl("abc")).session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    // ================================================================
+    // Scope guard: no rewrite / payment / history / by-id endpoint creep
+    // ================================================================
+
+    @Test
+    void noRewritePaymentHistoryOrByIdEndpointsImplemented() throws Exception {
+        // These Branch B-adjacent routes must NOT be functioning endpoints (no 2xx). They are later
+        // branches / deferred, so an unmapped route yields a 4xx (no handler), never a success.
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL) + "/rewrite").session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().is4xxClientError());
+        mockMvc.perform(get("/api/v1/" + SLUG_AUSSIE + "/orders/" + ORDER_FULL + "/payments")
+                        .session(liamStore1Session()))
+                .andExpect(status().is4xxClientError());
+        mockMvc.perform(get(invoicesUrl(ORDER_FULL)).session(liamStore1Session())) // history list
+                .andExpect(status().is4xxClientError());
+        mockMvc.perform(get(invoicesUrl(ORDER_FULL) + "/1").session(liamStore1Session())) // by-id
+                .andExpect(status().is4xxClientError());
     }
 }
