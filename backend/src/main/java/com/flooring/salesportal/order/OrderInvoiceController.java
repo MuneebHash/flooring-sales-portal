@@ -22,18 +22,18 @@ import java.nio.charset.StandardCharsets;
 /**
  * Phase 12 Chunk 4 invoice endpoints: Branch A — create (D.1 POST /orders/{orderId}/invoices);
  * Branch B — read the current invoice (D.3 GET /orders/{orderId}/invoices/current) and stream its PDF
- * (D.4 GET /orders/{orderId}/invoices/current/file). Shares the {@code /orders/{orderId}} base path
- * with the other order sub-resource controllers; mappings stay distinct by method + the
- * {@code /invoices...} sub-path.
+ * (D.4 GET /orders/{orderId}/invoices/current/file); Branch C — rewrite the current invoice (D.2 POST
+ * /orders/{orderId}/invoices/rewrite). Shares the {@code /orders/{orderId}} base path with the other
+ * order sub-resource controllers; mappings stay distinct by method + the {@code /invoices...} sub-path.
  *
  * <p>{@code orderId} is captured as a {@code String} (matching the rest of the order endpoints) so a
  * non-numeric / non-positive value becomes VALIDATION_FAILED on {@code order_id} in the service
- * rather than a path-binding error. The create body is taken as a raw {@code String}
- * ({@code required = false}) so it is parsed inside the service strictly after the guard / order-scope
- * gates (D.1 takes no body — {@code {}} only). The two JSON endpoints return the service-built
- * {@code ApiResponse} envelope; D.4 returns a raw {@code ResponseEntity<byte[]>} (the file-binary
- * exception, mirroring D.17 attachment download) while its error paths still flow through the standard
- * JSON {@code GlobalExceptionHandler}. Rewrite (D.2) and payments (D.6/D.7) are later branches.
+ * rather than a path-binding error. The create / rewrite bodies are taken as a raw {@code String}
+ * ({@code required = false}) so they are parsed inside the service strictly after the guard / order-scope
+ * (and, for rewrite, LAID) gates (D.1 / D.2 take no body — {@code {}} only). The JSON endpoints return
+ * the service-built {@code ApiResponse} envelope; D.4 returns a raw {@code ResponseEntity<byte[]>} (the
+ * file-binary exception, mirroring D.17 attachment download) while its error paths still flow through the
+ * standard JSON {@code GlobalExceptionHandler}. Payments (D.6/D.7) are a later branch.
  */
 @RestController
 @RequestMapping("/api/v1/{slug}/orders/{orderId}")
@@ -54,6 +54,17 @@ public class OrderInvoiceController {
             HttpServletRequest httpRequest) {
 
         return orderInvoiceService.createInvoice(slug, orderId, body, httpRequest);
+    }
+
+    @PostMapping("/invoices/rewrite")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ApiResponse<InvoiceResponse> rewriteInvoice(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestBody(required = false) String body,
+            HttpServletRequest httpRequest) {
+
+        return orderInvoiceService.rewriteInvoice(slug, orderId, body, httpRequest);
     }
 
     @GetMapping("/invoices/current")

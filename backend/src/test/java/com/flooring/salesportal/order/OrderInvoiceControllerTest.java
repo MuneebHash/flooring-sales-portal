@@ -38,8 +38,9 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 /**
- * Integration tests for Phase 12 Chunk 4 Branch A — D.1 POST /orders/{orderId}/invoices (create the
- * current invoice).
+ * Integration tests for Phase 12 Chunk 4 invoices: Branch A — D.1 POST /orders/{orderId}/invoices
+ * (create the current invoice); Branch B — D.3/D.4 read the current invoice + PDF; Branch C — D.2 POST
+ * /orders/{orderId}/invoices/rewrite (regenerate the current invoice from live order state).
  *
  * <p>Mirrors {@code OrderAttachmentControllerTest} / {@code OrderChargeLineControllerTest}:
  * {@code @SpringBootTest @Transactional}, MockMvc, a {@code MockHttpSession} carrying the seeded
@@ -784,22 +785,387 @@ class OrderInvoiceControllerTest {
     }
 
     // ================================================================
-    // Scope guard: no rewrite / payment / history / by-id endpoint creep
+    // Scope guard: no payment / history / by-id / old-PDF endpoint creep
     // ================================================================
 
     @Test
-    void noRewritePaymentHistoryOrByIdEndpointsImplemented() throws Exception {
-        // These Branch B-adjacent routes must NOT be functioning endpoints (no 2xx). They are later
-        // branches / deferred, so an unmapped route yields a 4xx (no handler), never a success.
-        mockMvc.perform(post(invoicesUrl(ORDER_FULL) + "/rewrite").session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().is4xxClientError());
+    void noPaymentHistoryByIdOrOldPdfEndpointsImplemented() throws Exception {
+        // Branch C adds ONLY POST /invoices/rewrite. Payments (D.6/D.7) and the deferred history /
+        // by-id / old-version-PDF routes (D.5) must remain unmapped -> a 4xx (no handler), never a 2xx.
         mockMvc.perform(get("/api/v1/" + SLUG_AUSSIE + "/orders/" + ORDER_FULL + "/payments")
                         .session(liamStore1Session()))
                 .andExpect(status().is4xxClientError());
+        mockMvc.perform(post("/api/v1/" + SLUG_AUSSIE + "/orders/" + ORDER_FULL + "/payments")
+                        .session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().is4xxClientError());
         mockMvc.perform(get(invoicesUrl(ORDER_FULL)).session(liamStore1Session())) // history list
                 .andExpect(status().is4xxClientError());
-        mockMvc.perform(get(invoicesUrl(ORDER_FULL) + "/1").session(liamStore1Session())) // by-id
+        mockMvc.perform(get(invoicesUrl(ORDER_FULL) + "/1").session(liamStore1Session())) // detail by-id
                 .andExpect(status().is4xxClientError());
+        mockMvc.perform(get(invoicesUrl(ORDER_FULL) + "/1/file").session(liamStore1Session())) // old-version PDF
+                .andExpect(status().is4xxClientError());
+    }
+
+    // ================================================================
+    // D.2 POST /invoices/rewrite (Branch C)
+    // ================================================================
+
+    private static String rewriteUrl(Object orderId) {
+        return invoicesUrl(orderId) + "/rewrite";
+    }
+
+    private static String rewriteUrl(String slug, Object orderId) {
+        return invoicesUrl(slug, orderId) + "/rewrite";
+    }
+
+    /** Insert an extra payment row for the order so total_paid can be exercised (identity id, post-seed). */
+    private void insertPayment(long orderId, String amount, String reference) {
+        jdbcTemplate.update(
+                "INSERT INTO payment_transaction (order_id, payment_method, amount, payment_reference) "
+                        + "VALUES (?, 'EFTPOS'::payment_method, ?, ?)",
+                orderId, new BigDecimal(amount), reference);
+    }
+
+    // ---- happy path -------------------------------------------------
+
+    @Test
+    void rewrite_existingInvoice_returns201_withRewrittenInvoiceDetail() throws Exception {
+        // Order 1 has the seeded v1 (ex 840 / inc 924 / paid 500 / balance 424). Rewrite snapshots the
+        // current live state into v2 with the same live totals and the same due_date rule (2026-05-01 - 2).
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value("Invoice rewritten."))
+                .andExpect(jsonPath("$.data.invoice.invoice_id").isNumber())
+                .andExpect(jsonPath("$.data.invoice.order_id").value(1))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2))
+                .andExpect(jsonPath("$.data.invoice.invoice_date").exists())
+                .andExpect(jsonPath("$.data.invoice.due_date").value("2026-04-29")) // 2026-05-01 minus 2 days
+                .andExpect(jsonPath("$.data.invoice.details_of_sale_snapshot",
+                        startsWith("Supply and install plush carpet")))
+                .andExpect(jsonPath("$.data.invoice.sale_price_ex_gst").value(840.00))
+                .andExpect(jsonPath("$.data.invoice.sale_price_inc_gst").value(924.00))
+                .andExpect(jsonPath("$.data.invoice.total_paid").value(500.00))
+                .andExpect(jsonPath("$.data.invoice.balance_due").value(424.00))
+                .andExpect(jsonPath("$.data.invoice.created_by_user_id").value(1))
+                .andExpect(jsonPath("$.data.invoice.created_at").exists())
+                .andExpect(jsonPath("$.data.invoice.pdf_download_path").value(EXPECTED_PDF_PATH));
+    }
+
+    @Test
+    void rewrite_emptyBody_alsoAccepted() throws Exception {
+        // No body at all (the contract allows {} or an empty body).
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2));
+    }
+
+    @Test
+    void rewrite_incrementsVersion_newHighestBecomesCurrent() throws Exception {
+        // Seeded v1 only. After rewrite there are exactly two invoice rows and the new MAX(version) is 2.
+        Assertions.assertEquals(1, countInvoices(ORDER_FULL));
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated());
+
+        Assertions.assertEquals(2, countInvoices(ORDER_FULL), "rewrite appends a new version (v1 retained)");
+        Integer maxVersion = jdbcTemplate.queryForObject(
+                "SELECT MAX(version_number) FROM invoice WHERE order_id = ?", Integer.class, ORDER_FULL);
+        Assertions.assertEquals(2, maxVersion);
+        // The current (max-version) row is the freshly rewritten one.
+        long currentId = latestInvoiceId(ORDER_FULL);
+        Integer currentVersion = jdbcTemplate.queryForObject(
+                "SELECT version_number FROM invoice WHERE invoice_id = ?", Integer.class, currentId);
+        Assertions.assertEquals(2, currentVersion);
+    }
+
+    @Test
+    void rewrite_fromV3_nextVersionIsMaxPlusOne() throws Exception {
+        // Seed v1 + a manually inserted v3 (gaps allowed): rewrite must use MAX(version)+1 = 4, not count+1.
+        long sf3 = insertStoredFileRow("invoice-" + ORDER_FULL_NUMBER + "-v3.pdf",
+                "/uploads/1/orders/1/v3-detail.pdf", 3333);
+        insertInvoiceVersion(ORDER_FULL, 3, sf3, "1000.00", "1100.00", "0.00", "1100.00");
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.version_number").value(4));
+    }
+
+    @Test
+    void rewrite_regeneratesPdfStoredFileForNewVersion() throws Exception {
+        // Capture v1's stored_file, rewrite, then assert v2 got a brand-new stored_file (different id,
+        // versioned name, real PDF bytes on disk).
+        long v1InvoiceId = latestInvoiceId(ORDER_FULL);
+        Long v1StoredFileId = jdbcTemplate.queryForObject(
+                "SELECT stored_file_id FROM invoice WHERE invoice_id = ?", Long.class, v1InvoiceId);
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated());
+
+        long v2InvoiceId = latestInvoiceId(ORDER_FULL);
+        Long v2StoredFileId = jdbcTemplate.queryForObject(
+                "SELECT stored_file_id FROM invoice WHERE invoice_id = ?", Long.class, v2InvoiceId);
+        Assertions.assertNotNull(v2StoredFileId);
+        Assertions.assertNotEquals(v1StoredFileId, v2StoredFileId, "rewrite writes a NEW stored_file");
+
+        String fileName = jdbcTemplate.queryForObject(
+                "SELECT file_name FROM stored_file WHERE stored_file_id = ?", String.class, v2StoredFileId);
+        String mimeType = jdbcTemplate.queryForObject(
+                "SELECT mime_type FROM stored_file WHERE stored_file_id = ?", String.class, v2StoredFileId);
+        long fileSize = jdbcTemplate.queryForObject(
+                "SELECT file_size FROM stored_file WHERE stored_file_id = ?", Long.class, v2StoredFileId);
+        String storagePath = jdbcTemplate.queryForObject(
+                "SELECT storage_path FROM stored_file WHERE stored_file_id = ?", String.class, v2StoredFileId);
+
+        Assertions.assertEquals("invoice-" + ORDER_FULL_NUMBER + "-v2.pdf", fileName);
+        Assertions.assertEquals("application/pdf", mimeType);
+        Assertions.assertTrue(fileSize > 0, "file_size must be positive");
+        Assertions.assertTrue(diskFileExists(storagePath), "rewritten invoice PDF should exist on disk");
+        byte[] bytes = Files.readAllBytes(tempStorageDir.resolve(storagePath.substring(1)));
+        Assertions.assertEquals((int) fileSize, bytes.length, "stored file_size matches the bytes on disk");
+        Assertions.assertEquals("%PDF-", new String(bytes, 0, 5, StandardCharsets.US_ASCII), "valid PDF header");
+    }
+
+    @Test
+    void rewrite_thenGetCurrent_returnsRewrittenInvoice() throws Exception {
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated());
+        long rewrittenId = latestInvoiceId(ORDER_FULL);
+
+        mockMvc.perform(get(currentInvoiceUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.invoice.invoice_id").value((int) rewrittenId))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2));
+    }
+
+    @Test
+    void rewrite_thenGetCurrentFile_returnsRewrittenPdf() throws Exception {
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated());
+
+        MvcResult result = mockMvc.perform(get(currentFileUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "application/pdf"))
+                .andExpect(header().string(HttpHeaders.CONTENT_DISPOSITION,
+                        containsString("invoice-" + ORDER_FULL_NUMBER + "-v2.pdf")))
+                .andReturn();
+
+        byte[] body = result.getResponse().getContentAsByteArray();
+        Assertions.assertEquals("%PDF-", new String(body, 0, 5, StandardCharsets.US_ASCII),
+                "current/file must stream the rewritten (v2) PDF");
+    }
+
+    @Test
+    void rewrite_usesLiveFinancialSummaryAfterSalePriceChange() throws Exception {
+        // Live saved order state, not the previous snapshot: a price adjustment makes
+        // final_sale_price_inc_gst 1000.00 (924.00 + 76.00), ex-GST = 909.09. v1 keeps 924/840; the
+        // rewritten v2 must reflect the live summary. balance = 1000.00 - 500.00 (existing payment) = 500.00.
+        jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = 76.00 WHERE order_id = ?", ORDER_FULL);
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2))
+                .andExpect(jsonPath("$.data.invoice.sale_price_inc_gst").value(1000.00))
+                .andExpect(jsonPath("$.data.invoice.sale_price_ex_gst").value(909.09))
+                .andExpect(jsonPath("$.data.invoice.balance_due").value(500.00));
+    }
+
+    @Test
+    void rewrite_carriesTotalPaidFromPaymentsAndRecalculatesBalance() throws Exception {
+        // total_paid is the live SUM(payment_transaction.amount): seeded 500.00 + an extra 100.00 = 600.00,
+        // so balance_due = inc 924.00 - 600.00 = 324.00 (recalculated against the live summary).
+        insertPayment(ORDER_FULL, "100.00", "EFTPOS-EXTRA");
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.total_paid").value(600.00))
+                .andExpect(jsonPath("$.data.invoice.balance_due").value(324.00));
+    }
+
+    @Test
+    void rewrite_snapshotsLiveDetailsIntoNewVersion_olderVersionUnchanged() throws Exception {
+        // D.2 step 5: rewrite re-snapshots the CURRENT live order state onto the new version (it is what
+        // makes live edits official), while older rows are never modified. Capture v1's frozen snapshot,
+        // change the live order + rewrite into v2, then assert: (a) v2 picked up the changed live details,
+        // and (b) v1's columns are untouched.
+        long v1InvoiceId = latestInvoiceId(ORDER_FULL);
+        BigDecimal v1Inc = invoiceMoney("sale_price_inc_gst", v1InvoiceId);
+        String v1Details = jdbcTemplate.queryForObject(
+                "SELECT details_of_sale_snapshot FROM invoice WHERE invoice_id = ?", String.class, v1InvoiceId);
+
+        jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = 76.00, "
+                + "details_of_sale = 'CHANGED BEFORE REWRITE' WHERE order_id = ?", ORDER_FULL);
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                // (a) the new version reflects the live (changed) details + live summary, not a carry-forward.
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2))
+                .andExpect(jsonPath("$.data.invoice.details_of_sale_snapshot").value("CHANGED BEFORE REWRITE"))
+                .andExpect(jsonPath("$.data.invoice.sale_price_inc_gst").value(1000.00));
+
+        // (b) the older version (v1) snapshot is untouched.
+        assertMoney(v1Inc.toPlainString(), invoiceMoney("sale_price_inc_gst", v1InvoiceId));
+        String v1DetailsAfter = jdbcTemplate.queryForObject(
+                "SELECT details_of_sale_snapshot FROM invoice WHERE invoice_id = ?", String.class, v1InvoiceId);
+        Assertions.assertEquals(v1Details, v1DetailsAfter, "older version snapshot must be untouched");
+    }
+
+    @Test
+    void rewrite_response_doesNotExposeStoredFileIdOrStoragePath() throws Exception {
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.stored_file_id").doesNotExist())
+                .andExpect(jsonPath("$.data.invoice.storage_path").doesNotExist())
+                .andExpect(jsonPath("$.data.invoice.business_id").doesNotExist())
+                .andExpect(jsonPath("$.data.invoice.store_id").doesNotExist());
+    }
+
+    // ---- business rules ---------------------------------------------
+
+    @Test
+    void rewrite_noExistingInvoice_returns422_invoiceRequired() throws Exception {
+        // Rewrite requires a prior invoice. Order 1 with its invoice cleared (still ACCEPTED, all
+        // preconditions pass) -> 422 INVOICE_REQUIRED, and no invoice is created.
+        clearSeededInvoice();
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_REQUIRED"));
+        Assertions.assertEquals(0, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void rewrite_laidOrder_returns422_orderLocked() throws Exception {
+        // Manual Rewrite is blocked when LAID (conventions §16). Order 1 keeps its seeded invoice and is
+        // flipped to LAID -> 422 ORDER_LOCKED, and no new version is created.
+        laidOrder(ORDER_FULL);
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+        Assertions.assertEquals(1, countInvoices(ORDER_FULL), "no new version on a locked order");
+    }
+
+    @Test
+    void rewrite_laidOrderWithNonEmptyBody_returns422_orderLockedWinsOverBody() throws Exception {
+        // Gate-first: the LAID gate runs before body validation (mirrors OrderService). A locked order
+        // with a bad body is still ORDER_LOCKED (422), never 400.
+        laidOrder(ORDER_FULL);
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"due_date\":\"2026-01-01\"}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ORDER_LOCKED"));
+    }
+
+    @Test
+    void rewrite_preconditionsFail_returns422_withDetails() throws Exception {
+        // Order 1 has an invoice (INVOICE_REQUIRED passes), then loses its customer so two name
+        // preconditions fail -> 422 INVOICE_PRECONDITIONS_NOT_MET with details; no new version created.
+        jdbcTemplate.update("DELETE FROM order_customer WHERE order_id = ?", ORDER_FULL);
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_PRECONDITIONS_NOT_MET"))
+                .andExpect(jsonPath("$.error.details", hasSize(2)))
+                .andExpect(jsonPath("$.error.details[*].field", hasItems("first_name", "last_name")));
+        Assertions.assertEquals(1, countInvoices(ORDER_FULL), "no new version when preconditions fail");
+    }
+
+    // ---- body / id validation (gate ordering) -----------------------
+
+    @Test
+    void rewrite_nonEmptyBody_returns400_validationFailed() throws Exception {
+        // Order 1 (ACCEPTED, has an invoice): passes the LAID gate, then a non-empty body is rejected.
+        // Any field (incl. due_date) -> VALIDATION_FAILED.
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"due_date\":\"2026-01-01\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("due_date"));
+    }
+
+    @Test
+    void rewrite_malformedJson_returns400_malformedJson() throws Exception {
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{not valid json"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    @Test
+    void rewrite_invalidOrderId_returns400() throws Exception {
+        mockMvc.perform(post(rewriteUrl("abc")).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    // ---- scoping / auth (no existence leak) -------------------------
+
+    @Test
+    void rewrite_noSession_returns401() throws Exception {
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL))
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void rewrite_sessionWithoutStore_returns403() throws Exception {
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamSessionNoStore())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void rewrite_crossStoreOrder_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(post(rewriteUrl(ORDER_OTHER_STORE)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void rewrite_crossBusinessOrder_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(post(rewriteUrl(ORDER_OTHER_BUSINESS)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void rewrite_nonexistentOrder_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(post(rewriteUrl(ORDER_DOES_NOT_EXIST)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void rewrite_crossBusinessSlug_returns404_notFound() throws Exception {
+        mockMvc.perform(post(rewriteUrl(SLUG_PREMIER, ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    @Test
+    void rewrite_crossStoreOrderWithNonEmptyBody_returns404_existenceWins() throws Exception {
+        // Gate ordering: the 404 scope check precedes the LAID/body gates, so a cross-store order with a
+        // bad body is still 404 (never 400/422) — no existence leak.
+        mockMvc.perform(post(rewriteUrl(ORDER_OTHER_STORE)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"due_date\":\"2026-01-01\"}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
     }
 }
