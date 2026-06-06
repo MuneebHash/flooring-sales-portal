@@ -18,6 +18,7 @@ import {
   uploadOrderAttachment,
   type OrderAttachment,
 } from '../../lib/api/orderAttachmentsApi'
+import { PhotoPreviewModal } from './PhotoPreviewModal'
 
 type Props = {
   orderId: number
@@ -171,6 +172,11 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
   const [uploadError, setUploadError] = useState<string | null>(null)
   const [deletingId, setDeletingId] = useState<number | null>(null)
   const [deleteError, setDeleteError] = useState<string | null>(null)
+  // B11 — large in-app photo preview. Stores the SELECTED attachment id (not the
+  // object) so the auto-close effect below can dismiss the modal when that photo
+  // leaves the visible list (delete / reload / cap-drop). The modal owns its OWN
+  // object URL — it never reuses the thumbnail previewUrls below. See PhotoPreviewModal.
+  const [selectedPhotoId, setSelectedPhotoId] = useState<number | null>(null)
   // attachment id → object URL for the credentialed preview, and ids whose
   // preview fetch failed. previewUrlsRef is the AUTHORITATIVE set used for
   // revocation (so unmount cleanup can revoke without depending on render state);
@@ -337,6 +343,19 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
     })
   }, [photos])
 
+  // B11 — auto-close the preview if its photo is no longer in the visible list
+  // (deleted, reloaded away, or dropped off the capped page). The delete handler
+  // only reloads the list; it does not signal the modal, so this effect is what
+  // dismisses a preview whose underlying photo has gone.
+  useEffect(() => {
+    if (
+      selectedPhotoId !== null &&
+      !photos.some((p) => p.order_attachment_id === selectedPhotoId)
+    ) {
+      setSelectedPhotoId(null)
+    }
+  }, [photos, selectedPhotoId])
+
   // Upload is disabled while the initial/refresh GET is loading (so an upload can't
   // race the list fetch and then be overwritten by the older GET — Codex issue 1)
   // AND while another upload is in flight. NEVER gated by `locked`: upload is
@@ -421,6 +440,14 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
         delete next[attachmentId]
         return next
       })
+      // B11 — if the deleted photo is the one open in the preview, close the modal
+      // NOW (on DELETE success), not only via the reload-driven auto-close effect.
+      // That effect fires only once `photos` actually changes; if the follow-up
+      // reload below FAILS, `photos` still contains this attachment, so the modal
+      // would otherwise stay open for an already-deleted photo (Codex).
+      setSelectedPhotoId((current) =>
+        current === attachmentId ? null : current,
+      )
       // Refetch page 1 from backend truth instead of only filtering locally, so a
       // truncated page backfills (e.g. 21 total / 20 shown → still 20 after a
       // delete) rather than showing a stale 19-of-20 (Codex issue 2). The reload
@@ -441,6 +468,13 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
   const notesTruncated = totalItems > notes.length
   // True when the server holds more photos than this page-1 view shows.
   const photosTruncated = photosTotal > photos.length
+  // The live photo backing the open preview, looked up by id each render so it
+  // tracks list updates and becomes null once the photo is gone (the auto-close
+  // effect above then clears selectedPhotoId, unmounting the modal).
+  const selectedPhoto =
+    selectedPhotoId === null
+      ? null
+      : photos.find((p) => p.order_attachment_id === selectedPhotoId) ?? null
 
   return (
     <div>
@@ -620,7 +654,17 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
                         key={id}
                         className="relative rounded-lg border border-slate-200 bg-white p-2 shadow-sm"
                       >
-                        <div className="aspect-square w-full overflow-hidden rounded-md bg-gradient-to-br from-slate-100 to-slate-200 flex items-center justify-center">
+                        {/* Preview trigger. A real <button> (not the <li>) so it is
+                            focusable and Enter/Space-activatable; it is a SIBLING of
+                            the delete button below (never a parent), so a delete click
+                            cannot bubble into it. NEVER gated by `locked` — preview is
+                            allowed on LAID orders. */}
+                        <button
+                          type="button"
+                          onClick={() => setSelectedPhotoId(id)}
+                          aria-label={`View ${photo.file_name}`}
+                          className="flex aspect-square w-full items-center justify-center overflow-hidden rounded-md bg-gradient-to-br from-slate-100 to-slate-200 p-0 transition hover:opacity-95 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/40"
+                        >
                           {previewUrl ? (
                             <img
                               src={previewUrl}
@@ -637,7 +681,7 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
                               )}
                             </div>
                           )}
-                        </div>
+                        </button>
                         {/* Delete is the ONLY photo control gated by LAID: render
                             it only when the order is not locked. */}
                         {!locked && (
@@ -672,6 +716,16 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
           </div>
         </section>
       </div>
+
+      {/* B11 — keyed by the selected id so switching photos remounts the modal
+          (fresh blob fetch + cleanup); closing/unmounting revokes its own URL. */}
+      {selectedPhoto && (
+        <PhotoPreviewModal
+          key={selectedPhoto.order_attachment_id}
+          photo={selectedPhoto}
+          onClose={() => setSelectedPhotoId(null)}
+        />
+      )}
     </div>
   )
 }
