@@ -440,6 +440,14 @@ export function NotesPhotosTab({ orderId, locked }: Props) {
         delete next[attachmentId]
         return next
       })
+      // B11 — if the deleted photo is the one open in the preview, close the modal
+      // NOW (on DELETE success), not only via the reload-driven auto-close effect.
+      // That effect fires only once `photos` actually changes; if the follow-up
+      // reload below FAILS, `photos` still contains this attachment, so the modal
+      // would otherwise stay open for an already-deleted photo (Codex).
+      setSelectedPhotoId((current) =>
+        current === attachmentId ? null : current,
+      )
       // Refetch page 1 from backend truth instead of only filtering locally, so a
       // truncated page backfills (e.g. 21 total / 20 shown → still 20 after a
       // delete) rather than showing a stale 19-of-20 (Codex issue 2). The reload
