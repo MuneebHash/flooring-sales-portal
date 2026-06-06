@@ -551,7 +551,13 @@ If preconditions are not met, return 422 with a structured body:
 - payment-driven invoice versions carry forward the latest official sale snapshot and only update payment fields: `total_paid` and `balance_due`
 - payment-driven invoice versions must not silently include unsent live order edits
 - old versions are never modified
-- old versions remain in invoice history
+- old versions remain in invoice history (retained internally)
+
+**MVP scope (Phase 12).** The versioning mechanism above runs internally, but the MVP API and
+frontend expose only the **current/latest invoice**. Invoice history listing, choosing an older
+version, and downloading old-version PDFs are deferred to post-MVP (along with signed/accepted
+invoice revision history and the revision dropdown). No schema field is removed and no migration
+is added — version history is reserved for post-MVP. See `docs/API-Contracts-Chunk-4.md` A.1 / D.5.
 
 
 ### Invoice due date rule

@@ -55,7 +55,7 @@
 ## 2. MVP Scope
 
 **Included:**
-auth, store selection, dashboard, create/open orders, customer + addresses, details of sale, products, charges, totals/GP, sale price override, notes, photos, invoices, invoice versions, PDF, payments, basic Stripe, container deploy.
+auth, store selection, dashboard, create/open orders, customer + addresses, details of sale, products, charges, totals/GP, sale price override, notes, photos, invoices, invoice PDF, payments, basic Stripe, container deploy.
 
 **Excluded:**
 Operations Portal UI, installer workflows, advanced quote comparison, AI features, refunds/disputes, finance products, surcharges, enterprise monitoring.
@@ -796,26 +796,28 @@ Status:
 
 ### Phase 12: Chunk 4 — Invoices + Payments — ⏭ NEXT
 
-Backend endpoints:
+Backend endpoints (MVP — current invoice only):
 
-* create invoice v1
-* rewrite invoice
-* invoice history
-* invoice detail
-* invoice PDF download
+* create invoice (current)
+* rewrite invoice (regenerate current)
+* get current invoice
+* current invoice PDF download
 * payment list
-* record payment
-* payment-driven invoice versioning
+* record payment (atomically regenerates the current invoice)
 
 Frontend wiring:
 
 * create invoice
 * precondition errors
 * rewrite invoice
-* invoice version history
-* PDF download
+* PDF download (current invoice)
 * record payment form
 * balance due display
+
+Deferred to post-MVP (schema kept; no migration; internal `version_number` may still be used):
+
+* invoice history / revision list, invoice detail by id, old-version PDF download
+* signed/accepted invoice revision history, revision dropdown, viewing old signed PDFs
 
 Known frontend cleanup:
 
@@ -823,7 +825,7 @@ Known frontend cleanup:
 
 Done when:
 
-* salesperson can create/rewrite invoices, record payments, view invoice versions, and download PDFs
+* salesperson can create/rewrite the current invoice, record payments, view the current invoice, and download its PDF
 
 ### Phase 13: Stripe
 
