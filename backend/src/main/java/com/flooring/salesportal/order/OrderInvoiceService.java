@@ -69,6 +69,7 @@ public class OrderInvoiceService {
     private static final String PDF_MIME = "application/pdf";
     private static final String PDF_EXTENSION = "pdf";
     private static final String ADDRESS_BILLING = "BILLING";
+    private static final String STATUS_LAID = "LAID";
 
     private final RequestContextGuard requestContextGuard;
     private final SalesOrderRepository salesOrderRepository;
@@ -137,6 +138,92 @@ public class OrderInvoiceService {
                     ErrorCode.INVOICE_ALREADY_EXISTS.defaultMessage());
         }
 
+        // Snapshot the live order state onto version 1 (shared with D.2 Rewrite). Payments are
+        // invoice-first (D.7 requires an existing invoice), so a brand-new order's total_paid is 0 and
+        // balance_due = inc - 0 = inc > 0 (precondition 9).
+        return snapshotAndPersistInvoice(slug, orderId, order, ctx, FIRST_VERSION, "Invoice created.");
+    }
+
+    // ------------------------------------------------------------------
+    // D.2 POST /orders/{orderId}/invoices/rewrite — regenerate the current invoice (Branch C)
+    // ------------------------------------------------------------------
+
+    /**
+     * Rewrite (regenerate) the current invoice from the CURRENT live order state (Chunk 4 D.2). The new
+     * row is the next {@code version_number} (= current max + 1); older rows are never modified and stay
+     * internal (MVP exposes only the current invoice). Manual Rewrite is what makes new live edits
+     * official, so the snapshot is taken from live state (NOT carried forward from the previous invoice).
+     * After commit, D.3 / D.4 resolve this new row as the current invoice.
+     *
+     * <p>Gate order follows the approved mutation ordering in {@code OrderService}: guard -> orderId
+     * parse (400 {@code VALIDATION_FAILED} on {@code order_id}) -> scoped {@code FOR UPDATE} order lookup
+     * (missing / cross-store / cross-business -> 404 {@code ORDER_NOT_FOUND}, no existence leak) -> LAID
+     * gate (422 {@code ORDER_LOCKED}; conventions §16 blocks manual Rewrite) -> empty-body check
+     * ({@code {}} only; any field -> 400 {@code VALIDATION_FAILED}; unparseable -> 400
+     * {@code MALFORMED_JSON}) -> require an existing invoice (else 422 {@code INVOICE_REQUIRED}) -> the 9
+     * preconditions (422 {@code INVOICE_PRECONDITIONS_NOT_MET}) -> snapshot + PDF + insert. The LAID gate
+     * runs BEFORE the body parse (mirroring {@code OrderService}) so a locked in-scope order is
+     * {@code ORDER_LOCKED} regardless of body content. The {@code FOR UPDATE} order lock serialises
+     * version allocation against a concurrent rewrite, so {@code uq_invoice_order_version} cannot be raced.
+     */
+    @Transactional
+    public ApiResponse<InvoiceResponse> rewriteInvoice(String slug,
+                                                       String orderIdRaw,
+                                                       String body,
+                                                       HttpServletRequest httpRequest) {
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+        long orderId = parsePositiveLong(orderIdRaw, "order_id");
+
+        // Scope (resource) before LAID / body / business rules. FOR UPDATE serialises version allocation
+        // against a concurrent rewrite; missing / cross-store / cross-business -> 404.
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        // Manual Rewrite is blocked on a LAID order (conventions §16 / Chunk 4 D.2). Gate-first (before
+        // the body parse), mirroring OrderService: a LAID in-scope order is ORDER_LOCKED regardless of body.
+        requireNotLaid(order);
+
+        // Body must be empty ({} / blank). Any field (including due_date) -> 400 VALIDATION_FAILED;
+        // unparseable -> 400 MALFORMED_JSON.
+        rejectNonEmptyBody(body);
+
+        // Rewrite requires an existing invoice; the current (max version) row drives the next version.
+        InvoiceRow current = invoiceRepository.findCurrentByOrderId(orderId)
+                .orElseThrow(() -> new BusinessRuleException(
+                        ErrorCode.INVOICE_REQUIRED, ErrorCode.INVOICE_REQUIRED.defaultMessage()));
+
+        return snapshotAndPersistInvoice(
+                slug, orderId, order, ctx, current.versionNumber() + 1, "Invoice rewritten.");
+    }
+
+    // ------------------------------------------------------------------
+    // Shared snapshot + PDF + persist (D.1 Create / D.2 Rewrite)
+    // ------------------------------------------------------------------
+
+    /**
+     * Snapshot the CURRENT live order state onto a new {@code invoice} row (version {@code versionNumber}),
+     * render + store its PDF, and return the E.2 detail wrapped with {@code successMessage}. Shared by D.1
+     * Create (version 1) and D.2 Rewrite (max + 1): both make the current live order state official, so
+     * the snapshot is identical apart from the version number and the response message. Caller has already
+     * passed the gates (scope, and — for rewrite — LAID + invoice-exists) and holds the order
+     * {@code FOR UPDATE} inside its transaction.
+     *
+     * <p>Runs the 9 preconditions against the live summary (422 {@code INVOICE_PRECONDITIONS_NOT_MET}).
+     * {@code sale_price_inc_gst} is taken directly from {@code final_sale_price_inc_gst} (not re-derived
+     * from ex-GST) so each money column is frozen independently and the {@code inc >= ex} CHECK holds.
+     * The PDF is written to disk BEFORE the {@code stored_file} / {@code invoice} rows with a
+     * rollback-cleanup hook (mirrors {@code OrderAttachmentService}): a disk-write failure throws before
+     * any DB row exists; a DB failure removes the just-written file (rollback hook + in-method catch), so
+     * a rollback never orphans the file. {@code invoice.stored_file_id} is NOT NULL + UNIQUE, so the file
+     * row must exist before the invoice row.
+     */
+    private ApiResponse<InvoiceResponse> snapshotAndPersistInvoice(String slug,
+                                                                   long orderId,
+                                                                   SalesOrder order,
+                                                                   RequestContext ctx,
+                                                                   int versionNumber,
+                                                                   String successMessage) {
         // Live financial summary (never persisted as a row) — products + charges + price adjustment.
         OrderFinancialSummaryDto summary = financialCalculator.compute(
                 orderProductLineRepository.sumFinancials(orderId),
@@ -163,27 +250,23 @@ public class OrderInvoiceService {
         BigDecimal totalPaid = paymentTransactionRepository.sumAmountByOrderId(orderId);
         BigDecimal balanceDue = salePriceIncGst.subtract(totalPaid).setScale(MONEY_SCALE, ROUNDING);
 
-        // Invariant: payments are invoice-first (D.7 requires an existing invoice), so an order with no
-        // invoice yet has total_paid = 0 and balance_due = inc - 0 = inc > 0 (precondition 9). This
-        // guard is a defensive backstop against an over-paid order (only reachable via inconsistent
-        // seeded/manual data): fail fast with a clear message rather than tripping the DB CHECK
-        // chk_invoice_balance_due_gte_zero with a cryptic constraint violation. (Overpayment is handled
-        // as PAYMENT_EXCEEDS_BALANCE on the later D.7 payments branch, not here.)
+        // Defensive backstop against an over-paid order (only reachable via inconsistent seeded/manual
+        // data): fail fast with a clear message rather than tripping the DB CHECK
+        // chk_invoice_balance_due_gte_zero with a cryptic constraint violation. Payments are invoice-first
+        // and capped at the latest balance on D.7, so total_paid never legitimately exceeds the recomputed
+        // inc-GST amount here. (Overpayment is handled as PAYMENT_EXCEEDS_BALANCE on the D.7 branch.)
         if (balanceDue.signum() < 0) {
             throw new IllegalStateException(
                     "Computed balance_due is negative (payments exceed the invoice amount) for order " + orderId);
         }
 
         // Render the PDF and write the file FIRST, then register rollback cleanup, then insert the
-        // stored_file + invoice rows (mirrors OrderAttachmentService). A disk-write failure throws
-        // before any DB row exists; a DB failure removes the just-written file (rollback hook +
-        // in-method catch). invoice.stored_file_id is NOT NULL + UNIQUE, so the file row must exist
-        // before the invoice row.
-        String fileName = "invoice-" + order.getOrderNumber() + "-v" + FIRST_VERSION + "." + PDF_EXTENSION;
+        // stored_file + invoice rows (mirrors OrderAttachmentService).
+        String fileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
         byte[] pdfBytes = invoicePdfGenerator.render(new InvoicePdfModel(
                 ctx.business().getName(),
                 order.getOrderNumber(),
-                FIRST_VERSION,
+                versionNumber,
                 invoiceDate,
                 dueDate,
                 customerName(customer),
@@ -199,12 +282,12 @@ public class OrderInvoiceService {
         try {
             long storedFileId = invoiceRepository.insertStoredFile(fileName, storagePath, PDF_MIME, pdfBytes.length);
             InvoiceRow row = invoiceRepository.insertInvoice(
-                    orderId, FIRST_VERSION, invoiceDate, dueDate, detailsSnapshot,
+                    orderId, versionNumber, invoiceDate, dueDate, detailsSnapshot,
                     salePriceExGst, salePriceIncGst, totalPaid, balanceDue,
                     storedFileId, ctx.userId());
 
             InvoiceDetailDto dto = toDto(slug, orderId, row);
-            return ApiResponse.ok(new InvoiceResponse(dto), "Invoice created.");
+            return ApiResponse.ok(new InvoiceResponse(dto), successMessage);
         } catch (RuntimeException ex) {
             fileStorageService.deleteQuietly(storagePath);
             throw ex;
@@ -275,6 +358,17 @@ public class OrderInvoiceService {
         salesOrderRepository
                 .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+    }
+
+    /**
+     * Manual Rewrite Invoice (D.2) is blocked on a LAID order (conventions §16). 422 {@code ORDER_LOCKED}.
+     * Mirrors the {@code requireNotLaid} guard in the sibling order-mutation services. (Create/D.1 has no
+     * such gate — it is allowed on a LAID order when no invoice exists yet.)
+     */
+    private void requireNotLaid(SalesOrder order) {
+        if (STATUS_LAID.equals(order.getOrderStatus())) {
+            throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
+        }
     }
 
     // ------------------------------------------------------------------
