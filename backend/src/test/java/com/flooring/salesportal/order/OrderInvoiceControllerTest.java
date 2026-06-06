@@ -789,16 +789,11 @@ class OrderInvoiceControllerTest {
     // ================================================================
 
     @Test
-    void noPaymentHistoryByIdOrOldPdfEndpointsImplemented() throws Exception {
-        // Branch C adds ONLY POST /invoices/rewrite. Payments (D.6/D.7) and the deferred history /
-        // by-id / old-version-PDF routes (D.5) must remain unmapped -> a 4xx (no handler), never a 2xx.
-        mockMvc.perform(get("/api/v1/" + SLUG_AUSSIE + "/orders/" + ORDER_FULL + "/payments")
-                        .session(liamStore1Session()))
-                .andExpect(status().is4xxClientError());
-        mockMvc.perform(post("/api/v1/" + SLUG_AUSSIE + "/orders/" + ORDER_FULL + "/payments")
-                        .session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().is4xxClientError());
+    void noInvoiceHistoryByIdOrOldPdfEndpointsImplemented() throws Exception {
+        // The invoice controller exposes ONLY current-invoice routes (D.1/D.2/D.3/D.4). The deferred
+        // history / by-id / old-version-PDF routes (D.5) must remain unmapped -> a 4xx (no handler),
+        // never a 2xx. Payments (D.6/D.7) are a separate controller (Branch D) and are intentionally not
+        // asserted here.
         mockMvc.perform(get(invoicesUrl(ORDER_FULL)).session(liamStore1Session())) // history list
                 .andExpect(status().is4xxClientError());
         mockMvc.perform(get(invoicesUrl(ORDER_FULL) + "/1").session(liamStore1Session())) // detail by-id
