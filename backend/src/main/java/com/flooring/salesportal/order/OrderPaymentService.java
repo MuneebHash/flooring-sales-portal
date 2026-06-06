@@ -76,6 +76,9 @@ public class OrderPaymentService {
 
     private static final int MONEY_SCALE = 2;
     private static final RoundingMode ROUNDING = RoundingMode.HALF_UP;
+    // Matches payment_transaction.payment_reference VARCHAR(100): reject over-length here (400) rather
+    // than letting the DB raise a value-too-long error (which would surface as a generic 500).
+    private static final int MAX_PAYMENT_REFERENCE_LENGTH = 100;
     private static final String PDF_MIME = "application/pdf";
     private static final String PDF_EXTENSION = "pdf";
     private static final String ADDRESS_BILLING = "BILLING";
@@ -416,7 +419,9 @@ public class OrderPaymentService {
     /**
      * Optional {@code payment_reference}: absent or explicit JSON null -> null (persist SQL NULL);
      * a non-string -> "Must be a string."; blank after trim -> "Must not be blank." (mirrors the DB CHECK
-     * {@code chk_payment_reference_not_blank}). Returns the TRIMMED value when present.
+     * {@code chk_payment_reference_not_blank}); longer than 100 chars after trim -> "Must be at most 100
+     * characters." (matches the {@code VARCHAR(100)} column, so an over-length value is a clean 400 rather
+     * than a DB value-too-long 500). Returns the TRIMMED value when present.
      */
     private static String readPaymentReference(JsonNode node, List<ErrorDetail> errors) {
         JsonNode value = node == null ? null : node.get("payment_reference");
@@ -430,6 +435,10 @@ public class OrderPaymentService {
         String trimmed = value.asText().trim();
         if (trimmed.isEmpty()) {
             errors.add(new ErrorDetail(null, "payment_reference", "Must not be blank."));
+            return null;
+        }
+        if (trimmed.length() > MAX_PAYMENT_REFERENCE_LENGTH) {
+            errors.add(new ErrorDetail(null, "payment_reference", "Must be at most 100 characters."));
             return null;
         }
         return trimmed;

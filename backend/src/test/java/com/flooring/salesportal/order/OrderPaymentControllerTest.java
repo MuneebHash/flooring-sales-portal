@@ -725,6 +725,38 @@ class OrderPaymentControllerTest {
     }
 
     @Test
+    void record_paymentReferenceAt100Chars_accepted() throws Exception {
+        // payment_transaction.payment_reference is VARCHAR(100): a 100-char reference is at the limit.
+        String ref = "X".repeat(100);
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content(body("CASH", "100.00", ref)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.payment_transaction.payment_reference").value(ref));
+    }
+
+    @Test
+    void record_paymentReferenceOver100Chars_returns400() throws Exception {
+        // 101 chars exceeds VARCHAR(100) -> a clean 400 VALIDATION_FAILED, not a DB value-too-long 500.
+        String ref = "X".repeat(101);
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content(body("CASH", "100.00", ref)))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("payment_reference"));
+    }
+
+    @Test
+    void record_paymentReferenceOver100Chars_persistsNothing() throws Exception {
+        // The over-length value must be rejected before the inserts: no payment row and no invoice version.
+        String ref = "X".repeat(101);
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content(body("CASH", "100.00", ref)))
+                .andExpect(status().isBadRequest());
+        Assertions.assertEquals(1, countPayments(ORDER_FULL), "no payment persisted on over-length reference");
+        Assertions.assertEquals(1, countInvoices(ORDER_FULL), "no new invoice version on over-length reference");
+    }
+
+    @Test
     void record_forbiddenGatewayField_returns400() throws Exception {
         mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON)
