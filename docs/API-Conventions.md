@@ -137,6 +137,7 @@ File upload and file download endpoints are the only allowed exception to the JS
 | 409  | Conflict | Duplicate resource (e.g., duplicate salesperson_code) |
 | 422  | Unprocessable Entity | Business rule violation (e.g., invoice preconditions not met) |
 | 500  | Internal Server Error | Unexpected server failure |
+| 502  | Bad Gateway | Upstream/provider dependency failed to complete a request (e.g., the email provider could not send an invoice — `EMAIL_SEND_FAILED`, Phase 13). Used only for failures of an external dependency the backend calls on the caller's behalf; an internal bug is still 500. |
 
 ### Important security note on 404
 When a resource exists but belongs to a different business, return 404 not 403.

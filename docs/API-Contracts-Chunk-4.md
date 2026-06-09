@@ -13,7 +13,9 @@
 
 **Order number format (locked):** `{store_code}.{salesperson_code}.{order_sequence_number_padded_5}` — e.g. `SYD-CBD.LC1.00042`. Backend-generated; frontend never sends it. Used in invoice PDF filenames.
 
-**File-binary exception (accepted in conventions §3):** file upload endpoints may accept `multipart/form-data`; file download endpoints may return raw binary bytes. Chunk 4 uses this exception only for the invoice PDF download endpoint (D.5).
+**File-binary exception (accepted in conventions §3):** file upload endpoints may accept `multipart/form-data`; file download endpoints may return raw binary bytes. Chunk 4 uses this exception only for the invoice PDF download endpoint (D.4).
+
+> **Phase 13 update (Invoice Acceptance + Signature + Email).** Chunk 4 is the locked **Phase 12** core (invoices + payments). After Chunk 4 was locked, invoice **acceptance + customer signature capture + emailing the accepted PDF** moved out of "deferred post-MVP" and into MVP scope as **Phase 13**. The full Phase 13 endpoint, data-model, PDF, email, and error contracts live in **`docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`** and are additive to this chunk. Where this document still said acceptance/signature/email was deferred, that wording is corrected below to point at Phase 13. What remains deferred post-MVP is unchanged: multi-version invoice **history** (list, detail-by-id, old-version PDF download), refunds/reversals, payment edit/delete, and any separate invoice-status enum.
 
 ---
 
@@ -39,7 +41,7 @@ NOT exposed by the MVP API or frontend:
 - Invoice history / version list per order.
 - Invoice detail by `invoiceId`.
 - Download of an older invoice version's PDF.
-- Signed / accepted invoice revision history, the invoice-page revision dropdown, viewing old signed PDFs, and the signed-invoice acceptance workflow.
+- Signed / accepted invoice revision **history**, the invoice-page revision dropdown, and viewing/downloading **old** signed PDFs. (The signed-invoice **acceptance workflow itself** — capturing a signature, accepting the current invoice, and emailing the accepted PDF — is **no longer deferred**; it is MVP **Phase 13**. See `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`. Only multi-version *history* of signed invoices stays deferred.)
 
 ---
 
@@ -53,13 +55,13 @@ Already locked in earlier chunks — not reopened:
 Out of MVP scope or deferred:
 - **Operations Portal catalog management is deferred to a separate future Operations Portal API contract. For the Sales Portal MVP, product and charge catalog data will be manually loaded into `store_product` and `store_charge` during onboarding/admin setup. Sales Portal consumes that catalog only through the locked Chunk 3 `available-products` and `available-charges` endpoints.** Operations Portal will have its own login/auth flow, its own users (owners / managers / catalog admins), and its own contract; it is not a sub-path of the Sales Portal API.
 - Payment edit / delete (conventions §13: not allowed in MVP).
-- **Invoice history / revision access (deferred post-MVP).** The MVP exposes only the current/latest invoice. Invoice history listing, invoice detail by `invoiceId`, and downloading an older invoice version's PDF are deferred. The schema (`invoice.version_number`, multiple rows per order) is kept and reserved; no migration is added (see A.1 and D.5).
-- **Signed / accepted invoice revision history (deferred post-MVP):** the signed-invoice acceptance workflow, the invoice-page revision dropdown, and viewing old signed PDFs. No signed-invoice fields are invented now.
+- **Invoice history / revision access (deferred post-MVP).** The MVP exposes only the current/latest invoice. Invoice history listing, invoice detail by `invoiceId`, and downloading an older invoice version's PDF are deferred. The schema (`invoice.version_number`, multiple rows per order) is kept and reserved; no migration is added for *history* (see A.1 and D.5).
+- **Signed / accepted invoice revision *history* (deferred post-MVP):** the invoice-page revision dropdown and viewing/downloading **old** signed PDFs. (The invoice **acceptance + signature + email** workflow itself is **MVP in Phase 13** — see `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` — which *does* add the signed-invoice fields `accepted_at`, `accepted_customer_name`, `accepted_signature_file_id`, and `last_emailed_at` via a documented `V10` migration. Phase 13 does **not** introduce a separate invoice-status enum.)
 - Refunds, surcharges, finance products, cheque, partial reversals.
-- Stripe / gateway-driven flows (`gateway_transaction_id`, `response_status`, `response_message` remain nullable backend fields for manual MVP payments).
-- Invoice email / send-to-customer endpoints (not yet locked in conventions).
-- Standalone invoice PDF (re)generation endpoints — PDFs are produced only as a side effect of Create Invoice, manual Rewrite Invoice, and POST Payment.
-- `SIGNATURE` attachment kind workflow (deferred from Chunk 3; full e-sign workflow not in MVP).
+- Stripe / gateway-driven flows (`gateway_transaction_id`, `response_status`, `response_message` remain nullable backend fields for manual MVP payments). Stripe is **Phase 14**.
+- Invoice email / send-to-customer **before signature/acceptance** (not allowed). Automatic emailing of the **accepted** invoice PDF, and Re-send of the current accepted invoice, are **MVP in Phase 13** (Accept / Resend endpoints — see the Phase 13 contract). Advanced email audit history stays post-MVP.
+- Standalone invoice PDF (re)generation endpoints — PDFs are produced only as a side effect of Create Invoice, manual Rewrite Invoice, POST Payment, and (Phase 13) Accept / Resend.
+- `SIGNATURE` attachment kind in the **general Notes & Photos attachments list** (Chunk 3 still rejects `attachment_kind=SIGNATURE` on the attachment upload endpoint). Phase 13 captures the signature through a **dedicated invoice-acceptance endpoint** that stores it via `stored_file` (reusing the existing storage mechanism) without surfacing it as a general order attachment. A full legal e-sign platform is post-MVP.
 
 ---
 
@@ -77,6 +79,16 @@ All endpoints are **Standard protected** (all 7 checks from conventions §9). Ev
 | GET  | `/api/v1/{slug}/orders/{orderId}/invoices/current/file` | Download the current invoice PDF binary | D.4 |
 | GET  | `/api/v1/{slug}/orders/{orderId}/payments` | List payments + current official payment summary | D.6 |
 | POST | `/api/v1/{slug}/orders/{orderId}/payments` | Record a payment against the current invoice; atomically regenerate the current invoice | D.7 |
+
+**Added in Phase 13 (Invoice Acceptance + Signature + Email — full contracts in `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`):**
+
+| Method | Path | Purpose | Contract |
+|--------|------|---------|----------|
+| POST | `/api/v1/{slug}/orders/{orderId}/invoices/current/accept` | Accept/sign the current invoice + auto-email the accepted PDF | Phase 13 |
+| POST | `/api/v1/{slug}/orders/{orderId}/invoices/current/resend` | Re-send the current accepted invoice PDF | Phase 13 |
+| GET  | `/api/v1/{slug}/orders/{orderId}/invoices/current/signature` | Stream the accepted signature image | Phase 13 |
+
+Phase 13 also adds a customer-email precondition to D.1 / D.2 (and to Accept / Resend), and makes D.7 carry acceptance/signature metadata forward and re-email when the current invoice was already accepted. See the Phase 13 contract for the deltas.
 
 **Deferred to post-MVP (NOT implemented in MVP — see D.5):** `GET .../invoices` (history
 list), `GET .../invoices/{invoiceId}` (detail by id), `GET .../invoices/{invoiceId}/file`
@@ -350,11 +362,14 @@ can be added later **without a migration**:
 - `GET /api/v1/{slug}/orders/{orderId}/invoices/{invoiceId}` — read a specific invoice version.
 - `GET /api/v1/{slug}/orders/{orderId}/invoices/{invoiceId}/file` — download a specific older version's PDF.
 
-Also deferred (no schema invented now): the signed / accepted invoice revision history, the
-invoice-page revision dropdown, viewing old signed PDFs, and the signed-invoice acceptance
-workflow.
+Still deferred (multi-version history only): the signed / accepted invoice revision **history**,
+the invoice-page revision dropdown, and viewing/downloading **old** signed PDFs. The
+signed-invoice **acceptance + signature + email** workflow itself is **not** deferred — it is
+MVP **Phase 13** (Accept / Resend / signature endpoints; see
+`docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`).
 
-MVP clients use only **D.3** (current invoice) and **D.4** (current invoice PDF).
+MVP clients use **D.3** (current invoice), **D.4** (current invoice PDF), and the Phase 13
+current-invoice acceptance endpoints. No older-version invoice or signature endpoint is exposed.
 
 ---
 
@@ -637,6 +652,8 @@ The 9 preconditions:
 
 Failure response: 422 with `error.code = "INVOICE_PRECONDITIONS_NOT_MET"` and `error.details[]` listing every failing item with `section`, `field`, and `message`.
 
+> **Phase 13 delta.** Phase 13 adds a **customer-email gate** to D.1 (Create) and D.2 (Rewrite), evaluated before these 9 preconditions: a missing/blank email → 422 `CUSTOMER_EMAIL_REQUIRED`, an invalid email → 422 `CUSTOMER_EMAIL_INVALID`. The same email gate also guards the Phase 13 Accept / Resend endpoints. See `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` §Error contract.
+
 **F.2 Invoice creation — current invoice (MVP).**
 
 MVP exposes only the current/latest invoice. Internally the backend still writes `invoice`
@@ -667,6 +684,8 @@ In all paths:
 - The regenerated current invoice must not silently make unsent live order edits official. Sale snapshot fields (`details_of_sale_snapshot`, `sale_price_ex_gst`, `sale_price_inc_gst`, `due_date`) are copied from the current invoice. To make new live edits official, the salesperson must use D.2 Rewrite Invoice first.
 - All side effects in a single DB transaction. Any failure → full rollback. The salesperson must retry; partial state is never persisted.
 - D.7 response includes the created payment, the updated `payment_summary`, and the updated `current_invoice` metadata (E.1 shape).
+
+> **Phase 13 delta.** When the current invoice has already been **accepted**, the payment-regenerated version additionally **carries the acceptance/signature metadata forward** (`accepted_at`, `accepted_customer_name`, `accepted_signature_file_id`) — the customer does **not** re-accept — and the updated signed PDF is **automatically re-emailed**, updating `last_emailed_at`. When the current invoice has **not** been accepted, the payment is still allowed, the new version stays unaccepted, and **no** email is sent. See `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` §Payment interaction rules. (E.1 / E.2 also gain the acceptance/email fields in Phase 13.)
 
 **F.5 Invoice due_date rule.**
 - Manual invoice versions (D.1 Create, D.2 Manual Rewrite) derive `due_date = sales_order.proposed_lay_date − 2 calendar days`. The frontend never sends `due_date`.
@@ -699,6 +718,9 @@ In all paths:
 | D.4 GET invoices/current/file (current PDF) | Yes |
 | D.6 GET payments | Yes |
 | D.7 POST payments | **Yes** (conventions §16: add payment is allowed; the current invoice is regenerated as the side effect of allowed payments) |
+| Phase 13 POST invoices/current/accept | **Yes** (acceptance parallels payment, not rewrite — a laid job's invoice may still need signing/emailing; carries the snapshot forward, never makes live edits official). See Phase 13 contract. |
+| Phase 13 POST invoices/current/resend | **Yes** (re-emails the existing accepted PDF) |
+| Phase 13 GET invoices/current/signature | **Yes** (read) |
 
 **F.9 Backend-controlled fields.** Client never sends or controls:
 - `business_id`, `store_id`, `user_id`, `order_id`, `invoice_id`, `payment_transaction_id` in any body.
