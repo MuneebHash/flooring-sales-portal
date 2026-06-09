@@ -55,6 +55,11 @@ type Props = {
   // minimal Saving… / Saved / error indicator. The parent owns the lift to
   // workspace state on success.
   queueDetailsAutosave: (body: DetailsOfSaleSaveRequest) => void
+  // Awaitable flush of any pending/in-flight Details autosave (lives in the always-
+  // mounted shell). Resolves true once the latest draft is persisted, false if a
+  // save failed. Awaited before a Create/Rewrite invoice action so the snapshot is
+  // never stale (Codex P1).
+  flushDetailsAutosave: () => Promise<boolean>
   detailsAutosaveSaving: boolean
   detailsAutosaveSaved: boolean
   detailsAutosaveError: string | null
@@ -302,6 +307,7 @@ export function DetailsOfSaleTab({
   finishSalePriceMutation,
   applyMutationFinancialSummary,
   queueDetailsAutosave,
+  flushDetailsAutosave,
   detailsAutosaveSaving,
   detailsAutosaveSaved,
   detailsAutosaveError,
@@ -518,12 +524,47 @@ export function DetailsOfSaleTab({
     )
   }
 
+  // Codex P1: before the backend snapshots Details of Sale into the official
+  // invoice, make sure the latest draft is actually saved. A field blur only QUEUES
+  // an async autosave, so a Create/Rewrite click can otherwise run before that PUT
+  // settles and snapshot stale data. Validate with the same rule autosave uses
+  // (invalid -> surface the field + invoice errors and abort), then force-save the
+  // latest draft and AWAIT the autosave drain. Returns true only when the details
+  // are safely persisted; false blocks the create/rewrite and keeps the user here.
+  async function flushDetailsBeforeInvoice(): Promise<boolean> {
+    const validationErrors = validateForm(detailsDraft)
+    if (Object.keys(validationErrors).length > 0) {
+      setErrors(validationErrors)
+      setInvoicePreconditions([])
+      setInvoiceActionError(
+        'Please fix the highlighted Details of Sale fields before creating or rewriting the invoice.',
+      )
+      return false
+    }
+    const saved = await flushDetailsAutosave()
+    if (!mountedRef.current) return false
+    if (!saved) {
+      setInvoicePreconditions([])
+      setInvoiceActionError(
+        'Could not save the latest Details of Sale changes. Please try again before creating or rewriting the invoice.',
+      )
+      return false
+    }
+    return true
+  }
+
   async function runCreateInvoice() {
     if (invoiceActionBusy) return
     setCreatingInvoice(true)
     setInvoiceActionError(null)
     setInvoicePreconditions([])
     try {
+      // Codex P1: flush pending Details of Sale autosaves first so the invoice
+      // snapshots the latest SAVED details. On failure stay on Details (the inline
+      // error is set by the flush helper) and do NOT create.
+      const detailsReady = await flushDetailsBeforeInvoice()
+      if (!detailsReady) return
+      if (!mountedRef.current) return
       // D.1 create — body is always {}. Create is NOT LAID-gated. On success switch
       // straight to the Invoice tab (no success notice, no View button).
       await createInvoice(orderId)
@@ -557,6 +598,12 @@ export function DetailsOfSaleTab({
     setInvoiceActionError(null)
     setInvoicePreconditions([])
     try {
+      // Codex P1: flush pending Details of Sale autosaves first so the rewritten
+      // invoice snapshots the latest SAVED details. On failure stay on Details and
+      // do NOT rewrite.
+      const detailsReady = await flushDetailsBeforeInvoice()
+      if (!detailsReady) return
+      if (!mountedRef.current) return
       // D.2 rewrite — body is always {}. Regenerates the current invoice. On
       // success switch straight to the Invoice tab (no success notice, no View
       // button) so the rewritten invoice is shown immediately.
