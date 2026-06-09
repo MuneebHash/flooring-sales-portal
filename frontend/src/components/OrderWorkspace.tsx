@@ -385,6 +385,7 @@ function WorkspaceShell({
                 detailsAutosaveSaving={detailsAutosaveSaving}
                 detailsAutosaveSaved={detailsAutosaveSaved}
                 detailsAutosaveError={detailsAutosaveError}
+                onInvoiceReady={() => setActiveTab('invoice')}
               />
             )}
             {/* `locked` (LAID) is passed for PHOTO-DELETE gating ONLY. Notes are
@@ -398,7 +399,6 @@ function WorkspaceShell({
             {activeTab === 'invoice' && (
               <InvoiceTab
                 orderId={orderId}
-                locked={locked}
                 orderNumber={orderNumber}
                 customer={customer}
                 billingAddress={billingAddress}

@@ -20,6 +20,12 @@ import type {
 } from '../../lib/api/orderWorkspaceApi'
 import { overrideSalePrice, resetSalePrice } from '../../lib/api/orderLinesApi'
 import type { OrderFinancialSummary } from '../../lib/api/orderLinesApi'
+import {
+  createInvoice,
+  fetchCurrentInvoice,
+  rewriteInvoice,
+  type InvoiceDetail,
+} from '../../lib/api/orderInvoicesApi'
 
 type Props = {
   orderId: number
@@ -52,6 +58,10 @@ type Props = {
   detailsAutosaveSaving: boolean
   detailsAutosaveSaved: boolean
   detailsAutosaveError: string | null
+  // Called ONLY after a successful invoice create/rewrite so the parent (the
+  // always-mounted shell) can switch to the Invoice tab, where the new/rewritten
+  // invoice mounts + refetches and is shown immediately. Not invoked on failure.
+  onInvoiceReady: () => void
 }
 
 // Local form mirror of the five details-of-sale fields. lay_date_status keeps the
@@ -156,6 +166,17 @@ function formatMoney(value: number): string {
   return MONEY_FORMATTER.format(value)
 }
 
+// Inline message for the overpaid-rewrite guard. Uses the exact amounts when they
+// are reliably known; otherwise an amount-free fallback. NO cost/GP wording.
+function overpaidRewriteMessage(
+  amounts: { paid: number; newTotal: number } | null,
+): string {
+  if (amounts) {
+    return `The new invoice total (${formatMoney(amounts.newTotal)}) is lower than the amount already paid (${formatMoney(amounts.paid)}). Please adjust the sale total before rewriting the invoice.`
+  }
+  return 'The new invoice total is lower than the amount already paid. Please adjust the sale total before rewriting the invoice.'
+}
+
 // gp_percent is nullable (null when sale_price_ex_gst <= 0); render null as a
 // dash. Negative percentages are shown verbatim.
 function formatPercent(value: number | null): string {
@@ -238,6 +259,38 @@ function salePriceErrorMessage(err: unknown): string {
   return 'Something went wrong while updating the sale price. Please try again.'
 }
 
+// INVOICE_PRECONDITIONS_NOT_MET (returned by both create and rewrite) carries a
+// details[] of backend ErrorDetail ({ section?, field?, message }). Parse
+// defensively (also tolerating plain strings) so the UI can list the specific
+// reasons the order is not yet invoice-ready.
+type PreconditionFailure = {
+  label: string | null
+  message: string
+}
+
+function parsePreconditionFailures(details: unknown): PreconditionFailure[] {
+  if (!Array.isArray(details)) return []
+  const out: PreconditionFailure[] = []
+  for (const item of details) {
+    if (typeof item === 'string') {
+      if (item.length > 0) out.push({ label: null, message: item })
+      continue
+    }
+    if (item && typeof item === 'object') {
+      const rec = item as {
+        section?: unknown
+        field?: unknown
+        message?: unknown
+      }
+      const message = typeof rec.message === 'string' ? rec.message : ''
+      const field = typeof rec.field === 'string' ? rec.field : null
+      const section = typeof rec.section === 'string' ? rec.section : null
+      if (message.length > 0) out.push({ label: field ?? section, message })
+    }
+  }
+  return out
+}
+
 export function DetailsOfSaleTab({
   orderId,
   locked,
@@ -252,6 +305,7 @@ export function DetailsOfSaleTab({
   detailsAutosaveSaving,
   detailsAutosaveSaved,
   detailsAutosaveError,
+  onInvoiceReady,
 }: Props) {
   const [errors, setErrors] = useState<Record<string, string>>({})
 
@@ -324,6 +378,11 @@ export function DetailsOfSaleTab({
       if (!mountedRef.current) return
       setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
       setSalePriceDirty(false)
+      // The SAVED sale total just changed, so any invoice-action error (notably the
+      // overpaid-rewrite message, which embeds the OLD total) is now stale. Clear it
+      // so it isn't left behind; the next Rewrite re-evaluates against this new total.
+      setInvoiceActionError(null)
+      setInvoicePreconditions([])
     } catch (err) {
       if (!mountedRef.current) return
       setSalePriceError(salePriceErrorMessage(err))
@@ -350,6 +409,11 @@ export function DetailsOfSaleTab({
       if (!mountedRef.current) return
       setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
       setSalePriceDirty(false)
+      // The SAVED sale total just changed, so any invoice-action error (notably the
+      // overpaid-rewrite message, which embeds the OLD total) is now stale. Clear it
+      // so it isn't left behind; the next Rewrite re-evaluates against this new total.
+      setInvoiceActionError(null)
+      setInvoicePreconditions([])
     } catch (err) {
       if (!mountedRef.current) return
       setSalePriceError(salePriceErrorMessage(err))
@@ -357,6 +421,215 @@ export function DetailsOfSaleTab({
       // Always release the in-flight lock in the parent, even after unmount.
       finishSalePriceMutation()
     }
+  }
+
+  // --- Invoice create / rewrite (D.1 create, D.2 rewrite). ---
+  // The invoice ACTION lives in this tab (not the Invoice tab) so the invoice is
+  // generated from this order's saved details. We probe GET /invoices/current on
+  // mount ONLY to choose Create (no invoice yet) vs Rewrite (an invoice exists).
+  // invoiceExists === null means still probing. The Invoice tab is view/download
+  // only.
+  const [invoiceExists, setInvoiceExists] = useState<boolean | null>(null)
+  // The current invoice from the mount probe — kept (not just invoiceExists) so the
+  // overpaid-rewrite guard can read its total_paid. null while probing / no invoice.
+  const [currentInvoice, setCurrentInvoice] = useState<InvoiceDetail | null>(null)
+  const [creatingInvoice, setCreatingInvoice] = useState(false)
+  const [rewritingInvoice, setRewritingInvoice] = useState(false)
+  const [invoiceActionError, setInvoiceActionError] = useState<string | null>(
+    null,
+  )
+  const [invoicePreconditions, setInvoicePreconditions] = useState<
+    PreconditionFailure[]
+  >([])
+  // Which action is awaiting explicit confirmation in the modal. Rewrite ALWAYS
+  // confirms; Create only confirms when the GP warning is active. null = closed.
+  const [confirmAction, setConfirmAction] = useState<'create' | 'rewrite' | null>(
+    null,
+  )
+
+  // Probe the current invoice on mount (the tab refetches fresh on each open) to
+  // decide Create vs Rewrite. 404 INVOICE_NOT_FOUND = no invoice yet = Create. Any
+  // other failure also defaults to Create — the backend stays authoritative (a real
+  // existing invoice is caught by 409 INVOICE_ALREADY_EXISTS, which flips this to
+  // Rewrite). Uses a per-run cancelled guard, not mountedRef.
+  useEffect(() => {
+    let cancelled = false
+    setInvoiceExists(null)
+    setCurrentInvoice(null)
+    setInvoiceActionError(null)
+    setInvoicePreconditions([])
+    fetchCurrentInvoice(orderId)
+      .then((res) => {
+        if (cancelled) return
+        setInvoiceExists(true)
+        // Keep the invoice so the rewrite guard can read total_paid.
+        setCurrentInvoice(res.data.invoice)
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        setCurrentInvoice(null)
+        if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
+          setInvoiceExists(false)
+          return
+        }
+        setInvoiceExists(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId])
+
+  // GP health flag already computed by the backend financial summary (Chunk 3).
+  // The confirmation popup is a FRONTEND guard only — it never changes the create/
+  // rewrite call or invents backend manager-approval behaviour.
+  const gpWarning = financialSummary?.gp_warning ?? false
+  const invoiceActionBusy = creatingInvoice || rewritingInvoice
+
+  // Overpaid-rewrite guard (MVP, frontend-only — no refunds, no negative balance,
+  // no payment/backend changes). A Rewrite regenerates the invoice with the NEW
+  // live sale total; if payments already recorded on the current invoice exceed
+  // that new total, the rewrite would push the balance negative (the backend
+  // rejects it). Detect it from already-available state: the current invoice's
+  // total_paid (mount probe) vs the live final sale price inc GST
+  // (order_financial_summary). NO cost/GP data is used. Returns the amounts when
+  // paid exceeds the new total by at least a cent (avoids a float-rounding false
+  // positive at exact equality), else null (also null when either value is not
+  // safely available, so the guard never blocks on unknown data).
+  function overpaidRewriteAmounts(): { paid: number; newTotal: number } | null {
+    const paid = currentInvoice?.total_paid
+    const newTotal = financialSummary?.final_sale_price_inc_gst
+    if (typeof paid !== 'number' || typeof newTotal !== 'number') return null
+    if (paid - newTotal > 0.005) return { paid, newTotal }
+    return null
+  }
+
+  function applyInvoiceActionError(err: unknown, fallback: string) {
+    if (err instanceof ApiError && err.code === 'INVOICE_PRECONDITIONS_NOT_MET') {
+      setInvoicePreconditions(parsePreconditionFailures(err.details))
+      setInvoiceActionError(
+        err.message.length > 0
+          ? err.message
+          : 'This order is not ready to be invoiced.',
+      )
+      return
+    }
+    setInvoiceActionError(
+      err instanceof ApiError && err.message.length > 0 ? err.message : fallback,
+    )
+  }
+
+  async function runCreateInvoice() {
+    if (invoiceActionBusy) return
+    setCreatingInvoice(true)
+    setInvoiceActionError(null)
+    setInvoicePreconditions([])
+    try {
+      // D.1 create — body is always {}. Create is NOT LAID-gated. On success switch
+      // straight to the Invoice tab (no success notice, no View button).
+      await createInvoice(orderId)
+      if (!mountedRef.current) return
+      setInvoiceExists(true)
+      onInvoiceReady()
+    } catch (err) {
+      if (!mountedRef.current) return
+      // An invoice already exists (state drifted) — flip the action to Rewrite.
+      if (err instanceof ApiError && err.code === 'INVOICE_ALREADY_EXISTS') {
+        setInvoiceExists(true)
+        return
+      }
+      applyInvoiceActionError(
+        err,
+        'Could not create the invoice. Please try again.',
+      )
+    } finally {
+      if (mountedRef.current) {
+        setCreatingInvoice(false)
+        setConfirmAction(null)
+      }
+    }
+  }
+
+  async function runRewriteInvoice() {
+    // Rewrite is blocked when LAID — the backend is the authority (422
+    // ORDER_LOCKED); this just disables the path early.
+    if (invoiceActionBusy || locked) return
+    setRewritingInvoice(true)
+    setInvoiceActionError(null)
+    setInvoicePreconditions([])
+    try {
+      // D.2 rewrite — body is always {}. Regenerates the current invoice. On
+      // success switch straight to the Invoice tab (no success notice, no View
+      // button) so the rewritten invoice is shown immediately.
+      await rewriteInvoice(orderId)
+      if (!mountedRef.current) return
+      setInvoiceExists(true)
+      onInvoiceReady()
+    } catch (err) {
+      if (!mountedRef.current) return
+      // No invoice to rewrite (state drifted) — flip the action back to Create.
+      if (err instanceof ApiError && err.code === 'INVOICE_REQUIRED') {
+        setInvoiceExists(false)
+        return
+      }
+      if (err instanceof ApiError && err.code === 'ORDER_LOCKED') {
+        setInvoiceActionError(
+          'This order is locked (LAID). The invoice cannot be rewritten.',
+        )
+        return
+      }
+      // Defensive: if the rewrite still failed and current state shows payments
+      // already exceed the new total, show the friendly overpayment message rather
+      // than a generic "unexpected error".
+      const overpaid = overpaidRewriteAmounts()
+      if (overpaid) {
+        setInvoicePreconditions([])
+        setInvoiceActionError(overpaidRewriteMessage(overpaid))
+        return
+      }
+      applyInvoiceActionError(
+        err,
+        'Could not rewrite the invoice. Please try again.',
+      )
+    } finally {
+      if (mountedRef.current) {
+        setRewritingInvoice(false)
+        setConfirmAction(null)
+      }
+    }
+  }
+
+  // Create: confirm only when the GP warning is active; otherwise create directly.
+  function handleCreateInvoiceClick() {
+    if (invoiceActionBusy || invoiceExists === null) return
+    if (gpWarning) {
+      setConfirmAction('create')
+      return
+    }
+    void runCreateInvoice()
+  }
+
+  // Rewrite: ALWAYS confirm (it regenerates the invoice and makes the changes
+  // official). The GP warning, when active, is shown in the same modal.
+  function handleRewriteInvoiceClick() {
+    if (invoiceActionBusy || locked || invoiceExists === null) return
+    // Overpaid-rewrite guard: block BEFORE opening the confirmation / calling the
+    // API when payments already exceed the new live total. Show the inline error
+    // near the action row; do not open the modal, call rewriteInvoice, or navigate.
+    const overpaid = overpaidRewriteAmounts()
+    if (overpaid) {
+      setInvoicePreconditions([])
+      setInvoiceActionError(overpaidRewriteMessage(overpaid))
+      return
+    }
+    setInvoiceActionError(null)
+    setInvoicePreconditions([])
+    setConfirmAction('rewrite')
+  }
+
+  function handleConfirmInvoiceAction() {
+    if (invoiceActionBusy) return
+    if (confirmAction === 'create') void runCreateInvoice()
+    else if (confirmAction === 'rewrite') void runRewriteInvoice()
   }
 
   function clearError(key: string) {
@@ -655,7 +928,40 @@ export function DetailsOfSaleTab({
             </button>
           </div>
 
-          <div className="flex flex-col items-start sm:items-end gap-1">
+          {/* Right side of the action row: the invoice action (Create when no
+              invoice exists, Rewrite once it does), with the manager-approval
+              warning beneath it — matching the reference layout. */}
+          <div className="flex flex-col items-start sm:items-end gap-1.5">
+            {invoiceExists ? (
+              <Button
+                type="button"
+                variant="success"
+                size="md"
+                onClick={handleRewriteInvoiceClick}
+                disabled={invoiceActionBusy || locked}
+                title={
+                  locked
+                    ? 'This order is locked (LAID) and cannot be rewritten.'
+                    : undefined
+                }
+              >
+                {rewritingInvoice ? 'Rewriting…' : 'Rewrite invoice'}
+              </Button>
+            ) : (
+              <Button
+                type="button"
+                variant="success"
+                size="md"
+                onClick={handleCreateInvoiceClick}
+                disabled={invoiceExists === null || invoiceActionBusy}
+              >
+                {invoiceExists === null
+                  ? 'Checking…'
+                  : creatingInvoice
+                    ? 'Creating…'
+                    : 'Create invoice'}
+              </Button>
+            )}
             {financialSummary?.gp_warning && (
               <span className="text-xs font-medium text-red-600">
                 Manager approval required!
@@ -663,7 +969,97 @@ export function DetailsOfSaleTab({
             )}
           </div>
         </div>
+
+        {/* Invoice action errors (precondition reasons / failures) — inline text,
+            no panel, mirroring the sale-price error treatment above. */}
+        {invoiceActionError && (
+          <div className="mt-2 sm:text-right" role="alert">
+            <p className="text-xs font-medium text-red-600">
+              {invoiceActionError}
+            </p>
+            {invoicePreconditions.length > 0 && (
+              <ul className="mt-1 space-y-0.5">
+                {invoicePreconditions.map((failure, idx) => (
+                  <li
+                    key={`${failure.label ?? ''}-${idx}`}
+                    className="text-xs text-red-600 leading-relaxed"
+                  >
+                    {failure.label ? (
+                      <span className="font-medium">{failure.label}: </span>
+                    ) : null}
+                    {failure.message}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
       </div>
+
+      {/* Create / Rewrite confirmation. Rewrite ALWAYS confirms; Create confirms
+          only when the GP warning is active. The GP warning, when active, is shown
+          here so the user explicitly accepts the below-threshold price. FRONTEND
+          confirmation only — it does not change backend behaviour. */}
+      <Modal
+        open={confirmAction !== null}
+        onClose={() => {
+          if (!invoiceActionBusy) setConfirmAction(null)
+        }}
+        labelledBy="invoice-action-confirm-title"
+      >
+        <div className="p-6">
+          <h3
+            id="invoice-action-confirm-title"
+            className="text-lg font-semibold text-slate-900 tracking-tight"
+          >
+            {confirmAction === 'rewrite' ? 'Rewrite invoice?' : 'Create invoice?'}
+          </h3>
+
+          {confirmAction === 'rewrite' && (
+            <p className="mt-2 text-sm text-slate-600 leading-relaxed">
+              Rewriting the invoice will regenerate the current invoice from the
+              latest saved order details and make those changes official.
+            </p>
+          )}
+
+          {/* Customer-safe manager-approval warning. Always plain red text (no
+              yellow background/border, no GP-tier colours, not derived from GP%) —
+              the salesperson may show this screen to the customer. The GP-warning
+              LOGIC is unchanged; only the wording/style here is customer-safe. */}
+          {gpWarning && (
+            <p className="mt-3 text-sm font-semibold text-red-600">
+              Manager approval required before proceeding with this invoice.
+            </p>
+          )}
+
+          <div className="mt-6 flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              size="md"
+              onClick={() => setConfirmAction(null)}
+              disabled={invoiceActionBusy}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="success"
+              size="md"
+              onClick={handleConfirmInvoiceAction}
+              disabled={invoiceActionBusy}
+            >
+              {invoiceActionBusy
+                ? confirmAction === 'rewrite'
+                  ? 'Rewriting…'
+                  : 'Creating…'
+                : confirmAction === 'rewrite'
+                  ? 'Rewrite invoice'
+                  : 'Create invoice'}
+            </Button>
+          </div>
+        </div>
+      </Modal>
 
       {/* Compact GP / financial info — hidden by default, opened by the "i" button. */}
       <Modal
