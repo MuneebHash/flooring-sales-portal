@@ -38,7 +38,7 @@ Concretely, Phase 13 adds:
 - Customer **signature capture** on the Invoice tab (draw on iPad/touchscreen); **accepted customer name** captured alongside.
 - **Accept Invoice** (one endpoint): requires an existing current invoice, a signature, an accepted name, and a valid customer email. Stores `accepted_at`, `accepted_customer_name`, and a signature file reference; regenerates the signed PDF; **auto-emails** the accepted PDF; updates `last_emailed_at`.
 - Accepted invoice is **not directly mutated** afterward (see §4, §7).
-- **Re-send Invoice**: re-emails the current accepted invoice PDF; updates `last_emailed_at`. Shown after the first successful email.
+- **Re-send Invoice**: re-emails the current accepted invoice PDF; updates `last_emailed_at`. Re-send Invoice is shown once the current invoice is **accepted**, including when the initial automatic email failed — it does **not** depend on a prior successful email (an accepted invoice with `last_emailed_at = null` can still be re-sent).
 - **Download PDF** remains available before acceptance (Phase 12 `D.4`). **Manual send before signature/acceptance is not allowed** (there is no pre-acceptance send endpoint).
 - **Payments** remain allowed before and after acceptance (do **not** require acceptance). Each payment still creates a new current invoice version with updated `total_paid` / `balance_due`. If the invoice was accepted, acceptance carries forward and the updated PDF is re-emailed; if not, no email is sent.
 - **Signature image download** for display in the app.
@@ -314,7 +314,7 @@ Summary of acceptance state per transition (on the resulting **current** invoice
 - **On Accept (`D.8`)**, the backend **automatically emails** the accepted invoice PDF to the customer.
 - The customer **email comes from the current order's customer record** (`order_customer.email`).
 - A valid customer email must exist before invoice **creation, rewrite, acceptance, and email send** (§12). The **email-format gate is a fatal precondition** (422 before any state change); the **actual send** on Accept is **non-fatal** (acceptance persists; `last_emailed_at` stays null on failure; Re-send retries).
-- After the first successful email, the frontend shows **Re-send Invoice** (`D.9`), which emails the current accepted PDF again and updates `last_emailed_at`.
+- **Re-send Invoice** (`D.9`) is shown once the current invoice is **accepted**, including when the initial automatic email failed (an accepted invoice with `last_emailed_at = null`). Re-send depends on the invoice being **accepted**, **not** on a prior successful email. It emails the current accepted PDF and, on success, updates `last_emailed_at`.
 - `last_emailed_at` is stored on the invoice and shown on the Invoice screen; `sales_order.last_emailed_at` is a **dashboard mirror that always equals the current invoice's `last_emailed_at`, including `null`** — set to the new current version's value whenever a version is created, and to the send timestamp on a successful email (§11.1).
 - **Manual send before signature/acceptance is not allowed** — there is no pre-acceptance send endpoint. The customer may still **Download PDF** before acceptance (`D.4`).
 - The **email provider is provider-independent** behind the backend (SendGrid / SES / Resend / SMTP — **not** decided here). The contract only requires: a provider-independent endpoint behaviour, a clear `EMAIL_SEND_FAILED` (502) on provider failure (Resend path), and the non-fatal accept-send behaviour above.
