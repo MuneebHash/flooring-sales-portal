@@ -60,7 +60,7 @@ Out of MVP scope or deferred:
 - Refunds, surcharges, finance products, cheque, partial reversals.
 - Stripe / gateway-driven flows (`gateway_transaction_id`, `response_status`, `response_message` remain nullable backend fields for manual MVP payments). Stripe is **Phase 14**.
 - Invoice email / send-to-customer **before signature/acceptance** (not allowed). Automatic emailing of the **accepted** invoice PDF, and Re-send of the current accepted invoice, are **MVP in Phase 13** (Accept / Resend endpoints — see the Phase 13 contract). Advanced email audit history stays post-MVP.
-- Standalone invoice PDF (re)generation endpoints — PDFs are produced only as a side effect of Create Invoice, manual Rewrite Invoice, POST Payment, and (Phase 13) Accept / Resend.
+- Standalone invoice PDF (re)generation endpoints — PDFs are produced only as a side effect of Create Invoice, manual Rewrite Invoice, POST Payment, and (Phase 13) Accept Invoice. **Re-send (D.9) does NOT (re)generate a PDF** — it only re-emails the already-current accepted PDF (no new invoice version).
 - `SIGNATURE` attachment kind in the **general Notes & Photos attachments list** (Chunk 3 still rejects `attachment_kind=SIGNATURE` on the attachment upload endpoint). Phase 13 captures the signature through a **dedicated invoice-acceptance endpoint** that stores it via `stored_file` (reusing the existing storage mechanism) without surfacing it as a general order attachment. A full legal e-sign platform is post-MVP.
 
 ---

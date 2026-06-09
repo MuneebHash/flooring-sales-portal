@@ -952,9 +952,11 @@ paths:
       summary: List order attachments
       operationId: listOrderAttachments
       description: >
-        Returns attachments linked to the order in descending created_at order (newest first).
+        Returns the order's PHOTO attachments in descending created_at order (newest first).
         This read endpoint is allowed when the order status is LAID. The order must
-        belong to the session business and store.
+        belong to the session business and store. Phase 13: the accepted invoice signature is
+        invoice-specific and is NEVER returned here (it is not stored as an order_attachment);
+        retrieve it via GET /orders/{orderId}/invoices/current/signature.
       parameters:
         - $ref: '#/components/parameters/OrderId'
         - $ref: '#/components/parameters/Page'
@@ -1088,7 +1090,11 @@ paths:
       description: >
         Creates the first invoice snapshot for the order (version 1). The request body
         must be an empty JSON object. This endpoint is allowed when the order status is
-        LAID if no invoice exists yet.
+        LAID if no invoice exists yet. Phase 13: requires a valid customer email on the
+        order, validated before the invoice preconditions (else 422 CUSTOMER_EMAIL_REQUIRED
+        when missing or CUSTOMER_EMAIL_INVALID when malformed). The created invoice is
+        unsigned/unaccepted and creating it sends NO email (last_emailed_at null;
+        sales_order.last_emailed_at mirror null).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1127,8 +1133,12 @@ paths:
       operationId: rewriteInvoice
       description: >
         Creates the next official invoice version from current live order state. The
-        request body must be an empty JSON object. Returns 422 when rewrite is blocked
-        (including LAID order lock, missing first invoice, or failed preconditions).
+        request body must be an empty JSON object. Phase 13: requires a valid customer
+        email (else 422 CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID). The new version
+        is UNSIGNED/UNACCEPTED — it clears accepted_at, accepted_customer_name, the
+        signature reference and last_emailed_at (sales_order.last_emailed_at mirror becomes
+        null); the customer must re-accept. Rewrite sends NO email. Returns 422 when rewrite
+        is blocked (including LAID order lock, missing first invoice, or failed preconditions).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
