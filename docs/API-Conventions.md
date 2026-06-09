@@ -137,6 +137,7 @@ File upload and file download endpoints are the only allowed exception to the JS
 | 409  | Conflict | Duplicate resource (e.g., duplicate salesperson_code) |
 | 422  | Unprocessable Entity | Business rule violation (e.g., invoice preconditions not met) |
 | 500  | Internal Server Error | Unexpected server failure |
+| 502  | Bad Gateway | Upstream/provider dependency failed to complete a request (e.g., the email provider could not send an invoice — `EMAIL_SEND_FAILED`, Phase 13). Used only for failures of an external dependency the backend calls on the caller's behalf; an internal bug is still 500. |
 
 ### Important security note on 404
 When a resource exists but belongs to a different business, return 404 not 403.
@@ -505,6 +506,8 @@ An invoice can be created or rewritten only if all of these are true:
 8. Lay date status is present
 9. Final sale price is valid and greater than 0
 
+**Phase 13 — customer email gate (Create, Rewrite, Accept, Resend).** In addition to the 9 preconditions above, a **valid customer email** must be present before Create Invoice, Rewrite Invoice, Accept Invoice, and Resend Invoice (so the accepted invoice can be emailed). This is a backend contract rule, not frontend-only. It is a **separate gate** evaluated before the 9 preconditions and returns its own codes (not bundled into `INVOICE_PRECONDITIONS_NOT_MET`): a missing/blank email → 422 `CUSTOMER_EMAIL_REQUIRED`; a malformed email → 422 `CUSTOMER_EMAIL_INVALID`. Create and Rewrite validate the email as a precondition but still **send no email**. Full Phase 13 contract: `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`.
+
 ### Address requirement
 Both installation address and billing address must exist as separate rows in `order_address`.
 "Billing same as install" is a UI convenience only — when the user selects it, the backend copies the installation address into a billing address row.
@@ -660,6 +663,8 @@ These actions are allowed even when the order is LAID:
 - add payment (and the automatic invoice version that comes with it)
 - add note
 - add attachment
+- accept the current invoice (Phase 13: `POST .../invoices/current/accept`)
+- re-send the current accepted invoice (Phase 13: `POST .../invoices/current/resend`)
 
 Reason: LAID does not require full payment. Final payments may still be collected after job completion. Notes and attachments may still need to be added for record-keeping after the job is done.
 

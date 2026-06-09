@@ -38,17 +38,21 @@
   * frontend notes wiring (PR #53)
   * frontend photos/attachments wiring (PR #54)
   * frontend photo preview modal (PR #56)
+* Phase 12 Chunk 4 — Invoices + Payments complete:
+
+  * backend invoices + payments (create/rewrite current invoice, current invoice PDF download, payment list, record payment)
+  * frontend invoice wiring, payments wiring, and invoice create/rewrite UX polish (through PR #64)
 
 **Current next phase:**
 
-* Phase 12: Chunk 4 — Invoices + Payments
+* Phase 13: Invoice Acceptance + Signature + Email
 
 **Not started:**
 
-* Phase 12 Chunk 4 backend/frontend implementation
-* Stripe
-* Deployment
-* Pilot/hardening
+* Phase 13 invoice acceptance/signature/email backend + frontend implementation
+* Stripe (Phase 14)
+* Deployment (Phase 15)
+* Pilot/hardening (Phase 16)
 
 ---
 
@@ -252,7 +256,7 @@ Implemented:
 
 Tracked deployment follow-up:
 
-* Production must override `app.cors.allowed-origins` with real frontend origin(s) in Phase 14.
+* Production must override `app.cors.allowed-origins` with real frontend origin(s) in Phase 15.
 * Do not rely on localhost origins in production deployment config.
 
 ### Phase 9: Frontend Wire Chunk 1 — ✅ DONE
@@ -794,7 +798,7 @@ Status:
 
 * Done and merged to `main`
 
-### Phase 12: Chunk 4 — Invoices + Payments — ⏭ NEXT
+### Phase 12: Chunk 4 — Invoices + Payments — ✅ DONE
 
 Backend endpoints (MVP — current invoice only):
 
@@ -816,8 +820,8 @@ Frontend wiring:
 
 Deferred to post-MVP (schema kept; no migration; internal `version_number` may still be used):
 
-* invoice history / revision list, invoice detail by id, old-version PDF download
-* signed/accepted invoice revision history, revision dropdown, viewing old signed PDFs
+* invoice history / revision list, invoice detail by id, old-version PDF download (still deferred)
+* viewing/downloading old signed invoice versions (still deferred). Invoice acceptance, signature capture, and emailing the signed PDF are NOT deferred — they move into **Phase 13** (MVP). See `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`.
 
 Known frontend cleanup:
 
@@ -827,7 +831,50 @@ Done when:
 
 * salesperson can create/rewrite the current invoice, record payments, view the current invoice, and download its PDF
 
-### Phase 13: Stripe
+Status:
+
+* Done and merged to `main` (invoices + payments backend, frontend invoice + payment wiring, invoice create/rewrite UX polish through PR #64)
+
+### Phase 13: Invoice Acceptance + Signature + Email — ⏭ NEXT
+
+Contract: `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` (locked spec; this branch is docs/contracts only). Builds on the Phase 12 current-invoice model — no separate invoice-status enum.
+
+Backend endpoints (MVP):
+
+* `POST /orders/{orderId}/invoices/current/accept` — capture customer signature + accepted name, regenerate the signed current invoice PDF, auto-email it to the customer, store `last_emailed_at`
+* `POST /orders/{orderId}/invoices/current/resend` — re-email the current accepted invoice PDF, update `last_emailed_at`
+* `GET /orders/{orderId}/invoices/current/signature` — stream the accepted signature image
+* customer-email precondition added to Create / Rewrite / Accept / Resend (`CUSTOMER_EMAIL_REQUIRED` / `CUSTOMER_EMAIL_INVALID`)
+* payment regeneration carries acceptance/signature forward and re-emails when the invoice was already accepted
+
+Data model (V10 migration — documented only, NOT created on this branch):
+
+* add to `invoice`: `accepted_at`, `accepted_customer_name`, `accepted_signature_file_id`, `last_emailed_at`
+* signature stored via the existing `stored_file` mechanism; not surfaced in the Notes & Photos attachments list
+
+Frontend wiring:
+
+* signature pad on the Invoice tab (draw on iPad/touchscreen) + accepted customer name field
+* Accept Invoice button under the signature (requires a signature first)
+* emailed success state + Re-send Invoice; show `last_emailed_at`
+* Download PDF allowed before acceptance; manual send before acceptance is not allowed
+* customer-email error surfaced at/before invoice creation, not at acceptance time
+
+Dashboard:
+
+* expose `invoice_accepted` boolean alongside the existing `last_emailed_at` (no invoice-status enum)
+
+Still deferred to post-MVP:
+
+* invoice version history / revision dropdown, viewing or downloading old signed invoice versions
+* advanced legal e-sign workflow, advanced email audit trail
+* refunds / reversals, payment edit / delete, Stripe (Phase 14)
+
+Done when:
+
+* salesperson can capture a customer signature, accept the current invoice, auto-email the signed PDF, re-send it, and a post-acceptance payment re-emails an updated signed PDF without requiring re-acceptance
+
+### Phase 14: Stripe
 
 If slipping:
 
@@ -847,7 +894,7 @@ Done when:
 * Stripe test card creates payment + invoice version
 * webhook retry does not duplicate payment/version
 
-### Phase 14: Deployment
+### Phase 15: Deployment
 
 Target:
 
@@ -876,7 +923,7 @@ Done when:
 * full sale flow works
 * DB survives restart
 
-### Phase 15: Pilot / Hardening
+### Phase 16: Pilot / Hardening
 
 Tasks:
 
@@ -918,7 +965,7 @@ These are known and accepted. They do not block the next phase.
 * CORS production origin config (issue #30)
 
   * production must override `app.cors.allowed-origins`
-  * real frontend origin(s) must be configured during Phase 14
+  * real frontend origin(s) must be configured during Phase 15
 * Rate limiting for login
 * Account lockout / brute-force mitigation
 * Audit logging for important business actions

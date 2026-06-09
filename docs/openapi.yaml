@@ -2,7 +2,10 @@ openapi: 3.0.3
 info:
   title: Sales Portal MVP API
   version: 1.0.0
-  description: Generated from locked Phase 4 API conventions and Chunk 1–4 contracts.
+  description: >-
+    Generated from locked Phase 4 API conventions and Chunk 1–4 contracts, plus the Phase 13
+    Invoice Acceptance + Signature + Email addendum
+    (docs/API-Contracts-Phase13-Acceptance-Signature-Email.md).
 
 servers:
   - url: /api/v1/{slug}
@@ -949,9 +952,11 @@ paths:
       summary: List order attachments
       operationId: listOrderAttachments
       description: >
-        Returns attachments linked to the order in descending created_at order (newest first).
+        Returns the order's PHOTO attachments in descending created_at order (newest first).
         This read endpoint is allowed when the order status is LAID. The order must
-        belong to the session business and store.
+        belong to the session business and store. Phase 13: the accepted invoice signature is
+        invoice-specific and is NEVER returned here (it is not stored as an order_attachment);
+        retrieve it via GET /orders/{orderId}/invoices/current/signature.
       parameters:
         - $ref: '#/components/parameters/OrderId'
         - $ref: '#/components/parameters/Page'
@@ -1085,7 +1090,11 @@ paths:
       description: >
         Creates the first invoice snapshot for the order (version 1). The request body
         must be an empty JSON object. This endpoint is allowed when the order status is
-        LAID if no invoice exists yet.
+        LAID if no invoice exists yet. Phase 13: requires a valid customer email on the
+        order, validated before the invoice preconditions (else 422 CUSTOMER_EMAIL_REQUIRED
+        when missing or CUSTOMER_EMAIL_INVALID when malformed). The created invoice is
+        unsigned/unaccepted and creating it sends NO email (last_emailed_at null;
+        sales_order.last_emailed_at mirror null).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1124,8 +1133,12 @@ paths:
       operationId: rewriteInvoice
       description: >
         Creates the next official invoice version from current live order state. The
-        request body must be an empty JSON object. Returns 422 when rewrite is blocked
-        (including LAID order lock, missing first invoice, or failed preconditions).
+        request body must be an empty JSON object. Phase 13: requires a valid customer
+        email (else 422 CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID). The new version
+        is UNSIGNED/UNACCEPTED — it clears accepted_at, accepted_customer_name, the
+        signature reference and last_emailed_at (sales_order.last_emailed_at mirror becomes
+        null); the customer must re-accept. Rewrite sends NO email. Returns 422 when rewrite
+        is blocked (including LAID order lock, missing first invoice, or failed preconditions).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1228,6 +1241,139 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/invoices/current/accept:
+    post:
+      tags:
+        - Invoices
+      summary: Accept current invoice
+      operationId: acceptCurrentInvoice
+      description: >
+        Accepts/signs the current invoice (Phase 13). Captures the customer signature
+        (image/png, max 2 MB) and accepted customer name, appends a new signed current invoice
+        version, regenerates the signed PDF, and automatically emails the accepted PDF to the
+        order customer's email, updating last_emailed_at. Requires a current invoice that is not
+        already accepted and a valid customer email. Allowed when order_status is LAID. If the
+        email send fails the acceptance is still persisted (201) with last_emailed_at null; use
+        Resend to retry.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/SignatureAcceptRequest'
+            encoding:
+              signature:
+                contentType: image/png
+      responses:
+        '201':
+          description: Invoice accepted (and emailed unless the send failed)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/invoices/current/resend:
+    post:
+      tags:
+        - Invoices
+      summary: Resend current accepted invoice
+      operationId: resendCurrentInvoice
+      description: >
+        Re-sends the current accepted invoice PDF to the customer and updates last_emailed_at
+        (Phase 13). The request body must be an empty JSON object. Requires a current invoice
+        that has been accepted and a valid customer email. Does not require a new signature and
+        does not create a new invoice version. Returns 502 when the email provider fails.
+        Allowed when order_status is LAID.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EmptyObjectRequest'
+      responses:
+        '200':
+          description: Invoice re-sent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InvoiceResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '502':
+          $ref: '#/components/responses/BadGateway'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/invoices/current/signature:
+    get:
+      tags:
+        - Invoices
+      summary: Download current invoice accepted signature image
+      operationId: downloadCurrentInvoiceSignature
+      description: >
+        Streams the accepted customer signature image (image/png) for the current invoice
+        (Phase 13). Returns 404 when no invoice exists yet and 422 when the current invoice has
+        not been accepted. Allowed when order_status is LAID. Not an old-version
+        signature-history endpoint.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Accepted signature image streamed
+          headers:
+            Content-Disposition:
+              description: Inline signature filename generated by backend.
+              schema:
+                type: string
+            Content-Length:
+              description: Signature file size in bytes.
+              schema:
+                type: integer
+                format: int64
+                minimum: 0
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
 
   /orders/{orderId}/payments:
     get:
@@ -1272,6 +1418,13 @@ paths:
         creates the next official invoice version carrying forward sale snapshot
         fields from the latest official invoice while updating only total_paid and
         balance_due. This endpoint is allowed when order status is LAID.
+        Phase 13: when the current invoice was already accepted, the new version also
+        carries forward the acceptance/signature metadata and the backend attempts to
+        email the updated signed PDF. That email is best-effort and NON-FATAL: if the
+        email provider fails, the payment and the new invoice version still succeed and
+        this endpoint still returns 201 (never 502) with last_emailed_at null and a
+        message telling the user to use Resend; the payment is never rolled back because
+        of an email failure. When the current invoice was not accepted, no email is sent.
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1282,7 +1435,10 @@ paths:
               $ref: '#/components/schemas/PaymentCreateRequest'
       responses:
         '201':
-          description: Payment recorded
+          description: >
+            Payment recorded and current invoice updated. If the current invoice was accepted,
+            the updated signed PDF is emailed (best-effort); on email failure the response is
+            still 201 with last_emailed_at null and a message indicating Resend should be used.
           content:
             application/json:
               schema:
@@ -2082,6 +2238,11 @@ components:
         - created_by_user_id
         - created_at
         - pdf_download_path
+        - accepted_at
+        - accepted_customer_name
+        - accepted_signature_present
+        - accepted_signature_download_path
+        - last_emailed_at
       properties:
         invoice_id:
           type: integer
@@ -2107,6 +2268,22 @@ components:
           $ref: '#/components/schemas/Timestamp'
         pdf_download_path:
           type: string
+        accepted_at:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+        accepted_customer_name:
+          type: string
+          nullable: true
+        accepted_signature_present:
+          type: boolean
+        accepted_signature_download_path:
+          type: string
+          nullable: true
+        last_emailed_at:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
 
     InvoiceDetail:
       type: object
@@ -2125,6 +2302,11 @@ components:
         - created_by_user_id
         - created_at
         - pdf_download_path
+        - accepted_at
+        - accepted_customer_name
+        - accepted_signature_present
+        - accepted_signature_download_path
+        - last_emailed_at
       properties:
         invoice_id:
           type: integer
@@ -2157,6 +2339,22 @@ components:
           $ref: '#/components/schemas/Timestamp'
         pdf_download_path:
           type: string
+        accepted_at:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+        accepted_customer_name:
+          type: string
+          nullable: true
+        accepted_signature_present:
+          type: boolean
+        accepted_signature_download_path:
+          type: string
+          nullable: true
+        last_emailed_at:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
 
     InvoiceResponse:
       type: object
@@ -2177,6 +2375,25 @@ components:
           $ref: '#/components/schemas/InvoiceResponse'
         message:
           type: string
+
+    SignatureAcceptRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - accepted_customer_name
+        - signature
+      properties:
+        accepted_customer_name:
+          type: string
+          minLength: 1
+          maxLength: 150
+          pattern: '.*\S.*'
+        signature:
+          type: string
+          format: binary
+          description: >
+            Customer signature image. PNG only (image/png), non-empty, max 2 MB
+            (2097152 bytes). Phase 13.
 
 
     PaymentTransactionRead:
@@ -2461,6 +2678,7 @@ components:
         - week_year
         - week_number
         - gp
+        - invoice_accepted
       properties:
         order_id:
           type: integer
@@ -2482,6 +2700,14 @@ components:
           allOf:
             - $ref: '#/components/schemas/DashboardInstallAddress'
         last_emailed_at:
+          description: >
+            Date/time the CURRENT invoice was last emailed to the customer, or null if the current
+            invoice has not been emailed. Sourced from sales_order.last_emailed_at, which in Phase 13
+            is a mirror that ALWAYS equals the current invoice's last_emailed_at (including null): it
+            is set to the new current invoice's value whenever a new version is created (Create /
+            Rewrite / Accept / payment -> null at creation) and to the send timestamp on a successful
+            email (accept / resend / post-acceptance payment). It never retains a previous version's
+            emailed time once a new, unemailed current invoice exists.
           allOf:
             - $ref: '#/components/schemas/Timestamp'
           nullable: true
@@ -2493,6 +2719,11 @@ components:
           allOf:
             - $ref: '#/components/schemas/Money'
           nullable: true
+        invoice_accepted:
+          type: boolean
+          description: >
+            True when the order's current invoice has been accepted (accepted_at set);
+            false when unaccepted or no invoice exists. Phase 13. No invoice-status enum.
 
     DashboardOrdersResponse:
       type: object
@@ -3184,6 +3415,14 @@ components:
             $ref: '#/components/schemas/StandardErrorResponse'
     UnprocessableEntity:
       description: Unprocessable Entity
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardErrorResponse'
+    BadGateway:
+      description: >
+        Bad Gateway. An upstream/provider dependency failed (e.g. the email provider could not
+        send the invoice — error.code EMAIL_SEND_FAILED). Phase 13.
       content:
         application/json:
           schema:
