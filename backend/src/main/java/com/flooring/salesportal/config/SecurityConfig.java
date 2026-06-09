@@ -48,6 +48,11 @@ public class SecurityConfig {
         config.setAllowedMethods(List.of("GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"));
         config.setAllowedHeaders(List.of("*"));
         config.setAllowCredentials(true);
+        // Expose Content-Disposition so cross-origin frontend JS can read the invoice PDF (D.4)
+        // filename the backend streams; without this the browser hides the header and the client
+        // falls back to a locally-built name. allowedHeaders("*") governs REQUEST headers only and
+        // does not cover this.
+        config.setExposedHeaders(List.of("Content-Disposition"));
 
         UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
         source.registerCorsConfiguration("/api/v1/**", config);

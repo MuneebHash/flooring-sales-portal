@@ -83,16 +83,79 @@ export function rewriteInvoice(
   )
 }
 
+// Result of a current-invoice PDF download: the raw bytes plus the server-provided file name parsed
+// from the D.4 Content-Disposition header. fileName is null when the header is absent or unreadable
+// (e.g. a cross-origin response that does not expose Content-Disposition), so the caller can fall
+// back to a client-side name.
+export type InvoicePdfDownload = {
+  blob: Blob
+  fileName: string | null
+}
+
+// Reduce a candidate file name to a safe basename: strip any path segments, control characters and
+// surrounding quotes/whitespace. Returns null when nothing usable remains.
+function sanitizeFileName(name: string): string | null {
+  const base = name.split(/[\\/]/).pop() ?? ''
+  // Drop control characters (codepoint < 0x20 or DEL 0x7f) via codepoint filtering — no control
+  // bytes embedded in a regex — then strip surrounding quotes/whitespace.
+  let printable = ''
+  for (const ch of base) {
+    const code = ch.codePointAt(0) ?? 0
+    if (code >= 0x20 && code !== 0x7f) printable += ch
+  }
+  const cleaned = printable.replace(/^["']+|["']+$/g, '').trim()
+  return cleaned.length > 0 ? cleaned : null
+}
+
+// Parse the file name out of a Content-Disposition header, preferring the RFC 5987 extended form
+// (filename*=UTF-8''…, which is what the backend actually emits) and falling back to the quoted and
+// bare filename= forms. Returns null when no valid name is present so the caller can use a
+// client-side fallback. Never throws.
+function parseContentDispositionFilename(header: string | null): string | null {
+  if (!header) return null
+  // RFC 5987 extended: filename*=<charset>'<lang>'<percent-encoded-value>
+  const extMatch = /filename\*\s*=\s*[^']*''([^;]+)/i.exec(header)
+  if (extMatch) {
+    let value = extMatch[1].trim()
+    try {
+      value = decodeURIComponent(value)
+    } catch {
+      // Malformed percent-encoding — keep the raw value and sanitize it.
+    }
+    const cleaned = sanitizeFileName(value)
+    if (cleaned) return cleaned
+  }
+  // Quoted: filename="…"
+  const quotedMatch = /filename\s*=\s*"([^"]*)"/i.exec(header)
+  if (quotedMatch) {
+    const cleaned = sanitizeFileName(quotedMatch[1])
+    if (cleaned) return cleaned
+  }
+  // Bare: filename=… (up to the next ';' or end of header)
+  const bareMatch = /filename\s*=\s*([^;]+)/i.exec(header)
+  if (bareMatch) {
+    const cleaned = sanitizeFileName(bareMatch[1])
+    if (cleaned) return cleaned
+  }
+  return null
+}
+
 // GET /api/v1/{slug}/orders/{orderId}/invoices/current/file — fetch the current invoice PDF as raw
-// bytes. This canNOT use request<T>: the file endpoint returns RAW BINARY (application/pdf) while
-// request<T>/parseBody always JSON-parses the body. It is also session-protected, so a bare href
-// would not carry the session cookie — hence a credentialed fetch -> Blob (-> one-shot object URL
-// in the component). Mirrors orderAttachmentsApi.fetchAttachmentBlob. The fixed /current/file path
-// is assembled here so the download always targets the CURRENT invoice (pdf_download_path is
-// neither relied on nor exposed). On a non-2xx response the body is the standard JSON error
+// bytes PLUS the server file name from Content-Disposition. This canNOT use request<T>: the file
+// endpoint returns RAW BINARY (application/pdf) while request<T>/parseBody always JSON-parses the
+// body. It is also session-protected, so a bare href would not carry the session cookie — hence a
+// credentialed fetch -> Blob (-> one-shot object URL in the component). Mirrors
+// orderAttachmentsApi.fetchAttachmentBlob. The fixed /current/file path is assembled here so the
+// download always targets the CURRENT invoice (pdf_download_path is neither relied on nor exposed).
+// The returned fileName is the authoritative name the backend just streamed for the CURRENT invoice,
+// so it stays correct even if the invoice changed since the tab's last read; it is null when the
+// header is missing/unreadable (e.g. cross-origin without Access-Control-Expose-Headers) and the
+// caller falls back to a client-side name. On a non-2xx response the body is the standard JSON error
 // envelope (e.g. 404 INVOICE_NOT_FOUND), so parse it to preserve the backend code/message. Allowed
 // on LAID orders.
-export async function fetchCurrentInvoicePdf(orderId: number): Promise<Blob> {
+export async function fetchCurrentInvoicePdf(
+  orderId: number,
+): Promise<InvoicePdfDownload> {
   const base = API_BASE_URL.replace(/\/+$/, '')
   const path = apiPath(
     DEFAULT_BUSINESS_SLUG,
@@ -138,5 +201,9 @@ export async function fetchCurrentInvoicePdf(orderId: number): Promise<Blob> {
     throw new ApiError({ status: response.status, code, message })
   }
 
-  return response.blob()
+  const fileName = parseContentDispositionFilename(
+    response.headers.get('Content-Disposition'),
+  )
+  const blob = await response.blob()
+  return { blob, fileName }
 }

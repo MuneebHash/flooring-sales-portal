@@ -73,4 +73,8 @@ export {
   rewriteInvoice,
   fetchCurrentInvoicePdf,
 } from './orderInvoicesApi'
-export type { InvoiceDetail, InvoiceResponse } from './orderInvoicesApi'
+export type {
+  InvoiceDetail,
+  InvoicePdfDownload,
+  InvoiceResponse,
+} from './orderInvoicesApi'

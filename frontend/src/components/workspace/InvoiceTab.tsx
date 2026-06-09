@@ -294,13 +294,17 @@ export function InvoiceTab({
     setDownloading(true)
     setActionError(null)
     try {
-      const blob = await fetchCurrentInvoicePdf(orderId)
+      const { blob, fileName } = await fetchCurrentInvoicePdf(orderId)
       if (!mountedRef.current) return
-      // One-shot object URL: create, trigger the download, revoke immediately.
+      // One-shot object URL: create, trigger the download, revoke immediately. Prefer the server
+      // file name from the D.4 Content-Disposition (authoritative for the CURRENT invoice the
+      // backend just streamed, so it stays correct even if the invoice changed since the last
+      // read); fall back to the client-side name only when the header is absent/unreadable.
       const url = URL.createObjectURL(blob)
       const anchor = document.createElement('a')
       anchor.href = url
-      anchor.download = pdfFileName(orderNumber, current.version_number)
+      anchor.download =
+        fileName ?? pdfFileName(orderNumber, current.version_number)
       document.body.appendChild(anchor)
       anchor.click()
       anchor.remove()
