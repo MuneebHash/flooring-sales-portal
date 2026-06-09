@@ -394,7 +394,7 @@ function WorkspaceShell({
             {activeTab === 'notes' && (
               <NotesPhotosTab orderId={orderId} locked={locked} />
             )}
-            {activeTab === 'payments' && <PaymentsTab />}
+            {activeTab === 'payments' && <PaymentsTab orderId={orderId} />}
             {activeTab === 'invoice' && (
               <InvoiceTab
                 orderId={orderId}

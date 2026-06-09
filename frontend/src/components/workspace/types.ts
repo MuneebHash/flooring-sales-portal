@@ -1,31 +1,12 @@
-// Workspace tab UI types that are NOT yet backed by an endpoint. Payments are
-// wired in a later chunk; these shapes describe the local/prototype data the
-// Payments tab renders until then. The Chunk 2 contract types (customer,
-// address, details, header, financials) live in src/lib/api/orderWorkspaceApi.ts;
-// the wired notes contract type (OrderNote) lives in src/lib/api/orderNotesApi.ts
-// (Phase 11 Chunk 3, B9); the wired attachment contract type (OrderAttachment)
-// lives in src/lib/api/orderAttachmentsApi.ts (Phase 11 Chunk 3, B10); the wired
-// invoice contract type (InvoiceDetail) lives in src/lib/api/orderInvoicesApi.ts
-// (Phase 12 Chunk 4).
-
-export type PaymentMethod =
-  | 'CASH'
-  | 'CREDIT_CARD'
-  | 'EFTPOS'
-  | 'BANK_TRANSFER'
-
-export type OrderPayment = {
-  payment_transaction_id: number
-  payment_method: PaymentMethod
-  amount: number
-  payment_reference: string | null
-  created_at: string
-}
-
-export type PaymentSummary = {
-  total_paid: number
-  balance_due: number | null
-}
+// Workspace tab UI types that are NOT yet backed by an endpoint. The Chunk 2
+// contract types (customer, address, details, header, financials) live in
+// src/lib/api/orderWorkspaceApi.ts; the wired notes contract type (OrderNote)
+// lives in src/lib/api/orderNotesApi.ts (Phase 11 Chunk 3, B9); the wired
+// attachment contract type (OrderAttachment) lives in
+// src/lib/api/orderAttachmentsApi.ts (Phase 11 Chunk 3, B10); the wired invoice
+// contract type (InvoiceDetail) lives in src/lib/api/orderInvoicesApi.ts and the
+// wired payment contract types (PaymentMethod, PaymentTransaction, PaymentSummary,
+// …) live in src/lib/api/orderPaymentsApi.ts (Phase 12 Chunk 4).
 
 export type PricingUnit = 'LM' | 'SQM'
 

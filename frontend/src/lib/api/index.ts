@@ -78,3 +78,13 @@ export type {
   InvoicePdfDownload,
   InvoiceResponse,
 } from './orderInvoicesApi'
+export { fetchOrderPayments, recordOrderPayment } from './orderPaymentsApi'
+export type {
+  PaymentMethod,
+  PaymentTransaction,
+  PaymentSummary,
+  PaymentsListResponse,
+  RecordPaymentRequest,
+  PaymentCurrentInvoiceSummary,
+  RecordPaymentResponse,
+} from './orderPaymentsApi'
