@@ -246,7 +246,7 @@ Errors use the standard JSON error wrapper (conventions §3).
 
 - **`D.1` POST `…/invoices` (Create).** Now requires a valid customer email (§12) — evaluated **before** the 9 invoice preconditions; failure → 422 `CUSTOMER_EMAIL_REQUIRED` / `CUSTOMER_EMAIL_INVALID`. Still creates an **unsigned/unaccepted** invoice (`accepted_at` null). **No email is sent on Create.** Response `invoice_detail` now carries the five acceptance/email fields (all null/false).
 - **`D.2` POST `…/invoices/rewrite` (Rewrite).** Now requires a valid customer email (§12). See §7 for the full rewrite-after-acceptance behaviour. Rewrite remains **blocked when LAID** → 422 `ORDER_LOCKED`.
-- **`D.7` POST `…/payments` (Record payment).** See §6. A payment never requires acceptance; if the current invoice was accepted, acceptance carries forward and the updated PDF is re-emailed.
+- **`D.7` POST `…/payments` (Record payment).** See §6. A payment never requires acceptance; if the current invoice was accepted, acceptance carries forward and the updated signed PDF is re-emailed. That email is **best-effort and non-fatal**: an email-provider failure does **not** roll back the payment or the new invoice version and does **not** make `D.7` return `502` — the payment still succeeds (`201`), `last_emailed_at` stays null, and the message tells the user to Re-send (`D.9`).
 - **`D.3` GET `…/invoices/current`**, **`D.4` GET `…/invoices/current/file`** — unchanged behaviour; `D.3`'s `invoice_detail` now carries the five new fields. `D.4` continues to stream the current PDF (which is the **signed** PDF once accepted).
 
 ---
@@ -257,15 +257,20 @@ Payments are independent of acceptance:
 - A payment is **allowed before and after** acceptance. **Recording a payment does not require the invoice to be accepted.**
 - Every payment still **appends a new current invoice version** with updated `total_paid` / `balance_due` (Chunk 4 F.4), carrying the sale snapshot forward. Overpayment stays blocked (422 `PAYMENT_EXCEEDS_BALANCE`); **no refunds/credits** are introduced.
 - **If the current invoice was accepted** when the payment is recorded:
+  - the payment is recorded and a **new current invoice version is created**;
   - the new version **carries forward** the acceptance/signature metadata (`accepted_at`, `accepted_customer_name`, `accepted_signature_file_id`) — the customer does **not** re-accept;
   - the regenerated PDF embeds the carried-forward signature;
-  - the updated signed PDF is **automatically emailed** to the customer; `last_emailed_at` is set on the new version (and mirrored to `sales_order`).
+  - the backend then **attempts to email** the updated signed PDF to the customer. **The email send is best-effort and does NOT gate the payment** (same model as Accept, §5.1):
+    - **email succeeds** → `last_emailed_at` is set on the new current invoice and mirrored to `sales_order.last_emailed_at` (dashboard); response message: `"Payment recorded. Current invoice updated and emailed to the customer."`
+    - **email fails** → the **payment still succeeds**, the **new current invoice version still succeeds**, the **acceptance/signature metadata still carries forward**, but `last_emailed_at` **remains null** on the new current invoice. The endpoint **still returns its success status (`201`), not `502`**, and the message tells the user the payment was recorded but the updated invoice email could not be sent — use **Re-send** (`D.9`): `"Payment recorded. Current invoice updated, but the invoice could not be emailed — use Re-send Invoice to try again."` The backend **must not roll back the payment (or the new invoice version) because the email failed.**
 - **If the current invoice was not accepted** when the payment is recorded:
   - the payment is still allowed and a new version is created;
   - the new version stays **unaccepted** (`accepted_at` null);
-  - **no email is sent** until the customer later accepts the invoice.
+  - **no email is sent** (and no email is attempted) until the customer later accepts the invoice.
 
 This preserves both invariants: **(1)** payments do not require acceptance, and **(2)** invoices are not emailed before signature/acceptance except via the accepted/signed flows.
+
+**Email-failure model is consistent across endpoints.** A payment-after-accepted email failure is **non-fatal** (payment + invoice version persist; `last_emailed_at` null; `201`; Re-send to retry) — exactly like **Accept** (§5.1, §9), where acceptance persists even if the email fails. `EMAIL_SEND_FAILED` / **502** is reserved for an **explicit Re-send** (`D.9`) failure, where emailing is the *whole* operation; **`D.7` never returns `502`** for an email failure.
 
 Payment edit/delete remain **not allowed**.
 
@@ -355,7 +360,7 @@ Error envelope is unchanged (conventions §3): `{ "error": { "code", "message", 
 | `SIGNATURE_INVALID` | 400 | "Signature must be a PNG image no larger than 2 MB." | `D.8` |
 | `INVOICE_ALREADY_ACCEPTED` | 409 | "This invoice has already been accepted. Use Re-send to email it again." | `D.8` |
 | `INVOICE_NOT_ACCEPTED` | 422 | "This invoice has not been accepted yet." | `D.9`, `D.10` |
-| `EMAIL_SEND_FAILED` | 502 | "The invoice could not be emailed. Please try again." | `D.9` (and the non-fatal accept-send path surfaces the same condition via `last_emailed_at = null` + message, **without** raising this error) |
+| `EMAIL_SEND_FAILED` | 502 | "The invoice could not be emailed. Please try again." | **`D.9` only.** The non-fatal accept-send (`D.8`) and payment-after-accepted (`D.7`) paths surface an email failure via `last_emailed_at = null` + a success message, **without** raising this error and **without** returning 502. |
 
 **Reused** existing codes (do **not** rename or duplicate):
 
@@ -381,7 +386,7 @@ Clarifications:
 
 - **Migration `V10` only.** Not created on this branch. Adds the four nullable `invoice` columns (§4); `accepted_signature_file_id` is a **non-unique** FK → `stored_file`. No enum change is needed (`attachment_kind = 'SIGNATURE'` already exists and stays unused by this flow).
 - **Append-only preserved.** Accept and payment **append** new invoice versions; only `last_emailed_at` is updated in place (Resend, and the post-commit email-success stamp on Accept/Payment). Carry-forward on Accept/Payment must copy the acceptance fields; Rewrite must **null** them. Update `OrderPaymentService.regenerateInvoiceVersion` (and the equivalent acceptance path) to copy `accepted_*` forward.
-- **Transaction boundaries.** Persist acceptance + signed PDF **in one transaction** (file-write-first + `TransactionSynchronization` rollback-cleanup, mirroring the existing attachment/invoice write pattern). The **email send happens after commit**; an email failure must **not** roll back acceptance. Set `last_emailed_at` in a short follow-up update on send success.
+- **Transaction boundaries.** Persist acceptance + signed PDF **in one transaction** (file-write-first + `TransactionSynchronization` rollback-cleanup, mirroring the existing attachment/invoice write pattern). The **email send happens after commit**; an email failure must **not** roll back acceptance. Set `last_emailed_at` in a short follow-up update on send success. The **same post-commit, non-fatal pattern applies to the payment-after-accepted email** (`D.7`, §6): the payment + new invoice version commit first, then the email is attempted; a send failure leaves `last_emailed_at` null and does **not** roll back the payment or return 502.
 - **Signature ingestion is invoice-specific.** Reuse `FileStorageService.store(...)` + a `stored_file` row; **do not** create an `order_attachment` row, so the signature never appears in the Notes & Photos list. Validate `image/png` + 2 MB before persisting.
 - **Signed PDF reuse.** `D.4` streams whatever the current invoice's `stored_file` is — once accepted, that's the signed PDF. No separate "signed PDF" endpoint is needed.
 - **Dashboard accuracy.** The dashboard reads `sales_order.last_emailed_at`; remember to mirror the email timestamp there on every successful invoice send, and to add `invoice_accepted` (derived from the current invoice's `accepted_at`). This touches the Chunk 1 dashboard query/DTO at implementation time (documented here + in `openapi.yaml`; Chunk 1 prose to be updated in the implementation PR).

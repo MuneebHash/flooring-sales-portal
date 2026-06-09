@@ -1405,6 +1405,13 @@ paths:
         creates the next official invoice version carrying forward sale snapshot
         fields from the latest official invoice while updating only total_paid and
         balance_due. This endpoint is allowed when order status is LAID.
+        Phase 13: when the current invoice was already accepted, the new version also
+        carries forward the acceptance/signature metadata and the backend attempts to
+        email the updated signed PDF. That email is best-effort and NON-FATAL: if the
+        email provider fails, the payment and the new invoice version still succeed and
+        this endpoint still returns 201 (never 502) with last_emailed_at null and a
+        message telling the user to use Resend; the payment is never rolled back because
+        of an email failure. When the current invoice was not accepted, no email is sent.
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1415,7 +1422,10 @@ paths:
               $ref: '#/components/schemas/PaymentCreateRequest'
       responses:
         '201':
-          description: Payment recorded
+          description: >
+            Payment recorded and current invoice updated. If the current invoice was accepted,
+            the updated signed PDF is emailed (best-effort); on email failure the response is
+            still 201 with last_emailed_at null and a message indicating Resend should be used.
           content:
             application/json:
               schema:
