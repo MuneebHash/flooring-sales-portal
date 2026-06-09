@@ -2691,9 +2691,13 @@ components:
             - $ref: '#/components/schemas/DashboardInstallAddress'
         last_emailed_at:
           description: >
-            Last date/time the order's invoice was emailed to the customer, or null if never
-            emailed. Sourced from sales_order.last_emailed_at; in Phase 13 this is stamped on
-            each successful invoice email (accept / resend / post-acceptance payment).
+            Date/time the CURRENT invoice was last emailed to the customer, or null if the current
+            invoice has not been emailed. Sourced from sales_order.last_emailed_at, which in Phase 13
+            is a mirror that ALWAYS equals the current invoice's last_emailed_at (including null): it
+            is set to the new current invoice's value whenever a new version is created (Create /
+            Rewrite / Accept / payment -> null at creation) and to the send timestamp on a successful
+            email (accept / resend / post-acceptance payment). It never retains a previous version's
+            emailed time once a new, unemailed current invoice exists.
           allOf:
             - $ref: '#/components/schemas/Timestamp'
           nullable: true
