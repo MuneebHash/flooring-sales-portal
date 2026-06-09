@@ -397,6 +397,8 @@ function WorkspaceShell({
             {activeTab === 'payments' && <PaymentsTab />}
             {activeTab === 'invoice' && (
               <InvoiceTab
+                orderId={orderId}
+                locked={locked}
                 orderNumber={orderNumber}
                 customer={customer}
                 billingAddress={billingAddress}
