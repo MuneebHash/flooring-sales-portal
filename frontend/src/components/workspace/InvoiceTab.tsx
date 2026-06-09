@@ -2,10 +2,8 @@ import { useEffect, useRef, useState } from 'react'
 import { Button } from '../ui/Button'
 import { ApiError } from '../../lib/api/ApiError'
 import {
-  createInvoice,
   fetchCurrentInvoice,
   fetchCurrentInvoicePdf,
-  rewriteInvoice,
   type InvoiceDetail,
 } from '../../lib/api/orderInvoicesApi'
 import type {
@@ -16,9 +14,7 @@ import type {
 
 type Props = {
   orderId: number
-  // LAID lock: gates the Rewrite action ONLY. Create / read / PDF download stay
-  // allowed on a locked order (matches the backend LAID split).
-  locked: boolean
+  // View/download only. Create + Rewrite live in the Details of Sale tab now.
   orderNumber?: string
   customer?: OrderCustomer | null
   billingAddress?: OrderAddress | null
@@ -64,38 +60,6 @@ function composeAddressLines(
     .filter(Boolean)
     .join(' ')
   return [line1, line2].filter((line) => line.length > 0)
-}
-
-// INVOICE_PRECONDITIONS_NOT_MET carries a details[] of backend ErrorDetail
-// ({ section?, field?, message }). Parse defensively (also tolerating plain
-// strings) so the UI can list the specific reasons the order is not yet
-// invoice-ready.
-type PreconditionFailure = {
-  label: string | null
-  message: string
-}
-
-function parsePreconditionFailures(details: unknown): PreconditionFailure[] {
-  if (!Array.isArray(details)) return []
-  const out: PreconditionFailure[] = []
-  for (const item of details) {
-    if (typeof item === 'string') {
-      if (item.length > 0) out.push({ label: null, message: item })
-      continue
-    }
-    if (item && typeof item === 'object') {
-      const rec = item as {
-        section?: unknown
-        field?: unknown
-        message?: unknown
-      }
-      const message = typeof rec.message === 'string' ? rec.message : ''
-      const field = typeof rec.field === 'string' ? rec.field : null
-      const section = typeof rec.section === 'string' ? rec.section : null
-      if (message.length > 0) out.push({ label: field ?? section, message })
-    }
-  }
-  return out
 }
 
 // Download filename mirrors the backend Content-Disposition pattern
@@ -151,7 +115,6 @@ function SignatureScribble() {
 
 export function InvoiceTab({
   orderId,
-  locked,
   orderNumber,
   customer,
   billingAddress,
@@ -162,11 +125,6 @@ export function InvoiceTab({
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
-  const [preconditionFailures, setPreconditionFailures] = useState<
-    PreconditionFailure[]
-  >([])
-  const [creating, setCreating] = useState(false)
-  const [rewriting, setRewriting] = useState(false)
   const [downloading, setDownloading] = useState(false)
   const [reloadToken, setReloadToken] = useState(0)
 
@@ -189,7 +147,6 @@ export function InvoiceTab({
     setLoading(true)
     setLoadError(null)
     setActionError(null)
-    setPreconditionFailures([])
     setInvoice(null)
     fetchCurrentInvoice(orderId)
       .then((res) => {
@@ -221,73 +178,6 @@ export function InvoiceTab({
     setReloadToken((token) => token + 1)
   }
 
-  function applyActionError(err: unknown, fallback: string) {
-    if (err instanceof ApiError && err.code === 'INVOICE_PRECONDITIONS_NOT_MET') {
-      setPreconditionFailures(parsePreconditionFailures(err.details))
-      setActionError(
-        err.message.length > 0
-          ? err.message
-          : 'This order is not ready to be invoiced.',
-      )
-      return
-    }
-    setActionError(
-      err instanceof ApiError && err.message.length > 0 ? err.message : fallback,
-    )
-  }
-
-  async function handleCreate() {
-    if (creating) return
-    setCreating(true)
-    setActionError(null)
-    setPreconditionFailures([])
-    try {
-      const res = await createInvoice(orderId)
-      if (!mountedRef.current) return
-      setInvoice(res.data.invoice)
-    } catch (err) {
-      if (!mountedRef.current) return
-      // An invoice already exists (state drifted) — refetch the current one.
-      if (err instanceof ApiError && err.code === 'INVOICE_ALREADY_EXISTS') {
-        refetch()
-        return
-      }
-      applyActionError(err, 'Could not create the invoice. Please try again.')
-    } finally {
-      if (mountedRef.current) setCreating(false)
-    }
-  }
-
-  async function handleRewrite() {
-    // Rewrite is blocked when LAID — the backend is the authority (422
-    // ORDER_LOCKED), this just disables the path early.
-    if (rewriting || locked) return
-    setRewriting(true)
-    setActionError(null)
-    setPreconditionFailures([])
-    try {
-      const res = await rewriteInvoice(orderId)
-      if (!mountedRef.current) return
-      setInvoice(res.data.invoice)
-    } catch (err) {
-      if (!mountedRef.current) return
-      // No invoice to rewrite (state drifted) — refetch.
-      if (err instanceof ApiError && err.code === 'INVOICE_REQUIRED') {
-        refetch()
-        return
-      }
-      if (err instanceof ApiError && err.code === 'ORDER_LOCKED') {
-        setActionError(
-          'This order is locked (LAID). The invoice cannot be rewritten.',
-        )
-        return
-      }
-      applyActionError(err, 'Could not rewrite the invoice. Please try again.')
-    } finally {
-      if (mountedRef.current) setRewriting(false)
-    }
-  }
-
   async function handleDownload() {
     if (downloading || invoice === null) return
     const current = invoice
@@ -317,9 +207,10 @@ export function InvoiceTab({
         refetch()
         return
       }
-      applyActionError(
-        err,
-        'Could not download the invoice PDF. Please try again.',
+      setActionError(
+        err instanceof ApiError && err.message.length > 0
+          ? err.message
+          : 'Could not download the invoice PDF. Please try again.',
       )
     } finally {
       if (mountedRef.current) setDownloading(false)
@@ -344,45 +235,17 @@ export function InvoiceTab({
             View the current invoice for this order.
           </p>
         </div>
-        {!loading && loadError === null && (
+        {!loading && loadError === null && invoice !== null && (
           <div className="flex items-center gap-2 shrink-0">
-            {invoice === null ? (
-              <Button
-                type="button"
-                variant="success"
-                size="md"
-                onClick={handleCreate}
-                disabled={creating}
-              >
-                {creating ? 'Creating…' : 'Create invoice'}
-              </Button>
-            ) : (
-              <>
-                <Button
-                  type="button"
-                  variant="secondary"
-                  size="md"
-                  onClick={handleDownload}
-                  disabled={downloading}
-                >
-                  {downloading ? 'Preparing…' : 'Download PDF'}
-                </Button>
-                <Button
-                  type="button"
-                  variant="success"
-                  size="md"
-                  onClick={handleRewrite}
-                  disabled={locked || rewriting}
-                  title={
-                    locked
-                      ? 'This order is locked (LAID) and cannot be rewritten.'
-                      : undefined
-                  }
-                >
-                  {rewriting ? 'Rewriting…' : 'Rewrite invoice'}
-                </Button>
-              </>
-            )}
+            <Button
+              type="button"
+              variant="secondary"
+              size="md"
+              onClick={handleDownload}
+              disabled={downloading}
+            >
+              {downloading ? 'Preparing…' : 'Download PDF'}
+            </Button>
           </div>
         )}
       </div>
@@ -390,21 +253,6 @@ export function InvoiceTab({
       {actionError !== null && (
         <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
           <p className="text-sm font-medium text-rose-700">{actionError}</p>
-          {preconditionFailures.length > 0 && (
-            <ul className="mt-2 space-y-1">
-              {preconditionFailures.map((failure, idx) => (
-                <li
-                  key={`${failure.label ?? ''}-${idx}`}
-                  className="text-xs text-rose-700 leading-relaxed"
-                >
-                  {failure.label ? (
-                    <span className="font-medium">{failure.label}: </span>
-                  ) : null}
-                  {failure.message}
-                </li>
-              ))}
-            </ul>
-          )}
         </div>
       )}
 
@@ -593,7 +441,8 @@ export function InvoiceTab({
             No invoice has been created yet.
           </p>
           <p className="mt-1 text-sm text-slate-500">
-            Use “Create invoice” to generate the current invoice for this order.
+            Create the invoice from the Details of Sale tab to view and download
+            it here.
           </p>
         </div>
       )}

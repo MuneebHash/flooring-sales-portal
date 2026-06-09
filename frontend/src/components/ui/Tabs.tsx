@@ -13,7 +13,11 @@ export function Tabs<T extends string>({ tabs, active, onChange }: Props<T>) {
   return (
     <div
       role="tablist"
-      className="flex items-center gap-1 border-b border-slate-200 px-3 overflow-x-auto"
+      // overflow-x-auto keeps the tabs horizontally scrollable on small screens.
+      // overflow-y-hidden is required because setting overflow-x to auto promotes
+      // overflow-y from visible to auto (CSS spec), which otherwise shows a spurious
+      // vertical scrollbar from the tabs' -mb-px / border-b-2 sub-pixel overflow.
+      className="flex items-center gap-1 border-b border-slate-200 px-3 overflow-x-auto overflow-y-hidden"
     >
       {tabs.map((tab) => {
         const isActive = tab.id === active

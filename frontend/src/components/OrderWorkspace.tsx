@@ -179,11 +179,24 @@ function WorkspaceShell({
   const [detailsDraft, setDetailsDraft] = useState(() =>
     formFromProps(saleDetails),
   )
+  // Mirror the latest draft into a ref so flushDetailsAutosave re-checks persistence
+  // against the FRESHEST draft rather than a click-time closure value. Without this,
+  // a re-edit during the in-flight flush could make the flush report a spurious
+  // "could not save" and block a valid Create/Rewrite (a benign false negative — the
+  // snapshot is never stale; this just avoids the needless re-click). Written during
+  // render (cache-latest pattern); only read in async handlers, never for rendering.
+  const detailsDraftRef = useRef(detailsDraft)
+  detailsDraftRef.current = detailsDraft
   const detailsSavingRef = useRef(false)
   const pendingDetailsBodyRef = useRef<DetailsOfSaleSaveRequest | null>(null)
   const lastSavedDetailsRef = useRef<string>(
     JSON.stringify(buildDetailsBody(formFromProps(saleDetails))),
   )
+  // Tracks the in-flight autosave drain as an awaitable promise so a Create/Rewrite
+  // invoice action can flush pending Details of Sale saves before the backend
+  // snapshots them (Codex P1). null when no chain is active; resolves only once the
+  // WHOLE queue (the in-flight body + any collapsed pending bodies) has drained.
+  const detailsSaveChainRef = useRef<Promise<void> | null>(null)
   const [detailsAutosaveSaving, setDetailsAutosaveSaving] = useState(false)
   const [detailsAutosaveSaved, setDetailsAutosaveSaved] = useState(false)
   const [detailsAutosaveError, setDetailsAutosaveError] = useState<string | null>(
@@ -205,7 +218,10 @@ function WorkspaceShell({
 
   // Single-flight save loop (mirrors the sale-price drain). Sends exactly one PUT;
   // on settle, drains the latest queued body only if it differs from what is now
-  // persisted. lastSavedDetailsRef is set ONLY after a successful response.
+  // persisted. lastSavedDetailsRef is set ONLY after a successful response. The
+  // recursive drain is AWAITED (not fire-and-forget), so the chain promise tracked
+  // in detailsSaveChainRef resolves only once the whole queue has drained — that is
+  // exactly what flushDetailsAutosave awaits (Codex P1).
   async function runDetailsSave(body: DetailsOfSaleSaveRequest) {
     detailsSavingRef.current = true
     if (detailsShellMountedRef.current) {
@@ -237,11 +253,26 @@ function WorkspaceShell({
         pending !== null &&
         JSON.stringify(pending) !== lastSavedDetailsRef.current
       ) {
-        void runDetailsSave(pending)
+        // AWAIT the drain so this chain's promise spans the full queue.
+        await runDetailsSave(pending)
       } else if (detailsShellMountedRef.current) {
         setDetailsAutosaveSaving(false)
       }
     }
+  }
+
+  // Starts a save chain and records its promise so flushDetailsAutosave can await
+  // the full drain. The ref is cleared when THIS chain settles (only if it is still
+  // the current one). runDetailsSave never rejects (it catches its own error), so
+  // the chain promise always resolves.
+  function startDetailsSaveChain(body: DetailsOfSaleSaveRequest) {
+    const chain = runDetailsSave(body)
+    detailsSaveChainRef.current = chain
+    void chain.finally(() => {
+      if (detailsSaveChainRef.current === chain) {
+        detailsSaveChainRef.current = null
+      }
+    })
   }
 
   // Parent-level autosave entry point passed to DetailsOfSaleTab. The tab still
@@ -255,7 +286,32 @@ function WorkspaceShell({
     }
     // Nothing changed since the last persisted save — skip the network call.
     if (JSON.stringify(body) === lastSavedDetailsRef.current) return
-    void runDetailsSave(body)
+    startDetailsSaveChain(body)
+  }
+
+  // Awaitable flush of any pending/in-flight Details autosave, used by
+  // DetailsOfSaleTab BEFORE Create / Rewrite so the official invoice never snapshots
+  // stale Details of Sale data (Codex P1). Force-commits the latest draft if it
+  // differs from the last persisted save (covers a click landing before the field's
+  // blur autosave settles), then awaits the active save chain (which internally
+  // drains all queued bodies). Returns true iff the latest draft is persisted
+  // afterwards — a failed save leaves lastSavedDetailsRef unchanged, so this returns
+  // false and the caller blocks the invoice action.
+  async function flushDetailsAutosave(): Promise<boolean> {
+    const startBody = buildDetailsBody(detailsDraftRef.current)
+    if (JSON.stringify(startBody) !== lastSavedDetailsRef.current) {
+      queueDetailsAutosave(startBody)
+    }
+    const chain = detailsSaveChainRef.current
+    if (chain) {
+      await chain
+    }
+    // Re-check against the FRESHEST draft (ref, not the click-time closure) so a
+    // re-edit during the in-flight flush does not yield a spurious false negative.
+    return (
+      JSON.stringify(buildDetailsBody(detailsDraftRef.current)) ===
+      lastSavedDetailsRef.current
+    )
   }
 
   // Seed the header summary without waiting for the Products & Charges tab to be
@@ -382,9 +438,11 @@ function WorkspaceShell({
                 finishSalePriceMutation={finishSalePriceMutation}
                 applyMutationFinancialSummary={applyMutationFinancialSummary}
                 queueDetailsAutosave={queueDetailsAutosave}
+                flushDetailsAutosave={flushDetailsAutosave}
                 detailsAutosaveSaving={detailsAutosaveSaving}
                 detailsAutosaveSaved={detailsAutosaveSaved}
                 detailsAutosaveError={detailsAutosaveError}
+                onInvoiceReady={() => setActiveTab('invoice')}
               />
             )}
             {/* `locked` (LAID) is passed for PHOTO-DELETE gating ONLY. Notes are
@@ -398,7 +456,6 @@ function WorkspaceShell({
             {activeTab === 'invoice' && (
               <InvoiceTab
                 orderId={orderId}
-                locked={locked}
                 orderNumber={orderNumber}
                 customer={customer}
                 billingAddress={billingAddress}
