@@ -1253,6 +1253,9 @@ paths:
           multipart/form-data:
             schema:
               $ref: '#/components/schemas/SignatureAcceptRequest'
+            encoding:
+              signature:
+                contentType: image/png
       responses:
         '201':
           description: Invoice accepted (and emailed unless the send failed)
