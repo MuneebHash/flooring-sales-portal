@@ -489,7 +489,13 @@ export function DetailsOfSaleTab({
   // The confirmation popup is a FRONTEND guard only — it never changes the create/
   // rewrite call or invents backend manager-approval behaviour.
   const gpWarning = financialSummary?.gp_warning ?? false
-  const invoiceActionBusy = creatingInvoice || rewritingInvoice
+  // Busy guard for ALL invoice actions. Includes salePriceMutationInFlight (Update
+  // Sale Price / Reset Price, in flight in the always-mounted shell) so a Create /
+  // Rewrite cannot fire while the sale total is still being persisted — otherwise the
+  // backend could snapshot the previous sale total (Codex P1). This single flag gates
+  // the Create/Rewrite buttons, the confirm-modal button, and every click/run guard.
+  const invoiceActionBusy =
+    creatingInvoice || rewritingInvoice || salePriceMutationInFlight
 
   // Overpaid-rewrite guard (MVP, frontend-only — no refunds, no negative balance,
   // no payment/backend changes). A Rewrite regenerates the invoice with the NEW
