@@ -1,35 +1,29 @@
+import { useEffect, useRef, useState } from 'react'
 import { Button } from '../ui/Button'
-import { ChevronDownIcon } from '../icons'
+import { ApiError } from '../../lib/api/ApiError'
+import {
+  createInvoice,
+  fetchCurrentInvoice,
+  fetchCurrentInvoicePdf,
+  rewriteInvoice,
+  type InvoiceDetail,
+} from '../../lib/api/orderInvoicesApi'
 import type {
   DetailsOfSaleFields,
   OrderAddress,
   OrderCustomer,
 } from '../../lib/api/orderWorkspaceApi'
-import type { InvoiceSummary, InvoiceVersion } from './types'
 
 type Props = {
+  orderId: number
+  // LAID lock: gates the Rewrite action ONLY. Create / read / PDF download stay
+  // allowed on a locked order (matches the backend LAID split).
+  locked: boolean
   orderNumber?: string
   customer?: OrderCustomer | null
   billingAddress?: OrderAddress | null
   saleDetails?: DetailsOfSaleFields | null
-  invoiceSummary?: InvoiceSummary | null
-  invoiceVersions?: InvoiceVersion[] | null
 }
-
-const MONTH_NAMES = [
-  'Jan',
-  'Feb',
-  'Mar',
-  'Apr',
-  'May',
-  'Jun',
-  'Jul',
-  'Aug',
-  'Sep',
-  'Oct',
-  'Nov',
-  'Dec',
-]
 
 const MONEY_FORMATTER = new Intl.NumberFormat('en-AU', {
   style: 'currency',
@@ -45,15 +39,6 @@ function formatDocDate(iso: string): string {
   if (!match) return ''
   const [, year, month, day] = match
   return `${day}/${month}/${year}`
-}
-
-function formatTimestamp(iso: string): string {
-  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso)
-  if (!match) return ''
-  const [, year, month, day, hours, minutes] = match
-  const name = MONTH_NAMES[Number(month) - 1]
-  if (!name) return ''
-  return `${day} ${name} ${year}, ${hours}:${minutes}`
 }
 
 function composeFullName(customer: OrderCustomer | null | undefined): string {
@@ -79,6 +64,50 @@ function composeAddressLines(
     .filter(Boolean)
     .join(' ')
   return [line1, line2].filter((line) => line.length > 0)
+}
+
+// INVOICE_PRECONDITIONS_NOT_MET carries a details[] of backend ErrorDetail
+// ({ section?, field?, message }). Parse defensively (also tolerating plain
+// strings) so the UI can list the specific reasons the order is not yet
+// invoice-ready.
+type PreconditionFailure = {
+  label: string | null
+  message: string
+}
+
+function parsePreconditionFailures(details: unknown): PreconditionFailure[] {
+  if (!Array.isArray(details)) return []
+  const out: PreconditionFailure[] = []
+  for (const item of details) {
+    if (typeof item === 'string') {
+      if (item.length > 0) out.push({ label: null, message: item })
+      continue
+    }
+    if (item && typeof item === 'object') {
+      const rec = item as {
+        section?: unknown
+        field?: unknown
+        message?: unknown
+      }
+      const message = typeof rec.message === 'string' ? rec.message : ''
+      const field = typeof rec.field === 'string' ? rec.field : null
+      const section = typeof rec.section === 'string' ? rec.section : null
+      if (message.length > 0) out.push({ label: field ?? section, message })
+    }
+  }
+  return out
+}
+
+// Download filename mirrors the backend Content-Disposition pattern
+// (invoice-{order_number}-v{version}.pdf). A blob object URL does not carry the
+// server's Content-Disposition, so the anchor sets the name explicitly.
+function pdfFileName(
+  orderNumber: string | undefined,
+  versionNumber: number,
+): string {
+  const safeOrder =
+    orderNumber && orderNumber.length > 0 ? orderNumber : 'order'
+  return `invoice-${safeOrder}-v${versionNumber}.pdf`
 }
 
 const TERMS: string[] = [
@@ -121,43 +150,283 @@ function SignatureScribble() {
 }
 
 export function InvoiceTab({
+  orderId,
+  locked,
   orderNumber,
   customer,
   billingAddress,
   saleDetails,
-  invoiceSummary,
-  invoiceVersions,
 }: Props) {
-  const summary: InvoiceSummary = invoiceSummary ?? {
-    invoice_total: 0,
-    total_paid: 0,
-    balance_due: 0,
-    current_version: null,
+  // Only ever the CURRENT/latest invoice — no version list, no history.
+  const [invoice, setInvoice] = useState<InvoiceDetail | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [actionError, setActionError] = useState<string | null>(null)
+  const [preconditionFailures, setPreconditionFailures] = useState<
+    PreconditionFailure[]
+  >([])
+  const [creating, setCreating] = useState(false)
+  const [rewriting, setRewriting] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const [reloadToken, setReloadToken] = useState(0)
+
+  // Tracks whether THIS tab is still mounted so async action handlers never
+  // setState after the tab unmounts on a tab switch. The mount fetch below uses
+  // its own per-run `cancelled` guard.
+  const mountedRef = useRef(true)
+  useEffect(() => {
+    mountedRef.current = true
+    return () => {
+      mountedRef.current = false
+    }
+  }, [])
+
+  // Fetch the current invoice on mount (the tab unmounts on a tab switch, so this
+  // refetches fresh each open) and whenever reloadToken bumps. A 404
+  // INVOICE_NOT_FOUND is the clean "no invoice yet" empty state, NOT an error.
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setLoadError(null)
+    setActionError(null)
+    setPreconditionFailures([])
+    setInvoice(null)
+    fetchCurrentInvoice(orderId)
+      .then((res) => {
+        if (cancelled) return
+        setInvoice(res.data.invoice)
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
+          setInvoice(null)
+          return
+        }
+        setLoadError(
+          err instanceof ApiError && err.message.length > 0
+            ? err.message
+            : 'Could not load the invoice. Please try again.',
+        )
+      })
+      .finally(() => {
+        if (cancelled) return
+        setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId, reloadToken])
+
+  function refetch() {
+    setReloadToken((token) => token + 1)
   }
-  const versions = invoiceVersions ?? []
-  const currentVersion = versions[0] ?? null
-  const invoiceIssued = currentVersion !== null
+
+  function applyActionError(err: unknown, fallback: string) {
+    if (err instanceof ApiError && err.code === 'INVOICE_PRECONDITIONS_NOT_MET') {
+      setPreconditionFailures(parsePreconditionFailures(err.details))
+      setActionError(
+        err.message.length > 0
+          ? err.message
+          : 'This order is not ready to be invoiced.',
+      )
+      return
+    }
+    setActionError(
+      err instanceof ApiError && err.message.length > 0 ? err.message : fallback,
+    )
+  }
+
+  async function handleCreate() {
+    if (creating) return
+    setCreating(true)
+    setActionError(null)
+    setPreconditionFailures([])
+    try {
+      const res = await createInvoice(orderId)
+      if (!mountedRef.current) return
+      setInvoice(res.data.invoice)
+    } catch (err) {
+      if (!mountedRef.current) return
+      // An invoice already exists (state drifted) — refetch the current one.
+      if (err instanceof ApiError && err.code === 'INVOICE_ALREADY_EXISTS') {
+        refetch()
+        return
+      }
+      applyActionError(err, 'Could not create the invoice. Please try again.')
+    } finally {
+      if (mountedRef.current) setCreating(false)
+    }
+  }
+
+  async function handleRewrite() {
+    // Rewrite is blocked when LAID — the backend is the authority (422
+    // ORDER_LOCKED), this just disables the path early.
+    if (rewriting || locked) return
+    setRewriting(true)
+    setActionError(null)
+    setPreconditionFailures([])
+    try {
+      const res = await rewriteInvoice(orderId)
+      if (!mountedRef.current) return
+      setInvoice(res.data.invoice)
+    } catch (err) {
+      if (!mountedRef.current) return
+      // No invoice to rewrite (state drifted) — refetch.
+      if (err instanceof ApiError && err.code === 'INVOICE_REQUIRED') {
+        refetch()
+        return
+      }
+      if (err instanceof ApiError && err.code === 'ORDER_LOCKED') {
+        setActionError(
+          'This order is locked (LAID). The invoice cannot be rewritten.',
+        )
+        return
+      }
+      applyActionError(err, 'Could not rewrite the invoice. Please try again.')
+    } finally {
+      if (mountedRef.current) setRewriting(false)
+    }
+  }
+
+  async function handleDownload() {
+    if (downloading || invoice === null) return
+    const current = invoice
+    setDownloading(true)
+    setActionError(null)
+    try {
+      const { blob, fileName } = await fetchCurrentInvoicePdf(orderId)
+      if (!mountedRef.current) return
+      // One-shot object URL: create, trigger the download, revoke immediately. Prefer the server
+      // file name from the D.4 Content-Disposition (authoritative for the CURRENT invoice the
+      // backend just streamed, so it stays correct even if the invoice changed since the last
+      // read); fall back to the client-side name only when the header is absent/unreadable.
+      const url = URL.createObjectURL(blob)
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download =
+        fileName ?? pdfFileName(orderNumber, current.version_number)
+      document.body.appendChild(anchor)
+      anchor.click()
+      anchor.remove()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      if (!mountedRef.current) return
+      // The invoice vanished server-side — show a message and refetch state.
+      if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
+        setActionError('This invoice is no longer available. Refreshing…')
+        refetch()
+        return
+      }
+      applyActionError(
+        err,
+        'Could not download the invoice PDF. Please try again.',
+      )
+    } finally {
+      if (mountedRef.current) setDownloading(false)
+    }
+  }
 
   const customerName = composeFullName(customer)
   const billingAddressLines = composeAddressLines(billingAddress)
-
   const detailsOfSaleText =
-    currentVersion?.details_of_sale_snapshot ??
-    saleDetails?.details_of_sale ??
-    ''
+    invoice?.details_of_sale_snapshot || saleDetails?.details_of_sale || ''
+  const dueDateText =
+    invoice && invoice.due_date ? formatDocDate(invoice.due_date) : ''
 
   return (
     <div>
-      <div className="mb-4">
-        <h2 className="text-lg font-semibold text-slate-900 tracking-tight">
-          Invoice
-        </h2>
-        <p className="text-sm text-slate-500 mt-1">
-          View the current invoice for this order.
-        </p>
+      <div className="mb-4 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold text-slate-900 tracking-tight">
+            Invoice
+          </h2>
+          <p className="text-sm text-slate-500 mt-1">
+            View the current invoice for this order.
+          </p>
+        </div>
+        {!loading && loadError === null && (
+          <div className="flex items-center gap-2 shrink-0">
+            {invoice === null ? (
+              <Button
+                type="button"
+                variant="success"
+                size="md"
+                onClick={handleCreate}
+                disabled={creating}
+              >
+                {creating ? 'Creating…' : 'Create invoice'}
+              </Button>
+            ) : (
+              <>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="md"
+                  onClick={handleDownload}
+                  disabled={downloading}
+                >
+                  {downloading ? 'Preparing…' : 'Download PDF'}
+                </Button>
+                <Button
+                  type="button"
+                  variant="success"
+                  size="md"
+                  onClick={handleRewrite}
+                  disabled={locked || rewriting}
+                  title={
+                    locked
+                      ? 'This order is locked (LAID) and cannot be rewritten.'
+                      : undefined
+                  }
+                >
+                  {rewriting ? 'Rewriting…' : 'Rewrite invoice'}
+                </Button>
+              </>
+            )}
+          </div>
+        )}
       </div>
 
-      {invoiceIssued && currentVersion ? (
+      {actionError !== null && (
+        <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
+          <p className="text-sm font-medium text-rose-700">{actionError}</p>
+          {preconditionFailures.length > 0 && (
+            <ul className="mt-2 space-y-1">
+              {preconditionFailures.map((failure, idx) => (
+                <li
+                  key={`${failure.label ?? ''}-${idx}`}
+                  className="text-xs text-rose-700 leading-relaxed"
+                >
+                  {failure.label ? (
+                    <span className="font-medium">{failure.label}: </span>
+                  ) : null}
+                  {failure.message}
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {loading ? (
+        <div className="rounded-xl border border-slate-200 bg-white px-6 py-10 text-center">
+          <p className="text-sm text-slate-500">Loading invoice…</p>
+        </div>
+      ) : loadError !== null ? (
+        <div className="rounded-xl border border-rose-200 bg-white px-6 py-10 text-center">
+          <p className="text-base font-medium text-slate-700">{loadError}</p>
+          <div className="mt-4">
+            <Button
+              type="button"
+              variant="secondary"
+              size="md"
+              onClick={refetch}
+            >
+              Try again
+            </Button>
+          </div>
+        </div>
+      ) : invoice !== null ? (
         <article className="rounded-lg border border-slate-200 bg-white shadow-sm p-6 sm:p-8">
           <header className="grid grid-cols-1 sm:grid-cols-3 gap-6 items-start">
             <div className="sm:col-span-1">
@@ -217,13 +486,13 @@ export function InvoiceTab({
               <div className="pt-2 text-sm text-slate-600">
                 Invoice Date :{' '}
                 <span className="text-slate-900 tabular-nums">
-                  {formatDocDate(currentVersion.invoice_date)}
+                  {formatDocDate(invoice.invoice_date)}
                 </span>
               </div>
               <div className="text-sm text-slate-600">
                 Due Date :{' '}
                 <span className="text-slate-900 tabular-nums">
-                  {formatDocDate(currentVersion.due_date)}
+                  {dueDateText || '—'}
                 </span>
               </div>
             </div>
@@ -242,19 +511,19 @@ export function InvoiceTab({
             <div className="flex items-center justify-between px-4 py-2.5">
               <span className="text-sm text-slate-700">Total Inc. GST</span>
               <span className="text-sm font-medium tabular-nums text-slate-900">
-                {formatMoney(summary.invoice_total)}
+                {formatMoney(invoice.sale_price_inc_gst)}
               </span>
             </div>
             <div className="flex items-center justify-between px-4 py-2.5 border-t border-slate-200">
               <span className="text-sm text-slate-700">Payment Made</span>
               <span className="text-sm font-medium tabular-nums text-rose-600">
-                {formatMoney(summary.total_paid)}
+                {formatMoney(invoice.total_paid)}
               </span>
             </div>
             <div className="flex items-center justify-between px-4 py-2.5 border-t border-slate-200">
               <span className="text-sm text-slate-700">Balance Due</span>
               <span className="text-sm font-semibold tabular-nums text-slate-900">
-                {formatMoney(summary.balance_due)}
+                {formatMoney(invoice.balance_due)}
               </span>
             </div>
           </div>
@@ -324,66 +593,10 @@ export function InvoiceTab({
             No invoice has been created yet.
           </p>
           <p className="mt-1 text-sm text-slate-500">
-            An invoice will appear here once it has been created for this
-            order.
+            Use “Create invoice” to generate the current invoice for this order.
           </p>
         </div>
       )}
-
-      <details className="group mt-5 rounded-lg border border-slate-200 bg-white">
-        <summary className="flex items-center justify-between gap-3 px-4 py-2.5 cursor-pointer text-sm text-slate-700 list-none [&::-webkit-details-marker]:hidden [&::marker]:hidden">
-          <span>
-            Invoice version history{' '}
-            <span className="text-slate-500">({versions.length})</span>
-          </span>
-          <ChevronDownIcon className="w-4 h-4 text-slate-500 transition-transform group-open:rotate-180" />
-        </summary>
-        <div className="border-t border-slate-200 px-4 py-3">
-          {versions.length === 0 ? (
-            <p className="text-xs text-slate-500">No invoice history yet.</p>
-          ) : (
-            <ul className="space-y-1.5">
-              {[...versions]
-                .sort((a, b) => b.version_number - a.version_number)
-                .map((version) => (
-                  <li
-                    key={version.invoice_id}
-                    className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-slate-700"
-                  >
-                    <span className="font-mono text-slate-700">
-                      v{version.version_number}
-                    </span>
-                    <span className="text-slate-500">·</span>
-                    <span className="tabular-nums">
-                      {formatTimestamp(version.created_at)}
-                    </span>
-                    <span className="text-slate-500">·</span>
-                    <span className="tabular-nums">
-                      Total {formatMoney(version.sale_price_inc_gst)}
-                    </span>
-                    <span className="text-slate-500">·</span>
-                    <span className="tabular-nums">
-                      Paid {formatMoney(version.total_paid)}
-                    </span>
-                    <span className="text-slate-500">·</span>
-                    <span className="tabular-nums">
-                      Balance {formatMoney(version.balance_due)}
-                    </span>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      disabled
-                      className="ml-auto"
-                    >
-                      Download PDF
-                    </Button>
-                  </li>
-                ))}
-            </ul>
-          )}
-        </div>
-      </details>
     </div>
   )
 }

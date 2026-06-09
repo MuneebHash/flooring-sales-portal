@@ -623,7 +623,7 @@ export function DetailsOfSaleTab({
           )}
         </div>
 
-        {/* Sale price controls (left) + visual-only Create Invoice (right). */}
+        {/* Sale price controls (left) + manager-approval warning (right). */}
         <div className="mt-4 flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
           <div className="flex flex-wrap items-center gap-2">
             <Button
@@ -656,16 +656,6 @@ export function DetailsOfSaleTab({
           </div>
 
           <div className="flex flex-col items-start sm:items-end gap-1">
-            {/* Visual only in B8 — no invoice API/logic is wired. */}
-            <button
-              type="button"
-              disabled
-              aria-disabled="true"
-              title="Visual only — invoice creation is not available yet"
-              className="inline-flex items-center justify-center h-10 px-4 rounded-lg text-sm font-medium bg-violet-200 text-violet-700 border border-violet-300 cursor-not-allowed"
-            >
-              Create Invoice
-            </button>
             {financialSummary?.gp_warning && (
               <span className="text-xs font-medium text-red-600">
                 Manager approval required!
