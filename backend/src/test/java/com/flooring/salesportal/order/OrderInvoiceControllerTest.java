@@ -26,6 +26,8 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Timestamp;
+import java.util.List;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasItems;
@@ -169,6 +171,46 @@ class OrderInvoiceControllerTest {
     private boolean diskFileExists(String storagePath) {
         String relative = storagePath.startsWith("/") ? storagePath.substring(1) : storagePath;
         return Files.exists(tempStorageDir.resolve(relative));
+    }
+
+    // ---- Phase 13 helpers (email gate / acceptance fields / dashboard mirror) ----
+
+    private void setCustomerEmail(long orderId, String email) {
+        jdbcTemplate.update("UPDATE order_customer SET email = ? WHERE order_id = ?", email, orderId);
+    }
+
+    /**
+     * The schema forbids a blank/NULL customer email (chk_order_customer_email_format + NOT NULL), so
+     * those gate branches are unreachable through normal data. Drop both rules (transactional DDL,
+     * rolled back with the test) to exercise the backend email gate's required-vs-invalid split.
+     */
+    private void relaxCustomerEmailDbConstraints() {
+        jdbcTemplate.execute("ALTER TABLE order_customer DROP CONSTRAINT chk_order_customer_email_format");
+        jdbcTemplate.execute("ALTER TABLE order_customer ALTER COLUMN email DROP NOT NULL");
+    }
+
+    /** Minimal valid customer row for an order that has none (order 2), so only non-customer gates fire. */
+    private void seedMinimalCustomer(long orderId, String email) {
+        jdbcTemplate.update(
+                "INSERT INTO order_customer (order_id, first_name, last_name, email, mobile) "
+                        + "VALUES (?, 'Test', 'Customer', ?, '0400000000')",
+                orderId, email);
+    }
+
+    private Timestamp orderLastEmailedAt(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT last_emailed_at FROM sales_order WHERE order_id = ?", Timestamp.class, orderId);
+    }
+
+    private int maxInvoiceVersion(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COALESCE(MAX(version_number), 0) FROM invoice WHERE order_id = ?", Integer.class, orderId);
+    }
+
+    private void setOrderLastEmailedAt(long orderId, String timestamp) {
+        jdbcTemplate.update(
+                "UPDATE sales_order SET last_emailed_at = CAST(? AS timestamp) WHERE order_id = ?",
+                timestamp, orderId);
     }
 
     // ================================================================
@@ -377,40 +419,34 @@ class OrderInvoiceControllerTest {
     }
 
     @Test
-    void create_emptyOrder_returns422_withAllNinePreconditionDetails() throws Exception {
+    void create_emptyOrderWithValidEmail_returns422_withSevenPreconditionDetails() throws Exception {
+        // Phase 13: the email gate runs FIRST, so the all-9-fail case (no customer row) now returns
+        // CUSTOMER_EMAIL_REQUIRED (asserted separately). With a valid customer row in place (names +
+        // email pass), the remaining 7 preconditions all fail and are reported together.
+        seedMinimalCustomer(ORDER_EMPTY, "test.customer@email.com");
+
         mockMvc.perform(post(invoicesUrl(ORDER_EMPTY)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("INVOICE_PRECONDITIONS_NOT_MET"))
-                .andExpect(jsonPath("$.error.details", hasSize(9)))
+                .andExpect(jsonPath("$.error.details", hasSize(7)))
                 .andExpect(jsonPath("$.error.details[*].field", hasItems(
-                        "first_name", "last_name", "installation_address", "billing_address", "lines",
+                        "installation_address", "billing_address", "lines",
                         "details_of_sale", "proposed_lay_date", "lay_date_status", "final_sale_price_inc_gst")));
         Assertions.assertEquals(0, countInvoices(ORDER_EMPTY));
     }
 
     @Test
-    void create_missingCustomerOnly_returns422_withTwoDetails() throws Exception {
-        // Order 1 minus its customer: only the two name preconditions fail (lines/addresses/details ok).
-        clearSeededInvoice();
-        jdbcTemplate.update("DELETE FROM order_customer WHERE order_id = ?", ORDER_FULL);
-
-        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
-                .andExpect(status().isUnprocessableEntity())
-                .andExpect(jsonPath("$.error.code").value("INVOICE_PRECONDITIONS_NOT_MET"))
-                .andExpect(jsonPath("$.error.details", hasSize(2)))
-                .andExpect(jsonPath("$.error.details[*].field", hasItems("first_name", "last_name")));
-        Assertions.assertEquals(0, countInvoices(ORDER_FULL));
-    }
-
-    @Test
     void create_preconditionDetailCarriesSection() throws Exception {
+        // With a valid customer (email gate + name preconditions pass), every remaining failing
+        // precondition still carries its section label.
+        seedMinimalCustomer(ORDER_EMPTY, "test.customer@email.com");
+
         mockMvc.perform(post(invoicesUrl(ORDER_EMPTY)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.details[*].section", hasItems(
-                        "customer", "address", "lines", "details", "financial")));
+                        "address", "lines", "details", "financial")));
     }
 
     // ================================================================
@@ -1062,15 +1098,17 @@ class OrderInvoiceControllerTest {
 
     @Test
     void rewrite_preconditionsFail_returns422_withDetails() throws Exception {
-        // Order 1 has an invoice (INVOICE_REQUIRED passes), then loses its customer so two name
-        // preconditions fail -> 422 INVOICE_PRECONDITIONS_NOT_MET with details; no new version created.
-        jdbcTemplate.update("DELETE FROM order_customer WHERE order_id = ?", ORDER_FULL);
+        // Order 1 has an invoice (INVOICE_REQUIRED passes) and a valid customer email (the Phase 13
+        // gate passes), then loses its details_of_sale so precondition 6 fails -> 422
+        // INVOICE_PRECONDITIONS_NOT_MET with the detail; no new version created. (Deleting the customer
+        // now trips the email gate first — asserted separately.)
+        jdbcTemplate.update("UPDATE sales_order SET details_of_sale = NULL WHERE order_id = ?", ORDER_FULL);
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("INVOICE_PRECONDITIONS_NOT_MET"))
-                .andExpect(jsonPath("$.error.details", hasSize(2)))
-                .andExpect(jsonPath("$.error.details[*].field", hasItems("first_name", "last_name")));
+                .andExpect(jsonPath("$.error.details", hasSize(1)))
+                .andExpect(jsonPath("$.error.details[*].field", hasItems("details_of_sale")));
         Assertions.assertEquals(1, countInvoices(ORDER_FULL), "no new version when preconditions fail");
     }
 
@@ -1162,5 +1200,423 @@ class OrderInvoiceControllerTest {
                         .contentType(MediaType.APPLICATION_JSON).content("{\"due_date\":\"2026-01-01\"}"))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    // ================================================================
+    // Phase 13 foundation — V10 schema (acceptance/email columns)
+    // ================================================================
+
+    @Test
+    void v10_invoiceAcceptanceColumns_existNullable_withNonUniqueFk() throws Exception {
+        // The four Phase 13 columns exist on invoice and are all nullable.
+        Integer nullableColumns = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_name = 'invoice'
+                  AND column_name IN ('accepted_at', 'accepted_customer_name',
+                                      'accepted_signature_file_id', 'last_emailed_at')
+                  AND is_nullable = 'YES'
+                """, Integer.class);
+        Assertions.assertEquals(4, nullableColumns, "all four Phase 13 invoice columns exist and are nullable");
+
+        // The signature FK exists…
+        Integer fk = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*) FROM information_schema.table_constraints
+                WHERE table_name = 'invoice'
+                  AND constraint_name = 'fk_invoice_accepted_signature_file'
+                  AND constraint_type = 'FOREIGN KEY'
+                """, Integer.class);
+        Assertions.assertEquals(1, fk, "fk_invoice_accepted_signature_file exists");
+
+        // …and is NOT unique (no unique constraint/index covers accepted_signature_file_id).
+        Integer uniqueOnSignature = jdbcTemplate.queryForObject("""
+                SELECT COUNT(*) FROM pg_indexes
+                WHERE tablename = 'invoice'
+                  AND indexdef ILIKE '%accepted_signature_file_id%'
+                  AND indexdef ILIKE '%unique%'
+                """, Integer.class);
+        Assertions.assertEquals(0, uniqueOnSignature, "accepted_signature_file_id must NOT be unique");
+    }
+
+    @Test
+    void v10_acceptedSignatureFileId_allowsTwoVersionsSharingOneFile() throws Exception {
+        // Behavioural non-uniqueness proof: two invoice versions referencing the SAME signature
+        // stored_file must both insert (a payment-carried-forward version reuses the signature file).
+        int next = maxInvoiceVersion(ORDER_FULL) + 1;
+        long signatureFile = insertStoredFileRow("signature-shared.png", "/uploads/1/orders/1/sig.png", 100);
+        long sf2 = insertStoredFileRow("invoice-v2.pdf", "/uploads/1/orders/1/v2-sig.pdf", 2222);
+        long sf3 = insertStoredFileRow("invoice-v3.pdf", "/uploads/1/orders/1/v3-sig.pdf", 3333);
+        long v2 = insertInvoiceVersion(ORDER_FULL, next, sf2, "840.00", "924.00", "500.00", "424.00");
+        long v3 = insertInvoiceVersion(ORDER_FULL, next + 1, sf3, "840.00", "924.00", "500.00", "424.00");
+
+        jdbcTemplate.update("UPDATE invoice SET accepted_signature_file_id = ? WHERE invoice_id = ?",
+                signatureFile, v2);
+        jdbcTemplate.update("UPDATE invoice SET accepted_signature_file_id = ? WHERE invoice_id = ?",
+                signatureFile, v3);
+
+        Integer sharing = jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM invoice WHERE accepted_signature_file_id = ?", Integer.class, signatureFile);
+        Assertions.assertEquals(2, sharing, "two versions may reference the same signature stored_file");
+    }
+
+    // ================================================================
+    // Phase 13 email gate — D.1 create
+    // ================================================================
+
+    @Test
+    void create_missingCustomerRow_returns422_customerEmailRequired() throws Exception {
+        // No order_customer row at all -> the email gate (which runs BEFORE the 9 preconditions)
+        // answers CUSTOMER_EMAIL_REQUIRED, never INVOICE_PRECONDITIONS_NOT_MET.
+        clearSeededInvoice();
+        jdbcTemplate.update("DELETE FROM order_customer WHERE order_id = ?", ORDER_FULL);
+
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"));
+        Assertions.assertEquals(0, countInvoices(ORDER_FULL), "no invoice created when the email gate fails");
+    }
+
+    @Test
+    void create_blankEmail_returns422_customerEmailRequired() throws Exception {
+        clearSeededInvoice();
+        relaxCustomerEmailDbConstraints();
+        setCustomerEmail(ORDER_FULL, "   ");
+
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"));
+        Assertions.assertEquals(0, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void create_nullEmail_returns422_customerEmailRequired() throws Exception {
+        clearSeededInvoice();
+        relaxCustomerEmailDbConstraints();
+        setCustomerEmail(ORDER_FULL, null);
+
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"));
+        Assertions.assertEquals(0, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void create_malformedEmail_returns422_customerEmailInvalid() throws Exception {
+        // "james@" passes the DB CHECK (non-blank, LIKE '%@%') but has no domain — the backend gate is
+        // deliberately stricter than the DB rule.
+        clearSeededInvoice();
+        setCustomerEmail(ORDER_FULL, "james@");
+
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_INVALID"));
+        Assertions.assertEquals(0, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void create_malformedEmailVariants_allReturnCustomerEmailInvalid() throws Exception {
+        // Every variant passes the DB CHECK (non-blank + '@') but is obviously malformed: missing local
+        // part, missing domain dot, interior whitespace, double '@', leading/trailing domain dot.
+        clearSeededInvoice();
+        List<String> malformed = List.of(
+                "@email.com", "james@email", "james wilson@email.com",
+                "james@@email.com", "james@.com", "james@email.");
+        for (String bad : malformed) {
+            setCustomerEmail(ORDER_FULL, bad);
+            mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                            .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                    .andExpect(status().isUnprocessableEntity())
+                    .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_INVALID"));
+        }
+        Assertions.assertEquals(0, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void create_frontendAcceptedTrailingDotDomain_passesTheGate() throws Exception {
+        // "john@example.com." passes the frontend Customer-tab regex (/^[^\s@]+@[^\s@]+\.[^\s@]+$/ —
+        // backtracking tolerates the trailing root dot), so the backend gate must accept it too:
+        // otherwise a saved customer email dead-ends invoice creation on an error the Customer tab
+        // says is not there. The gate requires an INTERIOR domain dot, which this address has.
+        clearSeededInvoice();
+        setCustomerEmail(ORDER_FULL, "john@example.com.");
+
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(false));
+        Assertions.assertEquals(1, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void create_emailGateFiresBeforePreconditions_missingCustomer() throws Exception {
+        // Order 2 would fail ALL 9 preconditions AND has no customer row. The email gate must answer
+        // first: CUSTOMER_EMAIL_REQUIRED with NO precondition details (the 9-check evaluation is skipped).
+        mockMvc.perform(post(invoicesUrl(ORDER_EMPTY)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"))
+                .andExpect(jsonPath("$.error.details").doesNotExist());
+        Assertions.assertEquals(0, countInvoices(ORDER_EMPTY));
+    }
+
+    @Test
+    void create_emailGateFiresBeforePreconditions_invalidEmail() throws Exception {
+        // Order 2 with a customer whose email is malformed (but DB-acceptable): the gate answers
+        // CUSTOMER_EMAIL_INVALID even though every other precondition would also fail.
+        seedMinimalCustomer(ORDER_EMPTY, "noreply@invalid");
+
+        mockMvc.perform(post(invoicesUrl(ORDER_EMPTY)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_INVALID"))
+                .andExpect(jsonPath("$.error.details").doesNotExist());
+    }
+
+    @Test
+    void create_invoiceAlreadyExistsStillPrecedesEmailGate() throws Exception {
+        // Existing gate ordering is unchanged: with the seeded invoice in place, the 409 already-exists
+        // check fires before the email gate even when the customer row is gone.
+        jdbcTemplate.update("DELETE FROM order_customer WHERE order_id = ?", ORDER_FULL);
+
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_ALREADY_EXISTS"));
+    }
+
+    // ================================================================
+    // Phase 13 email gate — D.2 rewrite
+    // ================================================================
+
+    @Test
+    void rewrite_missingCustomerRow_returns422_customerEmailRequired() throws Exception {
+        int invoicesBefore = countInvoices(ORDER_FULL);
+        jdbcTemplate.update("DELETE FROM order_customer WHERE order_id = ?", ORDER_FULL);
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"));
+        Assertions.assertEquals(invoicesBefore, countInvoices(ORDER_FULL),
+                "no new version when the email gate fails");
+    }
+
+    @Test
+    void rewrite_blankEmail_returns422_customerEmailRequired() throws Exception {
+        int invoicesBefore = countInvoices(ORDER_FULL);
+        relaxCustomerEmailDbConstraints();
+        setCustomerEmail(ORDER_FULL, "   ");
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"));
+        Assertions.assertEquals(invoicesBefore, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void rewrite_nullEmail_returns422_customerEmailRequired() throws Exception {
+        int invoicesBefore = countInvoices(ORDER_FULL);
+        relaxCustomerEmailDbConstraints();
+        setCustomerEmail(ORDER_FULL, null);
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"));
+        Assertions.assertEquals(invoicesBefore, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void rewrite_malformedEmail_returns422_customerEmailInvalid() throws Exception {
+        int invoicesBefore = countInvoices(ORDER_FULL);
+        setCustomerEmail(ORDER_FULL, "james@");
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_INVALID"));
+        Assertions.assertEquals(invoicesBefore, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void rewrite_emailGateFiresBeforePreconditions() throws Exception {
+        // Both the email gate (malformed email) and a precondition (details_of_sale gone) would fail —
+        // the email gate answers first and the 9-check evaluation is skipped (no details list).
+        setCustomerEmail(ORDER_FULL, "james@");
+        jdbcTemplate.update("UPDATE sales_order SET details_of_sale = NULL WHERE order_id = ?", ORDER_FULL);
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_INVALID"))
+                .andExpect(jsonPath("$.error.details").doesNotExist());
+    }
+
+    @Test
+    void rewrite_invoiceRequiredStillPrecedesEmailGate() throws Exception {
+        // Existing gate ordering is unchanged: with no invoice at all, INVOICE_REQUIRED fires before
+        // the email gate even when the customer row is gone.
+        clearSeededInvoice();
+        jdbcTemplate.update("DELETE FROM order_customer WHERE order_id = ?", ORDER_FULL);
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_REQUIRED"));
+    }
+
+    // ================================================================
+    // Phase 13 acceptance/email fields — D.1 / D.2 / D.3 responses + persisted columns
+    // ================================================================
+
+    @Test
+    void create_returnsUnsignedAcceptanceAndEmailFields() throws Exception {
+        clearSeededInvoice();
+
+        MvcResult result = mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(false))
+                .andReturn();
+
+        // The five Phase 13 fields are ALWAYS present; null values serialize as null (the jsonPath
+        // doesNotExist() matcher treats JSON null as absent, so assert on the raw body).
+        String json = result.getResponse().getContentAsString();
+        Assertions.assertTrue(json.contains("\"accepted_at\":null"), () -> "accepted_at null key: " + json);
+        Assertions.assertTrue(json.contains("\"accepted_customer_name\":null"),
+                () -> "accepted_customer_name null key: " + json);
+        Assertions.assertTrue(json.contains("\"accepted_signature_download_path\":null"),
+                () -> "accepted_signature_download_path null key: " + json);
+        Assertions.assertTrue(json.contains("\"last_emailed_at\":null"), () -> "last_emailed_at null key: " + json);
+        // The internal signature file id is never serialized.
+        Assertions.assertFalse(json.contains("accepted_signature_file_id"),
+                () -> "must not leak accepted_signature_file_id: " + json);
+    }
+
+    @Test
+    void rewrite_returnsUnsignedAcceptanceAndEmailFields() throws Exception {
+        int nextVersion = maxInvoiceVersion(ORDER_FULL) + 1;
+        MvcResult result = mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.version_number").value(nextVersion))
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(false))
+                .andReturn();
+
+        String json = result.getResponse().getContentAsString();
+        Assertions.assertTrue(json.contains("\"accepted_at\":null"), () -> "accepted_at null key: " + json);
+        Assertions.assertTrue(json.contains("\"accepted_customer_name\":null"),
+                () -> "accepted_customer_name null key: " + json);
+        Assertions.assertTrue(json.contains("\"accepted_signature_download_path\":null"),
+                () -> "accepted_signature_download_path null key: " + json);
+        Assertions.assertTrue(json.contains("\"last_emailed_at\":null"), () -> "last_emailed_at null key: " + json);
+        Assertions.assertFalse(json.contains("accepted_signature_file_id"),
+                () -> "must not leak accepted_signature_file_id: " + json);
+    }
+
+    @Test
+    void getCurrent_returnsUnsignedAcceptanceAndEmailFields() throws Exception {
+        // D.3 reads the seeded (unaccepted) invoice — the five fields are present with null/false values.
+        MvcResult result = mockMvc.perform(get(currentInvoiceUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(false))
+                .andReturn();
+
+        String json = result.getResponse().getContentAsString();
+        Assertions.assertTrue(json.contains("\"accepted_at\":null"), () -> "accepted_at null key: " + json);
+        Assertions.assertTrue(json.contains("\"accepted_customer_name\":null"),
+                () -> "accepted_customer_name null key: " + json);
+        Assertions.assertTrue(json.contains("\"accepted_signature_download_path\":null"),
+                () -> "accepted_signature_download_path null key: " + json);
+        Assertions.assertTrue(json.contains("\"last_emailed_at\":null"), () -> "last_emailed_at null key: " + json);
+    }
+
+    @Test
+    void create_persistsNullAcceptanceColumnsOnNewRow() throws Exception {
+        clearSeededInvoice();
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated());
+
+        long invoiceId = latestInvoiceId(ORDER_FULL);
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT accepted_at FROM invoice WHERE invoice_id = ?", Timestamp.class, invoiceId));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT accepted_customer_name FROM invoice WHERE invoice_id = ?", String.class, invoiceId));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT accepted_signature_file_id FROM invoice WHERE invoice_id = ?", Long.class, invoiceId));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT last_emailed_at FROM invoice WHERE invoice_id = ?", Timestamp.class, invoiceId));
+    }
+
+    @Test
+    void rewrite_afterAcceptedCurrentInvoice_newVersionIsUnaccepted() throws Exception {
+        // Phase 13 §7: rewriting a previously accepted invoice produces a new UNSIGNED/UNACCEPTED
+        // current version (the customer must re-accept). The acceptance columns are simply not carried.
+        long acceptedInvoiceId = latestInvoiceId(ORDER_FULL);
+        jdbcTemplate.update("UPDATE invoice SET accepted_at = TIMESTAMP '2026-04-22 14:31:10', "
+                + "accepted_customer_name = 'James Wilson' WHERE invoice_id = ?", acceptedInvoiceId);
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(false));
+
+        long newVersionId = latestInvoiceId(ORDER_FULL);
+        Assertions.assertNotEquals(acceptedInvoiceId, newVersionId, "rewrite appended a new current version");
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT accepted_at FROM invoice WHERE invoice_id = ?", Timestamp.class, newVersionId));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT accepted_customer_name FROM invoice WHERE invoice_id = ?", String.class, newVersionId));
+        // The older accepted version is untouched (append-only).
+        Assertions.assertNotNull(jdbcTemplate.queryForObject(
+                "SELECT accepted_at FROM invoice WHERE invoice_id = ?", Timestamp.class, acceptedInvoiceId));
+    }
+
+    // ================================================================
+    // Phase 13 dashboard mirror — sales_order.last_emailed_at reset on new versions
+    // ================================================================
+
+    @Test
+    void create_resetsSalesOrderLastEmailedAtMirrorToNull() throws Exception {
+        // §11.1: a new current invoice version starts unemailed, so the dashboard mirror must be reset
+        // to null — never left showing a stale emailed time from a previous version.
+        clearSeededInvoice();
+        setOrderLastEmailedAt(ORDER_FULL, "2026-01-05 09:30:00");
+
+        mockMvc.perform(post(invoicesUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated());
+
+        Assertions.assertNull(orderLastEmailedAt(ORDER_FULL), "mirror reset to the new version's null value");
+    }
+
+    @Test
+    void rewrite_resetsSalesOrderLastEmailedAtMirrorToNull() throws Exception {
+        setOrderLastEmailedAt(ORDER_FULL, "2026-01-05 09:30:00");
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated());
+
+        Assertions.assertNull(orderLastEmailedAt(ORDER_FULL), "mirror reset to the new version's null value");
+    }
+
+    @Test
+    void rewrite_failedPreconditions_leaveMirrorUntouched() throws Exception {
+        // No new version -> no mirror write: a failed rewrite must not clear the existing mirror value.
+        setOrderLastEmailedAt(ORDER_FULL, "2026-01-05 09:30:00");
+        jdbcTemplate.update("UPDATE sales_order SET details_of_sale = NULL WHERE order_id = ?", ORDER_FULL);
+
+        mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_PRECONDITIONS_NOT_MET"));
+
+        Assertions.assertNotNull(orderLastEmailedAt(ORDER_FULL), "mirror unchanged when no version is created");
     }
 }

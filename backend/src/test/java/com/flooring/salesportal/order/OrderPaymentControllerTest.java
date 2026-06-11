@@ -25,6 +25,7 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Timestamp;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -189,6 +190,19 @@ class OrderPaymentControllerTest {
     private String body(String method, String amount, String reference) {
         String ref = reference == null ? "null" : "\"" + reference + "\"";
         return "{\"payment_method\":\"" + method + "\",\"amount\":" + amount + ",\"payment_reference\":" + ref + "}";
+    }
+
+    // ---- Phase 13 helpers (acceptance fields / dashboard mirror) ----
+
+    private Timestamp orderLastEmailedAt(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT last_emailed_at FROM sales_order WHERE order_id = ?", Timestamp.class, orderId);
+    }
+
+    private void setOrderLastEmailedAt(long orderId, String timestamp) {
+        jdbcTemplate.update(
+                "UPDATE sales_order SET last_emailed_at = CAST(? AS timestamp) WHERE order_id = ?",
+                timestamp, orderId);
     }
 
     // ================================================================
@@ -893,6 +907,78 @@ class OrderPaymentControllerTest {
         Assertions.assertEquals(1, countPayments(ORDER_FULL), "payment rolled back to the seed");
         Assertions.assertEquals(1, countInvoices(ORDER_FULL), "invoice version rolled back to the seed");
         Assertions.assertFalse(diskFileExists(storagePath), "PDF removed on rollback (no orphan)");
+    }
+
+    // ================================================================
+    // Phase 13 foundation — acceptance/email fields + dashboard mirror on the payment version
+    // ================================================================
+
+    @Test
+    void record_currentInvoiceCarriesUnsignedAcceptanceAndEmailFields() throws Exception {
+        // The E.1 current_invoice summary in the D.7 response now carries the five Phase 13 fields;
+        // a payment-created version on this branch is always unsigned/unaccepted (carry-forward of an
+        // accepted invoice is a later Phase 13 branch).
+        MvcResult result = mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content(body("EFTPOS", "100.00", null)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.current_invoice.accepted_signature_present").value(false))
+                .andReturn();
+
+        // The five fields are ALWAYS present; null values serialize as null (jsonPath doesNotExist()
+        // treats JSON null as absent, so assert on the raw body — these keys exist only on
+        // current_invoice in this response).
+        String json = result.getResponse().getContentAsString();
+        Assertions.assertTrue(json.contains("\"accepted_at\":null"), () -> "accepted_at null key: " + json);
+        Assertions.assertTrue(json.contains("\"accepted_customer_name\":null"),
+                () -> "accepted_customer_name null key: " + json);
+        Assertions.assertTrue(json.contains("\"accepted_signature_download_path\":null"),
+                () -> "accepted_signature_download_path null key: " + json);
+        Assertions.assertTrue(json.contains("\"last_emailed_at\":null"), () -> "last_emailed_at null key: " + json);
+        Assertions.assertFalse(json.contains("accepted_signature_file_id"),
+                () -> "must not leak accepted_signature_file_id: " + json);
+    }
+
+    @Test
+    void record_newVersionPersistsNullAcceptanceColumns() throws Exception {
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content(body("CASH", "100.00", null)))
+                .andExpect(status().isCreated());
+
+        long v2 = latestInvoiceId(ORDER_FULL);
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT accepted_at FROM invoice WHERE invoice_id = ?", Timestamp.class, v2));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT accepted_customer_name FROM invoice WHERE invoice_id = ?", String.class, v2));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT accepted_signature_file_id FROM invoice WHERE invoice_id = ?", Long.class, v2));
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                "SELECT last_emailed_at FROM invoice WHERE invoice_id = ?", Timestamp.class, v2));
+    }
+
+    @Test
+    void record_resetsSalesOrderLastEmailedAtMirrorToNull() throws Exception {
+        // Phase 13 §11.1: the payment-created version starts unemailed, so the dashboard mirror is set
+        // to that new version's null — never left showing a previous version's emailed time.
+        setOrderLastEmailedAt(ORDER_FULL, "2026-01-05 09:30:00");
+
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content(body("CASH", "100.00", null)))
+                .andExpect(status().isCreated());
+
+        Assertions.assertNull(orderLastEmailedAt(ORDER_FULL), "mirror reset to the new version's null value");
+    }
+
+    @Test
+    void record_rejectedPayment_leavesMirrorUntouched() throws Exception {
+        // No new version (overpayment rejected) -> no mirror write.
+        setOrderLastEmailedAt(ORDER_FULL, "2026-01-05 09:30:00");
+
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content(body("EFTPOS", "425.00", null)))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("PAYMENT_EXCEEDS_BALANCE"));
+
+        Assertions.assertNotNull(orderLastEmailedAt(ORDER_FULL), "mirror unchanged when no version is created");
     }
 
     // ================================================================
