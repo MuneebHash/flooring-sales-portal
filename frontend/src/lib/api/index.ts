@@ -72,6 +72,10 @@ export {
   createInvoice,
   rewriteInvoice,
   fetchCurrentInvoicePdf,
+  acceptCurrentInvoice,
+  resendCurrentInvoice,
+  fetchCurrentInvoiceSignature,
+  ACCEPTED_NAME_MAX_LENGTH,
 } from './orderInvoicesApi'
 export type {
   InvoiceDetail,

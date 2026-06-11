@@ -98,6 +98,11 @@ export function PaymentsTab({ orderId }: Props) {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
+  // The D.7 backend success message, surfaced VERBATIM (Phase 13 §6: three
+  // variants — unaccepted / accepted+emailed / accepted+email-failed). It
+  // survives the post-record refetch and clears when the form is edited (a new
+  // draft makes the old outcome stale) or a new submission starts.
+  const [actionMessage, setActionMessage] = useState<string | null>(null)
   const [fieldErrors, setFieldErrors] = useState<string[]>([])
   const [recording, setRecording] = useState(false)
   const [reloadToken, setReloadToken] = useState(0)
@@ -261,6 +266,7 @@ export function PaymentsTab({ orderId }: Props) {
 
     setRecording(true)
     setActionError(null)
+    setActionMessage(null)
     setFieldErrors([])
     try {
       // Send ONLY the three client-owned fields. Omit payment_reference entirely
@@ -272,8 +278,17 @@ export function PaymentsTab({ orderId }: Props) {
           ? { payment_reference: trimmedReference }
           : {}),
       }
-      await recordOrderPayment(orderId, body)
+      const res = await recordOrderPayment(orderId, body)
       if (!mountedRef.current) return
+      // Surface the backend message VERBATIM — it tells the user whether the
+      // updated invoice was emailed (accepted invoices) or not. The response's
+      // current_invoice is deliberately not consumed (the Invoice tab refetches
+      // its own current invoice on remount).
+      setActionMessage(
+        res.message && res.message.length > 0
+          ? res.message
+          : 'Payment recorded.',
+      )
       // Reset the form, then refetch so the list + summary reflect the new payment
       // (newest first) and the regenerated balance consistently.
       setMethod('')
@@ -319,6 +334,14 @@ export function PaymentsTab({ orderId }: Props) {
         </div>
       ) : (
         <>
+          {actionMessage !== null && (
+            <div className="mb-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3">
+              <p className="text-sm font-medium text-teal-700">
+                {actionMessage}
+              </p>
+            </div>
+          )}
+
           {actionError !== null && (
             <div className="mb-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
               <p className="text-sm font-medium text-rose-700">{actionError}</p>
@@ -400,9 +423,11 @@ export function PaymentsTab({ orderId }: Props) {
                       id="payment_method"
                       value={method}
                       disabled={formDisabled}
-                      onChange={(e) =>
+                      onChange={(e) => {
+                        // Editing the form makes the previous outcome stale.
+                        setActionMessage(null)
                         setMethod(e.target.value as PaymentMethod | '')
-                      }
+                      }}
                     >
                       <option value="">— Select —</option>
                       <option value="CASH">Cash</option>
@@ -421,7 +446,10 @@ export function PaymentsTab({ orderId }: Props) {
                       placeholder="0.00"
                       value={amount}
                       disabled={formDisabled}
-                      onChange={(e) => setAmount(e.target.value)}
+                      onChange={(e) => {
+                        setActionMessage(null)
+                        setAmount(e.target.value)
+                      }}
                     />
                   </Field>
                   <Field
@@ -435,7 +463,10 @@ export function PaymentsTab({ orderId }: Props) {
                       placeholder="e.g. EFTPOS-20260514"
                       value={reference}
                       disabled={formDisabled}
-                      onChange={(e) => setReference(e.target.value)}
+                      onChange={(e) => {
+                        setActionMessage(null)
+                        setReference(e.target.value)
+                      }}
                     />
                   </Field>
                 </div>
