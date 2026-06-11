@@ -2,6 +2,9 @@ package com.flooring.salesportal.order;
 
 import com.flooring.salesportal.common.email.InvoiceEmailRequest;
 import com.flooring.salesportal.common.email.RecordingInvoiceEmailSender;
+import jakarta.persistence.EntityManager;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.text.PDFTextStripper;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
@@ -112,6 +115,9 @@ class InvoiceAcceptanceControllerTest {
 
     @Autowired
     private RecordingInvoiceEmailSender recordingInvoiceEmailSender;
+
+    @Autowired
+    private EntityManager entityManager;
 
     private MockMvc mockMvc;
 
@@ -901,5 +907,232 @@ class InvoiceAcceptanceControllerTest {
         String json = result.getResponse().getContentAsString();
         Assertions.assertTrue(json.contains("\"last_emailed_at\":null"),
                 () -> "dashboard mirror must stay null after a failed accept email: " + json);
+    }
+
+    // ================================================================
+    // Phase 13 §6 — payment after acceptance: carry-forward + best-effort email (D.7)
+    // ================================================================
+
+    private static final String PAYMENT_EMAILED_MESSAGE =
+            "Payment recorded. Current invoice updated and emailed to the customer.";
+    private static final String PAYMENT_EMAIL_FAILED_MESSAGE =
+            "Payment recorded. Current invoice updated, but the invoice could not be emailed — "
+                    + "use Re-send Invoice to try again.";
+
+    private static String paymentsUrl(Object orderId) {
+        return "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/payments";
+    }
+
+    private static String paymentBody(String amount) {
+        return "{\"payment_method\":\"EFTPOS\",\"amount\":" + amount + ",\"payment_reference\":null}";
+    }
+
+    private static String extractPdfText(byte[] pdf) throws Exception {
+        try (PDDocument document = PDDocument.load(pdf)) {
+            return new PDFTextStripper().getText(document).replaceAll("\\s+", " ");
+        }
+    }
+
+    @Test
+    void paymentOnAccepted_carriesAcceptanceForward_sameSignatureFile_dashboardStaysAccepted() throws Exception {
+        long acceptedInvoiceId = acceptWithFailedEmail(ORDER_FULL);
+        Timestamp acceptedAt = invoiceAcceptedAt(acceptedInvoiceId);
+        long signatureFileId = acceptedSignatureFileId(acceptedInvoiceId);
+        int nextVersion = maxInvoiceVersion(ORDER_FULL) + 1;
+        int storedFilesBefore = countStoredFiles();
+
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content(paymentBody("100.00")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.current_invoice.version_number").value(nextVersion))
+                .andExpect(jsonPath("$.data.current_invoice.accepted_at").isNotEmpty())
+                .andExpect(jsonPath("$.data.current_invoice.accepted_customer_name").value("James Wilson"))
+                .andExpect(jsonPath("$.data.current_invoice.accepted_signature_present").value(true))
+                .andExpect(jsonPath("$.data.current_invoice.accepted_signature_download_path")
+                        .value(signatureUrl(ORDER_FULL)));
+
+        // Acceptance metadata carried UNCHANGED; the SAME signature stored_file is referenced (the V10
+        // FK is deliberately non-unique) — only ONE new stored_file row exists: the regenerated PDF.
+        long newInvoiceId = latestInvoiceId(ORDER_FULL);
+        Assertions.assertNotEquals(acceptedInvoiceId, newInvoiceId);
+        Assertions.assertEquals(acceptedAt, invoiceAcceptedAt(newInvoiceId));
+        Assertions.assertEquals(signatureFileId, (long) acceptedSignatureFileId(newInvoiceId),
+                "payment version must reference the SAME signature stored_file");
+        Assertions.assertEquals(storedFilesBefore + 1, countStoredFiles(),
+                "exactly one new stored_file (the regenerated PDF), never a new signature row");
+
+        mockMvc.perform(get(dashboardUrl("LC1.00001")).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].invoice_accepted").value(true));
+    }
+
+    @Test
+    void paymentOnAccepted_regeneratesSignedPdf_withAcceptanceBlock() throws Exception {
+        acceptWithFailedEmail(ORDER_FULL);
+
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content(paymentBody("100.00")))
+                .andExpect(status().isCreated());
+
+        // The emailed attachment IS the regenerated signed PDF for the payment-created version.
+        List<InvoiceEmailRequest> sent = recordingInvoiceEmailSender.sentEmails();
+        Assertions.assertEquals(1, sent.size());
+        byte[] pdf = sent.get(0).pdfBytes();
+        Assertions.assertEquals("%PDF-", new String(pdf, 0, 5, StandardCharsets.US_ASCII));
+        Assertions.assertEquals(
+                "invoice-" + ORDER_FULL_NUMBER + "-v" + maxInvoiceVersion(ORDER_FULL) + ".pdf",
+                sent.get(0).pdfFileName());
+        String text = extractPdfText(pdf);
+        Assertions.assertTrue(text.contains("Accepted by"), () -> "missing acceptance caption: " + text);
+        Assertions.assertTrue(text.contains("James Wilson"), () -> "missing carried accepted name: " + text);
+        Assertions.assertFalse(text.contains("Customer signature"),
+                () -> "signed PDF must not show the blank-area caption: " + text);
+    }
+
+    @Test
+    void paymentOnAccepted_emailSuccess_stampsBothTimestampsWithSameValue() throws Exception {
+        acceptWithFailedEmail(ORDER_FULL);
+
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content(paymentBody("100.00")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(PAYMENT_EMAILED_MESSAGE))
+                // Final post-email state: the send succeeded, so the response carries the stamp.
+                .andExpect(jsonPath("$.data.current_invoice.last_emailed_at").isNotEmpty());
+
+        Assertions.assertEquals(1, recordingInvoiceEmailSender.sentEmails().size());
+        Timestamp invoiceStamp = invoiceLastEmailedAt(latestInvoiceId(ORDER_FULL));
+        Assertions.assertNotNull(invoiceStamp);
+        Assertions.assertEquals(invoiceStamp, orderLastEmailedAt(ORDER_FULL),
+                "sales_order mirror must equal the invoice stamp");
+    }
+
+    @Test
+    void paymentOnAccepted_emailFailure_still201_acceptedPreserved_resendAvailable() throws Exception {
+        long acceptedInvoiceId = acceptWithFailedEmail(ORDER_FULL);
+        long signatureFileId = acceptedSignatureFileId(acceptedInvoiceId);
+        recordingInvoiceEmailSender.failNextSend();
+
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content(paymentBody("100.00")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(PAYMENT_EMAIL_FAILED_MESSAGE))
+                .andExpect(jsonPath("$.data.current_invoice.accepted_signature_present").value(true));
+
+        // Payment + carried acceptance persisted; both timestamps stay null; never a 502.
+        long newInvoiceId = latestInvoiceId(ORDER_FULL);
+        Assertions.assertNotNull(invoiceAcceptedAt(newInvoiceId));
+        Assertions.assertEquals(signatureFileId, (long) acceptedSignatureFileId(newInvoiceId));
+        Assertions.assertNull(invoiceLastEmailedAt(newInvoiceId));
+        Assertions.assertNull(orderLastEmailedAt(ORDER_FULL));
+        Assertions.assertEquals(1, recordingInvoiceEmailSender.failedEmails().size());
+
+        // Re-send remains available: the current invoice is still accepted.
+        recordingInvoiceEmailSender.reset();
+        mockMvc.perform(post(resendUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value(RESEND_MESSAGE));
+        Assertions.assertEquals(1, recordingInvoiceEmailSender.sentEmails().size());
+    }
+
+    @Test
+    void signatureDownload_afterPaymentOnAccepted_stillStreamsTheCarriedSignature() throws Exception {
+        acceptWithFailedEmail(ORDER_FULL);
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content(paymentBody("100.00")))
+                .andExpect(status().isCreated());
+
+        int currentVersion = maxInvoiceVersion(ORDER_FULL);
+        MvcResult result = mockMvc.perform(get(signatureUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "image/png"))
+                .andExpect(header().string(HttpHeaders.CONTENT_DISPOSITION,
+                        containsString("signature-" + ORDER_FULL_NUMBER + "-v" + currentVersion + ".png")))
+                .andReturn();
+        Assertions.assertArrayEquals(ONE_PIXEL_PNG, result.getResponse().getContentAsByteArray(),
+                "carried-forward signature bytes must still stream after a payment");
+    }
+
+    @Test
+    void resend_afterPaymentOnAccepted_reemailsCurrentVersion_withoutNewVersion() throws Exception {
+        acceptWithFailedEmail(ORDER_FULL);
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content(paymentBody("100.00")))
+                .andExpect(status().isCreated());
+        int versionsAfterPayment = countInvoices(ORDER_FULL);
+        int currentVersion = maxInvoiceVersion(ORDER_FULL);
+        recordingInvoiceEmailSender.reset();
+
+        mockMvc.perform(post(resendUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value(RESEND_MESSAGE));
+
+        Assertions.assertEquals(versionsAfterPayment, countInvoices(ORDER_FULL), "resend appends no version");
+        List<InvoiceEmailRequest> sent = recordingInvoiceEmailSender.sentEmails();
+        Assertions.assertEquals(1, sent.size());
+        Assertions.assertEquals("invoice-" + ORDER_FULL_NUMBER + "-v" + currentVersion + ".pdf",
+                sent.get(0).pdfFileName(), "resend must email the payment-created current version's PDF");
+    }
+
+    @Test
+    void paymentOnUnaccepted_remainsUnaccepted_andSendsNoEmail() throws Exception {
+        // Seeded v1 is unaccepted — existing D.7 behavior is unchanged: no acceptance, no email attempt.
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content(paymentBody("100.00")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value("Payment recorded. Current invoice updated."))
+                .andExpect(jsonPath("$.data.current_invoice.accepted_signature_present").value(false));
+
+        Assertions.assertNull(invoiceAcceptedAt(latestInvoiceId(ORDER_FULL)));
+        Assertions.assertEquals(0, recordingInvoiceEmailSender.sentEmails().size());
+        Assertions.assertEquals(0, recordingInvoiceEmailSender.failedEmails().size());
+    }
+
+    @Test
+    void paymentOnAccepted_missingCustomerEmail_isNonFatal_andPreservesAcceptance() throws Exception {
+        long acceptedInvoiceId = acceptWithFailedEmail(ORDER_FULL);
+        long signatureFileId = acceptedSignatureFileId(acceptedInvoiceId);
+        // Payment must NOT gate on the customer email: remove it entirely after acceptance. The accept
+        // above loaded the OrderCustomer entity into this test transaction's persistence context, so
+        // the JdbcTemplate update below must be followed by a clear() — otherwise the payment would
+        // re-read the CACHED entity with the old email (a test-only artifact; production requests each
+        // have their own persistence context).
+        relaxCustomerEmailDbConstraints();
+        setCustomerEmail(ORDER_FULL, null);
+        entityManager.flush();
+        entityManager.clear();
+
+        mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content(paymentBody("100.00")))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(PAYMENT_EMAIL_FAILED_MESSAGE))
+                .andExpect(jsonPath("$.data.current_invoice.accepted_signature_present").value(true));
+
+        // No CUSTOMER_EMAIL_* gate fired; no send was attempted; acceptance carried; timestamps null.
+        long newInvoiceId = latestInvoiceId(ORDER_FULL);
+        Assertions.assertNotNull(invoiceAcceptedAt(newInvoiceId));
+        Assertions.assertEquals(signatureFileId, (long) acceptedSignatureFileId(newInvoiceId));
+        Assertions.assertNull(invoiceLastEmailedAt(newInvoiceId));
+        Assertions.assertNull(orderLastEmailedAt(ORDER_FULL));
+        Assertions.assertEquals(0, recordingInvoiceEmailSender.sentEmails().size());
+        Assertions.assertEquals(0, recordingInvoiceEmailSender.failedEmails().size());
+    }
+
+    @Test
+    void paymentOnAccepted_responseDoesNotLeakInternalFields() throws Exception {
+        acceptWithFailedEmail(ORDER_FULL);
+
+        MvcResult result = mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content(paymentBody("100.00")))
+                .andExpect(status().isCreated())
+                .andReturn();
+
+        String json = result.getResponse().getContentAsString();
+        Assertions.assertFalse(json.contains("accepted_signature_file_id"), json);
+        Assertions.assertFalse(json.contains("stored_file_id"), json);
+        Assertions.assertFalse(json.contains("storage_path"), json);
+        Assertions.assertFalse(json.contains("/uploads/"), json);
     }
 }
