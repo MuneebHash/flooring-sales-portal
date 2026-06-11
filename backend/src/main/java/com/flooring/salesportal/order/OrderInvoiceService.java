@@ -79,6 +79,7 @@ public class OrderInvoiceService {
     private final OrderChargeLineReadRepository orderChargeLineReadRepository;
     private final OrderFinancialCalculator financialCalculator;
     private final InvoicePreconditionValidator preconditionValidator;
+    private final CustomerEmailValidator customerEmailValidator;
     private final PaymentTransactionRepository paymentTransactionRepository;
     private final InvoiceRepository invoiceRepository;
     private final InvoicePdfGenerator invoicePdfGenerator;
@@ -93,6 +94,7 @@ public class OrderInvoiceService {
                                OrderChargeLineReadRepository orderChargeLineReadRepository,
                                OrderFinancialCalculator financialCalculator,
                                InvoicePreconditionValidator preconditionValidator,
+                               CustomerEmailValidator customerEmailValidator,
                                PaymentTransactionRepository paymentTransactionRepository,
                                InvoiceRepository invoiceRepository,
                                InvoicePdfGenerator invoicePdfGenerator,
@@ -106,6 +108,7 @@ public class OrderInvoiceService {
         this.orderChargeLineReadRepository = orderChargeLineReadRepository;
         this.financialCalculator = financialCalculator;
         this.preconditionValidator = preconditionValidator;
+        this.customerEmailValidator = customerEmailValidator;
         this.paymentTransactionRepository = paymentTransactionRepository;
         this.invoiceRepository = invoiceRepository;
         this.invoicePdfGenerator = invoicePdfGenerator;
@@ -224,13 +227,20 @@ public class OrderInvoiceService {
                                                                    RequestContext ctx,
                                                                    int versionNumber,
                                                                    String successMessage) {
+        // Phase 13 email gate (contract §12): a valid customer email is required BEFORE the 9
+        // preconditions are evaluated; when it fails, the 9-check evaluation is skipped entirely. A
+        // missing customer row is therefore 422 CUSTOMER_EMAIL_REQUIRED, never
+        // INVOICE_PRECONDITIONS_NOT_MET. Create / Rewrite still send NO email — the gate only
+        // guarantees the later Accept auto-email can always be addressed.
+        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
+        customerEmailValidator.requireValidCustomerEmail(customer);
+
         // Live financial summary (never persisted as a row) — products + charges + price adjustment.
         OrderFinancialSummaryDto summary = financialCalculator.compute(
                 orderProductLineRepository.sumFinancials(orderId),
                 orderChargeLineReadRepository.sumFinancials(orderId),
                 order.getPriceAdjustmentIncGst());
 
-        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
         List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
 
         List<ErrorDetail> failures = preconditionValidator.collectFailures(order, customer, addresses, summary);
@@ -285,6 +295,12 @@ public class OrderInvoiceService {
                     orderId, versionNumber, invoiceDate, dueDate, detailsSnapshot,
                     salePriceExGst, salePriceIncGst, totalPaid, balanceDue,
                     storedFileId, ctx.userId());
+
+            // Dashboard mirror invariant (Phase 13 §11.1): whenever a new current invoice version is
+            // created, sales_order.last_emailed_at is set to that version's last_emailed_at — null here
+            // (Create / Rewrite never email), so the dashboard cannot show a stale emailed time from a
+            // previous version. Same transaction as the insert; the order row is held FOR UPDATE.
+            invoiceRepository.updateSalesOrderLastEmailedAt(orderId, row.lastEmailedAt());
 
             InvoiceDetailDto dto = toDto(slug, orderId, row);
             return ApiResponse.ok(new InvoiceResponse(dto), successMessage);
@@ -456,6 +472,10 @@ public class OrderInvoiceService {
     // ------------------------------------------------------------------
 
     private static InvoiceDetailDto toDto(String slug, long orderId, InvoiceRow row) {
+        // accepted_signature_present / the download path are DERIVED from the internal
+        // accepted_signature_file_id, which itself is never serialized (mirrors how stored_file_id is
+        // hidden behind pdf_download_path). The path is built only when a signature is actually stored.
+        boolean signaturePresent = row.acceptedSignatureFileId() != null;
         return new InvoiceDetailDto(
                 row.invoiceId(),
                 row.orderId(),
@@ -469,12 +489,22 @@ public class OrderInvoiceService {
                 row.balanceDue(),
                 row.createdByUserId(),
                 row.createdAt(),
-                buildPdfDownloadPath(slug, orderId));
+                buildPdfDownloadPath(slug, orderId),
+                row.acceptedAt(),
+                row.acceptedCustomerName(),
+                signaturePresent,
+                signaturePresent ? buildSignatureDownloadPath(slug, orderId) : null,
+                row.lastEmailedAt());
     }
 
     // Stable current-invoice file path (always resolves to the current version at request time).
     private static String buildPdfDownloadPath(String slug, long orderId) {
         return "/api/v1/" + slug + "/orders/" + orderId + "/invoices/current/file";
+    }
+
+    // Stable current-invoice signature path (Phase 13 D.10 — the endpoint itself is a later branch).
+    private static String buildSignatureDownloadPath(String slug, long orderId) {
+        return "/api/v1/" + slug + "/orders/" + orderId + "/invoices/current/signature";
     }
 
     private static String customerName(OrderCustomer customer) {

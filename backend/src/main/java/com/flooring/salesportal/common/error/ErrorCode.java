@@ -34,6 +34,11 @@ public enum ErrorCode {
     INVOICE_NOT_FOUND(HttpStatus.NOT_FOUND, "Invoice not found."),
     INVOICE_PRECONDITIONS_NOT_MET(HttpStatus.UNPROCESSABLE_ENTITY, "Complete required fields before creating invoice."),
     PAYMENT_EXCEEDS_BALANCE(HttpStatus.UNPROCESSABLE_ENTITY, "Payment amount cannot exceed the current balance due."),
+    // Phase 13 customer-email gate (contract §12): evaluated on D.1 Create / D.2 Rewrite BEFORE the 9
+    // invoice preconditions (and reused by the later Accept / Resend branches). The remaining Phase 13
+    // codes (signature / already-accepted / email-send) are added by the branches that use them.
+    CUSTOMER_EMAIL_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "A valid customer email is required before this action."),
+    CUSTOMER_EMAIL_INVALID(HttpStatus.UNPROCESSABLE_ENTITY, "Customer email is not a valid email address."),
     INTERNAL_SERVER_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
 
     private final HttpStatus status;

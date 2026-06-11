@@ -13,8 +13,13 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.context.WebApplicationContext;
 
+import org.junit.jupiter.api.Assertions;
+import org.springframework.test.web.servlet.MvcResult;
+
 import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.everyItem;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.isA;
 import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -456,6 +461,126 @@ class DashboardOrderControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
                 .andExpect(jsonPath("$.error.details[0].field").value("status"));
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 13 — invoice_accepted (boolean, derived from the CURRENT invoice) + last_emailed_at mirror
+    // ----------------------------------------------------------------
+
+    /** Insert an extra (unaccepted) invoice version for the order, so current = MAX(version_number) moves. */
+    private void insertUnacceptedInvoiceVersion(long orderId, int version) {
+        Long storedFileId = jdbcTemplate.queryForObject(
+                "INSERT INTO stored_file (file_name, storage_path, mime_type, file_size) "
+                        + "VALUES (?, ?, 'application/pdf', 1000) RETURNING stored_file_id",
+                Long.class, "invoice-v" + version + ".pdf", "/uploads/1/orders/" + orderId + "/v" + version + ".pdf");
+        jdbcTemplate.update(
+                "INSERT INTO invoice (order_id, version_number, invoice_date, due_date, "
+                        + "details_of_sale_snapshot, sale_price_ex_gst, sale_price_inc_gst, total_paid, "
+                        + "balance_due, stored_file_id, created_by_user_id) "
+                        + "VALUES (?, ?, CURRENT_DATE, CURRENT_DATE, ?, 840.00, 924.00, 500.00, 424.00, ?, ?)",
+                orderId, version, "snapshot v" + version, storedFileId, USER_LIAM);
+    }
+
+    private int maxInvoiceVersion(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COALESCE(MAX(version_number), 0) FROM invoice WHERE order_id = ?", Integer.class, orderId);
+    }
+
+    /** Mark the order's CURRENT (max version_number) invoice as accepted. */
+    private void acceptCurrentInvoice(long orderId) {
+        jdbcTemplate.update("""
+                UPDATE invoice SET accepted_at = TIMESTAMP '2026-04-22 14:31:10'
+                WHERE invoice_id = (SELECT invoice_id FROM invoice WHERE order_id = ?
+                                    ORDER BY version_number DESC LIMIT 1)
+                """, orderId);
+    }
+
+    @Test
+    void invoiceAccepted_falseWhenNoInvoiceExists() throws Exception {
+        // Order 2 has no invoice at all -> invoice_accepted is false (never null / never missing).
+        mockMvc.perform(get(LIST_URL + "?search=LC1.00002").session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data", hasSize(1)))
+                .andExpect(jsonPath("$.data[0].order_id").value(2))
+                .andExpect(jsonPath("$.data[0].invoice_accepted").value(false));
+    }
+
+    @Test
+    void invoiceAccepted_falseWhenCurrentInvoiceUnaccepted() throws Exception {
+        // Order 1 has the seeded invoice (accepted_at NULL) -> false.
+        mockMvc.perform(get(LIST_URL + "?search=LC1.00001").session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data", hasSize(1)))
+                .andExpect(jsonPath("$.data[0].order_id").value(1))
+                .andExpect(jsonPath("$.data[0].invoice_accepted").value(false));
+    }
+
+    @Test
+    void invoiceAccepted_trueWhenCurrentInvoiceAccepted() throws Exception {
+        acceptCurrentInvoice(1);
+
+        mockMvc.perform(get(LIST_URL + "?search=LC1.00001").session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].invoice_accepted").value(true));
+    }
+
+    @Test
+    void invoiceAccepted_derivedFromCurrentVersionOnly() throws Exception {
+        // Accept the current version, then add a newer UNACCEPTED version: the current (max version)
+        // invoice decides, so the row flips back to false — an old accepted version must not keep the
+        // dashboard showing accepted.
+        acceptCurrentInvoice(1);
+        insertUnacceptedInvoiceVersion(1, maxInvoiceVersion(1) + 1);
+
+        mockMvc.perform(get(LIST_URL + "?search=LC1.00001").session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].invoice_accepted").value(false));
+    }
+
+    @Test
+    void invoiceAccepted_presentOnEveryRow_andNoInvoiceStatusEnumLeaks() throws Exception {
+        // The indefinite-path projection silently skips rows missing the key (and everyItem passes
+        // vacuously on an empty projection), so anchor the assertion: the first row must carry the
+        // boolean, and the projection size must equal the row count.
+        mockMvc.perform(get(LIST_URL).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].invoice_accepted").isBoolean())
+                // Every row carries invoice_accepted as a boolean, regardless of invoice state.
+                .andExpect(jsonPath("$.data[*].invoice_accepted", everyItem(isA(Boolean.class))))
+                .andExpect(result -> {
+                    String json = result.getResponse().getContentAsString();
+                    int rows = com.jayway.jsonpath.JsonPath.read(json, "$.data.length()");
+                    int withKey = ((java.util.List<?>) com.jayway.jsonpath.JsonPath
+                            .read(json, "$.data[*].invoice_accepted")).size();
+                    Assertions.assertEquals(rows, withKey, "invoice_accepted present on every row");
+                })
+                // No invoice-status enum on the dashboard (Phase 13 contract §11): the indefinite path
+                // collects matches across all rows, so zero matches = the key appears on no row.
+                .andExpect(jsonPath("$.data[*].invoice_status", hasSize(0)));
+    }
+
+    @Test
+    void lastEmailedAt_nullByDefault_keyStillPresent() throws Exception {
+        // The seeded mirror column is NULL (nothing has been emailed). jsonPath doesNotExist() treats
+        // JSON null as absent, so assert the key is present-as-null on the raw single-row body.
+        MvcResult result = mockMvc.perform(get(LIST_URL + "?search=LC1.00001").session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data", hasSize(1)))
+                .andReturn();
+
+        String json = result.getResponse().getContentAsString();
+        Assertions.assertTrue(json.contains("\"last_emailed_at\":null"),
+                () -> "last_emailed_at must be present as null: " + json);
+    }
+
+    @Test
+    void lastEmailedAt_rendersMirrorTimestamp() throws Exception {
+        jdbcTemplate.update(
+                "UPDATE sales_order SET last_emailed_at = TIMESTAMP '2026-04-22 14:31:12' WHERE order_id = 1");
+
+        mockMvc.perform(get(LIST_URL + "?search=LC1.00001").session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data[0].last_emailed_at").value("2026-04-22T14:31:12"));
     }
 
     @Test

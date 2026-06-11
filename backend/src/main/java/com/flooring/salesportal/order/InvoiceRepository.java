@@ -41,7 +41,10 @@ public class InvoiceRepository {
             RETURNING stored_file_id
             """;
 
-    // RETURNING projection = exactly the E.2 invoice_detail columns (NO stored_file_id).
+    // RETURNING projection = the E.2 invoice_detail columns (NO stored_file_id) plus the Phase 13
+    // acceptance/email columns. accepted_signature_file_id is SERVER-INTERNAL: it rides on InvoiceRow
+    // only so the services can derive accepted_signature_present / the signature download path (and so
+    // later Phase 13 branches can carry it forward); the DTO mapping never exposes the id itself.
     private static final String RETURN_COLUMNS = """
                 invoice_id,
                 order_id,
@@ -54,7 +57,11 @@ public class InvoiceRepository {
                 total_paid,
                 balance_due,
                 created_by_user_id,
-                created_at
+                created_at,
+                accepted_at,
+                accepted_customer_name,
+                accepted_signature_file_id,
+                last_emailed_at
             """;
 
     private static final String INSERT_INVOICE_SQL = """
@@ -86,6 +93,14 @@ public class InvoiceRepository {
             WHERE i.order_id = :orderId
             ORDER BY i.version_number DESC
             LIMIT 1
+            """;
+
+    // Dashboard mirror (Phase 13 §11.1): sales_order.last_emailed_at must always equal the CURRENT
+    // invoice's last_emailed_at, including NULL. Called whenever a new invoice version is created.
+    private static final String UPDATE_SALES_ORDER_LAST_EMAILED_SQL = """
+            UPDATE sales_order
+            SET last_emailed_at = :lastEmailedAt
+            WHERE order_id = :orderId
             """;
 
     private final NamedParameterJdbcTemplate jdbc;
@@ -153,10 +168,28 @@ public class InvoiceRepository {
         return jdbc.query(FIND_CURRENT_FILE_SQL, params, FILE_ROW_MAPPER).stream().findFirst();
     }
 
+    /**
+     * Set the dashboard mirror {@code sales_order.last_emailed_at} to the CURRENT invoice's
+     * {@code last_emailed_at} (Phase 13 §11.1 mirror invariant) — including {@code null}, so the
+     * dashboard never shows a stale emailed time from a previous version. Callers invoke this with the
+     * new version's value whenever a new invoice version is created (Create / Rewrite / payment — and
+     * the later Phase 13 Accept branch); the caller already holds the order row {@code FOR UPDATE}
+     * inside its transaction. {@code updated_at} is deliberately untouched — this is a system-side
+     * delivery marker, not a user edit.
+     */
+    public void updateSalesOrderLastEmailedAt(long orderId, LocalDateTime lastEmailedAt) {
+        MapSqlParameterSource params = new MapSqlParameterSource()
+                .addValue("orderId", orderId)
+                .addValue("lastEmailedAt", lastEmailedAt == null ? null : Timestamp.valueOf(lastEmailedAt));
+        jdbc.update(UPDATE_SALES_ORDER_LAST_EMAILED_SQL, params);
+    }
+
     private static final RowMapper<InvoiceRow> ROW_MAPPER = (rs, n) -> {
         Date invoiceDate = rs.getDate("invoice_date");
         Date dueDate = rs.getDate("due_date");
         Timestamp createdAt = rs.getTimestamp("created_at");
+        Timestamp acceptedAt = rs.getTimestamp("accepted_at");
+        Timestamp lastEmailedAt = rs.getTimestamp("last_emailed_at");
         return new InvoiceRow(
                 rs.getLong("invoice_id"),
                 rs.getLong("order_id"),
@@ -169,7 +202,11 @@ public class InvoiceRepository {
                 rs.getBigDecimal("total_paid"),
                 rs.getBigDecimal("balance_due"),
                 rs.getLong("created_by_user_id"),
-                createdAt == null ? null : createdAt.toLocalDateTime());
+                createdAt == null ? null : createdAt.toLocalDateTime(),
+                acceptedAt == null ? null : acceptedAt.toLocalDateTime(),
+                rs.getString("accepted_customer_name"),
+                rs.getObject("accepted_signature_file_id", Long.class),
+                lastEmailedAt == null ? null : lastEmailedAt.toLocalDateTime());
     };
 
     private static final RowMapper<InvoiceFile> FILE_ROW_MAPPER = (rs, n) -> new InvoiceFile(
@@ -178,7 +215,13 @@ public class InvoiceRepository {
             rs.getString("mime_type"),
             rs.getLong("file_size"));
 
-    /** The E.2 invoice columns returned by an insert / current read (no stored_file_id / storage_path). */
+    /**
+     * The E.2 invoice columns returned by an insert / current read (no stored_file_id / storage_path),
+     * plus the Phase 13 acceptance/email columns. {@code acceptedSignatureFileId} is SERVER-INTERNAL —
+     * the services derive {@code accepted_signature_present} / the signature download path from it and
+     * never serialize the id itself. On this branch every insert path leaves all four acceptance/email
+     * columns NULL (Accept / carry-forward are later Phase 13 branches).
+     */
     public record InvoiceRow(
             long invoiceId,
             long orderId,
@@ -191,7 +234,11 @@ public class InvoiceRepository {
             BigDecimal totalPaid,
             BigDecimal balanceDue,
             long createdByUserId,
-            LocalDateTime createdAt) {
+            LocalDateTime createdAt,
+            LocalDateTime acceptedAt,
+            String acceptedCustomerName,
+            Long acceptedSignatureFileId,
+            LocalDateTime lastEmailedAt) {
     }
 
     /**

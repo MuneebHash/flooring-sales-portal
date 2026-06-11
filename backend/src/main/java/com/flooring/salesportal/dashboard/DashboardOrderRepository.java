@@ -20,6 +20,11 @@ public class DashboardOrderRepository {
             LEFT JOIN order_address oa ON oa.order_id = so.order_id AND oa.address_type = 'INSTALLATION'
             """;
 
+    // invoice_accepted (Phase 13 §11): true iff the order's CURRENT invoice (max version_number) has
+    // accepted_at IS NOT NULL; false when no invoice exists or the current one is unaccepted. Derived
+    // per row via a LIMIT-1 correlated subquery on idx_invoice_order — NO invoice-status enum.
+    // last_emailed_at stays sourced from sales_order: Phase 13 redefines that column as a mirror of the
+    // current invoice's last_emailed_at (§11.1), maintained by the invoice/payment services.
     private static final String SELECT_COLUMNS = """
             SELECT
                 so.order_id,
@@ -28,6 +33,13 @@ public class DashboardOrderRepository {
                 so.flooring_type::text   AS flooring_type,
                 so.order_status::text    AS order_status,
                 so.last_emailed_at,
+                COALESCE((
+                    SELECT i.accepted_at IS NOT NULL
+                    FROM invoice i
+                    WHERE i.order_id = so.order_id
+                    ORDER BY i.version_number DESC
+                    LIMIT 1
+                ), FALSE)                AS invoice_accepted,
                 so.week_year,
                 so.week_number,
                 so.gp,
@@ -153,6 +165,7 @@ public class DashboardOrderRepository {
                 rs.getString("order_status"),
                 customer,
                 installAddress,
+                rs.getBoolean("invoice_accepted"),
                 emailedAt == null ? null : emailedAt.toLocalDateTime(),
                 rs.getInt("week_year"),
                 rs.getInt("week_number"),

@@ -271,10 +271,17 @@ public class OrderPaymentService {
         deleteFileOnRollback(storagePath);
         try {
             long storedFileId = invoiceRepository.insertStoredFile(fileName, storagePath, PDF_MIME, pdfBytes.length);
-            return invoiceRepository.insertInvoice(
+            InvoiceRow newVersion = invoiceRepository.insertInvoice(
                     orderId, versionNumber, invoiceDate, dueDate, detailsSnapshot,
                     salePriceExGst, salePriceIncGst, totalPaidAfter, newBalance,
                     storedFileId, ctx.userId());
+
+            // Dashboard mirror invariant (Phase 13 §11.1): whenever a new current invoice version is
+            // created, sales_order.last_emailed_at is set to that version's last_emailed_at — null here
+            // (a payment-created version starts unemailed; the payment-after-accepted email is a later
+            // Phase 13 branch). Same transaction as the insert; the order row is held FOR UPDATE.
+            invoiceRepository.updateSalesOrderLastEmailedAt(orderId, newVersion.lastEmailedAt());
+            return newVersion;
         } catch (RuntimeException ex) {
             fileStorageService.deleteQuietly(storagePath);
             throw ex;
@@ -498,6 +505,11 @@ public class OrderPaymentService {
     }
 
     private static CurrentInvoiceSummaryDto toSummaryDto(String slug, long orderId, InvoiceRow row) {
+        // accepted_signature_present / the download path are DERIVED from the internal
+        // accepted_signature_file_id, which itself is never serialized (mirrors how stored_file_id is
+        // hidden behind pdf_download_path). On this branch a payment-created version is always
+        // unsigned/unaccepted, so these resolve to null/false (carry-forward is a later Phase 13 branch).
+        boolean signaturePresent = row.acceptedSignatureFileId() != null;
         return new CurrentInvoiceSummaryDto(
                 row.invoiceId(),
                 row.versionNumber(),
@@ -508,7 +520,14 @@ public class OrderPaymentService {
                 row.balanceDue(),
                 row.createdByUserId(),
                 row.createdAt(),
-                "/api/v1/" + slug + "/orders/" + orderId + "/invoices/current/file");
+                "/api/v1/" + slug + "/orders/" + orderId + "/invoices/current/file",
+                row.acceptedAt(),
+                row.acceptedCustomerName(),
+                signaturePresent,
+                signaturePresent
+                        ? "/api/v1/" + slug + "/orders/" + orderId + "/invoices/current/signature"
+                        : null,
+                row.lastEmailedAt());
     }
 
     // Presentational PDF helpers (mirror OrderInvoiceService — kept local so Branch D stays self-contained
