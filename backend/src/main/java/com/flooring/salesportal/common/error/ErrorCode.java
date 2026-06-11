@@ -35,10 +35,19 @@ public enum ErrorCode {
     INVOICE_PRECONDITIONS_NOT_MET(HttpStatus.UNPROCESSABLE_ENTITY, "Complete required fields before creating invoice."),
     PAYMENT_EXCEEDS_BALANCE(HttpStatus.UNPROCESSABLE_ENTITY, "Payment amount cannot exceed the current balance due."),
     // Phase 13 customer-email gate (contract §12): evaluated on D.1 Create / D.2 Rewrite BEFORE the 9
-    // invoice preconditions (and reused by the later Accept / Resend branches). The remaining Phase 13
-    // codes (signature / already-accepted / email-send) are added by the branches that use them.
+    // invoice preconditions, and reused by D.8 Accept / D.9 Resend (where it runs last, after the
+    // invoice-state and signature checks).
     CUSTOMER_EMAIL_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "A valid customer email is required before this action."),
     CUSTOMER_EMAIL_INVALID(HttpStatus.UNPROCESSABLE_ENTITY, "Customer email is not a valid email address."),
+    // Phase 13 Accept / Resend / signature codes (contract §12). EMAIL_SEND_FAILED (502) is raised by
+    // D.9 Resend ONLY: the non-fatal D.8 accept-send (and the later D.7 payment-after-accepted send)
+    // surface an email failure via last_emailed_at = null + a success message, never via this code.
+    ACCEPTED_CUSTOMER_NAME_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "Accepted customer name is required."),
+    SIGNATURE_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "A customer signature is required to accept the invoice."),
+    SIGNATURE_INVALID(HttpStatus.BAD_REQUEST, "Signature must be a PNG image no larger than 2 MB."),
+    INVOICE_ALREADY_ACCEPTED(HttpStatus.CONFLICT, "This invoice has already been accepted. Use Re-send to email it again."),
+    INVOICE_NOT_ACCEPTED(HttpStatus.UNPROCESSABLE_ENTITY, "This invoice has not been accepted yet."),
+    EMAIL_SEND_FAILED(HttpStatus.BAD_GATEWAY, "The invoice could not be emailed. Please try again."),
     INTERNAL_SERVER_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
 
     private final HttpStatus status;

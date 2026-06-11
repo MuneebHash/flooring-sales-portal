@@ -64,15 +64,21 @@ public class InvoiceRepository {
                 last_emailed_at
             """;
 
+    // The four Phase 13 acceptance/email columns are written explicitly: Create / Rewrite / payment
+    // pass nulls (an unaccepted version), the Accept flow (D.8) passes the captured acceptance values
+    // with last_emailed_at = null (stamped post-commit on email success), and the later 13C
+    // payment-carry-forward branch passes the previous version's acceptance values.
     private static final String INSERT_INVOICE_SQL = """
             INSERT INTO invoice
                 (order_id, version_number, invoice_date, due_date, details_of_sale_snapshot,
                  sale_price_ex_gst, sale_price_inc_gst, total_paid, balance_due,
-                 stored_file_id, created_by_user_id)
+                 stored_file_id, created_by_user_id,
+                 accepted_at, accepted_customer_name, accepted_signature_file_id, last_emailed_at)
             VALUES
                 (:orderId, :versionNumber, :invoiceDate, :dueDate, :detailsOfSaleSnapshot,
                  :salePriceExGst, :salePriceIncGst, :totalPaid, :balanceDue,
-                 :storedFileId, :createdByUserId)
+                 :storedFileId, :createdByUserId,
+                 :acceptedAt, :acceptedCustomerName, :acceptedSignatureFileId, :lastEmailedAt)
             RETURNING
             """ + RETURN_COLUMNS;
 
@@ -103,6 +109,25 @@ public class InvoiceRepository {
             WHERE order_id = :orderId
             """;
 
+    // In-place delivery stamp (Phase 13 §4: last_emailed_at is a mutable delivery marker, NOT part of
+    // the immutable acceptance snapshot). Used by the post-commit email-success update on D.8 Accept
+    // and by D.9 Resend — the only writes that touch an existing invoice row.
+    private static final String UPDATE_INVOICE_LAST_EMAILED_SQL = """
+            UPDATE invoice
+            SET last_emailed_at = :lastEmailedAt
+            WHERE invoice_id = :invoiceId
+            """;
+
+    // Signature stored_file metadata by id (Phase 13 D.10 download / future 13C PDF embed). The id
+    // comes from invoice.accepted_signature_file_id on the CURRENT row — deliberately NOT a join on
+    // ORDER BY version_number, which could skip a current row whose signature column is NULL and
+    // wrongly surface an older version's signature.
+    private static final String FIND_STORED_FILE_SQL = """
+            SELECT file_name, storage_path, mime_type, file_size
+            FROM stored_file
+            WHERE stored_file_id = :storedFileId
+            """;
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public InvoiceRepository(NamedParameterJdbcTemplate jdbc) {
@@ -129,7 +154,13 @@ public class InvoiceRepository {
         return id;
     }
 
-    /** Insert one invoice row and return its E.2 columns (stored_file_id is written but not returned). */
+    /**
+     * Insert one invoice row and return its E.2 columns (stored_file_id is written but not returned).
+     * The four acceptance/email parameters are nullable: Create / Rewrite / payment pass nulls; the
+     * Accept flow (D.8) passes {@code acceptedAt} / {@code acceptedCustomerName} /
+     * {@code acceptedSignatureFileId} with {@code lastEmailedAt = null} (the email-success timestamp is
+     * stamped post-commit via {@link #updateInvoiceLastEmailedAt}).
+     */
     public InvoiceRow insertInvoice(long orderId,
                                     int versionNumber,
                                     LocalDate invoiceDate,
@@ -140,7 +171,11 @@ public class InvoiceRepository {
                                     BigDecimal totalPaid,
                                     BigDecimal balanceDue,
                                     long storedFileId,
-                                    long createdByUserId) {
+                                    long createdByUserId,
+                                    LocalDateTime acceptedAt,
+                                    String acceptedCustomerName,
+                                    Long acceptedSignatureFileId,
+                                    LocalDateTime lastEmailedAt) {
         MapSqlParameterSource params = new MapSqlParameterSource()
                 .addValue("orderId", orderId)
                 .addValue("versionNumber", versionNumber)
@@ -152,7 +187,11 @@ public class InvoiceRepository {
                 .addValue("totalPaid", totalPaid)
                 .addValue("balanceDue", balanceDue)
                 .addValue("storedFileId", storedFileId)
-                .addValue("createdByUserId", createdByUserId);
+                .addValue("createdByUserId", createdByUserId)
+                .addValue("acceptedAt", acceptedAt == null ? null : Timestamp.valueOf(acceptedAt))
+                .addValue("acceptedCustomerName", acceptedCustomerName)
+                .addValue("acceptedSignatureFileId", acceptedSignatureFileId)
+                .addValue("lastEmailedAt", lastEmailedAt == null ? null : Timestamp.valueOf(lastEmailedAt));
         return jdbc.queryForObject(INSERT_INVOICE_SQL, params, ROW_MAPPER);
     }
 
@@ -182,6 +221,30 @@ public class InvoiceRepository {
                 .addValue("orderId", orderId)
                 .addValue("lastEmailedAt", lastEmailedAt == null ? null : Timestamp.valueOf(lastEmailedAt));
         jdbc.update(UPDATE_SALES_ORDER_LAST_EMAILED_SQL, params);
+    }
+
+    /**
+     * Stamp {@code invoice.last_emailed_at} IN PLACE on one row (Phase 13 §4: the delivery marker is
+     * the only mutable invoice column — the sale snapshot and acceptance fields stay append-only).
+     * Used by the post-commit email-success update (D.8 Accept) and by D.9 Resend; the caller updates
+     * the {@code sales_order} mirror to the CURRENT invoice's value in the same transaction
+     * ({@link #updateSalesOrderLastEmailedAt}) so the §11.1 invariant holds.
+     */
+    public void updateInvoiceLastEmailedAt(long invoiceId, LocalDateTime lastEmailedAt) {
+        MapSqlParameterSource params = new MapSqlParameterSource()
+                .addValue("invoiceId", invoiceId)
+                .addValue("lastEmailedAt", lastEmailedAt == null ? null : Timestamp.valueOf(lastEmailedAt));
+        jdbc.update(UPDATE_INVOICE_LAST_EMAILED_SQL, params);
+    }
+
+    /**
+     * One {@code stored_file} row's metadata by id, for binary streaming (Phase 13 D.10: the current
+     * invoice's {@code accepted_signature_file_id}). {@code storage_path} is server-internal — used
+     * only to read the bytes, never returned in any response.
+     */
+    public Optional<InvoiceFile> findStoredFileById(long storedFileId) {
+        MapSqlParameterSource params = new MapSqlParameterSource().addValue("storedFileId", storedFileId);
+        return jdbc.query(FIND_STORED_FILE_SQL, params, FILE_ROW_MAPPER).stream().findFirst();
     }
 
     private static final RowMapper<InvoiceRow> ROW_MAPPER = (rs, n) -> {
@@ -219,8 +282,9 @@ public class InvoiceRepository {
      * The E.2 invoice columns returned by an insert / current read (no stored_file_id / storage_path),
      * plus the Phase 13 acceptance/email columns. {@code acceptedSignatureFileId} is SERVER-INTERNAL —
      * the services derive {@code accepted_signature_present} / the signature download path from it and
-     * never serialize the id itself. On this branch every insert path leaves all four acceptance/email
-     * columns NULL (Accept / carry-forward are later Phase 13 branches).
+     * never serialize the id itself. Create / Rewrite / payment inserts leave all four acceptance/email
+     * columns NULL; the Accept flow (D.8) writes the three acceptance columns on its appended version
+     * (payment carry-forward of acceptance is the later 13C branch).
      */
     public record InvoiceRow(
             long invoiceId,

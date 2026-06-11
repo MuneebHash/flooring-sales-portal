@@ -10,6 +10,8 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.util.Base64;
 
 /**
  * DB-free unit test for {@link InvoicePdfGenerator} (Phase 12 Branch A). Exercises the real Thymeleaf
@@ -24,6 +26,11 @@ class InvoicePdfGeneratorTest {
 
     private static final InvoicePdfGenerator GENERATOR = new InvoicePdfGenerator();
 
+    // A real, decodable 1x1 PNG: openhtmltopdf must actually decode the data URI when embedding the
+    // signature image, so fake bytes would break the accepted-render path.
+    private static final byte[] ONE_PIXEL_PNG = Base64.getDecoder().decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
+
     private static InvoicePdfModel sampleModel(LocalDate dueDate) {
         return new InvoicePdfModel(
                 "Aussie Floors Group",
@@ -37,7 +44,27 @@ class InvoicePdfGeneratorTest {
                 "Supply and install plush carpet to lounge and dining rooms. Furniture to be moved by installer.",
                 new BigDecimal("924.00"),
                 new BigDecimal("500.00"),
-                new BigDecimal("424.00"));
+                new BigDecimal("424.00"),
+                null, null, null);
+    }
+
+    private static InvoicePdfModel acceptedModel(byte[] signaturePng) {
+        return new InvoicePdfModel(
+                "Aussie Floors Group",
+                "SYD-CBD.LC1.00001",
+                2,
+                LocalDate.of(2026, 4, 22),
+                LocalDate.of(2026, 4, 29),
+                "James Wilson",
+                "42 Oxford Street",
+                "Paddington NSW 2021",
+                "Supply and install plush carpet to lounge and dining rooms.",
+                new BigDecimal("924.00"),
+                new BigDecimal("500.00"),
+                new BigDecimal("424.00"),
+                LocalDateTime.of(2026, 4, 22, 14, 31, 10),
+                "James Wilson Jr",
+                signaturePng);
     }
 
     private static String extractText(byte[] pdf) throws IOException {
@@ -89,7 +116,8 @@ class InvoicePdfGeneratorTest {
                 LocalDate.of(2026, 4, 14), LocalDate.of(2026, 4, 29),
                 "James Wilson & Co", "42 Oxford Street", "Paddington NSW 2021",
                 "Tile & timber to lounge < dining > hallway; premium finish.",
-                new BigDecimal("1000.00"), new BigDecimal("0.00"), new BigDecimal("1000.00"));
+                new BigDecimal("1000.00"), new BigDecimal("0.00"), new BigDecimal("1000.00"),
+                null, null, null);
         byte[] pdf = GENERATOR.render(model);
         assertPdfHeader(pdf);
 
@@ -97,5 +125,66 @@ class InvoicePdfGeneratorTest {
         Assertions.assertTrue(text.contains("Tile & timber"), () -> "escaped ampersand not rendered: " + text);
         Assertions.assertTrue(text.contains("Wilson & Co"), () -> "escaped name not rendered: " + text);
         Assertions.assertTrue(text.contains("1,000.00"), () -> "grouped amount not rendered: " + text);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 13 §8 — acceptance/signature block
+    // ------------------------------------------------------------------
+
+    /** Number of image XObjects across the document — the embedded signature shows up here. */
+    private static int countImages(byte[] pdf) throws IOException {
+        int images = 0;
+        try (PDDocument document = PDDocument.load(pdf)) {
+            for (var page : document.getPages()) {
+                var resources = page.getResources();
+                for (var name : resources.getXObjectNames()) {
+                    if (resources.isImageXObject(name)) {
+                        images++;
+                    }
+                }
+            }
+        }
+        return images;
+    }
+
+    @Test
+    void render_unaccepted_rendersBlankSignatureAreaWithoutAcceptanceText() throws IOException {
+        byte[] pdf = GENERATOR.render(sampleModel(LocalDate.of(2026, 4, 29)));
+        assertPdfHeader(pdf);
+
+        // .section-title CSS uppercases the heading, so it extracts as "CUSTOMER ACCEPTANCE".
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        Assertions.assertTrue(text.contains("CUSTOMER ACCEPTANCE"), () -> "missing acceptance section: " + text);
+        Assertions.assertTrue(text.contains("Customer signature"), () -> "missing blank-area caption: " + text);
+        Assertions.assertFalse(text.contains("Accepted by"), () -> "unaccepted PDF must not show acceptance: " + text);
+        Assertions.assertEquals(0, countImages(pdf), "unaccepted PDF must embed no signature image");
+    }
+
+    @Test
+    void render_accepted_embedsSignatureImageNameAndTimestamp() throws IOException {
+        byte[] pdf = GENERATOR.render(acceptedModel(ONE_PIXEL_PNG));
+        assertPdfHeader(pdf);
+
+        // PDFBox may extract the caption spans out of visual order, so the name / timestamp / static
+        // text are asserted independently rather than as one phrase.
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        Assertions.assertTrue(text.contains("CUSTOMER ACCEPTANCE"), () -> "missing acceptance section: " + text);
+        Assertions.assertTrue(text.contains("Accepted by"), () -> "missing acceptance caption: " + text);
+        Assertions.assertTrue(text.contains("James Wilson Jr"), () -> "missing accepted name: " + text);
+        Assertions.assertTrue(text.contains("22/04/2026 14:31"), () -> "missing accepted timestamp: " + text);
+        Assertions.assertFalse(text.contains("Customer signature"),
+                () -> "accepted PDF must not show the blank-area caption: " + text);
+        Assertions.assertTrue(countImages(pdf) >= 1, "accepted PDF must embed the signature image");
+    }
+
+    @Test
+    void render_accepted_withoutSignatureBytes_stillRendersCaption() throws IOException {
+        // Defensive: acceptedAt set but no bytes (must not NPE / emit a broken img element).
+        byte[] pdf = GENERATOR.render(acceptedModel(null));
+        assertPdfHeader(pdf);
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        Assertions.assertTrue(text.contains("Accepted by"), () -> "missing caption: " + text);
+        Assertions.assertTrue(text.contains("James Wilson Jr"), () -> "missing accepted name: " + text);
+        Assertions.assertEquals(0, countImages(pdf), "no signature bytes -> no embedded image");
     }
 }

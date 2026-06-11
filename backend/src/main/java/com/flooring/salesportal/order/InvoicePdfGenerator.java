@@ -13,7 +13,9 @@ import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.util.Base64;
 import java.util.Locale;
 
 /**
@@ -36,6 +38,8 @@ public class InvoicePdfGenerator {
     private static final Locale DISPLAY_LOCALE = Locale.ENGLISH;
     private static final DateTimeFormatter DISPLAY_DATE =
             DateTimeFormatter.ofPattern("dd/MM/yyyy", DISPLAY_LOCALE);
+    private static final DateTimeFormatter DISPLAY_DATE_TIME =
+            DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm", DISPLAY_LOCALE);
 
     private final TemplateEngine templateEngine;
 
@@ -67,6 +71,19 @@ public class InvoicePdfGenerator {
         context.setVariable("totalPaid", money(model.totalPaid()));
         context.setVariable("balanceDue", money(model.balanceDue()));
 
+        // Phase 13 §8 acceptance block: blank signature area before acceptance; after acceptance the
+        // signature image + accepted name + accepted timestamp render. The signature is embedded as a
+        // base64 data URI — withHtmlContent(html, null) below has a NULL baseUri, so relative/classpath
+        // image src values would not resolve, while data URIs need no resolution.
+        boolean accepted = model.acceptedAt() != null;
+        context.setVariable("accepted", accepted);
+        context.setVariable("acceptedCustomerName", model.acceptedCustomerName());
+        context.setVariable("acceptedAtDisplay",
+                model.acceptedAt() == null ? "" : DISPLAY_DATE_TIME.format(model.acceptedAt()));
+        context.setVariable("signatureDataUri", model.signaturePng() == null
+                ? null
+                : "data:image/png;base64," + Base64.getEncoder().encodeToString(model.signaturePng()));
+
         String html = templateEngine.process("invoice", context);
 
         try (ByteArrayOutputStream os = new ByteArrayOutputStream()) {
@@ -89,6 +106,11 @@ public class InvoicePdfGenerator {
     /**
      * Flat, pre-resolved data the invoice template needs. Built by the service from the order /
      * customer / billing address / live financial summary at create time, then frozen onto the PDF.
+     *
+     * <p>The three acceptance fields (Phase 13 §8) are nullable: Create / Rewrite always pass nulls
+     * (an unaccepted version renders the blank signature area), the Accept flow (D.8) passes the
+     * freshly captured values, and the payment path passes nulls until the 13C carry-forward branch.
+     * {@code signaturePng} is the raw PNG bytes; the generator base64-encodes them into a data URI.
      */
     public record InvoicePdfModel(
             String businessName,
@@ -102,6 +124,9 @@ public class InvoicePdfGenerator {
             String detailsOfSale,
             BigDecimal salePriceIncGst,
             BigDecimal totalPaid,
-            BigDecimal balanceDue) {
+            BigDecimal balanceDue,
+            LocalDateTime acceptedAt,
+            String acceptedCustomerName,
+            byte[] signaturePng) {
     }
 }

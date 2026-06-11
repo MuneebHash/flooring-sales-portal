@@ -915,9 +915,10 @@ class OrderPaymentControllerTest {
 
     @Test
     void record_currentInvoiceCarriesUnsignedAcceptanceAndEmailFields() throws Exception {
-        // The E.1 current_invoice summary in the D.7 response now carries the five Phase 13 fields;
-        // a payment-created version on this branch is always unsigned/unaccepted (carry-forward of an
-        // accepted invoice is a later Phase 13 branch).
+        // The E.1 current_invoice summary in the D.7 response carries the five Phase 13 fields. The
+        // seeded invoice here is UNACCEPTED, so the payment-created version stays unaccepted with all
+        // five resolving to null/false (the accepted-invoice carry-forward path is covered in
+        // InvoiceAcceptanceControllerTest).
         MvcResult result = mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON).content(body("EFTPOS", "100.00", null)))
                 .andExpect(status().isCreated())
