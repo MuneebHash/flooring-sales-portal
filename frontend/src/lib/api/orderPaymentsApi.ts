@@ -67,6 +67,12 @@ export type RecordPaymentRequest = {
 // This is the SUMMARY shape — deliberately NOT the full InvoiceDetail (E.2): it omits order_id,
 // details_of_sale_snapshot and sale_price_ex_gst. The Payments tab does not render it (the Invoice
 // tab refetches its own current invoice on remount), so it is typed only for contract completeness.
+//
+// Phase 13: the five acceptance/email fields are ALWAYS present (nullable values serialized as
+// null). A payment on an ACCEPTED invoice carries acceptance forward onto the new version
+// (accepted_at / accepted_customer_name / signature preserved — the customer does NOT re-sign) and
+// the updated signed PDF is re-emailed best-effort; a payment on an unaccepted invoice leaves them
+// null/false and sends no email.
 export type PaymentCurrentInvoiceSummary = {
   invoice_id: number
   version_number: number
@@ -78,11 +84,22 @@ export type PaymentCurrentInvoiceSummary = {
   created_by_user_id: number
   created_at: string
   pdf_download_path: string
+  accepted_at: string | null
+  accepted_customer_name: string | null
+  accepted_signature_present: boolean
+  accepted_signature_download_path: string | null
+  last_emailed_at: string | null
 }
 
 // POST 201 data envelope: the created payment, the refreshed payment_summary, and the regenerated
-// current invoice, wrapped by the standard ApiSuccess `data` envelope with the top-level message
-// "Payment recorded. Current invoice updated.".
+// current invoice, wrapped by the standard ApiSuccess `data` envelope. The top-level message has
+// THREE variants (Phase 13 §6), surfaced VERBATIM by the Payments tab:
+// - unaccepted invoice -> "Payment recorded. Current invoice updated."
+// - accepted + email sent -> "Payment recorded. Current invoice updated and emailed to the
+//   customer."
+// - accepted + email failed -> "Payment recorded. Current invoice updated, but the invoice could
+//   not be emailed — use Re-send Invoice to try again." (the payment STILL succeeds — the email is
+//   best-effort and D.7 never returns 502 for an email failure).
 export type RecordPaymentResponse = {
   payment_transaction: PaymentTransaction
   payment_summary: PaymentSummary

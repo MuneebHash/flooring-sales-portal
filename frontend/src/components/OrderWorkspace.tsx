@@ -460,6 +460,9 @@ function WorkspaceShell({
                 customer={customer}
                 billingAddress={billingAddress}
                 saleDetails={saleDetails}
+                // Lets an accept/resend customer-email error send the user
+                // straight to where the email is fixed.
+                onGoToCustomer={() => setActiveTab('customer')}
               />
             )}
           </div>
