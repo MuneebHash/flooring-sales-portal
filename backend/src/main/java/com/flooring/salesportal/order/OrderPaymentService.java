@@ -253,6 +253,9 @@ public class OrderPaymentService {
         List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
 
         String fileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
+        // Acceptance fields are null on a payment-created version: carrying an accepted invoice's
+        // acceptance/signature forward (and re-emailing the updated signed PDF) is the later Phase 13C
+        // branch — until then a payment on an accepted invoice produces an UNACCEPTED current version.
         byte[] pdfBytes = invoicePdfGenerator.render(new InvoicePdfModel(
                 ctx.business().getName(),
                 order.getOrderNumber(),
@@ -265,7 +268,8 @@ public class OrderPaymentService {
                 detailsSnapshot,
                 salePriceIncGst,
                 totalPaidAfter,
-                newBalance));
+                newBalance,
+                null, null, null));
 
         String storagePath = fileStorageService.store(pdfBytes, ctx.businessId(), orderId, PDF_EXTENSION);
         deleteFileOnRollback(storagePath);
@@ -274,7 +278,8 @@ public class OrderPaymentService {
             InvoiceRow newVersion = invoiceRepository.insertInvoice(
                     orderId, versionNumber, invoiceDate, dueDate, detailsSnapshot,
                     salePriceExGst, salePriceIncGst, totalPaidAfter, newBalance,
-                    storedFileId, ctx.userId());
+                    storedFileId, ctx.userId(),
+                    null, null, null, null);
 
             // Dashboard mirror invariant (Phase 13 §11.1): whenever a new current invoice version is
             // created, sales_order.last_emailed_at is set to that version's last_emailed_at — null here
