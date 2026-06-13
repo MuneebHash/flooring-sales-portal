@@ -159,6 +159,7 @@ function validateForm(detailsDraft: DetailsForm): Record<string, string> {
 
 // Largest GST-inclusive sale price the backend accepts (DECIMAL(10,2)).
 const SALE_PRICE_MAX = 99999999.99
+const GST_MULTIPLIER = 1.1
 
 const MONEY_FORMATTER = new Intl.NumberFormat('en-AU', {
   style: 'currency',
@@ -242,6 +243,16 @@ function toFixed2(value: number): string {
   return value.toFixed(2)
 }
 
+function round2(value: number): number {
+  if (!Number.isFinite(value)) return value
+  const scaled = value * 100
+  // Java BigDecimal HALF_UP rounds halves away from zero. Use a small epsilon to
+  // avoid binary-float values like 11764.999999 rounding down by accident.
+  const epsilon = 1e-9
+  if (scaled >= 0) return Math.floor(scaled + 0.5 + epsilon) / 100
+  return Math.ceil(scaled - 0.5 - epsilon) / 100
+}
+
 // Parse the sale-price input. Returns null for blank / non-finite input. Never
 // clamps — the > 0 and <= max rules are applied by the caller before the API call.
 function parseSalePrice(value: string): number | null {
@@ -249,6 +260,132 @@ function parseSalePrice(value: string): number | null {
   if (trimmed === '') return null
   const n = Number(trimmed)
   return Number.isFinite(n) ? n : null
+}
+
+function parseTargetGp(value: string): number | null {
+  const trimmed = value.trim()
+  if (trimmed === '') return null
+  const n = Number(trimmed)
+  return Number.isFinite(n) ? n : null
+}
+
+function targetGpCostUnavailableMessage(
+  summary: OrderFinancialSummary | null,
+): string | null {
+  if (!summary) {
+    return 'Add products and charges before applying a target GP.'
+  }
+  if (!Number.isFinite(summary.total_cost) || summary.total_cost <= 0) {
+    return 'Target GP needs a positive total cost before it can calculate a sale price.'
+  }
+  return null
+}
+
+function calculateTargetSalePriceIncGst(
+  totalCostExGst: number,
+  targetGpPercent: number,
+): number | null {
+  const targetRate = targetGpPercent / 100
+  const salePriceExGst = totalCostExGst / (1 - targetRate)
+  const naiveIncGst = round2(salePriceExGst * GST_MULTIPLIER)
+  return chooseBackendRoundedTargetPrice(
+    naiveIncGst,
+    totalCostExGst,
+    targetGpPercent,
+  )
+}
+
+function simulateBackendGpPercent(
+  finalSalePriceIncGst: number,
+  totalCostExGst: number,
+): number | null {
+  const salePriceExGst = round2(finalSalePriceIncGst / GST_MULTIPLIER)
+  if (!Number.isFinite(salePriceExGst) || salePriceExGst <= 0) return null
+  const gp = round2(salePriceExGst - totalCostExGst)
+  const gpPercent = round2((gp / salePriceExGst) * 100)
+  return Number.isFinite(gpPercent) ? gpPercent : null
+}
+
+type TargetPriceCandidate = {
+  finalSalePriceIncGst: number
+  gpPercent: number
+}
+
+// Boundary cases: total_cost = 100.01 and target GP = 15: naive 129.42
+// would display 14.99, so choose 129.43 / 15.00. When no exact display exists,
+// total_cost = 10.00 and target GP = 15 should choose 12.95 / 15.04, not
+// under-target 12.94 / 14.97.
+function chooseBackendRoundedTargetPrice(
+  naiveIncGst: number,
+  totalCostExGst: number,
+  targetGpPercent: number,
+): number | null {
+  if (!Number.isFinite(naiveIncGst)) return null
+  const naiveCents = Math.round(round2(naiveIncGst) * 100)
+  const candidates: TargetPriceCandidate[] = []
+
+  for (let offset = -10; offset <= 10; offset += 1) {
+    const cents = naiveCents + offset
+    const finalSalePriceIncGst = cents / 100
+    if (
+      !Number.isFinite(finalSalePriceIncGst) ||
+      finalSalePriceIncGst <= 0 ||
+      finalSalePriceIncGst > SALE_PRICE_MAX
+    ) {
+      continue
+    }
+    const gpPercent = simulateBackendGpPercent(
+      finalSalePriceIncGst,
+      totalCostExGst,
+    )
+    if (gpPercent === null) continue
+    candidates.push({ finalSalePriceIncGst, gpPercent })
+  }
+
+  if (candidates.length === 0) return null
+
+  const targetDisplayed = round2(targetGpPercent)
+  const naiveCandidate = candidates.find(
+    (candidate) =>
+      Math.round(candidate.finalSalePriceIncGst * 100) === naiveCents,
+  )
+  // Preserve the exact naive price when it already displays the requested target;
+  // this keeps clean cases like total_cost = 8000, target GP = 20 at 11000.
+  if (
+    naiveCandidate &&
+    naiveCandidate.gpPercent === targetDisplayed &&
+    naiveCandidate.gpPercent >= targetGpPercent
+  ) {
+    return naiveCandidate.finalSalePriceIncGst
+  }
+
+  const exactMatches = candidates.filter(
+    (candidate) => candidate.gpPercent === targetDisplayed,
+  )
+  if (exactMatches.length > 0) {
+    return exactMatches.reduce((best, candidate) =>
+      candidate.finalSalePriceIncGst < best.finalSalePriceIncGst
+        ? candidate
+        : best,
+    ).finalSalePriceIncGst
+  }
+
+  const aboveTarget = candidates.filter(
+    (candidate) => candidate.gpPercent > targetGpPercent,
+  )
+  if (aboveTarget.length > 0) {
+    return aboveTarget.reduce((best, candidate) => {
+      if (candidate.gpPercent < best.gpPercent) return candidate
+      if (candidate.gpPercent > best.gpPercent) return best
+      return candidate.finalSalePriceIncGst < best.finalSalePriceIncGst
+        ? candidate
+        : best
+    }).finalSalePriceIncGst
+  }
+
+  return candidates.reduce((best, candidate) =>
+    candidate.gpPercent > best.gpPercent ? candidate : best,
+  ).finalSalePriceIncGst
 }
 
 // Surfaces a friendly message for sale-price override/reset failures. A LAID
@@ -326,6 +463,9 @@ export function DetailsOfSaleTab({
   const [salePriceError, setSalePriceError] = useState<string | null>(null)
   // Toggles the compact GP / financial info modal (full breakdown hidden by default).
   const [salePriceInfoOpen, setSalePriceInfoOpen] = useState(false)
+  const [targetGpInput, setTargetGpInput] = useState('')
+  const [targetGpError, setTargetGpError] = useState<string | null>(null)
+  const [targetGpSuccess, setTargetGpSuccess] = useState<string | null>(null)
 
   // Guards setState after the tab unmounts (e.g. the order route changes, or the
   // user switches tabs, while a save is still in flight).
@@ -359,29 +499,53 @@ export function DetailsOfSaleTab({
     setSalePriceError(null)
   }
 
-  async function handleOverrideSalePrice() {
-    if (locked || salePriceMutationInFlight) return
-    const parsed = parseSalePrice(salePriceInput)
+  function handleTargetGpChange(value: string) {
+    setTargetGpInput(value)
+    setTargetGpError(null)
+    setTargetGpSuccess(null)
+  }
+
+  async function bestEffortFlushDetailsBeforeSalePriceOverride() {
+    try {
+      await flushDetailsAutosave()
+    } catch {
+      // Sale price is independent from Details of Sale; invoice actions keep the
+      // blocking flush, but price overrides continue if this best-effort save fails.
+    }
+  }
+
+  async function submitSalePriceOverride(
+    finalSalePriceIncGst: number,
+    onError?: (message: string) => void,
+  ): Promise<boolean> {
+    if (locked || salePriceMutationInFlight) return false
     // Client-side guard mirrors the backend: required, finite, > 0, <= max.
     // Blank / zero / negative / non-finite never reaches the API.
-    if (parsed === null || parsed <= 0 || parsed > SALE_PRICE_MAX) {
-      setSalePriceError('Enter a sale price greater than 0 and at most 99,999,999.99.')
-      return
+    if (
+      !Number.isFinite(finalSalePriceIncGst) ||
+      finalSalePriceIncGst <= 0 ||
+      finalSalePriceIncGst > SALE_PRICE_MAX
+    ) {
+      const message = 'Enter a sale price greater than 0 and at most 99,999,999.99.'
+      setSalePriceError(message)
+      onError?.(message)
+      return false
     }
 
     setSalePriceError(null)
     // In-flight lock (parent) survives this tab unmounting.
     beginSalePriceMutation()
     try {
+      await bestEffortFlushDetailsBeforeSalePriceOverride()
       const res = await overrideSalePrice(orderId, {
-        final_sale_price_inc_gst: parsed,
+        final_sale_price_inc_gst: finalSalePriceIncGst,
       })
       const summary = res.data.order_financial_summary
       // A mutation response is the newest persisted state — apply it to the
       // workspace header FIRST (before the mountedRef guard, and even if this tab
       // has since unmounted). A later read-only GET /lines can never discard it.
       applyMutationFinancialSummary(summary)
-      if (!mountedRef.current) return
+      if (!mountedRef.current) return false
       setSalePriceInput(toFixed2(summary.final_sale_price_inc_gst))
       setSalePriceDirty(false)
       // The SAVED sale total just changed, so any invoice-action error (notably the
@@ -389,13 +553,69 @@ export function DetailsOfSaleTab({
       // so it isn't left behind; the next Rewrite re-evaluates against this new total.
       setInvoiceActionError(null)
       setInvoicePreconditions([])
+      return true
     } catch (err) {
-      if (!mountedRef.current) return
-      setSalePriceError(salePriceErrorMessage(err))
+      if (!mountedRef.current) return false
+      const message = salePriceErrorMessage(err)
+      setSalePriceError(message)
+      onError?.(message)
+      return false
     } finally {
       // Always release the in-flight lock in the parent, even after unmount.
       finishSalePriceMutation()
     }
+  }
+
+  async function handleOverrideSalePrice() {
+    const parsed = parseSalePrice(salePriceInput)
+    await submitSalePriceOverride(parsed ?? NaN)
+  }
+
+  async function handleApplyTargetGp() {
+    if (locked || salePriceMutationInFlight) return
+    setTargetGpSuccess(null)
+    setTargetGpError(null)
+    setSalePriceError(null)
+
+    const summary = financialSummary
+    const costMessage = targetGpCostUnavailableMessage(summary)
+    if (costMessage) {
+      setTargetGpError(costMessage)
+      return
+    }
+    if (!summary) return
+
+    const parsed = parseTargetGp(targetGpInput)
+    if (parsed === null) {
+      setTargetGpError('Enter a target GP percentage.')
+      return
+    }
+    if (parsed <= 0 || parsed >= 100) {
+      setTargetGpError('Target GP must be greater than 0 and less than 100.')
+      return
+    }
+
+    const nextSalePriceIncGst = calculateTargetSalePriceIncGst(
+      summary.total_cost,
+      parsed,
+    )
+    if (
+      nextSalePriceIncGst === null ||
+      nextSalePriceIncGst <= 0 ||
+      nextSalePriceIncGst > SALE_PRICE_MAX
+    ) {
+      setTargetGpError(
+        'That target GP would produce a sale price outside the supported range.',
+      )
+      return
+    }
+
+    const applied = await submitSalePriceOverride(
+      nextSalePriceIncGst,
+      setTargetGpError,
+    )
+    if (!mountedRef.current) return
+    if (applied) setTargetGpSuccess('Target GP applied.')
   }
 
   async function handleResetSalePrice() {
@@ -747,6 +967,9 @@ export function DetailsOfSaleTab({
   // no-op), so it only depends on the order being editable and no request being
   // in flight — never on the input state or whether an adjustment exists.
   const resetDisabled = locked || salePriceMutationInFlight
+  const targetGpCostMessage = targetGpCostUnavailableMessage(financialSummary)
+  const targetGpControlsDisabled =
+    locked || salePriceMutationInFlight || targetGpCostMessage !== null
 
   return (
     <div>
@@ -972,7 +1195,11 @@ export function DetailsOfSaleTab({
             </Button>
             <button
               type="button"
-              onClick={() => setSalePriceInfoOpen(true)}
+              onClick={() => {
+                setTargetGpError(null)
+                setTargetGpSuccess(null)
+                setSalePriceInfoOpen(true)
+              }}
               disabled={!priced}
               aria-label="Show sale information"
               className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-sky-500 text-white hover:bg-sky-600 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sky-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1171,6 +1398,49 @@ export function DetailsOfSaleTab({
               </div>
               <GpInfoRows summary={financialSummary} />
             </dl>
+          )}
+
+          {financialSummary && (
+            <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50/70 p-3 text-left">
+              <Field
+                label="Target GP %"
+                htmlFor="target_gp_percent"
+                error={targetGpError ?? undefined}
+              >
+                <div className="flex flex-col gap-2 sm:flex-row">
+                  <Input
+                    id="target_gp_percent"
+                    type="text"
+                    inputMode="decimal"
+                    value={targetGpInput}
+                    onChange={(e) => handleTargetGpChange(e.target.value)}
+                    invalid={!!targetGpError}
+                    disabled={targetGpControlsDisabled}
+                    placeholder="20"
+                    className="font-semibold tabular-nums"
+                  />
+                  <Button
+                    type="button"
+                    variant="success"
+                    size="md"
+                    onClick={handleApplyTargetGp}
+                    disabled={targetGpControlsDisabled}
+                  >
+                    {salePriceMutationInFlight ? 'Applying…' : 'Apply target GP'}
+                  </Button>
+                </div>
+              </Field>
+              {targetGpCostMessage && !targetGpError && (
+                <p className="mt-1.5 text-xs text-slate-500">
+                  {targetGpCostMessage}
+                </p>
+              )}
+              {targetGpSuccess && !targetGpError && (
+                <p className="mt-1.5 text-xs font-medium text-teal-700">
+                  {targetGpSuccess}
+                </p>
+              )}
+            </div>
           )}
 
           <div className="mt-5 flex justify-center">
