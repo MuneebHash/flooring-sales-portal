@@ -23,3 +23,30 @@ export function getActiveSlug(): string {
   const segment = window.location.pathname.split('/').filter(Boolean)[0]
   return segment && segment.length > 0 ? segment : DEFAULT_BUSINESS_SLUG
 }
+
+// Reserved app/system words that must NEVER be treated as a business slug. A
+// tenant slug equal to any of these would shadow a real top-level app path
+// (/login, /orders, /account, …), so the router redirects them to the marketing
+// site instead of routing them as a tenant.
+//
+// THIS LIST MUST MIRROR the backend V11 `chk_business_slug_reserved` constraint
+// (db/migration/V11__reserve_app_route_words_in_business_slug.sql) EXACTLY — it
+// is the single frontend source of truth. If a word is added/removed/changed in
+// that constraint, change it here too, or the two will silently drift.
+export const RESERVED_BUSINESS_SLUGS = [
+  'admin', 'api', 'login', 'static', 'auth', 'health',
+  'dashboard', 'orders', 'select-store', 'assets', 'new',
+  'logout', 'account', 'settings', 'public',
+] as const
+
+const RESERVED_BUSINESS_SLUG_SET: ReadonlySet<string> = new Set(
+  RESERVED_BUSINESS_SLUGS,
+)
+
+// True when `value` is a reserved word and therefore NOT a valid business slug.
+// Used by the router guard to redirect reserved top-level paths to the marketing
+// site. Exact (case-sensitive) match, mirroring the backend constraint — real
+// slugs are always lowercase (chk_business_slug_format).
+export function isReservedBusinessSlug(value: string): boolean {
+  return RESERVED_BUSINESS_SLUG_SET.has(value)
+}

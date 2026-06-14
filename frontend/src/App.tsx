@@ -2,12 +2,17 @@ import { useEffect, type ReactNode } from 'react'
 import {
   BrowserRouter,
   Navigate,
+  Outlet,
   Route,
   Routes,
   useParams,
 } from 'react-router-dom'
 import { AuthProvider, useAuth } from './lib/auth'
-import { DEFAULT_BUSINESS_SLUG, MARKETING_URL } from './lib/tenant'
+import {
+  DEFAULT_BUSINESS_SLUG,
+  MARKETING_URL,
+  isReservedBusinessSlug,
+} from './lib/tenant'
 import { DashboardPage } from './components/DashboardPage'
 import { Login } from './components/Login'
 import { OrderWorkspace } from './components/OrderWorkspace'
@@ -48,30 +53,24 @@ function MarketingRedirect() {
   return null
 }
 
+// Central reserved-slug guard for the :slug route. If the first URL segment is a
+// reserved app/system word (RESERVED_BUSINESS_SLUGS in lib/tenant.ts, which
+// mirrors backend V11 chk_business_slug_reserved) it is NOT a tenant — leave for
+// the marketing site, same as bare "/". Otherwise render the tenant routes. This
+// single guard replaces per-word route entries so the reserved list lives in one
+// place and cannot drift.
+function TenantGuard() {
+  const { slug } = useParams<{ slug: string }>()
+  if (slug && isReservedBusinessSlug(slug)) return <MarketingRedirect />
+  return <Outlet />
+}
+
 function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
         <Routes>
-          {/*
-            Reserved top-level app path names. Without these, React Router would
-            capture the first segment of a missing-slug app URL (/login,
-            /dashboard, /select-store, /orders/123, …) as a tenant :slug. These
-            are NOT tenant URLs — like bare "/", they leave for the marketing
-            site. Listed before :slug so the static segment wins over the
-            dynamic slug for these exact names.
-
-            This list must match every top-level app route name — if a new
-            top-level route is added, add it here too, or it will be wrongly
-            captured as a tenant slug.
-          */}
-          <Route path="/login" element={<MarketingRedirect />} />
-          <Route path="/dashboard" element={<MarketingRedirect />} />
-          <Route path="/select-store" element={<MarketingRedirect />} />
-          <Route path="/orders" element={<MarketingRedirect />} />
-          <Route path="/orders/new" element={<MarketingRedirect />} />
-          <Route path="/orders/*" element={<MarketingRedirect />} />
-          <Route path=":slug">
+          <Route path=":slug" element={<TenantGuard />}>
             <Route path="login" element={<Login />} />
             <Route
               path="select-store"
