@@ -53,6 +53,24 @@ function App() {
     <BrowserRouter>
       <AuthProvider>
         <Routes>
+          {/*
+            Reserved top-level app path names. Without these, React Router would
+            capture the first segment of a missing-slug app URL (/login,
+            /dashboard, /select-store, /orders/123, …) as a tenant :slug. These
+            are NOT tenant URLs — like bare "/", they leave for the marketing
+            site. Listed before :slug so the static segment wins over the
+            dynamic slug for these exact names.
+
+            This list must match every top-level app route name — if a new
+            top-level route is added, add it here too, or it will be wrongly
+            captured as a tenant slug.
+          */}
+          <Route path="/login" element={<MarketingRedirect />} />
+          <Route path="/dashboard" element={<MarketingRedirect />} />
+          <Route path="/select-store" element={<MarketingRedirect />} />
+          <Route path="/orders" element={<MarketingRedirect />} />
+          <Route path="/orders/new" element={<MarketingRedirect />} />
+          <Route path="/orders/*" element={<MarketingRedirect />} />
           <Route path=":slug">
             <Route path="login" element={<Login />} />
             <Route
