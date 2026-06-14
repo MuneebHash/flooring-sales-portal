@@ -4,15 +4,17 @@ import { AppHeader } from './AppHeader'
 import { Panel } from './ui/Panel'
 import { ChevronRightIcon } from './icons'
 import { useAuth } from '../lib/auth'
+import { useTenantSlug } from '../lib/useTenantSlug'
 
 export function StoreSelection() {
   const { user, stores, activeStore, selectStore } = useAuth()
+  const slug = useTenantSlug()
 
   const [pendingStoreId, setPendingStoreId] = useState<number | null>(null)
   const [error, setError] = useState<string | undefined>()
 
-  if (!user) return <Navigate to="/login" replace />
-  if (activeStore) return <Navigate to="/dashboard" replace />
+  if (!user) return <Navigate to={`/${slug}/login`} replace />
+  if (activeStore) return <Navigate to={`/${slug}/dashboard`} replace />
 
   const handleSelect = async (storeId: number) => {
     if (pendingStoreId !== null) return

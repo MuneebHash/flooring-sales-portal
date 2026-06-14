@@ -5,9 +5,11 @@ import { Field } from './ui/Field'
 import { Input } from './ui/Input'
 import { Panel } from './ui/Panel'
 import { useAuth } from '../lib/auth'
+import { useTenantSlug } from '../lib/useTenantSlug'
 
 export function Login() {
   const { isAuthenticated, activeStore, login } = useAuth()
+  const slug = useTenantSlug()
 
   const [salespersonCode, setSalespersonCode] = useState('')
   const [password, setPassword] = useState('')
@@ -19,7 +21,7 @@ export function Login() {
   if (isAuthenticated) {
     return (
       <Navigate
-        to={activeStore ? '/dashboard' : '/select-store'}
+        to={`/${slug}/${activeStore ? 'dashboard' : 'select-store'}`}
         replace
       />
     )

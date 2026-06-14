@@ -1,6 +1,6 @@
 import type { FlooringType } from '../flooring'
 import type { OrderStatus } from '../statuses'
-import { DEFAULT_BUSINESS_SLUG } from '../tenant'
+import { getActiveSlug } from '../tenant'
 import { get, post, put } from './client'
 import { apiPath } from './paths'
 import type { ApiSuccess } from './types'
@@ -137,7 +137,7 @@ export function createOrder(
 ): Promise<ApiSuccess<OrderHeader>> {
   const body: CreateOrderRequest = { flooring_type: flooringType }
   return post<ApiSuccess<OrderHeader>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, '/orders'),
+    apiPath(getActiveSlug(), '/orders'),
     body,
   )
 }
@@ -148,7 +148,7 @@ export function fetchOrderWorkspace(
   orderId: number,
 ): Promise<ApiSuccess<OrderWorkspace>> {
   return get<ApiSuccess<OrderWorkspace>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}`),
+    apiPath(getActiveSlug(), `/orders/${orderId}`),
   )
 }
 
@@ -160,7 +160,7 @@ export function saveCustomer(
   body: CustomerSaveRequest,
 ): Promise<ApiSuccess<CustomerSaveResponse>> {
   return put<ApiSuccess<CustomerSaveResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/customer`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/customer`),
     body,
   )
 }
@@ -172,7 +172,7 @@ export function saveInstallationAddress(
   body: AddressUpsertRequest,
 ): Promise<ApiSuccess<InstallationAddressResponse>> {
   return put<ApiSuccess<InstallationAddressResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/addresses/installation`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/addresses/installation`),
     body,
   )
 }
@@ -184,7 +184,7 @@ export function saveBillingAddress(
   body: AddressUpsertRequest,
 ): Promise<ApiSuccess<BillingAddressResponse>> {
   return put<ApiSuccess<BillingAddressResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/addresses/billing`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/addresses/billing`),
     body,
   )
 }
@@ -198,7 +198,7 @@ export function copyBillingFromInstallation(
 ): Promise<ApiSuccess<BillingAddressResponse>> {
   return post<ApiSuccess<BillingAddressResponse>>(
     apiPath(
-      DEFAULT_BUSINESS_SLUG,
+      getActiveSlug(),
       `/orders/${orderId}/addresses/billing/copy-from-installation`,
     ),
   )
@@ -214,7 +214,7 @@ export function saveDetailsOfSale(
   body: DetailsOfSaleSaveRequest,
 ): Promise<ApiSuccess<DetailsOfSaleSaveResponse>> {
   return put<ApiSuccess<DetailsOfSaleSaveResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/details-of-sale`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/details-of-sale`),
     body,
   )
 }

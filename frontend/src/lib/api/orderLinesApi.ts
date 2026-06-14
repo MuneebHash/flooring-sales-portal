@@ -1,5 +1,5 @@
 import type { FlooringType } from '../flooring'
-import { DEFAULT_BUSINESS_SLUG } from '../tenant'
+import { getActiveSlug } from '../tenant'
 import { del, get, patch, post, put } from './client'
 import { apiPath } from './paths'
 import type { ApiCollection, ApiSuccess } from './types'
@@ -164,7 +164,7 @@ export function fetchAvailableProducts(
   query: CatalogSearchQuery = {},
 ): Promise<ApiCollection<AvailableProduct>> {
   return get<ApiCollection<AvailableProduct>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/available-products`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/available-products`),
     { query },
   )
 }
@@ -176,7 +176,7 @@ export function fetchAvailableCharges(
   query: CatalogSearchQuery = {},
 ): Promise<ApiCollection<AvailableCharge>> {
   return get<ApiCollection<AvailableCharge>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/available-charges`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/available-charges`),
     { query },
   )
 }
@@ -187,7 +187,7 @@ export function fetchOrderLines(
   orderId: number,
 ): Promise<ApiSuccess<OrderLinesResponse>> {
   return get<ApiSuccess<OrderLinesResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/lines`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/lines`),
   )
 }
 
@@ -198,7 +198,7 @@ export function addProductLine(
   body: AddProductLineRequest,
 ): Promise<ApiSuccess<ProductLineMutationResponse>> {
   return post<ApiSuccess<ProductLineMutationResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/product-lines`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/product-lines`),
     body,
   )
 }
@@ -211,7 +211,7 @@ export function updateProductLine(
   body: PatchProductLineRequest,
 ): Promise<ApiSuccess<ProductLineMutationResponse>> {
   return patch<ApiSuccess<ProductLineMutationResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/product-lines/${lineId}`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/product-lines/${lineId}`),
     body,
   )
 }
@@ -222,7 +222,7 @@ export function deleteProductLine(
   lineId: number,
 ): Promise<ApiSuccess<ProductLineDeleteResponse>> {
   return del<ApiSuccess<ProductLineDeleteResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/product-lines/${lineId}`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/product-lines/${lineId}`),
   )
 }
 
@@ -232,7 +232,7 @@ export function addChargeLine(
   body: AddChargeLineRequest,
 ): Promise<ApiSuccess<ChargeLineMutationResponse>> {
   return post<ApiSuccess<ChargeLineMutationResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/charge-lines`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/charge-lines`),
     body,
   )
 }
@@ -245,7 +245,7 @@ export function updateChargeLine(
   body: PatchChargeLineRequest,
 ): Promise<ApiSuccess<ChargeLineMutationResponse>> {
   return patch<ApiSuccess<ChargeLineMutationResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/charge-lines/${lineId}`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/charge-lines/${lineId}`),
     body,
   )
 }
@@ -256,7 +256,7 @@ export function deleteChargeLine(
   lineId: number,
 ): Promise<ApiSuccess<ChargeLineDeleteResponse>> {
   return del<ApiSuccess<ChargeLineDeleteResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/charge-lines/${lineId}`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/charge-lines/${lineId}`),
   )
 }
 
@@ -282,7 +282,7 @@ export function overrideSalePrice(
   body: SalePriceOverrideRequest,
 ): Promise<ApiSuccess<SalePriceMutationResponse>> {
   return put<ApiSuccess<SalePriceMutationResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/sale-price`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/sale-price`),
     body,
   )
 }
@@ -293,6 +293,6 @@ export function resetSalePrice(
   orderId: number,
 ): Promise<ApiSuccess<SalePriceMutationResponse>> {
   return post<ApiSuccess<SalePriceMutationResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/sale-price/reset`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/sale-price/reset`),
   )
 }

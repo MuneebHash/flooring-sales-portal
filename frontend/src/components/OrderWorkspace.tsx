@@ -26,6 +26,7 @@ import {
   type OrderStatus,
 } from '../lib/statuses'
 import { ApiError } from '../lib/api/ApiError'
+import { useTenantSlug } from '../lib/useTenantSlug'
 import { fetchOrderWorkspace, saveDetailsOfSale } from '../lib/api/orderWorkspaceApi'
 import type {
   DetailsOfSaleFields,
@@ -107,6 +108,7 @@ function WorkspaceShell({
   onCustomerSaved,
   onDetailsSaved,
 }: ShellProps) {
+  const slug = useTenantSlug()
   const [activeTab, setActiveTab] = useState<TabId>('customer')
   // Live order financial summary that backs the always-visible header Sale total.
   // Sourced from the Chunk 3 order_financial_summary, never from the nullable
@@ -343,7 +345,7 @@ function WorkspaceShell({
 
         <Panel className="px-6 py-5">
           <Link
-            to="/dashboard"
+            to={`/${slug}/dashboard`}
             className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-500 hover:text-slate-800 transition-colors"
           >
             <ArrowLeftIcon className="w-3.5 h-3.5" />
@@ -643,6 +645,7 @@ function ErrorWorkspace({
   onRetry: () => void
 }) {
   const navigate = useNavigate()
+  const slug = useTenantSlug()
   return (
     <WorkspaceMessage>
       <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
@@ -653,7 +656,7 @@ function ErrorWorkspace({
         <Button
           variant="secondary"
           size="md"
-          onClick={() => navigate('/dashboard')}
+          onClick={() => navigate(`/${slug}/dashboard`)}
         >
           Back to dashboard
         </Button>
@@ -667,6 +670,7 @@ function ErrorWorkspace({
 
 function NewOrderNotice() {
   const navigate = useNavigate()
+  const slug = useTenantSlug()
   return (
     <WorkspaceMessage>
       <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
@@ -680,7 +684,7 @@ function NewOrderNotice() {
         <Button
           variant="success"
           size="md"
-          onClick={() => navigate('/dashboard')}
+          onClick={() => navigate(`/${slug}/dashboard`)}
         >
           Back to dashboard
         </Button>
@@ -691,6 +695,7 @@ function NewOrderNotice() {
 
 function InvalidWorkspace() {
   const navigate = useNavigate()
+  const slug = useTenantSlug()
   return (
     <WorkspaceMessage>
       <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
@@ -704,7 +709,7 @@ function InvalidWorkspace() {
         <Button
           variant="success"
           size="md"
-          onClick={() => navigate('/dashboard')}
+          onClick={() => navigate(`/${slug}/dashboard`)}
         >
           Back to dashboard
         </Button>
@@ -715,6 +720,7 @@ function InvalidWorkspace() {
 
 function NotFoundWorkspace() {
   const navigate = useNavigate()
+  const slug = useTenantSlug()
   return (
     <WorkspaceMessage>
       <h2 className="text-xl font-semibold text-slate-900 tracking-tight">
@@ -728,7 +734,7 @@ function NotFoundWorkspace() {
         <Button
           variant="success"
           size="md"
-          onClick={() => navigate('/dashboard')}
+          onClick={() => navigate(`/${slug}/dashboard`)}
         >
           Back to dashboard
         </Button>

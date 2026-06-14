@@ -1,4 +1,4 @@
-import { DEFAULT_BUSINESS_SLUG } from '../tenant'
+import { getActiveSlug } from '../tenant'
 import { get, post } from './client'
 import { apiPath } from './paths'
 import type { ApiSuccess, Pagination } from './types'
@@ -120,7 +120,7 @@ export function fetchOrderPayments(
   orderId: number,
 ): Promise<ApiSuccess<PaymentsListResponse>> {
   return get<ApiSuccess<PaymentsListResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/payments`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/payments`),
     { query: { page_size: PAYMENTS_PAGE_SIZE } },
   )
 }
@@ -134,7 +134,7 @@ export function recordOrderPayment(
   body: RecordPaymentRequest,
 ): Promise<ApiSuccess<RecordPaymentResponse>> {
   return post<ApiSuccess<RecordPaymentResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/payments`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/payments`),
     body,
   )
 }
