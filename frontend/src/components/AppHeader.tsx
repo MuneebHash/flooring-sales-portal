@@ -4,6 +4,7 @@ import { Button } from './ui/Button'
 import { Panel } from './ui/Panel'
 import { LogoutIcon, StoreIcon, UserIcon } from './icons'
 import { useAuth } from '../lib/auth'
+import { useTenantSlug } from '../lib/useTenantSlug'
 
 function ContextBlock({
   icon,
@@ -30,12 +31,13 @@ function ContextBlock({
 export function AppHeader() {
   const { user, activeStore, logout } = useAuth()
   const navigate = useNavigate()
+  const slug = useTenantSlug()
 
   if (!user) return null
 
   const handleLogout = async () => {
     await logout()
-    navigate('/login', { replace: true })
+    navigate(`/${slug}/login`, { replace: true })
   }
 
   return (

@@ -1,6 +1,6 @@
 import { API_BASE_URL } from './config'
 import { ApiError } from './ApiError'
-import { DEFAULT_BUSINESS_SLUG } from '../tenant'
+import { getActiveSlug } from '../tenant'
 import { del, get, post } from './client'
 import { apiPath } from './paths'
 import type { ApiCollection, ApiSuccess } from './types'
@@ -69,7 +69,7 @@ export function fetchOrderAttachments(
   orderId: number,
 ): Promise<ApiCollection<OrderAttachment>> {
   return get<ApiCollection<OrderAttachment>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/attachments`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/attachments`),
   )
 }
 
@@ -86,7 +86,7 @@ export function uploadOrderAttachment(
   formData.append('file', file)
   formData.append('attachment_kind', 'PHOTO')
   return post<ApiSuccess<AttachmentUploadResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/attachments`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/attachments`),
     formData,
   )
 }
@@ -100,7 +100,7 @@ export function deleteOrderAttachment(
 ): Promise<ApiSuccess<AttachmentDeleteResponse>> {
   return del<ApiSuccess<AttachmentDeleteResponse>>(
     apiPath(
-      DEFAULT_BUSINESS_SLUG,
+      getActiveSlug(),
       `/orders/${orderId}/attachments/${attachmentId}`,
     ),
   )

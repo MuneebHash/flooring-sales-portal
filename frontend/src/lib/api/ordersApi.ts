@@ -1,6 +1,6 @@
 import type { FlooringType } from '../flooring'
 import type { OrderStatus } from '../statuses'
-import { DEFAULT_BUSINESS_SLUG } from '../tenant'
+import { getActiveSlug } from '../tenant'
 import { get, patch } from './client'
 import { apiPath } from './paths'
 import type { ApiCollection, ApiSuccess } from './types'
@@ -47,7 +47,7 @@ export function fetchDashboardOrders(): Promise<
   ApiCollection<DashboardOrderRow>
 > {
   return get<ApiCollection<DashboardOrderRow>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, '/orders'),
+    apiPath(getActiveSlug(), '/orders'),
     { query: { page: 1, page_size: 100 } },
   )
 }
@@ -57,7 +57,7 @@ export function updateOrderStatus(
   nextStatus: OrderStatus,
 ): Promise<ApiSuccess<OrderStatusUpdateResponse>> {
   return patch<ApiSuccess<OrderStatusUpdateResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/status`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/status`),
     { order_status: nextStatus },
   )
 }

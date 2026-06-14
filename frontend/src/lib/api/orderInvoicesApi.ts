@@ -1,6 +1,6 @@
 import { API_BASE_URL } from './config'
 import { ApiError } from './ApiError'
-import { DEFAULT_BUSINESS_SLUG } from '../tenant'
+import { getActiveSlug } from '../tenant'
 import { get, post } from './client'
 import { apiPath } from './paths'
 import type { ApiSuccess } from './types'
@@ -71,7 +71,7 @@ export function fetchCurrentInvoice(
   orderId: number,
 ): Promise<ApiSuccess<InvoiceResponse>> {
   return get<ApiSuccess<InvoiceResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/invoices/current`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/invoices/current`),
   )
 }
 
@@ -83,7 +83,7 @@ export function createInvoice(
   orderId: number,
 ): Promise<ApiSuccess<InvoiceResponse>> {
   return post<ApiSuccess<InvoiceResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/invoices`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/invoices`),
     {},
   )
 }
@@ -96,7 +96,7 @@ export function rewriteInvoice(
   orderId: number,
 ): Promise<ApiSuccess<InvoiceResponse>> {
   return post<ApiSuccess<InvoiceResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/invoices/rewrite`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/invoices/rewrite`),
     {},
   )
 }
@@ -135,7 +135,7 @@ export function acceptCurrentInvoice(
   formData.append('signature', signatureBlob, 'signature.png')
   return post<ApiSuccess<InvoiceResponse>>(
     apiPath(
-      DEFAULT_BUSINESS_SLUG,
+      getActiveSlug(),
       `/orders/${orderId}/invoices/current/accept`,
     ),
     formData,
@@ -156,7 +156,7 @@ export function resendCurrentInvoice(
 ): Promise<ApiSuccess<InvoiceResponse>> {
   return post<ApiSuccess<InvoiceResponse>>(
     apiPath(
-      DEFAULT_BUSINESS_SLUG,
+      getActiveSlug(),
       `/orders/${orderId}/invoices/current/resend`,
     ),
     {},
@@ -296,7 +296,7 @@ export async function fetchCurrentInvoicePdf(
 ): Promise<InvoicePdfDownload> {
   const base = API_BASE_URL.replace(/\/+$/, '')
   const path = apiPath(
-    DEFAULT_BUSINESS_SLUG,
+    getActiveSlug(),
     `/orders/${orderId}/invoices/current/file`,
   )
   let response: Response

@@ -21,11 +21,13 @@ import {
   updateOrderStatus,
 } from '../lib/api/ordersApi'
 import { apiRowToOrder } from '../lib/api/ordersAdapter'
+import { useTenantSlug } from '../lib/useTenantSlug'
 
 type StatusFilter = OrderStatus | 'ALL'
 
 export function Dashboard() {
   const navigate = useNavigate()
+  const slug = useTenantSlug()
   const [orders, setOrders] = useState<Order[]>([])
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
@@ -248,7 +250,7 @@ export function Dashboard() {
                         <Button
                           variant="success-outline"
                           size="sm"
-                          onClick={() => navigate(`/orders/${o.order_id}`)}
+                          onClick={() => navigate(`/${slug}/orders/${o.order_id}`)}
                         >
                           Open
                         </Button>

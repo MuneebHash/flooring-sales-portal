@@ -4,6 +4,7 @@ import { Modal } from './ui/Modal'
 import { FLOORING_LABELS, type FlooringType } from '../lib/flooring'
 import { ApiError } from '../lib/api/ApiError'
 import { createOrder } from '../lib/api/orderWorkspaceApi'
+import { useTenantSlug } from '../lib/useTenantSlug'
 
 type Props = {
   open: boolean
@@ -20,6 +21,7 @@ const OPTION_STYLES: Record<FlooringType, string> = {
 
 export function NewOrderModal({ open, onClose, onSelect }: Props) {
   const navigate = useNavigate()
+  const slug = useTenantSlug()
   const [pending, setPending] = useState<FlooringType | null>(null)
   const [error, setError] = useState<string | null>(null)
 
@@ -43,7 +45,7 @@ export function NewOrderModal({ open, onClose, onSelect }: Props) {
       const response = await createOrder(type)
       onSelect?.(type)
       onClose()
-      navigate(`/orders/${response.data.order_id}`)
+      navigate(`/${slug}/orders/${response.data.order_id}`)
     } catch (err) {
       const message =
         err instanceof ApiError && err.message.length > 0

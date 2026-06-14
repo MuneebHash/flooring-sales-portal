@@ -1,4 +1,4 @@
-import { DEFAULT_BUSINESS_SLUG } from '../tenant'
+import { getActiveSlug } from '../tenant'
 import { get, post } from './client'
 import { apiPath } from './paths'
 import type { ApiCollection, ApiSuccess } from './types'
@@ -43,7 +43,7 @@ export function fetchOrderNotes(
   orderId: number,
 ): Promise<ApiCollection<OrderNote>> {
   return get<ApiCollection<OrderNote>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/notes`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/notes`),
   )
 }
 
@@ -54,7 +54,7 @@ export function addOrderNote(
   body: AddNoteRequest,
 ): Promise<ApiSuccess<AddNoteResponse>> {
   return post<ApiSuccess<AddNoteResponse>>(
-    apiPath(DEFAULT_BUSINESS_SLUG, `/orders/${orderId}/notes`),
+    apiPath(getActiveSlug(), `/orders/${orderId}/notes`),
     body,
   )
 }
