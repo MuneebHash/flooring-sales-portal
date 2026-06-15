@@ -26,6 +26,7 @@ import {
   rewriteInvoice,
   type InvoiceDetail,
 } from '../../lib/api/orderInvoicesApi'
+import { fetchQuickDescriptions } from '../../lib/api/quickDescriptionsApi'
 
 type Props = {
   orderId: number
@@ -79,14 +80,6 @@ type DetailsForm = {
   lay_date_status: '' | LayDateStatus
   details_of_sale: string
 }
-
-const QUICK_DESCRIPTIONS = [
-  'Floor to be clear and clean for installers arrival.',
-  'Furniture to be moved by installer.',
-  'Site measure required before installation.',
-  'No pull up and disposal required.',
-  'Additional floor preparation may be charged if required.',
-]
 
 const MONTH_NAMES = [
   'Jan',
@@ -451,6 +444,28 @@ export function DetailsOfSaleTab({
   onInvoiceReady,
 }: Props) {
   const [errors, setErrors] = useState<Record<string, string>>({})
+
+  // Phase 14C: quick-add presets are TENANT data (GET /api/v1/{slug}/quick-descriptions),
+  // fetched on mount with the [BUSINESS_NAME] token already substituted server-side. They
+  // REPLACE the former hardcoded list. Empty result OR any fetch failure => no quick-add
+  // buttons (the panel is hidden); the failure is swallowed so it never blocks the Details
+  // tab or the sale/financial flow. Per-run cancelled guard, mirroring the invoice probe.
+  const [quickDescriptions, setQuickDescriptions] = useState<string[]>([])
+  useEffect(() => {
+    let cancelled = false
+    fetchQuickDescriptions()
+      .then((descriptions) => {
+        if (cancelled) return
+        setQuickDescriptions(descriptions)
+      })
+      .catch(() => {
+        if (cancelled) return
+        setQuickDescriptions([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   // --- Sale price override / reset (independent of the details-of-sale save). ---
   // The input mirrors the GST-inclusive final sale price. `salePriceDirty` tracks
@@ -1023,40 +1038,42 @@ export function DetailsOfSaleTab({
             </Field>
           </div>
 
-          <div className="lg:col-span-1">
-            <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-4 h-full">
-              <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-600">
-                Quick add descriptions
-              </h3>
-              <p className="text-[11px] text-slate-500 mt-1">
-                Tap + to append a preset to the description.
-              </p>
-              <ul className="mt-3 space-y-2">
-                {QUICK_DESCRIPTIONS.map((snippet) => (
-                  <li
-                    key={snippet}
-                    className="flex items-start gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 shadow-sm"
-                  >
-                    <span className="flex-1 text-xs text-slate-700 leading-snug">
-                      {snippet}
-                    </span>
-                    <button
-                      type="button"
-                      onMouseDown={(e) => e.preventDefault()}
-                      onClick={() => appendSnippet(snippet)}
-                      disabled={editingDisabled}
-                      aria-label={`Add snippet: ${snippet}`}
-                      className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-teal-500 bg-white text-teal-600 hover:bg-teal-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          {quickDescriptions.length > 0 && (
+            <div className="lg:col-span-1">
+              <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-4 h-full">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-600">
+                  Quick add descriptions
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-1">
+                  Tap + to append a preset to the description.
+                </p>
+                <ul className="mt-3 space-y-2">
+                  {quickDescriptions.map((snippet) => (
+                    <li
+                      key={snippet}
+                      className="flex items-start gap-2 rounded-md border border-slate-200 bg-white px-3 py-2 shadow-sm"
                     >
-                      <span aria-hidden="true" className="text-base leading-none">
-                        +
+                      <span className="flex-1 text-xs text-slate-700 leading-snug">
+                        {snippet}
                       </span>
-                    </button>
-                  </li>
-                ))}
-              </ul>
+                      <button
+                        type="button"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={() => appendSnippet(snippet)}
+                        disabled={editingDisabled}
+                        aria-label={`Add snippet: ${snippet}`}
+                        className="inline-flex h-6 w-6 shrink-0 items-center justify-center rounded-md border border-teal-500 bg-white text-teal-600 hover:bg-teal-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/30 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                      >
+                        <span aria-hidden="true" className="text-base leading-none">
+                          +
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
             </div>
-          </div>
+          )}
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">

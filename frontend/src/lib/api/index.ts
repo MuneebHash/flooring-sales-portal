@@ -82,6 +82,7 @@ export type {
   InvoicePdfDownload,
   InvoiceResponse,
 } from './orderInvoicesApi'
+export { fetchQuickDescriptions } from './quickDescriptionsApi'
 export { fetchOrderPayments, recordOrderPayment } from './orderPaymentsApi'
 export type {
   PaymentMethod,
