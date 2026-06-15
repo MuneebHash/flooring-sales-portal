@@ -63,14 +63,14 @@ jobs:
         run: ./mvnw -B -ntp verify
 
   locked-migrations:
-    name: Locked migration protection (V1-V6)
+    name: Locked migration protection (V1-V12)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Check for changes to locked migrations V1-V6
+      - name: Check for changes to locked migrations V1-V12
         env:
           EVENT_NAME: ${{ github.event_name }}
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -97,7 +97,7 @@ jobs:
           #   "<status>\t<path>"            for A / M / D / T
           #   "<status>\t<old>\t<new>"      for R<sim> / C<sim>
           # We must inspect BOTH old and new paths on rename/copy lines.
-          # Otherwise a locked V1-V6 migration could be renamed to a
+          # Otherwise a locked V1-V12 migration could be renamed to a
           # non-matching filename and slip past --name-only's "new path
           # only" reporting.
           paths=$(printf '%s\n' "$changed" | awk -F'\t' '
@@ -107,12 +107,12 @@ jobs:
 
           # grep returns 1 when no matches; "|| true" prevents the step
           # from failing on a clean diff. We fail only if matches exist.
-          matches=$(printf '%s\n' "$paths" | grep -E '^backend/src/main/resources/db/migration/V[1-6]__.*\.sql$' || true)
+          matches=$(printf '%s\n' "$paths" | grep -E '^backend/src/main/resources/db/migration/V([1-9]|1[0-2])__.*\.sql$' || true)
 
           if [ -n "$matches" ]; then
-            echo "ERROR: Locked migration files V1-V6 were modified:"
+            echo "ERROR: Locked migration files V1-V12 were modified:"
             printf '%s\n' "$matches"
             exit 1
           fi
 
-          echo "OK: no locked migration files (V1-V6) modified."
+          echo "OK: no locked migration files (V1-V12) modified."
