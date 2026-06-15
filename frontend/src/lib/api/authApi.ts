@@ -1,4 +1,4 @@
-import type { Store, User } from '../auth'
+import type { Store, User } from '../authTypes'
 import { getActiveSlug } from '../tenant'
 import { post } from './client'
 import { apiPath } from './paths'

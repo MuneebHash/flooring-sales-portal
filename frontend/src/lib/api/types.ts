@@ -22,3 +22,13 @@ export type ApiErrorBody = {
     details?: unknown
   }
 }
+
+// Public tenant lookup payload (GET /api/v1/public/businesses/{slug}). This is
+// the unauthenticated branding whitelist — name plus optional logo/accent. Field
+// names are snake_case to match the backend response verbatim; logo_path and
+// accent_colour are nullable (a business may have no branding configured yet).
+export type PublicBusiness = {
+  name: string
+  logo_path: string | null
+  accent_colour: string | null
+}

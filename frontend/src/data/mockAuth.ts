@@ -1,4 +1,4 @@
-import type { Store, User } from '../lib/auth'
+import type { Store, User } from '../lib/authTypes'
 
 export type MockAuthScenario = {
   salesperson_code: string
