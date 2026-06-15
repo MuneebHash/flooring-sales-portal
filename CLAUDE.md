@@ -248,20 +248,44 @@ If this list changes in the backend migration/constraint, update the frontend re
 
 All committed Flyway migrations are locked.
 
-Current locked migrations include V1–V11.
+Current locked migrations include V1–V12 (CI guards the V1–V12 range).
 
 Do not edit old migration files.
 
 Rule:
 
 ```text
-Never edit V1–V11.
+Never edit V1–V12.
 Any schema change must be a new migration.
 ```
 
 Customer onboarding seed scripts are not product migrations.
 
 Do not create a Flyway migration for every customer/tenant.
+
+### Go-forward seed rule (Phase 14D — locked)
+
+```text
+schema        = Flyway migration (db/migration, versioned, locked once committed)
+demo/dev data = db/dev-seed (manual, idempotent, run by hand — NEVER auto-runs)
+new tests     = self-seed required data; do NOT depend on the V4 legacy seed
+```
+
+Dev/demo seed scripts live in `backend/src/main/resources/db/dev-seed/` (a sibling of
+`db/migration`). Flyway scans only `classpath:db/migration` and `spring.sql.init.mode=never`,
+so dev-seed files never auto-apply. Run them MANUALLY after Flyway, in order:
+
+```text
+1. start Postgres
+2. start backend (Flyway applies V1–V12)
+3. psql -f db/dev-seed/quick_descriptions_demo.sql
+4. psql -f db/dev-seed/multi_store_user_demo.sql
+5. verify login / store-selection / quick-adds / products / charges
+```
+
+The production-safe schema-only baseline/squash (separating the V4 demo seed from the
+schema) is deferred to Phase 16 / pre-deploy — not done in 14D. The legacy V4–V7 demo
+data stays for now (locked + test-dependent).
 
 ---
 
