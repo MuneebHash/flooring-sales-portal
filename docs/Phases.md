@@ -95,8 +95,12 @@ Current task:
 
 ```text
 - Phase 14A (tenant data model + public business lookup, #74) — COMPLETE.
-- Next: Phase 14B (login slug validation + Business-Not-Found + real login name; move
-  shared auth types out of auth.tsx). Issues #72, #31.
+- Phase 14B (login slug validation + Business-Not-Found + real login name; move
+  shared auth types out of auth.tsx, #72/#31) — COMPLETE.
+- Phase 14C (authenticated quick-descriptions endpoint + DetailsOfSaleTab quick-adds, #74) — COMPLETE.
+- Current: Phase 14D (go-forward db/dev-seed workflow + MS1 multi-store demo user, #73/#28).
+  Demo seed lives in db/dev-seed (manual, idempotent); schema-only baseline/squash deferred
+  to Phase 16/pre-deploy.
 ```
 
 ---
@@ -410,12 +414,13 @@ V8 per-product LM/SQM factor
 V9 negative sale price constraint adjustment
 V10 invoice acceptance/signature/email fields
 V11 reserved app/system route words in business slug
+V12 per-tenant branding + invoice-legal fields + business_quick_description table
 ```
 
 Rule:
 
 ```text
-Never edit V1–V11.
+Never edit V1–V12.
 Any schema change must be a new migration.
 ```
 
@@ -423,9 +428,15 @@ Customer onboarding seed scripts are not product migrations.
 
 Do not create a Flyway migration for every customer/tenant.
 
+Go-forward seed rule (Phase 14D): schema = Flyway migration; demo/dev data =
+`db/dev-seed` (manual, idempotent, never auto-runs); new tests self-seed required data
+and must NOT depend on the V4 legacy seed.
+
 Phase 14 note: production must start schema-only. The demo seed (V4 Aussie/Premier
 data) must not run on the production database. This is a controlled change, done on
 a branch with a verified fresh-DB-from-zero test — not by deleting old migrations.
+The schema-only baseline/squash itself is deferred to Phase 16/pre-deploy; the legacy
+V4–V7 demo data stays in the migration path for now (locked + backend-test-dependent).
 
 ---
 
@@ -571,9 +582,9 @@ the phase it belongs to. Deferred items below are unbuilt FEATURES, not open bug
 ```text
 Phase 14 branch breakdown:
   14A  feature/phase14-tenant-data-model        #74        V12 migration + Business entity + public endpoint        [COMPLETE]
-  14B  feature/phase14-tenant-login-validation  #72, #31   slug validation, Business-Not-Found, real login name; move shared auth types out of auth.tsx
-  14C  feature/phase14-tenant-quick-adds        #74        authenticated tenant-config endpoint (ABN/bank/T&Cs/quick-adds) + DetailsOfSaleTab reads tenant quick-adds (EMPTY if none — no hardcoded fallback)
-  14D  feature/phase14-seed-workflow            #73, #28   prod-safe schema-only seed structure + real-tenant seed template + multi-store seed user + fresh-DB-from-zero verify
+  14B  feature/phase14-tenant-login-validation  #72, #31   slug validation, Business-Not-Found, real login name; move shared auth types out of auth.tsx   [COMPLETE]
+  14C  feature/phase14-tenant-quick-adds        #74        authenticated quick-descriptions endpoint + DetailsOfSaleTab reads tenant quick-adds (EMPTY if none — no hardcoded fallback)   [COMPLETE]
+  14D  feature/phase14-dev-seed-workflow        #73, #28   go-forward db/dev-seed workflow (manual, idempotent) + MS1 multi-store demo user + all-users-all-stores grant; schema-only baseline/squash deferred to Phase 16   [CURRENT]
 ```
 
 Phase 14 builds the DATA MODEL + endpoints + seed workflow only.
@@ -692,8 +703,8 @@ Private invoice/legal:  authenticated only (ABN, bank, T&Cs, quick-adds).
 
 ```text
 Open follow-ups (not yet ticketed):
-- CI "Locked migration protection" guard covers only V1–V6; locked range is now V1–V11.
-  Update the range in a tiny standalone CI PR.
+- [DONE] CI "Locked migration protection" guard now covers V1–V12
+  (.github/workflows/ci.yml, commit d8c6374 extended the range V1–V6 -> V1–V12).
 - W1: business_quick_description has a FK to business with no ON DELETE. The Phase 14D
   tenant seed/wipe workflow must DELETE business_quick_description rows BEFORE the
   business row, or the delete is FK-blocked.
