@@ -30,4 +30,14 @@ public class Business {
 
     @Column(name = "is_active", nullable = false)
     private boolean active;
+
+    // Public branding (exposed via GET /api/v1/public/businesses/{slug}). Nullable.
+    // Private tenant fields added in V12 (abn, bank_*, terms_and_conditions, stripe_*,
+    // invoice_template_key) are intentionally NOT mapped here so the public endpoint cannot
+    // leak them; they are wired by the authenticated config endpoint in Phase 14C.
+    @Column(name = "logo_path")
+    private String logoPath;
+
+    @Column(name = "accent_colour")
+    private String accentColour;
 }

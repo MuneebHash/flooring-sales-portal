@@ -94,7 +94,9 @@ using the partner's real business/store/user/catalog/invoice-legal data.
 Current task:
 
 ```text
-Phase 14 — starting with a full GitHub issue audit, then controlled branches.
+- Phase 14A (tenant data model + public business lookup, #74) — COMPLETE.
+- Next: Phase 14B (login slug validation + Business-Not-Found + real login name; move
+  shared auth types out of auth.tsx). Issues #72, #31.
 ```
 
 ---
@@ -566,6 +568,14 @@ the phase it belongs to. Deferred items below are unbuilt FEATURES, not open bug
 
 ### Phase 14 — Rebaseline & Tenant Foundation (data + identity)
 
+```text
+Phase 14 branch breakdown:
+  14A  feature/phase14-tenant-data-model        #74        V12 migration + Business entity + public endpoint        [COMPLETE]
+  14B  feature/phase14-tenant-login-validation  #72, #31   slug validation, Business-Not-Found, real login name; move shared auth types out of auth.tsx
+  14C  feature/phase14-tenant-quick-adds        #74        authenticated tenant-config endpoint (ABN/bank/T&Cs/quick-adds) + DetailsOfSaleTab reads tenant quick-adds (EMPTY if none — no hardcoded fallback)
+  14D  feature/phase14-seed-workflow            #73, #28   prod-safe schema-only seed structure + real-tenant seed template + multi-store seed user + fresh-DB-from-zero verify
+```
+
 Phase 14 builds the DATA MODEL + endpoints + seed workflow only.
 It does NOT redesign the invoice display (that is Phase 15).
 
@@ -578,7 +588,9 @@ It does NOT redesign the invoice display (that is Phase 15).
     invoice-legal:  abn, bank_name, bsb, account_number, account_name,
                     terms_and_conditions (single free-text block)
     payments:       stripe_payment_link_url
-    quick-add:      new table business_quick_description (business_id, text, sort_order)
+    invoice-config: invoice_template_key DEFAULT 'standard'
+    quick-add:      new table business_quick_description (business_id, description, sort_order)
+                    (column is `description`, not `text` — `text` is a Postgres type-name footgun)
 - Public tenant-lookup endpoint  GET /api/v1/public/businesses/{slug}  -> name, logo, accent ONLY.
 - Private invoice/legal data (abn, bank, T&Cs, quick-adds) -> AUTHENTICATED only, never public.
 - Slug validation before login + proper "Business Not Found" page.
@@ -652,7 +664,8 @@ It does NOT redesign the invoice display (that is Phase 15).
 
 ```text
 T&Cs:                 one free-text block per business; render preserving line breaks.
-Quick-add descriptions: separate table business_quick_description(business_id, text, sort_order).
+Quick-add descriptions: separate table business_quick_description(business_id, description, sort_order).
+Invoice template:     invoice_template_key DEFAULT 'standard'.
 Bank / ABN:           business-level for now.
 Logo:                 stored as file path/URL (local in dev, S3 URL in prod).
 Public tenant endpoint: name / logo / accent only.
@@ -664,15 +677,26 @@ Private invoice/legal:  authenticated only (ABN, bank, T&Cs, quick-adds).
 ## 13. Known issues — tagged to phases
 
 ```text
-NEW  tenant slug validation + remove hardcoded business name   -> Phase 14 (create issue)
-NEW  separate demo seed from production migrations              -> Phase 14 (create issue)
-#28  multi-store demo user / store-selection testing           -> audit relevance (may be moot)
-#29  CSRF protection before production                         -> Phase 16
-#30  production CORS origins                                    -> Phase 16
-#31  shared auth types cleanup                                  -> Phase 14 audit (decide)
-#34  app/database timezone before production                    -> Phase 16
-#55  financial summary versioning (concurrent mutations)        -> audit (likely deferred)
-#69  backend version precondition on invoice accept             -> audit (likely deferred)
+#72  validate tenant slug before login + remove hardcoded login business name   -> Phase 14B
+#73  separate demo seed from production schema migrations                        -> Phase 14D
+#74  per-tenant data model (branding/invoice-legal/quick-add/stripe/template)    -> Phase 14 (14A done; 14C consumes private fields)
+#75  centralize backend auth enforcement (fail-closed) before production         -> Phase 16 (deferred-hardening)
+#28  multi-store demo user / store-selection testing                            -> Phase 14D
+#31  move shared auth types out of auth.tsx                                     -> Phase 14B
+#29  CSRF protection before production                                          -> Phase 16
+#30  production CORS origins                                                    -> Phase 16
+#34  app/database timezone before production                                    -> Phase 16
+#55  financial summary versioning (concurrent mutations)                        -> deferred-hardening (post-pilot)
+#69  backend version precondition on invoice accept                            -> deferred-hardening (post-pilot)
+```
+
+```text
+Open follow-ups (not yet ticketed):
+- CI "Locked migration protection" guard covers only V1–V6; locked range is now V1–V11.
+  Update the range in a tiny standalone CI PR.
+- W1: business_quick_description has a FK to business with no ON DELETE. The Phase 14D
+  tenant seed/wipe workflow must DELETE business_quick_description rows BEFORE the
+  business row, or the delete is FK-blocked.
 ```
 
 ---
