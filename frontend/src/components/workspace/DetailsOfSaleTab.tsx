@@ -972,6 +972,9 @@ export function DetailsOfSaleTab({
 
   // Fields stay editable during a background autosave; only LAID locks them.
   const editingDisabled = locked
+  // When there are no tenant quick-add presets the panel is hidden, so the
+  // description field takes the full grid width instead of leaving an empty column.
+  const hasQuickDescriptions = quickDescriptions.length > 0
   // Whether the order has a live financial summary yet (priced).
   const priced = financialSummary !== null
   // Sale-price input + Update are disabled when locked, mid-request, or unpriced.
@@ -1019,7 +1022,7 @@ export function DetailsOfSaleTab({
 
       <div className="space-y-6">
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-          <div className="lg:col-span-2">
+          <div className={hasQuickDescriptions ? 'lg:col-span-2' : 'lg:col-span-3'}>
             <Field
               label="Description"
               htmlFor="details_of_sale"
@@ -1038,7 +1041,7 @@ export function DetailsOfSaleTab({
             </Field>
           </div>
 
-          {quickDescriptions.length > 0 && (
+          {hasQuickDescriptions && (
             <div className="lg:col-span-1">
               <div className="rounded-lg border border-slate-200 bg-slate-50/60 p-4 h-full">
                 <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-600">
