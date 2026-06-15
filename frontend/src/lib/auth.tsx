@@ -10,19 +10,7 @@ import {
   logoutRequest,
   selectStoreRequest,
 } from './api/authApi'
-
-export type User = {
-  user_id: number
-  first_name: string
-  last_name: string
-  salesperson_code: string
-}
-
-export type Store = {
-  store_id: number
-  name: string
-  store_code: string
-}
+import type { Store, User } from './authTypes'
 
 type AuthState = {
   user: User | null

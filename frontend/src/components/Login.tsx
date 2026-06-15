@@ -1,11 +1,21 @@
-import { useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent } from 'react'
 import { Navigate } from 'react-router-dom'
 import { Button } from './ui/Button'
 import { Field } from './ui/Field'
 import { Input } from './ui/Input'
 import { Panel } from './ui/Panel'
+import { BusinessNotFound } from './BusinessNotFound'
 import { useAuth } from '../lib/auth'
 import { useTenantSlug } from '../lib/useTenantSlug'
+import { ApiError } from '../lib/api/ApiError'
+import { fetchPublicBusiness } from '../lib/api/tenantApi'
+import type { PublicBusiness } from '../lib/api/types'
+
+type TenantState =
+  | { status: 'loading' }
+  | { status: 'ready'; tenant: PublicBusiness }
+  | { status: 'not-found' }
+  | { status: 'error' }
 
 export function Login() {
   const { isAuthenticated, activeStore, login } = useAuth()
@@ -18,6 +28,39 @@ export function Login() {
   const [formError, setFormError] = useState<string | undefined>()
   const [loading, setLoading] = useState(false)
 
+  const [tenantState, setTenantState] = useState<TenantState>({
+    status: 'loading',
+  })
+  const [reloadToken, setReloadToken] = useState(0)
+
+  // Validate the tenant slug against the public lookup before showing the form.
+  // Skipped entirely when already authenticated — that user is redirected below
+  // and never needs the loading / not-found / error states. Re-runs on slug
+  // change and on retry (reloadToken); a cancel flag prevents a stale request
+  // from writing state after the slug changed or the component unmounted.
+  useEffect(() => {
+    if (isAuthenticated) return
+    let cancelled = false
+    setTenantState({ status: 'loading' })
+    fetchPublicBusiness(slug)
+      .then((tenant) => {
+        if (!cancelled) setTenantState({ status: 'ready', tenant })
+      })
+      .catch((err) => {
+        if (cancelled) return
+        if (err instanceof ApiError && err.status === 404) {
+          setTenantState({ status: 'not-found' })
+        } else {
+          setTenantState({ status: 'error' })
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [slug, isAuthenticated, reloadToken])
+
+  // Guard 1 (FIRST): an already-authenticated user goes straight to their
+  // destination — never the loading / not-found / error states below.
   if (isAuthenticated) {
     return (
       <Navigate
@@ -26,6 +69,47 @@ export function Login() {
       />
     )
   }
+
+  // Guard 2: tenant validation must resolve before the login form renders.
+  if (tenantState.status === 'loading') {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center px-4 py-8">
+        <Panel className="w-full max-w-[420px] p-8 text-center">
+          <p className="text-sm text-slate-500">Loading…</p>
+        </Panel>
+      </div>
+    )
+  }
+
+  if (tenantState.status === 'not-found') {
+    return <BusinessNotFound />
+  }
+
+  if (tenantState.status === 'error') {
+    return (
+      <div className="min-h-screen bg-slate-50 text-slate-900 flex items-center justify-center px-4 py-8">
+        <Panel className="w-full max-w-[420px] p-8 text-center">
+          <h1 className="text-xl font-semibold tracking-tight text-slate-900">
+            Something went wrong
+          </h1>
+          <p className="text-sm text-slate-500 mt-2">
+            We could not load this business right now. Please try again.
+          </p>
+          <Button
+            type="button"
+            variant="success"
+            size="md"
+            className="mt-5 w-full"
+            onClick={() => setReloadToken((n) => n + 1)}
+          >
+            Try again
+          </Button>
+        </Panel>
+      </div>
+    )
+  }
+
+  const tenant = tenantState.tenant
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
@@ -66,7 +150,7 @@ export function Login() {
           <h1 className="text-xl font-semibold tracking-tight text-slate-900">
             Flooring Sales Portal
           </h1>
-          <p className="text-sm text-slate-500 mt-1">Aussie Floors Group</p>
+          <p className="text-sm text-slate-500 mt-1">{tenant.name}</p>
         </div>
 
         {formError && (
