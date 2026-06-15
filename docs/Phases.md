@@ -578,7 +578,9 @@ It does NOT redesign the invoice display (that is Phase 15).
     invoice-legal:  abn, bank_name, bsb, account_number, account_name,
                     terms_and_conditions (single free-text block)
     payments:       stripe_payment_link_url
-    quick-add:      new table business_quick_description (business_id, text, sort_order)
+    invoice-config: invoice_template_key DEFAULT 'standard'
+    quick-add:      new table business_quick_description (business_id, description, sort_order)
+                    (column is `description`, not `text` — `text` is a Postgres type-name footgun)
 - Public tenant-lookup endpoint  GET /api/v1/public/businesses/{slug}  -> name, logo, accent ONLY.
 - Private invoice/legal data (abn, bank, T&Cs, quick-adds) -> AUTHENTICATED only, never public.
 - Slug validation before login + proper "Business Not Found" page.
@@ -652,7 +654,8 @@ It does NOT redesign the invoice display (that is Phase 15).
 
 ```text
 T&Cs:                 one free-text block per business; render preserving line breaks.
-Quick-add descriptions: separate table business_quick_description(business_id, text, sort_order).
+Quick-add descriptions: separate table business_quick_description(business_id, description, sort_order).
+Invoice template:     invoice_template_key DEFAULT 'standard'.
 Bank / ABN:           business-level for now.
 Logo:                 stored as file path/URL (local in dev, S3 URL in prod).
 Public tenant endpoint: name / logo / accent only.
