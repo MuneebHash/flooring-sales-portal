@@ -82,14 +82,19 @@ Target GP price control — hidden GP panel can calculate sale price from target
 Local uploads now persist under user home instead of OS temp
 ```
 
-Current planned order:
+Tenant data note:
 
 ```text
-1. Issue #27 dynamic slug routing — DONE
-2. Update Phases.md — CURRENT
-3. Fix Terralux seed SQL so business insert includes slug = 'terralux'
-4. Seed Terralux into local DB
-5. Frontend revamp / polish
+A local "Terralux" demo seed was created and then removed.
+It contained placeholder (non-real) catalog data and is gone from the local DB.
+Real Terralux onboarding is handled by the Phase 14 real-tenant seed workflow,
+using the partner's real business/store/user/catalog/invoice-legal data.
+```
+
+Current task:
+
+```text
+Phase 14 — starting with a full GitHub issue audit, then controlled branches.
 ```
 
 ---
@@ -332,16 +337,6 @@ payment list
 balance due display
 ```
 
-Deferred:
-
-```text
-invoice version-history UI
-old signed invoice download
-payment edit/delete/void workflow
-refunds/reversals
-Stripe
-```
-
 ### Phase 13 — Invoice acceptance/signature/email — DONE
 
 Implemented:
@@ -366,7 +361,7 @@ accepted customer name comes from saved customer record
 signature is captured separately
 ```
 
-Email is currently MVP/stub/local depending on environment. Production email setup belongs to deployment/hardening.
+Email is currently MVP/stub/local depending on environment. Production email setup belongs to Phase 16.
 
 ### Issue #27 — Dynamic business slug routing — DONE
 
@@ -374,19 +369,7 @@ Completed in PR #71.
 
 Frontend now derives the business slug from the first URL segment instead of hardcoding `aussie-floors-group`.
 
-Examples:
-
-```text
-/aussie-floors-group/login
-/aussie-floors-group/dashboard
-/terralux/login
-```
-
-API calls now use:
-
-```text
-/api/v1/{slug}/...
-```
+API calls now use `/api/v1/{slug}/...`.
 
 Reserved top-level words redirect to marketing instead of being treated as tenant slugs.
 
@@ -395,24 +378,19 @@ Backend V11 reserves app/system words as invalid business slugs.
 Reserved business slugs:
 
 ```text
-admin
-api
-login
-static
-auth
-health
-dashboard
-orders
-select-store
-assets
-new
-logout
-account
-settings
-public
+admin api login static auth health dashboard orders
+select-store assets new logout account settings public
 ```
 
 Frontend reserved-slug guard must mirror backend V11 `chk_business_slug_reserved`.
+
+Known gap from PR #71 (now tracked, fixed in Phase 14):
+
+```text
+Login page does not validate the slug before rendering, and the login + invoice
+header still print a hardcoded "Aussie Floors Group". This was left untracked
+after PR #71 — that must never happen again. Now scheduled in Phase 14.
+```
 
 ---
 
@@ -442,6 +420,10 @@ Any schema change must be a new migration.
 Customer onboarding seed scripts are not product migrations.
 
 Do not create a Flyway migration for every customer/tenant.
+
+Phase 14 note: production must start schema-only. The demo seed (V4 Aussie/Premier
+data) must not run on the production database. This is a controlled change, done on
+a branch with a verified fresh-DB-from-zero test — not by deleting old migrations.
 
 ---
 
@@ -493,15 +475,7 @@ CANCELLED
 Do not invent statuses like:
 
 ```text
-NEW
-IN_PROGRESS
-INVOICED
-COMPLETED
-WON
-LOST
-DRAFT
-PAID
-READY
+NEW IN_PROGRESS INVOICED COMPLETED WON LOST DRAFT PAID READY
 ```
 
 Flooring types:
@@ -569,17 +543,11 @@ blocks a negative final sale price.
 
 ## 10. Current demo login data
 
-Known seeded users usually include:
+Known seeded demo users (Aussie Floors Group business 1, Premier Flooring Co business 2):
 
 ```text
-LC1 / password123
-SN1 / password123
-JW1 / password123
-EP1 / password123
-OS1 / password123
-MJ1 / password123
-NB1 / password123
-CT1 / password123
+LC1 / password123   SN1 / password123   JW1 / password123   EP1 / password123
+OS1 / password123   MJ1 / password123   NB1 / password123   CT1 / password123
 EL1 / password123
 ```
 
@@ -587,116 +555,143 @@ Do not use old `LC01`.
 
 Multi-store user may exist only if manually inserted into local DB. Check DB before relying on `MS1`.
 
----
-
-## 11. Current immediate task: Terralux seed
-
-Next real task after this Phases.md update:
-
-```text
-Fix Terralux seed SQL and seed Terralux locally.
-```
-
-Important:
-
-```text
-business slug must be terralux
-business insert must include slug = 'terralux'
-do not create a Flyway migration for Terralux
-customer/tenant seed script is onboarding data, not product schema
-```
-
-Expected local URL after seed:
-
-```text
-http://localhost:5173/terralux/login
-```
-
-Terralux seed script may be local/outside repo. If a `seed-terralux.sql` file is added or edited, inspect carefully before running.
-
-Before running the seed:
-
-```text
-confirm no existing business slug conflicts
-confirm stores/users/products/charges are scoped to the Terralux business
-confirm salesperson codes are unique within that business
-confirm prices/costs are ex GST if using the current product model
-```
-
-Do not commit real customer data unless the user explicitly decides it belongs in the repo.
+This demo data is dev-only and must NOT run in production (see Phase 14 / section 7).
 
 ---
 
-## 12. Frontend revamp direction
+## 11. LOCKED ROADMAP — Phase 14 onward
 
-Frontend revamp is after Terralux seed.
+Principle: no known bug or follow-up is left untracked. Audit all issues, fix each in
+the phase it belongs to. Deferred items below are unbuilt FEATURES, not open bugs.
 
-Do not start revamp while seed/routing/data setup is incomplete.
+### Phase 14 — Rebaseline & Tenant Foundation (data + identity)
 
-Revamp goals:
+Phase 14 builds the DATA MODEL + endpoints + seed workflow only.
+It does NOT redesign the invoice display (that is Phase 15).
 
 ```text
-make demo look sharper
-preserve existing workflow
-do not break backend wiring
-do not redesign into generic CRM
-keep iPad-friendly layout
-keep app compact and professional
+- GitHub issue audit: catalogue every open issue, tag each to its phase, nothing untracked.
+- Clean migrations: production-safe seed structure (schema-only prod path;
+  demo seed V4 stays dev-only). Verify fresh-DB-from-zero. Controlled branch, not file deletion.
+- ONE new migration adds all per-tenant fields:
+    branding:       logo (file path/URL), accent_colour   (business name already exists)
+    invoice-legal:  abn, bank_name, bsb, account_number, account_name,
+                    terms_and_conditions (single free-text block)
+    payments:       stripe_payment_link_url
+    quick-add:      new table business_quick_description (business_id, text, sort_order)
+- Public tenant-lookup endpoint  GET /api/v1/public/businesses/{slug}  -> name, logo, accent ONLY.
+- Private invoice/legal data (abn, bank, T&Cs, quick-adds) -> AUTHENTICATED only, never public.
+- Slug validation before login + proper "Business Not Found" page.
+- Remove hardcoded "Aussie Floors Group" from the login page.
+- Real-tenant seed workflow (captures every field above; runnable against local and prod).
+- Quick-add wiring: DetailsOfSaleTab reads the tenant list instead of the
+  hardcoded QUICK_DESCRIPTIONS constant.
 ```
 
-Do not remove working functionality for visual polish.
+### Phase 15 — Invoice & Payment Correctness (money / document trust layer)
+
+```text
+- Fix invoice PDF generation to match the provided sample template
+  (generated PDF must match the on-screen / required invoice design).
+- Render per-tenant invoice data ONCE, on screen + PDF together
+  (logo, ABN, bank details, T&Cs). Remove hardcoded Aussie Floors / sample ABN /
+  sample TERMS from InvoiceTab. Do not smear invoice branding across phases.
+- Kill automatic invoice email after a payment update.
+  (Manual "Resend invoice" already exists in the Invoice tab — keep it, add nothing.)
+- Payment delete / reversal:
+    delete payment -> paid amount drops -> balance_due increases
+    invoice stays accepted/signed; NO customer re-sign; NO automatic email
+    salesperson may manually resend if they choose
+    (exact mirror of how adding a payment behaves)
+- Stripe payment-link button:
+    opens the tenant's external Stripe link in a new tab
+    money goes to the tenant's own Stripe account
+    NO webhook, NO auto-confirm; salesperson still records the payment manually
+```
+
+### Phase 16 — Deploy & Hardening (no revamp here)
+
+```text
+- AWS: App Runner + RDS + S3 + Secrets Manager + domain + HTTPS.
+- CSRF (#29), production CORS (#30), secure cookies, timezone (#34).
+- Production email provider (SES). RDS automated backups BEFORE any real data.
+- Secrets / env config.
+- Seed the real launch tenant into production.
+```
+
+### Phase 17 — Revamp (app chrome only)
+
+```text
+- FloorxTack identity + per-tenant logo / name / accent colour on
+  login / dashboard / workspace + clean payment screen.
+- Invoice is ALREADY branded in Phase 15 — do not redo it here.
+- Light skin only: preserve workflow, placeholders, and backend wiring.
+  No generic-CRM redesign. Keep iPad-friendly and compact.
+```
+
+### Phase 18 — Pitch Features
+
+```text
+- Quotation PDF (quote on the spot — pitch-critical).
+- Lead-source field in Customer Details.
+```
+
+### Phase 19 — Final Audit Gate
+
+```text
+- Fresh-DB rebuild from zero.
+- Tenant isolation test.
+- Full E2E: order -> invoice -> payment -> reversal -> signature.
+- Production smoke test.
+- Confirm no untracked follow-ups remain.
+```
 
 ---
 
-## 13. Deferred / future work
-
-Important deferred work:
+## 12. Locked data-model decisions (Phase 14)
 
 ```text
-Stripe / payment gateway
-deployment
-production email provider
-CSRF before production if session-cookie auth remains
-production CORS config
-cookie secure=true for HTTPS
-database backup strategy
-S3/object storage for production uploads
-payment void/edit/delete workflow
-invoice revision/history UI
-Operations Portal
-Store Portal / dashboard
+T&Cs:                 one free-text block per business; render preserving line breaks.
+Quick-add descriptions: separate table business_quick_description(business_id, text, sort_order).
+Bank / ABN:           business-level for now.
+Logo:                 stored as file path/URL (local in dev, S3 URL in prod).
+Public tenant endpoint: name / logo / accent only.
+Private invoice/legal:  authenticated only (ABN, bank, T&Cs, quick-adds).
+```
+
+---
+
+## 13. Known issues — tagged to phases
+
+```text
+NEW  tenant slug validation + remove hardcoded business name   -> Phase 14 (create issue)
+NEW  separate demo seed from production migrations              -> Phase 14 (create issue)
+#28  multi-store demo user / store-selection testing           -> audit relevance (may be moot)
+#29  CSRF protection before production                         -> Phase 16
+#30  production CORS origins                                    -> Phase 16
+#31  shared auth types cleanup                                  -> Phase 14 audit (decide)
+#34  app/database timezone before production                    -> Phase 16
+#55  financial summary versioning (concurrent mutations)        -> audit (likely deferred)
+#69  backend version precondition on invoice accept             -> audit (likely deferred)
+```
+
+---
+
+## 14. Deferred — features, not bugs
+
+Do not start these unless explicitly requested:
+
+```text
+Twilio remote invoice signing
+Real Stripe webhook / auto-confirm / Stripe Connect (in-app checkout)
+Operations Portal (tenant self-loads its own catalog)
+Store Portal / analytics dashboard
 installer / laybook workflows
 advanced quote comparison
-AI features
-```
-
-Known issues / follow-ups:
-
-```text
-#28 multi-store demo user and store-selection testing
-#29 CSRF protection before production
-#30 production CORS origins
-#31 shared auth types cleanup
-#55 backend financial summary versioning for concurrent mutations
-#69 backend version precondition on invoice accept
-```
-
----
-
-## 14. What not to do next
-
-Do not start these before Terralux seed and demo readiness:
-
-```text
-full deployment
-Stripe Connect
-Operations Portal
-Store Portal
-installer workflows
-major frontend rewrite
-AI features
-quote comparison
 room-level complexity
+AI features
+invoice version-history UI / old signed invoice download
+payment void/edit beyond the Phase 15 delete/reversal flow
 ```
 
 ---
