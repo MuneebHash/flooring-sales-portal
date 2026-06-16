@@ -53,6 +53,8 @@ public class TenantInvoiceConfigService {
                 view.getAccountNumber(),
                 view.getAccountName(),
                 view.getTermsAndConditions(),
+                view.getTermsHard(),
+                view.getTermsSoft(),
                 view.getLogoPath(),
                 view.getStripePaymentLinkUrl(),
                 view.getInvoiceTemplateKey());

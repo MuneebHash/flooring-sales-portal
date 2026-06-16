@@ -30,6 +30,8 @@ public interface BusinessRepository extends JpaRepository<Business, Long> {
                    account_number          AS "accountNumber",
                    account_name            AS "accountName",
                    terms_and_conditions    AS "termsAndConditions",
+                   terms_hard              AS "termsHard",
+                   terms_soft              AS "termsSoft",
                    logo_path               AS "logoPath",
                    stripe_payment_link_url AS "stripePaymentLinkUrl",
                    invoice_template_key    AS "invoiceTemplateKey"

@@ -23,9 +23,14 @@ import {
 import { fetchPublicBusiness } from '../../lib/api/tenantApi'
 import { useAuth } from '../../lib/auth'
 import { getActiveSlug } from '../../lib/tenant'
+import type { FlooringType } from '../../lib/flooring'
 
 type Props = {
   orderId: number
+  // The order's flooring type (SOFT or HARD). An order has exactly one type, which
+  // selects WHICH per-tenant terms block (terms_soft vs terms_hard) renders on the
+  // invoice — see termsText below.
+  flooringType: FlooringType
   // View/download + Phase 13 acceptance (sign / accept / re-send). Create + Rewrite
   // live in the Details of Sale tab now. NOTE: LAID/`locked` is deliberately NOT a
   // prop here — Accept, Re-send and the signature download are all allowed when
@@ -134,6 +139,7 @@ const ACCEPTANCE_LINES: string[] = [
 
 export function InvoiceTab({
   orderId,
+  flooringType,
   orderNumber,
   customer,
   billingAddress,
@@ -166,9 +172,9 @@ export function InvoiceTab({
   )
   const [businessName, setBusinessName] = useState<string | null>(null)
   // Legal-risk gate (Codex P1): Accept must be unavailable until the tenant invoice
-  // config is SAFELY known. Configured terms_and_conditions may exist but not yet have
-  // rendered, so the customer must not sign/accept while the config is still loading or
-  // failed to load. `tenantConfigLoading` is true until the config request resolves;
+  // config is SAFELY known. Configured per-type terms (terms_soft/terms_hard) may exist
+  // but not yet have rendered, so the customer must not sign/accept while the config is
+  // still loading or failed to load. `tenantConfigLoading` is true until the config request resolves;
   // `tenantConfigError` is true when it failed. (The public business / name request
   // stays soft — see the effect below — and never gates Accept.)
   const [tenantConfigLoading, setTenantConfigLoading] = useState(true)
@@ -631,7 +637,15 @@ export function InvoiceTab({
   const bsb = nonBlank(tenantConfig?.bsb)
   const accountNumber = nonBlank(tenantConfig?.account_number)
   const accountName = nonBlank(tenantConfig?.account_name)
-  const termsText = nonBlank(tenantConfig?.terms_and_conditions)
+  // Per-flooring-type terms (Phase 15B-2): a SOFT order shows terms_soft, a HARD order
+  // shows terms_hard. Exactly one block renders. NO fallback to the legacy single-block
+  // terms_and_conditions — an unset per-type terms block hides like any other null/blank
+  // tenant-config row.
+  const termsText = nonBlank(
+    flooringType === 'SOFT'
+      ? tenantConfig?.terms_soft
+      : tenantConfig?.terms_hard,
+  )
   const hasBankDetails =
     bankName !== null ||
     bsb !== null ||

@@ -5,11 +5,15 @@ package com.flooring.salesportal.tenant.dto;
  * {@code GET /api/v1/{slug}/invoice-config}.
  *
  * <p>A hand-written whitelist of the per-tenant invoice-legal / bank / payment fields a
- * salesperson may read. Eight fields are nullable; {@code invoiceTemplateKey} is always
+ * salesperson may read. Ten fields are nullable; {@code invoiceTemplateKey} is always
  * non-null (DB default {@code 'standard'}). Global Jackson {@code SNAKE_CASE} serialises these
  * as {@code abn}, {@code bank_name}, {@code bsb}, {@code account_number}, {@code account_name},
- * {@code terms_and_conditions}, {@code logo_path}, {@code stripe_payment_link_url},
- * {@code invoice_template_key}.
+ * {@code terms_and_conditions}, {@code terms_hard}, {@code terms_soft}, {@code logo_path},
+ * {@code stripe_payment_link_url}, {@code invoice_template_key}.
+ *
+ * <p>{@code termsHard} / {@code termsSoft} (V13) are the per-flooring-type invoice terms
+ * (SOFT vs HARD); the legacy single-block {@code termsAndConditions} (V12) is retained for
+ * compatibility. All three are independent nullable fields — there is no backfill between them.
  *
  * <p>Deliberately EXCLUDES {@code business_id}/internal ids, {@code name}, {@code slug},
  * {@code accent_colour} (app-chrome branding, not invoice data), {@code is_active}, and any
@@ -23,6 +27,8 @@ public record TenantInvoiceConfigResponse(
         String accountNumber,
         String accountName,
         String termsAndConditions,
+        String termsHard,
+        String termsSoft,
         String logoPath,
         String stripePaymentLinkUrl,
         String invoiceTemplateKey
