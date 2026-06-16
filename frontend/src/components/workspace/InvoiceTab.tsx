@@ -237,42 +237,55 @@ export function InvoiceTab({
     }
   }, [orderId, reloadToken])
 
-  // Phase 15B — load tenant invoice metadata (private invoice-config + public business
-  // name). SEPARATE from the invoice fetch: tenant-scoped and order-independent (never
-  // keyed on orderId), refreshed on reloadToken so "Try again" refreshes it too.
-  // allSettled keeps the two requests independent — one failing never discards the
-  // other's result — and neither ever touches invoice/loadError, so a metadata failure
-  // degrades to hidden rows, never a broken invoice screen.
+  // Phase 15B — load tenant invoice metadata. SEPARATE from the invoice fetch:
+  // tenant-scoped and order-independent (never keyed on orderId), refreshed on
+  // reloadToken so "Try again" refreshes it too. The two requests run as FULLY
+  // INDEPENDENT chains (no Promise.all/allSettled, no awaiting one before the other),
+  // so a slow/hung optional lookup can never hold up the legal gate (Codex P2):
+  //   - fetchTenantInvoiceConfig is the legal-risk gate (Codex P1) and is the SOLE
+  //     driver of tenantConfig / tenantConfigLoading / tenantConfigError. Its loading
+  //     flag clears on its OWN settlement, so once the config has safely loaded Accept
+  //     is no longer blocked even if the public business lookup is still pending.
+  //   - fetchPublicBusiness is optional branding: it only ever sets businessName and
+  //     NEVER touches the config gate, so its failure/hang fails soft (the store name
+  //     still comes from auth). Neither chain ever touches invoice/loadError.
   useEffect(() => {
     let cancelled = false
-    // Re-enter the gated state on every (re)load so a reloadToken retry re-disables
-    // Accept until the retry resolves.
+
+    // Legal-risk gate chain: re-enter the gated state on every (re)load, then let ONLY
+    // this chain's settlement clear the loading flag — on BOTH success and failure.
     setTenantConfigLoading(true)
     setTenantConfigError(false)
-    Promise.allSettled([
-      fetchTenantInvoiceConfig(),
-      fetchPublicBusiness(getActiveSlug()),
-    ]).then(([configResult, businessResult]) => {
-      if (cancelled) return
-      // Config is the legal-risk gate: success stores it and clears the error; failure
-      // clears it and raises the error so Accept stays disabled (terms may exist).
-      if (configResult.status === 'fulfilled') {
-        setTenantConfig(configResult.value)
+    fetchTenantInvoiceConfig()
+      .then((config) => {
+        if (cancelled) return
+        setTenantConfig(config)
         setTenantConfigError(false)
-      } else {
+      })
+      .catch(() => {
+        if (cancelled) return
+        // Config failed → null it and raise the error so Accept stays disabled
+        // (configured terms may exist but failed to load).
         setTenantConfig(null)
         setTenantConfigError(true)
-      }
-      // Public business / name still fails soft — it never gates Accept.
-      setBusinessName(
-        businessResult.status === 'fulfilled'
-          ? nonBlank(businessResult.value.name)
-          : null,
-      )
-      // Cleared AFTER the cancelled guard (not in a .finally) so no state update runs
-      // post-unmount.
-      setTenantConfigLoading(false)
-    })
+      })
+      .finally(() => {
+        if (cancelled) return
+        setTenantConfigLoading(false)
+      })
+
+    // Optional branding chain — independent; only ever sets businessName and NEVER
+    // touches tenantConfig / tenantConfigLoading / tenantConfigError under any outcome.
+    fetchPublicBusiness(getActiveSlug())
+      .then((business) => {
+        if (cancelled) return
+        setBusinessName(nonBlank(business.name))
+      })
+      .catch(() => {
+        if (cancelled) return
+        setBusinessName(null)
+      })
+
     return () => {
       cancelled = true
     }
