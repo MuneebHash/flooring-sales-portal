@@ -458,6 +458,7 @@ function WorkspaceShell({
             {activeTab === 'invoice' && (
               <InvoiceTab
                 orderId={orderId}
+                flooringType={flooringType}
                 orderNumber={orderNumber}
                 customer={customer}
                 billingAddress={billingAddress}

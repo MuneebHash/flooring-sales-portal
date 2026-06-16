@@ -85,6 +85,8 @@ class TenantInvoiceConfigControllerTest {
                     account_number          = '12345678',
                     account_name            = 'Aussie Floors Pty Ltd',
                     terms_and_conditions    = 'Payment due within 7 days.',
+                    terms_hard              = 'Hard flooring terms: 25-year structural warranty.',
+                    terms_soft              = 'Soft flooring terms: stain warranty applies.',
                     logo_path               = '/uploads/1/branding/logo.png',
                     stripe_payment_link_url = 'https://stripe.example/pay/aussie',
                     invoice_template_key    = 'premium'
@@ -92,7 +94,7 @@ class TenantInvoiceConfigControllerTest {
                 """, businessId);
     }
 
-    /** Null out the 8 nullable invoice-config columns; pin template key to its default. */
+    /** Null out the 10 nullable invoice-config columns; pin template key to its default. */
     private void seedNullConfig(long businessId) {
         jdbcTemplate.update("""
                 UPDATE business SET
@@ -102,6 +104,8 @@ class TenantInvoiceConfigControllerTest {
                     account_number          = NULL,
                     account_name            = NULL,
                     terms_and_conditions    = NULL,
+                    terms_hard              = NULL,
+                    terms_soft              = NULL,
                     logo_path               = NULL,
                     stripe_payment_link_url = NULL,
                     invoice_template_key    = 'standard'
@@ -148,7 +152,7 @@ class TenantInvoiceConfigControllerTest {
     // ================================================================
 
     @Test
-    void authenticated_returnsAllNineFieldsWithValues() throws Exception {
+    void authenticated_returnsAllConfigFieldsWithValues() throws Exception {
         seedFullConfig(BUSINESS_AUSSIE);
 
         mockMvc.perform(get(url(SLUG_AUSSIE)).session(liamStore1Session()))
@@ -158,7 +162,13 @@ class TenantInvoiceConfigControllerTest {
                 .andExpect(jsonPath("$.data.bsb").value("062-000"))
                 .andExpect(jsonPath("$.data.account_number").value("12345678"))
                 .andExpect(jsonPath("$.data.account_name").value("Aussie Floors Pty Ltd"))
+                // Legacy single-block terms (V12) stays in the response for compatibility.
                 .andExpect(jsonPath("$.data.terms_and_conditions").value("Payment due within 7 days."))
+                // Per-flooring-type terms (V13) are returned under snake_case keys.
+                .andExpect(jsonPath("$.data.terms_hard")
+                        .value("Hard flooring terms: 25-year structural warranty."))
+                .andExpect(jsonPath("$.data.terms_soft")
+                        .value("Soft flooring terms: stain warranty applies."))
                 .andExpect(jsonPath("$.data.logo_path").value("/uploads/1/branding/logo.png"))
                 .andExpect(jsonPath("$.data.stripe_payment_link_url").value("https://stripe.example/pay/aussie"))
                 .andExpect(jsonPath("$.data.invoice_template_key").value("premium"));
@@ -199,6 +209,8 @@ class TenantInvoiceConfigControllerTest {
         Assertions.assertTrue(json.contains("\"account_number\":null"), () -> "account_number not explicit null: " + json);
         Assertions.assertTrue(json.contains("\"account_name\":null"), () -> "account_name not explicit null: " + json);
         Assertions.assertTrue(json.contains("\"terms_and_conditions\":null"), () -> "terms_and_conditions not explicit null: " + json);
+        Assertions.assertTrue(json.contains("\"terms_hard\":null"), () -> "terms_hard not explicit null: " + json);
+        Assertions.assertTrue(json.contains("\"terms_soft\":null"), () -> "terms_soft not explicit null: " + json);
         Assertions.assertTrue(json.contains("\"logo_path\":null"), () -> "logo_path not explicit null: " + json);
         Assertions.assertTrue(json.contains("\"stripe_payment_link_url\":null"), () -> "stripe_payment_link_url not explicit null: " + json);
         // invoice_template_key is NOT NULL and must remain a non-null string.
@@ -234,6 +246,8 @@ class TenantInvoiceConfigControllerTest {
                     account_number          = '11111111',
                     account_name            = 'Aussie Isolation Account',
                     terms_and_conditions    = 'Aussie terms only',
+                    terms_hard              = 'Aussie hard terms only',
+                    terms_soft              = 'Aussie soft terms only',
                     logo_path               = '/uploads/1/branding/aussie-isolation-logo.png',
                     stripe_payment_link_url = 'https://stripe.example/pay/aussie-isolation',
                     invoice_template_key    = 'aussie-template'
@@ -252,6 +266,8 @@ class TenantInvoiceConfigControllerTest {
                     account_number          = '99999999',
                     account_name            = 'Premier Isolation Account',
                     terms_and_conditions    = 'Premier terms must not leak',
+                    terms_hard              = 'Premier hard terms must not leak',
+                    terms_soft              = 'Premier soft terms must not leak',
                     logo_path               = '/uploads/2/branding/premier-isolation-logo.png',
                     stripe_payment_link_url = 'https://stripe.example/pay/premier-isolation',
                     invoice_template_key    = 'premier-template'
@@ -267,6 +283,8 @@ class TenantInvoiceConfigControllerTest {
                 .andExpect(jsonPath("$.data.abn").value("11122233344"))
                 .andExpect(jsonPath("$.data.bank_name").value("Aussie Isolation Bank"))
                 .andExpect(jsonPath("$.data.account_name").value("Aussie Isolation Account"))
+                .andExpect(jsonPath("$.data.terms_hard").value("Aussie hard terms only"))
+                .andExpect(jsonPath("$.data.terms_soft").value("Aussie soft terms only"))
                 .andExpect(jsonPath("$.data.invoice_template_key").value("aussie-template"))
                 .andReturn();
 
@@ -275,6 +293,8 @@ class TenantInvoiceConfigControllerTest {
         Assertions.assertFalse(json.contains("Premier Isolation Bank"), () -> "bank_name leaked: " + json);
         Assertions.assertFalse(json.contains("Premier Isolation Account"), () -> "account_name leaked: " + json);
         Assertions.assertFalse(json.contains("Premier terms must not leak"), () -> "terms leaked: " + json);
+        Assertions.assertFalse(json.contains("Premier hard terms must not leak"), () -> "terms_hard leaked: " + json);
+        Assertions.assertFalse(json.contains("Premier soft terms must not leak"), () -> "terms_soft leaked: " + json);
         Assertions.assertFalse(json.contains("premier-template"), () -> "invoice_template_key leaked: " + json);
         Assertions.assertFalse(json.contains("99988877766"), () -> "abn leaked: " + json);
     }

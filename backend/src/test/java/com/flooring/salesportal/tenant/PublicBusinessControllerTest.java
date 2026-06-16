@@ -86,6 +86,8 @@ class PublicBusinessControllerTest {
                 .andExpect(jsonPath("$.data.account_number").doesNotExist())
                 .andExpect(jsonPath("$.data.account_name").doesNotExist())
                 .andExpect(jsonPath("$.data.terms_and_conditions").doesNotExist())
+                .andExpect(jsonPath("$.data.terms_hard").doesNotExist())
+                .andExpect(jsonPath("$.data.terms_soft").doesNotExist())
                 .andExpect(jsonPath("$.data.stripe_payment_link_url").doesNotExist())
                 .andExpect(jsonPath("$.data.invoice_template_key").doesNotExist())
                 // Internal identifiers / status flags must not leak either.
@@ -111,6 +113,8 @@ class PublicBusinessControllerTest {
                     account_number          = '987654321',
                     account_name            = 'Aussie Floors Pty Ltd',
                     terms_and_conditions    = 'SECRET-TERMS-LEAK-CHECK',
+                    terms_hard              = 'SECRET-HARD-TERMS-LEAK-CHECK',
+                    terms_soft              = 'SECRET-SOFT-TERMS-LEAK-CHECK',
                     stripe_payment_link_url = 'https://stripe.example/secret-link',
                     invoice_template_key    = 'premium'
                 WHERE business_id = ?
@@ -129,6 +133,8 @@ class PublicBusinessControllerTest {
                 .andExpect(jsonPath("$.data.account_number").doesNotExist())
                 .andExpect(jsonPath("$.data.account_name").doesNotExist())
                 .andExpect(jsonPath("$.data.terms_and_conditions").doesNotExist())
+                .andExpect(jsonPath("$.data.terms_hard").doesNotExist())
+                .andExpect(jsonPath("$.data.terms_soft").doesNotExist())
                 .andExpect(jsonPath("$.data.stripe_payment_link_url").doesNotExist())
                 .andExpect(jsonPath("$.data.invoice_template_key").doesNotExist())
                 // Quick-add data must not appear under any key.
@@ -144,6 +150,8 @@ class PublicBusinessControllerTest {
         Assertions.assertFalse(json.contains("987654321"), () -> "account_number leaked: " + json);
         Assertions.assertFalse(json.contains("Aussie Floors Pty Ltd"), () -> "account_name leaked: " + json);
         Assertions.assertFalse(json.contains("SECRET-TERMS-LEAK-CHECK"), () -> "terms leaked: " + json);
+        Assertions.assertFalse(json.contains("SECRET-HARD-TERMS-LEAK-CHECK"), () -> "terms_hard leaked: " + json);
+        Assertions.assertFalse(json.contains("SECRET-SOFT-TERMS-LEAK-CHECK"), () -> "terms_soft leaked: " + json);
         Assertions.assertFalse(json.contains("stripe.example"), () -> "stripe link leaked: " + json);
         Assertions.assertFalse(json.contains("SECRET-QUICKADD-LEAK-CHECK"), () -> "quick-add leaked: " + json);
     }
