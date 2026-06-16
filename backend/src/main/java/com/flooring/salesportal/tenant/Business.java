@@ -34,7 +34,8 @@ public class Business {
     // Public branding (exposed via GET /api/v1/public/businesses/{slug}). Nullable.
     // Private tenant fields added in V12 (abn, bank_*, terms_and_conditions, stripe_*,
     // invoice_template_key) are intentionally NOT mapped here so the public endpoint cannot
-    // leak them; they are wired by the authenticated config endpoint in Phase 14C.
+    // leak them; they are read by the authenticated invoice-config endpoint in Phase 15A
+    // (GET /api/v1/{slug}/invoice-config) via a native-query projection, not the entity.
     @Column(name = "logo_path")
     private String logoPath;
 
