@@ -62,24 +62,24 @@ floorxtack.com/{business-slug}
 
 ## 3. Current repo status
 
-Current main state after PR #71:
+Current main state after PR #79 (docs commit 99f0148):
 
 ```text
-main includes dynamic business slug routing
-main includes V11 reserved business slug migration
-main includes invoice acceptance/signature/email frontend and backend
-main includes target GP price control
-main includes persistent local upload storage config
+main includes the full Phase 14 multi-tenant foundation
+main includes dynamic business slug routing + V11 reserved-slug migration
+main includes V12 per-tenant branding / invoice-legal / quick-add schema
+main includes tenant slug validation + Business-Not-Found + per-tenant quick-adds
+main includes the db/dev-seed workflow + MS1 multi-store demo user
+main includes invoice acceptance/signature/email + target GP price control
 ```
 
 Latest important completed work:
 
 ```text
-PR #71 — dynamic business slug routing from URL
-V11 — reserved app/system route words as invalid business slugs
+Phase 14A–14D — tenant data model, login validation, quick-adds, dev-seed (PRs #76–#79)
+V12 — per-tenant branding + invoice-legal fields + business_quick_description table
 Phase 13 — invoice acceptance/signature/resend/email UI and backend
-Target GP price control — hidden GP panel can calculate sale price from target GP%
-Local uploads now persist under user home instead of OS temp
+Target GP price control — sale price from target GP%
 ```
 
 Tenant data note:
@@ -94,15 +94,10 @@ using the partner's real business/store/user/catalog/invoice-legal data.
 Current task:
 
 ```text
-- Phase 14A (tenant data model + public business lookup, #74) — COMPLETE.
-- Phase 14B (login slug validation + Business-Not-Found + real login name; move
-  shared auth types out of auth.tsx, #72/#31) — COMPLETE.
-- Phase 14C (authenticated quick-descriptions endpoint + DetailsOfSaleTab quick-adds, #74) — COMPLETE.
-- Phase 14D (go-forward db/dev-seed workflow + MS1 multi-store demo user, #73/#28) — COMPLETE.
-  Demo seed lives in db/dev-seed (manual, idempotent); schema-only baseline/squash deferred
-  to Phase 16/pre-deploy.
-- Current: Phase 15 (Invoice & Payment Correctness — money / document trust layer). See §11.
+Phase 15 — Invoice & Payment Correctness (money / document trust layer). See §11.
 ```
+
+(Phase 14A–14D complete — see the roadmap in §11.)
 
 ---
 

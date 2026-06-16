@@ -527,12 +527,13 @@ Important future work:
 Known issues/follow-ups:
 
 ```text
-#28 multi-store demo user and store-selection testing
 #29 CSRF protection before production
 #30 production CORS origins
-#31 shared auth types cleanup
+#34 app/database timezone before production
 #55 backend financial summary versioning for concurrent mutations
 #69 backend version precondition on invoice accept
+#74 per-tenant private config (ABN/bank/T&Cs/Stripe link/template) — Phase 15
+#75 centralize backend auth enforcement (fail-closed) — Phase 16
 ```
 
 ---
