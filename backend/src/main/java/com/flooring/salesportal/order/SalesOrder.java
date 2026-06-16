@@ -37,6 +37,12 @@ public class SalesOrder {
     @Column(name = "store_id")
     private Integer storeId;
 
+    // sales_order.user_id (V2, NOT NULL): the order's salesperson — the app_user who owns the order.
+    // Mapped in Phase 15C so the invoice PDF can render the order-bound salesperson name. This is the
+    // authoritative salesperson source; it is NOT the session/invoice-creating user.
+    @Column(name = "user_id")
+    private Long userId;
+
     @Column(name = "order_sequence_number")
     private Integer orderSequenceNumber;
 
