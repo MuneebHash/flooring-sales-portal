@@ -16,6 +16,13 @@ import type {
   OrderAddress,
   OrderCustomer,
 } from '../../lib/api/orderWorkspaceApi'
+import {
+  fetchTenantInvoiceConfig,
+  type TenantInvoiceConfig,
+} from '../../lib/api/tenantInvoiceConfigApi'
+import { fetchPublicBusiness } from '../../lib/api/tenantApi'
+import { useAuth } from '../../lib/auth'
+import { getActiveSlug } from '../../lib/tenant'
 
 type Props = {
   orderId: number
@@ -112,20 +119,13 @@ function pdfFileName(
   return `invoice-${safeOrder}-v${versionNumber}.pdf`
 }
 
-const TERMS: string[] = [
-  'The customer is responsible for providing clear and clean access to all areas to be installed.',
-  'The customer agrees to be present at the premises during the installation where reasonably practical.',
-  'The customer is responsible for the removal and re-fitting of any internal doors as required for the installation.',
-  'Adequate mains power is to be provided at the installation site for installer equipment.',
-  'Furniture removal and replacement remains the customer’s responsibility unless otherwise stated above.',
-  'The price stated on this invoice is for laying to the area described; a per-metre rate has not been quoted.',
-  'Manufacturers make every effort to match dye lots; colour shades may vary from samples shown.',
-  'Flooring is installed to normal industry standards using standard underlays unless otherwise stated above.',
-  'Where the customer raises a complaint, reasonable access must be granted to inspect the affected area.',
-  'These terms together with the details set out above constitute the entire agreement between the parties.',
-  'Any variation in GST or government charges imposed after the date of this invoice is payable by the customer.',
-  'Carpet, timber and vinyl products are subject to natural characteristics which may include shading and minor variation.',
-]
+// Trim a nullable/optional string and return it only when it has visible content;
+// otherwise null. Lets the invoice hide tenant-config rows that are null/blank rather
+// than render an empty label, a sample fallback, or a "—" placeholder.
+function nonBlank(value: string | null | undefined): string | null {
+  const trimmed = value?.trim()
+  return trimmed && trimmed.length > 0 ? trimmed : null
+}
 
 const ACCEPTANCE_LINES: string[] = [
   'I agree to pay the balance before the installation date.',
@@ -154,6 +154,25 @@ export function InvoiceTab({
   const [accepting, setAccepting] = useState(false)
   const [resending, setResending] = useState(false)
   const [reloadToken, setReloadToken] = useState(0)
+
+  // Phase 15B — per-tenant invoice metadata for the document header / terms / bank
+  // section. The store name comes from the already-loaded auth context (no fetch). The
+  // business name + private invoice-config are fetched in a SEPARATE, order-independent
+  // effect below and FAIL SOFT: a failure hides the affected rows, never blocks the
+  // invoice document, and never routes through loadError.
+  const { activeStore } = useAuth()
+  const [tenantConfig, setTenantConfig] = useState<TenantInvoiceConfig | null>(
+    null,
+  )
+  const [businessName, setBusinessName] = useState<string | null>(null)
+  // Legal-risk gate (Codex P1): Accept must be unavailable until the tenant invoice
+  // config is SAFELY known. Configured terms_and_conditions may exist but not yet have
+  // rendered, so the customer must not sign/accept while the config is still loading or
+  // failed to load. `tenantConfigLoading` is true until the config request resolves;
+  // `tenantConfigError` is true when it failed. (The public business / name request
+  // stays soft — see the effect below — and never gates Accept.)
+  const [tenantConfigLoading, setTenantConfigLoading] = useState(true)
+  const [tenantConfigError, setTenantConfigError] = useState(false)
 
   // Acceptance draft (unaccepted invoice only): whether the pad has at least one
   // drawn stroke. The accepted customer name is NOT typed — it is derived from the
@@ -217,6 +236,75 @@ export function InvoiceTab({
       cancelled = true
     }
   }, [orderId, reloadToken])
+
+  // Phase 15B — load tenant invoice metadata. SEPARATE from the invoice fetch:
+  // tenant-scoped and order-independent (never keyed on orderId), refreshed on
+  // reloadToken so "Try again" refreshes it too. The two requests run as FULLY
+  // INDEPENDENT chains (no Promise.all/allSettled, no awaiting one before the other),
+  // so a slow/hung optional lookup can never hold up the legal gate (Codex P2):
+  //   - fetchTenantInvoiceConfig is the legal-risk gate (Codex P1) and is the SOLE
+  //     driver of tenantConfig / tenantConfigLoading / tenantConfigError. Its loading
+  //     flag clears on its OWN settlement, so once the config has safely loaded Accept
+  //     is no longer blocked even if the public business lookup is still pending.
+  //   - fetchPublicBusiness is optional branding: it only ever sets businessName and
+  //     NEVER touches the config gate, so its failure/hang fails soft (the store name
+  //     still comes from auth). Neither chain ever touches invoice/loadError.
+  useEffect(() => {
+    let cancelled = false
+
+    // Legal-risk gate chain: re-enter the gated state on every (re)load, then let ONLY
+    // this chain's settlement clear the loading flag — on BOTH success and failure.
+    setTenantConfigLoading(true)
+    setTenantConfigError(false)
+    fetchTenantInvoiceConfig()
+      .then((config) => {
+        if (cancelled) return
+        setTenantConfig(config)
+        setTenantConfigError(false)
+      })
+      .catch(() => {
+        if (cancelled) return
+        // Config failed → null it and raise the error so Accept stays disabled
+        // (configured terms may exist but failed to load).
+        setTenantConfig(null)
+        setTenantConfigError(true)
+      })
+      .finally(() => {
+        if (cancelled) return
+        setTenantConfigLoading(false)
+      })
+
+    // Optional branding chain — independent; only ever sets businessName and NEVER
+    // touches tenantConfig / tenantConfigLoading / tenantConfigError under any outcome.
+    fetchPublicBusiness(getActiveSlug())
+      .then((business) => {
+        if (cancelled) return
+        setBusinessName(nonBlank(business.name))
+      })
+      .catch(() => {
+        if (cancelled) return
+        setBusinessName(null)
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [reloadToken])
+
+  // Codex (signature-before-terms) — keep the signature gate and the ink in sync: while
+  // the tenant invoice config is loading or failed (i.e. NOT ready for acceptance), the
+  // pad is disabled AND any already-drawn ink is dropped, so a signature drawn before the
+  // terms rendered can never become submittable once the config later loads. Keyed on the
+  // RAW flags (tenantConfigLoading || tenantConfigError, exactly
+  // !tenantConfigReadyForAcceptance) so this hook groups with the other effects above the
+  // JSX return rather than depending on a const declared just before render — and stays
+  // hook-order-safe if an early return is ever added later.
+  useEffect(() => {
+    if (tenantConfigLoading || tenantConfigError) {
+      padRef.current?.clear()
+      setHasInk(false)
+    }
+  }, [tenantConfigLoading, tenantConfigError])
 
   function refetch() {
     setReloadToken((token) => token + 1)
@@ -343,7 +431,15 @@ export function InvoiceTab({
   }
 
   async function handleAccept() {
-    if (accepting || resending || invoice === null) return
+    // Stray-call guard: never accept while the tenant invoice config is not safely
+    // loaded (Codex P1) — configured terms may exist but not yet have rendered.
+    if (
+      accepting ||
+      resending ||
+      invoice === null ||
+      !tenantConfigReadyForAcceptance
+    )
+      return
     const displayed = invoice
     // accepted_customer_name is auto-derived from the order's saved customer —
     // the customer never types it. A blank or over-length name disables Accept
@@ -527,6 +623,28 @@ export function InvoiceTab({
   const dueDateText =
     invoice && invoice.due_date ? formatDocDate(invoice.due_date) : ''
 
+  // Phase 15B tenant document fields — each hidden when null/blank (never "—"/sample).
+  // Store name from auth; business name + abn/bank from the tenant fetch above.
+  const storeName = nonBlank(activeStore?.name)
+  const abn = nonBlank(tenantConfig?.abn)
+  const bankName = nonBlank(tenantConfig?.bank_name)
+  const bsb = nonBlank(tenantConfig?.bsb)
+  const accountNumber = nonBlank(tenantConfig?.account_number)
+  const accountName = nonBlank(tenantConfig?.account_name)
+  const termsText = nonBlank(tenantConfig?.terms_and_conditions)
+  const hasBankDetails =
+    bankName !== null ||
+    bsb !== null ||
+    accountNumber !== null ||
+    accountName !== null
+
+  // Accept is gated on the tenant invoice config being SAFELY loaded (Codex P1): not
+  // loading and not errored. Configured terms may exist but not yet have rendered, so
+  // signing/accepting before this is true is a legal risk. (Business-name failure is
+  // soft and never affects this flag.)
+  const tenantConfigReadyForAcceptance =
+    !tenantConfigLoading && !tenantConfigError
+
   return (
     <div>
       <div className="mb-4 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
@@ -621,15 +739,17 @@ export function InvoiceTab({
         <article className="rounded-lg border border-slate-200 bg-white shadow-sm p-6 sm:p-8">
           <header className="grid grid-cols-1 sm:grid-cols-3 gap-6 items-start">
             <div className="sm:col-span-1">
-              <div className="text-base font-bold text-slate-900 tracking-tight">
-                Aussie Floors Group
-              </div>
-              <div className="mt-0.5 text-xs text-slate-600">
-                Aussie Floors Sydney CBD
-              </div>
-              <div className="mt-2 text-[11px] text-slate-500">
-                ABN: Sample only
-              </div>
+              {businessName && (
+                <div className="text-base font-bold text-slate-900 tracking-tight">
+                  {businessName}
+                </div>
+              )}
+              {storeName && (
+                <div className="mt-0.5 text-xs text-slate-600">{storeName}</div>
+              )}
+              {abn && (
+                <div className="mt-2 text-[11px] text-slate-500">ABN: {abn}</div>
+              )}
             </div>
             <div className="hidden sm:block sm:col-span-1" />
             <div className="sm:col-span-1 sm:text-right">
@@ -686,6 +806,39 @@ export function InvoiceTab({
                   {dueDateText || '—'}
                 </span>
               </div>
+              {hasBankDetails && (
+                <div className="pt-2 space-y-0.5">
+                  <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
+                    Payment Details
+                  </div>
+                  {bankName && (
+                    <div className="text-sm text-slate-600">
+                      Bank :{' '}
+                      <span className="text-slate-900">{bankName}</span>
+                    </div>
+                  )}
+                  {bsb && (
+                    <div className="text-sm text-slate-600">
+                      BSB :{' '}
+                      <span className="text-slate-900 tabular-nums">{bsb}</span>
+                    </div>
+                  )}
+                  {accountNumber && (
+                    <div className="text-sm text-slate-600">
+                      Account No. :{' '}
+                      <span className="text-slate-900 tabular-nums">
+                        {accountNumber}
+                      </span>
+                    </div>
+                  )}
+                  {accountName && (
+                    <div className="text-sm text-slate-600">
+                      Account Name :{' '}
+                      <span className="text-slate-900">{accountName}</span>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           </div>
 
@@ -721,27 +874,16 @@ export function InvoiceTab({
 
           <div className="my-8 border-t border-slate-200" />
 
-          <div>
-            <div className="text-center text-xs font-semibold uppercase tracking-wider text-slate-800">
-              Terms and Conditions — applicable to this invoice
+          {termsText && (
+            <div>
+              <div className="text-center text-xs font-semibold uppercase tracking-wider text-slate-800">
+                Terms and Conditions — applicable to this invoice
+              </div>
+              <div className="mt-4 text-xs text-slate-700 leading-relaxed whitespace-pre-wrap">
+                {termsText}
+              </div>
             </div>
-            <div className="mt-1 text-center text-[11px] text-slate-500">
-              Sample terms for visual prototype only.
-            </div>
-            <div className="mt-4 grid grid-cols-1 lg:grid-cols-2 gap-x-8 gap-y-2">
-              {TERMS.map((term, idx) => (
-                <div
-                  key={term}
-                  className="flex gap-2 text-xs text-slate-700 leading-relaxed"
-                >
-                  <span className="text-slate-500 font-medium tabular-nums shrink-0">
-                    {idx + 1}.
-                  </span>
-                  <span>{term}</span>
-                </div>
-              ))}
-            </div>
-          </div>
+          )}
 
           <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 gap-6">
             <div className="space-y-2">
@@ -842,7 +984,7 @@ export function InvoiceTab({
                   <div className="mt-2 rounded-md border border-slate-300 bg-slate-50/60 p-2">
                     <SignaturePad
                       ref={padRef}
-                      disabled={accepting}
+                      disabled={accepting || !tenantConfigReadyForAcceptance}
                       onInkChange={setHasInk}
                     />
                   </div>
@@ -899,6 +1041,29 @@ export function InvoiceTab({
                       )}
                     </div>
                   ) : null}
+                  {/* Codex P1 legal-risk gate — exactly one state: loading XOR error,
+                      never both. Sits by the Accept button (outside the invoice terms
+                      body). Accept stays disabled until tenant config is safely loaded. */}
+                  {tenantConfigLoading ? (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Loading invoice terms and business details…
+                    </p>
+                  ) : tenantConfigError ? (
+                    <div className="mt-2 flex flex-col sm:flex-row sm:items-center gap-2">
+                      <p className="text-xs font-medium text-amber-700">
+                        Invoice terms and business details could not be loaded.
+                        Try again before accepting.
+                      </p>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        onClick={refetch}
+                      >
+                        Try again
+                      </Button>
+                    </div>
+                  ) : null}
                   <div className="mt-3 flex justify-end">
                     <Button
                       type="button"
@@ -910,7 +1075,8 @@ export function InvoiceTab({
                         resending ||
                         !hasInk ||
                         derivedAcceptedName.length === 0 ||
-                        derivedNameTooLong
+                        derivedNameTooLong ||
+                        !tenantConfigReadyForAcceptance
                       }
                     >
                       {accepting ? 'Accepting…' : 'Accept Invoice'}
