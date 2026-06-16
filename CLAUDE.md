@@ -68,14 +68,16 @@ Completed major capabilities:
 - accepted invoice resend/email state
 - dynamic business slug routing from URL
 - reserved app/system route words blocked as business slugs
+- tenant slug validation before login + Business-Not-Found page
+- per-tenant quick-add descriptions (authenticated)
+- go-forward db/dev-seed workflow + MS1 multi-store demo user
 
-Current planned order:
+Current phase:
 
-1. Issue #27 dynamic slug routing — DONE
-2. Update `docs/Phases.md` and `CLAUDE.md` — CURRENT
-3. Fix Terralux seed SQL so business insert includes `slug = 'terralux'`
-4. Seed Terralux into local DB
-5. Frontend revamp / polish
+```text
+Phase 15 — Invoice & Payment Correctness (money / document trust layer).
+See docs/Phases.md §11 for scope.
+```
 
 ---
 
@@ -458,34 +460,20 @@ Do not invent a parallel design system.
 
 ---
 
-## Current immediate task: Terralux seed
+## Current immediate task: Phase 15 — Invoice & Payment Correctness
 
-Next implementation task after docs cleanup:
+Scope (see docs/Phases.md §11 for full detail):
 
-```text
-Fix Terralux seed SQL and seed Terralux locally.
-```
+- Fix invoice PDF generation to match the provided sample template.
+- Render per-tenant invoice data ONCE on screen + PDF (logo, ABN, bank, T&Cs);
+  remove the hardcoded Aussie Floors / sample ABN / sample TERMS from InvoiceTab.tsx.
+- Kill automatic invoice email after a payment update (keep manual Resend).
+- Payment delete / reversal (paid drops, balance rises, stays accepted/signed,
+  no re-sign, no auto-email).
+- Stripe payment-link button (opens tenant's external link, manual recording, no webhook).
 
-Important:
-
-- business slug must be `terralux`
-- business insert must include `slug = 'terralux'`
-- do not create a Flyway migration for Terralux
-- customer/tenant seed script is onboarding data, not product schema
-- do not commit real customer data unless the user explicitly decides it belongs in the repo
-
-Expected local URL after seed:
-
-```text
-http://localhost:5173/terralux/login
-```
-
-Before running seed SQL:
-
-- confirm no existing business slug conflicts
-- confirm stores/users/products/charges are scoped to the Terralux business
-- confirm salesperson codes are unique within that business
-- confirm prices/costs are ex GST if using the current product model
+Note: the old "Terralux" demo seed was created then removed. Real tenant onboarding is
+handled by the db/dev-seed workflow, not a one-off Terralux script.
 
 ---
 
@@ -511,13 +499,13 @@ Do not start these unless explicitly requested:
 - advanced quote comparison
 - room-level complexity
 - AI features
-- refunds/reversals
+- refunds/reversals beyond the Phase 15 payment delete/reversal flow
 - finance products
 - Stripe Connect/full payment gateway build
 - major deployment work
-- major frontend redesign before Terralux seed is working
+- major frontend redesign (FloorxTack chrome is Phase 17)
 
-Frontend revamp/polish is planned after Terralux seed and local demo data are ready.
+Frontend revamp/polish (per-tenant chrome) is Phase 17, after Phase 15/16.
 
 ---
 

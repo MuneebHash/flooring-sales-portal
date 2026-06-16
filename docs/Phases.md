@@ -98,9 +98,10 @@ Current task:
 - Phase 14B (login slug validation + Business-Not-Found + real login name; move
   shared auth types out of auth.tsx, #72/#31) — COMPLETE.
 - Phase 14C (authenticated quick-descriptions endpoint + DetailsOfSaleTab quick-adds, #74) — COMPLETE.
-- Current: Phase 14D (go-forward db/dev-seed workflow + MS1 multi-store demo user, #73/#28).
+- Phase 14D (go-forward db/dev-seed workflow + MS1 multi-store demo user, #73/#28) — COMPLETE.
   Demo seed lives in db/dev-seed (manual, idempotent); schema-only baseline/squash deferred
   to Phase 16/pre-deploy.
+- Current: Phase 15 (Invoice & Payment Correctness — money / document trust layer). See §11.
 ```
 
 ---
@@ -584,7 +585,7 @@ Phase 14 branch breakdown:
   14A  feature/phase14-tenant-data-model        #74        V12 migration + Business entity + public endpoint        [COMPLETE]
   14B  feature/phase14-tenant-login-validation  #72, #31   slug validation, Business-Not-Found, real login name; move shared auth types out of auth.tsx   [COMPLETE]
   14C  feature/phase14-tenant-quick-adds        #74        authenticated quick-descriptions endpoint + DetailsOfSaleTab reads tenant quick-adds (EMPTY if none — no hardcoded fallback)   [COMPLETE]
-  14D  feature/phase14-dev-seed-workflow        #73, #28   go-forward db/dev-seed workflow (manual, idempotent) + MS1 multi-store demo user + all-users-all-stores grant; schema-only baseline/squash deferred to Phase 16   [CURRENT]
+  14D  feature/phase14-dev-seed-workflow        #73, #28   go-forward db/dev-seed workflow (manual, idempotent) + MS1 multi-store demo user + all-users-all-stores grant; schema-only baseline/squash deferred to Phase 16   [COMPLETE]
 ```
 
 Phase 14 builds the DATA MODEL + endpoints + seed workflow only.
