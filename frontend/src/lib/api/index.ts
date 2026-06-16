@@ -83,6 +83,8 @@ export type {
   InvoiceResponse,
 } from './orderInvoicesApi'
 export { fetchQuickDescriptions } from './quickDescriptionsApi'
+export { fetchTenantInvoiceConfig } from './tenantInvoiceConfigApi'
+export type { TenantInvoiceConfig } from './tenantInvoiceConfigApi'
 export { fetchOrderPayments, recordOrderPayment } from './orderPaymentsApi'
 export type {
   PaymentMethod,
