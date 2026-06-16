@@ -291,6 +291,21 @@ export function InvoiceTab({
     }
   }, [reloadToken])
 
+  // Codex (signature-before-terms) — keep the signature gate and the ink in sync: while
+  // the tenant invoice config is loading or failed (i.e. NOT ready for acceptance), the
+  // pad is disabled AND any already-drawn ink is dropped, so a signature drawn before the
+  // terms rendered can never become submittable once the config later loads. Keyed on the
+  // RAW flags (tenantConfigLoading || tenantConfigError, exactly
+  // !tenantConfigReadyForAcceptance) so this hook groups with the other effects above the
+  // JSX return rather than depending on a const declared just before render — and stays
+  // hook-order-safe if an early return is ever added later.
+  useEffect(() => {
+    if (tenantConfigLoading || tenantConfigError) {
+      padRef.current?.clear()
+      setHasInk(false)
+    }
+  }, [tenantConfigLoading, tenantConfigError])
+
   function refetch() {
     setReloadToken((token) => token + 1)
   }
@@ -969,7 +984,7 @@ export function InvoiceTab({
                   <div className="mt-2 rounded-md border border-slate-300 bg-slate-50/60 p-2">
                     <SignaturePad
                       ref={padRef}
-                      disabled={accepting}
+                      disabled={accepting || !tenantConfigReadyForAcceptance}
                       onInkChange={setHasInk}
                     />
                   </div>
