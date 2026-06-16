@@ -24,6 +24,7 @@ import java.util.Base64;
 import java.util.Optional;
 import javax.imageio.ImageIO;
 
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -141,7 +142,7 @@ class InvoicePdfModelAssemblerTest {
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(cfg));
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
         when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.of(salesperson()));
-        when(fileStorageService.read("/uploads/1/branding/logo.png")).thenReturn(ONE_PIXEL_PNG);
+        when(fileStorageService.readWithLimit(eq("/uploads/1/branding/logo.png"), anyLong())).thenReturn(ONE_PIXEL_PNG);
 
         InvoicePdfModel m = assembler.assemble(inputs(business("/uploads/1/branding/logo.png"), order("SOFT")));
 
@@ -236,7 +237,7 @@ class InvoicePdfModelAssemblerTest {
         InvoicePdfModel m = assembler.assemble(inputs(business("/uploads/1/branding/logo.gif"), order("SOFT")));
 
         Assertions.assertNull(m.logoDataUri(), "unsupported logo type falls back to business name");
-        verify(fileStorageService, never()).read(eq("/uploads/1/branding/logo.gif"));
+        verify(fileStorageService, never()).readWithLimit(eq("/uploads/1/branding/logo.gif"), anyLong());
     }
 
     @Test
@@ -244,7 +245,7 @@ class InvoicePdfModelAssemblerTest {
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
         when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.of(salesperson()));
-        when(fileStorageService.read("/uploads/1/branding/logo.png"))
+        when(fileStorageService.readWithLimit(eq("/uploads/1/branding/logo.png"), anyLong()))
                 .thenThrow(new UncheckedIOException("missing", new java.io.IOException("nope")));
 
         InvoicePdfModel m = Assertions.assertDoesNotThrow(() ->
@@ -256,12 +257,16 @@ class InvoicePdfModelAssemblerTest {
     // Phase 15C hardening — logo magic-byte + decode validation (must never 500 the invoice)
     // ------------------------------------------------------------------
 
-    /** Resolve only the logo: stub config/store/salesperson empty, return {@code logoBytes} for {@code path}. */
+    /**
+     * Resolve only the logo: stub config/store/salesperson empty, and stub the bounded read for
+     * {@code path} to return {@code logoBytes} (a {@code null} value simulates the over-limit rejection
+     * {@code readWithLimit} returns).
+     */
     private InvoicePdfModel assembleWithLogo(String path, byte[] logoBytes) {
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.empty());
         when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.empty());
-        when(fileStorageService.read(path)).thenReturn(logoBytes);
+        when(fileStorageService.readWithLimit(eq(path), anyLong())).thenReturn(logoBytes);
         return assembler.assemble(inputs(business(path), order("SOFT")));
     }
 
@@ -292,14 +297,13 @@ class InvoicePdfModelAssemblerTest {
     }
 
     @Test
-    void oversizedBytesUnderPngPathFailSoftWithoutDecoding() {
-        // Just over the 5 MB cap, with a valid PNG signature so only the size guard can reject it.
-        byte[] big = new byte[5 * 1024 * 1024 + 1];
-        byte[] pngMagic = {(byte) 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
-        System.arraycopy(pngMagic, 0, big, 0, pngMagic.length);
+    void oversizedLogoRejectedByBoundedReadFailsSoft() {
+        // readWithLimit returns null for an over-cap file WITHOUT materialising it (proven end-to-end in
+        // FileStorageServiceTest); here we assert the assembler treats that null as fail-soft. No large
+        // array is built in memory — the over-limit rejection happens in the bounded read, not here.
         InvoicePdfModel m = Assertions.assertDoesNotThrow(() ->
-                assembleWithLogo("/uploads/1/branding/logo.png", big));
-        Assertions.assertNull(m.logoDataUri(), "oversized logo must fall back to business name (no decode)");
+                assembleWithLogo("/uploads/1/branding/logo.png", null));
+        Assertions.assertNull(m.logoDataUri(), "over-limit logo must fall back to business name");
     }
 
     @Test

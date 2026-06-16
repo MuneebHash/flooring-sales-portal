@@ -161,21 +161,22 @@ public class InvoicePdfModelAssembler {
             return null;
         }
 
+        // Bounded read: the size cap is enforced BEFORE the file is fully materialised (readWithLimit
+        // never buffers more than MAX_LOGO_BYTES + 1), so an oversized/huge logo cannot OOM at read time.
+        // null => over the cap (or empty); a read failure (missing/unreadable) throws and is caught here.
         byte[] bytes;
         try {
-            bytes = fileStorageService.read(path);
+            bytes = fileStorageService.readWithLimit(path, MAX_LOGO_BYTES);
         } catch (RuntimeException ex) {
             log.warn("Invoice logo unavailable for path {} — falling back to business name", path, ex);
             return null;
         }
-        if (bytes == null || bytes.length == 0) {
+        if (bytes == null) {
+            log.warn("Invoice logo at {} is missing or exceeds the {}-byte cap — falling back to business name",
+                    path, MAX_LOGO_BYTES);
             return null;
         }
-
-        // Size cap BEFORE any decode: never hand an oversized payload to the image decoder.
-        if (bytes.length > MAX_LOGO_BYTES) {
-            log.warn("Invoice logo at {} is {} bytes (over the {}-byte cap) — falling back to business name",
-                    path, bytes.length, MAX_LOGO_BYTES);
+        if (bytes.length == 0) {
             return null;
         }
 

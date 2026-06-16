@@ -6,6 +6,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -65,6 +66,35 @@ public class FileStorageService {
         Path source = resolve(storagePath);
         try {
             return Files.readAllBytes(source);
+        } catch (IOException e) {
+            throw new UncheckedIOException("Attachment file is not available", e);
+        }
+    }
+
+    /**
+     * Read a persisted {@code storage_path} but never materialise more than {@code maxBytes}. Reads at
+     * most {@code maxBytes + 1} bytes from the stream: if the file is larger than {@code maxBytes} it is
+     * REJECTED with {@code null} WITHOUT buffering the whole file — so an oversized (or maliciously huge)
+     * file cannot OOM the JVM at read time (the flaw {@link #read} has via {@code Files.readAllBytes}).
+     * Returns {@code null} for {@code maxBytes <= 0} or an over-limit file; throws
+     * {@link UncheckedIOException} when the file is missing/unreadable (same as {@link #read}). The
+     * path-traversal containment guard in {@link #resolve} still applies. Phase 15C: used for the invoice
+     * logo so logo size is bounded before decode.
+     */
+    public byte[] readWithLimit(String storagePath, long maxBytes) {
+        if (maxBytes <= 0) {
+            return null;
+        }
+        Path source = resolve(storagePath);
+        // Read up to maxBytes+1 (capped at Integer.MAX_VALUE) so we can detect "larger than the cap"
+        // without ever loading the whole oversized file into memory.
+        int readCap = (int) Math.min(maxBytes + 1, Integer.MAX_VALUE);
+        try (InputStream in = Files.newInputStream(source)) {
+            byte[] data = in.readNBytes(readCap);
+            if (data.length > maxBytes) {
+                return null;
+            }
+            return data;
         } catch (IOException e) {
             throw new UncheckedIOException("Attachment file is not available", e);
         }
