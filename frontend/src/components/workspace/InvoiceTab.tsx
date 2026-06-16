@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import DOMPurify from 'dompurify'
 import { Button } from '../ui/Button'
 import { SignaturePad, type SignaturePadHandle } from './SignaturePad'
 import { ApiError } from '../../lib/api/ApiError'
@@ -23,7 +24,7 @@ import {
 import { fetchPublicBusiness } from '../../lib/api/tenantApi'
 import { useAuth } from '../../lib/auth'
 import { getActiveSlug } from '../../lib/tenant'
-import type { FlooringType } from '../../lib/flooring'
+import { FLOORING_LABELS, type FlooringType } from '../../lib/flooring'
 
 type Props = {
   orderId: number
@@ -39,6 +40,10 @@ type Props = {
   customer?: OrderCustomer | null
   billingAddress?: OrderAddress | null
   saleDetails?: DetailsOfSaleFields | null
+  // Order-bound salesperson name (sales_order.user_id -> app_user first/last), the same
+  // source the PDF uses — NOT the session user. Rendered in the document meta; hidden
+  // (fail-soft) when null/blank, like every other optional tenant/store field.
+  salespersonName?: string | null
   // Switches the workspace to the Customer tab when an accept/resend fails with
   // CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID so the salesperson can fix the
   // email where it lives.
@@ -112,6 +117,29 @@ function composeAddressLines(
   return [line1, line2].filter((line) => line.length > 0)
 }
 
+// Store contact block for the document header — mirrors the PDF store address
+// (street on line 1; suburb / state / postcode on line 2). Blank parts are dropped
+// and an all-blank store yields no lines, so the block hides like any other optional row.
+function composeStoreAddressLines(
+  store:
+    | {
+        street?: string
+        suburb?: string
+        state_code?: string
+        postcode?: string
+      }
+    | null
+    | undefined,
+): string[] {
+  if (!store) return []
+  const line1 = store.street?.trim() ?? ''
+  const line2 = [store.suburb, store.state_code, store.postcode]
+    .map((part) => part?.trim() ?? '')
+    .filter((part) => part.length > 0)
+    .join(' ')
+  return [line1, line2].filter((line) => line.length > 0)
+}
+
 // Download filename mirrors the backend Content-Disposition pattern
 // (invoice-{order_number}-v{version}.pdf). A blob object URL does not carry the
 // server's Content-Disposition, so the anchor sets the name explicitly.
@@ -144,6 +172,7 @@ export function InvoiceTab({
   customer,
   billingAddress,
   saleDetails,
+  salespersonName,
   onGoToCustomer,
 }: Props) {
   // Only ever the CURRENT/latest invoice — no version list, no history.
@@ -630,8 +659,15 @@ export function InvoiceTab({
     invoice && invoice.due_date ? formatDocDate(invoice.due_date) : ''
 
   // Phase 15B tenant document fields — each hidden when null/blank (never "—"/sample).
-  // Store name from auth; business name + abn/bank from the tenant fetch above.
+  // Store name + contact/address from auth; business name + abn/bank from the tenant fetch above.
   const storeName = nonBlank(activeStore?.name)
+  // Phase 15C PR2 — store contact/address + order-bound salesperson + flooring-type label,
+  // mirroring the PDF header. All fail-soft via nonBlank() / empty list (no "—"/sample).
+  const storePhone = nonBlank(activeStore?.phone)
+  const storeEmail = nonBlank(activeStore?.email)
+  const storeAddressLines = composeStoreAddressLines(activeStore)
+  const salesperson = nonBlank(salespersonName)
+  const flooringTypeLabel = FLOORING_LABELS[flooringType]
   const abn = nonBlank(tenantConfig?.abn)
   const bankName = nonBlank(tenantConfig?.bank_name)
   const bsb = nonBlank(tenantConfig?.bsb)
@@ -646,6 +682,56 @@ export function InvoiceTab({
       ? tenantConfig?.terms_soft
       : tenantConfig?.terms_hard,
   )
+  // Tenant per-type terms are stored as HTML (sanitized server-side for the PDF). Render them
+  // as HTML on screen too, but ALWAYS sanitize client-side first (defense in depth) with an
+  // EXPLICIT restricted allowlist — NOT DOMPurify defaults. Everything outside the list (script,
+  // style, iframe/object/embed, form controls, img, a, event handlers, javascript: URLs, remote
+  // images) is stripped. Memoised on termsText so a large block isn't re-sanitized every render.
+  // The terms section hides when termsText is blank, sanitization yields a blank string, OR
+  // the sanitized HTML has no visible text (textless markup). The dangerouslySetInnerHTML
+  // below receives ONLY this sanitized value, never raw termsText.
+  const sanitizedTermsHtml = useMemo(() => {
+    if (!termsText) return null
+    const sanitized = nonBlank(
+      DOMPurify.sanitize(termsText, {
+        ALLOWED_TAGS: [
+          'p',
+          'br',
+          'strong',
+          'b',
+          'em',
+          'i',
+          'u',
+          'ol',
+          'ul',
+          'li',
+          'table',
+          'thead',
+          'tbody',
+          'tr',
+          'th',
+          'td',
+          'div',
+          'span',
+          'small',
+        ],
+        ALLOWED_ATTR: ['class'],
+        // Lock attributes to literally `class` only: DOMPurify's defaults otherwise let
+        // inert data-*/aria-* attributes through regardless of ALLOWED_ATTR. PR2 rule = class only.
+        ALLOW_DATA_ATTR: false,
+        ALLOW_ARIA_ATTR: false,
+      }),
+    )
+    if (!sanitized) return null
+    // A sanitized-but-TEXTLESS fragment (e.g. <p></p>, <div class="x"></div>, an empty
+    // table) is still a non-blank STRING yet renders nothing — it must hide the whole
+    // section (no empty "Terms and Conditions" heading). Parse the sanitized HTML into an
+    // INERT document (parseFromString does not execute scripts or load resources) and
+    // require visible text before returning. A real table/list WITH text still renders.
+    const doc = new DOMParser().parseFromString(sanitized, 'text/html')
+    if (!doc.body.textContent?.trim()) return null
+    return sanitized
+  }, [termsText])
   const hasBankDetails =
     bankName !== null ||
     bsb !== null ||
@@ -753,13 +839,34 @@ export function InvoiceTab({
         <article className="rounded-lg border border-slate-200 bg-white shadow-sm p-6 sm:p-8">
           <header className="grid grid-cols-1 sm:grid-cols-3 gap-6 items-start">
             <div className="sm:col-span-1">
+              {/* Logo is business-name TEXT only (PR2): logo_path is a server-internal
+                  storage key, not a browser URL — no <img>, no logo route. */}
               {businessName && (
                 <div className="text-base font-bold text-slate-900 tracking-tight">
                   {businessName}
                 </div>
               )}
               {storeName && (
-                <div className="mt-0.5 text-xs text-slate-600">{storeName}</div>
+                <div className="mt-0.5 text-xs font-medium text-slate-700">
+                  {storeName}
+                </div>
+              )}
+              {storeAddressLines.length > 0 && (
+                <div className="mt-0.5 text-[11px] text-slate-600 leading-relaxed">
+                  {storeAddressLines.map((line) => (
+                    <div key={line}>{line}</div>
+                  ))}
+                </div>
+              )}
+              {storePhone && (
+                <div className="mt-0.5 text-[11px] text-slate-600">
+                  Phone: {storePhone}
+                </div>
+              )}
+              {storeEmail && (
+                <div className="text-[11px] text-slate-600">
+                  Email: {storeEmail}
+                </div>
               )}
               {abn && (
                 <div className="mt-2 text-[11px] text-slate-500">ABN: {abn}</div>
@@ -768,7 +875,7 @@ export function InvoiceTab({
             <div className="hidden sm:block sm:col-span-1" />
             <div className="sm:col-span-1 sm:text-right">
               <div className="text-2xl font-bold text-slate-900 tracking-tight">
-                INVOICE
+                TAX INVOICE
               </div>
               {orderNumber && (
                 <div className="mt-1 text-sm font-mono text-slate-700">
@@ -820,6 +927,16 @@ export function InvoiceTab({
                   {dueDateText || '—'}
                 </span>
               </div>
+              <div className="text-sm text-slate-600">
+                Flooring Type :{' '}
+                <span className="text-slate-900">{flooringTypeLabel}</span>
+              </div>
+              {salesperson && (
+                <div className="text-sm text-slate-600">
+                  Salesperson :{' '}
+                  <span className="text-slate-900">{salesperson}</span>
+                </div>
+              )}
               {hasBankDetails && (
                 <div className="pt-2 space-y-0.5">
                   <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
@@ -888,14 +1005,19 @@ export function InvoiceTab({
 
           <div className="my-8 border-t border-slate-200" />
 
-          {termsText && (
+          {sanitizedTermsHtml && (
             <div>
               <div className="text-center text-xs font-semibold uppercase tracking-wider text-slate-800">
                 Terms and Conditions — applicable to this invoice
               </div>
-              <div className="mt-4 text-xs text-slate-700 leading-relaxed whitespace-pre-wrap">
-                {termsText}
-              </div>
+              {/* Terms are HTML (sanitized server-side for the PDF), re-sanitized client-side
+                  with a restricted allowlist (see sanitizedTermsHtml). dangerouslySetInnerHTML
+                  NEVER receives raw termsText. No whitespace-pre-wrap — the HTML carries its
+                  own block structure. */}
+              <div
+                className="invoice-terms mt-4 text-xs text-slate-700 leading-relaxed"
+                dangerouslySetInnerHTML={{ __html: sanitizedTermsHtml }}
+              />
             </div>
           )}
 

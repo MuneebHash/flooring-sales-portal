@@ -17,4 +17,15 @@ export type Store = {
   store_id: number
   name: string
   store_code: string
+  // Phase 15C PR2 — store contact/address exposed by the backend StoreDto (V2 columns),
+  // consumed by the invoice document header so the on-screen invoice mirrors the PDF.
+  // OPTIONAL so existing construction sites (e.g. data/mockAuth.ts) compile unchanged.
+  // snake_case to mirror the backend JSON verbatim (global Jackson SNAKE_CASE; the API
+  // client does no casing transform).
+  phone?: string
+  email?: string | null
+  street?: string
+  suburb?: string
+  state_code?: string
+  postcode?: string
 }

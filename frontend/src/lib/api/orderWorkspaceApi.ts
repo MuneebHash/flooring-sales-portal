@@ -87,10 +87,16 @@ export type OrderHeader = {
 }
 
 // Full order workspace read (GET /orders/{orderId}). Mirrors the backend
-// OrderWorkspaceResponse: the header fields plus nested customer / addresses
-// (each null when the row does not exist yet) and the always-present
-// persisted_financials object.
+// OrderWorkspaceResponse: the header fields plus the order-bound salesperson_name,
+// nested customer / addresses (each null when the row does not exist yet) and the
+// always-present persisted_financials object.
+//
+// salesperson_name (Phase 15C PR2) is order-bound (sales_order.user_id ->
+// app_user first_name + last_name), the same source the invoice PDF uses — NOT the
+// session user. It lives ONLY on the workspace read, never on OrderHeader (the POST
+// create shell). Null when the user row is missing.
 export type OrderWorkspace = OrderHeader & {
+  salesperson_name: string | null
   customer: OrderCustomer | null
   install_address: OrderAddress | null
   billing_address: OrderAddress | null

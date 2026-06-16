@@ -8,8 +8,6 @@ import com.flooring.salesportal.store.StoreRepository;
 import com.flooring.salesportal.tenant.Business;
 import com.flooring.salesportal.tenant.BusinessInvoiceConfigView;
 import com.flooring.salesportal.tenant.BusinessRepository;
-import com.flooring.salesportal.user.AppUser;
-import com.flooring.salesportal.user.AppUserRepository;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -47,7 +45,7 @@ class InvoicePdfModelAssemblerTest {
 
     private BusinessRepository businessRepository;
     private StoreRepository storeRepository;
-    private AppUserRepository appUserRepository;
+    private OrderSalespersonResolver salespersonResolver;
     private FileStorageService fileStorageService;
     private InvoicePdfModelAssembler assembler;
 
@@ -55,10 +53,13 @@ class InvoicePdfModelAssemblerTest {
     void setUp() {
         businessRepository = mock(BusinessRepository.class);
         storeRepository = mock(StoreRepository.class);
-        appUserRepository = mock(AppUserRepository.class);
+        // The salesperson lookup moved to the shared OrderSalespersonResolver (used by both the PDF
+        // and the on-screen workspace read); the assembler now delegates to it. Its own
+        // first/last-name + tenant-scoping logic is covered by OrderSalespersonResolverTest.
+        salespersonResolver = mock(OrderSalespersonResolver.class);
         fileStorageService = mock(FileStorageService.class);
         assembler = new InvoicePdfModelAssembler(
-                businessRepository, storeRepository, appUserRepository,
+                businessRepository, storeRepository, salespersonResolver,
                 fileStorageService, new InvoiceTermsSanitizer());
     }
 
@@ -92,16 +93,6 @@ class InvoicePdfModelAssemblerTest {
         s.setStateCode("NSW");
         s.setPostcode("2000");
         return s;
-    }
-
-    private AppUser salesperson() {
-        AppUser u = new AppUser();
-        u.setUserId(USER_ID);
-        u.setBusinessId(BUSINESS_ID);
-        u.setFirstName("Liam");
-        u.setLastName("Carter");
-        u.setSalespersonCode("LC1");
-        return u;
     }
 
     private BusinessInvoiceConfigView config(String termsSoft, String termsHard) {
@@ -141,7 +132,7 @@ class InvoicePdfModelAssemblerTest {
         BusinessInvoiceConfigView cfg = config("<p>Soft flooring terms.</p>", "<p>Hard flooring terms.</p>");
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(cfg));
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.of(salesperson()));
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
         when(fileStorageService.readWithLimit(eq("/uploads/1/branding/logo.png"), anyLong())).thenReturn(ONE_PIXEL_PNG);
 
         InvoicePdfModel m = assembler.assemble(inputs(business("/uploads/1/branding/logo.png"), order("SOFT")));
@@ -166,9 +157,10 @@ class InvoicePdfModelAssemblerTest {
         Assertions.assertFalse(m.termsHtml().contains("Hard flooring terms."), "must not include hard terms");
         Assertions.assertFalse(m.termsOnSeparatePage(), "SOFT terms render inline (page 1)");
 
-        // Lookups are tenant-scoped to the session business.
+        // Lookups are tenant-scoped to the session business; salesperson resolution is delegated
+        // to the shared resolver, called with the order's user id + the session business id.
         verify(storeRepository).findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID);
-        verify(appUserRepository).findByUserIdAndBusinessId(USER_ID, BUSINESS_ID);
+        verify(salespersonResolver).resolveName(USER_ID, BUSINESS_ID);
     }
 
     @Test
@@ -176,7 +168,7 @@ class InvoicePdfModelAssemblerTest {
         BusinessInvoiceConfigView cfg = config("<p>Soft flooring terms.</p>", "<p>Hard flooring terms.</p>");
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(cfg));
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.of(salesperson()));
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
 
         InvoicePdfModel m = assembler.assemble(inputs(order("HARD")));
 
@@ -191,7 +183,7 @@ class InvoicePdfModelAssemblerTest {
     void missingConfigFailsSoft() {
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.of(salesperson()));
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
 
         InvoicePdfModel m = assembler.assemble(inputs(order("SOFT")));
 
@@ -208,7 +200,7 @@ class InvoicePdfModelAssemblerTest {
         BusinessInvoiceConfigView cfg = config("<p>Soft.</p>", null);
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(cfg));
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.empty());
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.of(salesperson()));
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
 
         InvoicePdfModel m = assembler.assemble(inputs(order("SOFT")));
 
@@ -222,7 +214,7 @@ class InvoicePdfModelAssemblerTest {
     void missingSalespersonFailsSoft() {
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.empty());
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn(null);
 
         InvoicePdfModel m = assembler.assemble(inputs(order("SOFT")));
         Assertions.assertNull(m.salespersonName());
@@ -232,7 +224,7 @@ class InvoicePdfModelAssemblerTest {
     void unsupportedLogoTypeFailsSoftAndNeverReads() {
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.of(salesperson()));
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
 
         InvoicePdfModel m = assembler.assemble(inputs(business("/uploads/1/branding/logo.gif"), order("SOFT")));
 
@@ -244,7 +236,7 @@ class InvoicePdfModelAssemblerTest {
     void unreadableLogoFailsSoftAndNeverThrows() {
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.of(salesperson()));
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
         when(fileStorageService.readWithLimit(eq("/uploads/1/branding/logo.png"), anyLong()))
                 .thenThrow(new UncheckedIOException("missing", new java.io.IOException("nope")));
 
@@ -265,7 +257,7 @@ class InvoicePdfModelAssemblerTest {
     private InvoicePdfModel assembleWithLogo(String path, byte[] logoBytes) {
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.empty());
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.empty());
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn(null);
         when(fileStorageService.readWithLimit(eq(path), anyLong())).thenReturn(logoBytes);
         return assembler.assemble(inputs(business(path), order("SOFT")));
     }
@@ -330,7 +322,7 @@ class InvoicePdfModelAssemblerTest {
         BusinessInvoiceConfigView cfg = config("   ", null);
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(cfg));
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.of(salesperson()));
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
 
         InvoicePdfModel m = assembler.assemble(inputs(order("SOFT")));
         Assertions.assertNull(m.termsHtml());
@@ -340,7 +332,7 @@ class InvoicePdfModelAssemblerTest {
     void carriesFrozenSnapshotInputsThroughUnchanged() {
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.empty());
-        when(appUserRepository.findByUserIdAndBusinessId(USER_ID, BUSINESS_ID)).thenReturn(Optional.empty());
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn(null);
 
         InvoicePdfModel m = assembler.assemble(inputs(order("SOFT")));
 

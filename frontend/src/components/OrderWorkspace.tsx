@@ -84,6 +84,8 @@ type ShellProps = {
   installationAddress: OrderAddress | null
   billingAddress: OrderAddress | null
   saleDetails: DetailsOfSaleFields | null
+  // Order-bound salesperson name for the invoice document header (Phase 15C PR2).
+  salespersonName: string | null
   // Lifts confirmed server-saved customer/address data up so workspace state
   // (and sibling tabs) stay in sync without a refetch.
   onCustomerSaved: (saved: CustomerSavedPayload) => void
@@ -105,6 +107,7 @@ function WorkspaceShell({
   installationAddress,
   billingAddress,
   saleDetails,
+  salespersonName,
   onCustomerSaved,
   onDetailsSaved,
 }: ShellProps) {
@@ -463,6 +466,7 @@ function WorkspaceShell({
                 customer={customer}
                 billingAddress={billingAddress}
                 saleDetails={saleDetails}
+                salespersonName={salespersonName}
                 // Lets an accept/resend customer-email error send the user
                 // straight to where the email is fixed.
                 onGoToCustomer={() => setActiveTab('customer')}
@@ -611,6 +615,7 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
       installationAddress={workspace.install_address}
       billingAddress={workspace.billing_address}
       saleDetails={saleDetails}
+      salespersonName={workspace.salesperson_name}
       onCustomerSaved={handleCustomerSaved}
       onDetailsSaved={handleDetailsSaved}
     />

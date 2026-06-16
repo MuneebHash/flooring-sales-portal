@@ -1,1 +1,55 @@
 @import "tailwindcss";
+
+/* Phase 15C PR2 — on-screen invoice terms (InvoiceTab `.invoice-terms`). The tenant terms are
+   sanitized HTML (restricted allowlist: p, br, lists, tables, strong/em/u, div/span/small +
+   class only). Tailwind's preflight strips list markers and table borders, so these scoped
+   rules restore readable numbered/structured terms on screen. SCREEN-ONLY — the invoice PDF
+   styles its own terms server-side. Every rule is scoped under `.invoice-terms` so no other
+   part of the app is affected. */
+.invoice-terms p {
+  margin: 0 0 0.5rem;
+}
+.invoice-terms ol,
+.invoice-terms ul {
+  margin: 0 0 0.5rem;
+  padding-left: 1.5rem;
+}
+.invoice-terms ol {
+  list-style: decimal outside;
+}
+.invoice-terms ul {
+  list-style: disc outside;
+}
+.invoice-terms li {
+  margin: 0.125rem 0;
+}
+.invoice-terms strong,
+.invoice-terms b {
+  font-weight: 600;
+}
+.invoice-terms em,
+.invoice-terms i {
+  font-style: italic;
+}
+.invoice-terms u {
+  text-decoration: underline;
+}
+.invoice-terms table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 0.5rem 0;
+}
+.invoice-terms th,
+.invoice-terms td {
+  border: 1px solid #cbd5e1; /* slate-300 */
+  padding: 0.25rem 0.5rem;
+  text-align: left;
+  vertical-align: top;
+}
+.invoice-terms th {
+  font-weight: 600;
+  background-color: #f8fafc; /* slate-50 */
+}
+.invoice-terms > :last-child {
+  margin-bottom: 0;
+}
