@@ -165,6 +165,14 @@ export function InvoiceTab({
     null,
   )
   const [businessName, setBusinessName] = useState<string | null>(null)
+  // Legal-risk gate (Codex P1): Accept must be unavailable until the tenant invoice
+  // config is SAFELY known. Configured terms_and_conditions may exist but not yet have
+  // rendered, so the customer must not sign/accept while the config is still loading or
+  // failed to load. `tenantConfigLoading` is true until the config request resolves;
+  // `tenantConfigError` is true when it failed. (The public business / name request
+  // stays soft — see the effect below — and never gates Accept.)
+  const [tenantConfigLoading, setTenantConfigLoading] = useState(true)
+  const [tenantConfigError, setTenantConfigError] = useState(false)
 
   // Acceptance draft (unaccepted invoice only): whether the pad has at least one
   // drawn stroke. The accepted customer name is NOT typed — it is derived from the
@@ -237,19 +245,33 @@ export function InvoiceTab({
   // degrades to hidden rows, never a broken invoice screen.
   useEffect(() => {
     let cancelled = false
+    // Re-enter the gated state on every (re)load so a reloadToken retry re-disables
+    // Accept until the retry resolves.
+    setTenantConfigLoading(true)
+    setTenantConfigError(false)
     Promise.allSettled([
       fetchTenantInvoiceConfig(),
       fetchPublicBusiness(getActiveSlug()),
     ]).then(([configResult, businessResult]) => {
       if (cancelled) return
-      setTenantConfig(
-        configResult.status === 'fulfilled' ? configResult.value : null,
-      )
+      // Config is the legal-risk gate: success stores it and clears the error; failure
+      // clears it and raises the error so Accept stays disabled (terms may exist).
+      if (configResult.status === 'fulfilled') {
+        setTenantConfig(configResult.value)
+        setTenantConfigError(false)
+      } else {
+        setTenantConfig(null)
+        setTenantConfigError(true)
+      }
+      // Public business / name still fails soft — it never gates Accept.
       setBusinessName(
         businessResult.status === 'fulfilled'
           ? nonBlank(businessResult.value.name)
           : null,
       )
+      // Cleared AFTER the cancelled guard (not in a .finally) so no state update runs
+      // post-unmount.
+      setTenantConfigLoading(false)
     })
     return () => {
       cancelled = true
@@ -381,7 +403,15 @@ export function InvoiceTab({
   }
 
   async function handleAccept() {
-    if (accepting || resending || invoice === null) return
+    // Stray-call guard: never accept while the tenant invoice config is not safely
+    // loaded (Codex P1) — configured terms may exist but not yet have rendered.
+    if (
+      accepting ||
+      resending ||
+      invoice === null ||
+      !tenantConfigReadyForAcceptance
+    )
+      return
     const displayed = invoice
     // accepted_customer_name is auto-derived from the order's saved customer —
     // the customer never types it. A blank or over-length name disables Accept
@@ -579,6 +609,13 @@ export function InvoiceTab({
     bsb !== null ||
     accountNumber !== null ||
     accountName !== null
+
+  // Accept is gated on the tenant invoice config being SAFELY loaded (Codex P1): not
+  // loading and not errored. Configured terms may exist but not yet have rendered, so
+  // signing/accepting before this is true is a legal risk. (Business-name failure is
+  // soft and never affects this flag.)
+  const tenantConfigReadyForAcceptance =
+    !tenantConfigLoading && !tenantConfigError
 
   return (
     <div>
@@ -976,6 +1013,29 @@ export function InvoiceTab({
                       )}
                     </div>
                   ) : null}
+                  {/* Codex P1 legal-risk gate — exactly one state: loading XOR error,
+                      never both. Sits by the Accept button (outside the invoice terms
+                      body). Accept stays disabled until tenant config is safely loaded. */}
+                  {tenantConfigLoading ? (
+                    <p className="mt-2 text-xs text-slate-500">
+                      Loading invoice terms and business details…
+                    </p>
+                  ) : tenantConfigError ? (
+                    <div className="mt-2 flex flex-col sm:flex-row sm:items-center gap-2">
+                      <p className="text-xs font-medium text-amber-700">
+                        Invoice terms and business details could not be loaded.
+                        Try again before accepting.
+                      </p>
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        onClick={refetch}
+                      >
+                        Try again
+                      </Button>
+                    </div>
+                  ) : null}
                   <div className="mt-3 flex justify-end">
                     <Button
                       type="button"
@@ -987,7 +1047,8 @@ export function InvoiceTab({
                         resending ||
                         !hasInk ||
                         derivedAcceptedName.length === 0 ||
-                        derivedNameTooLong
+                        derivedNameTooLong ||
+                        !tenantConfigReadyForAcceptance
                       }
                     >
                       {accepting ? 'Accepting…' : 'Accept Invoice'}
