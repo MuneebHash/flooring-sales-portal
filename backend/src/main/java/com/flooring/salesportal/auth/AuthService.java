@@ -215,6 +215,12 @@ public class AuthService {
         return new StoreDto(
                 store.getStoreId(),
                 store.getName(),
-                store.getStoreCode());
+                store.getStoreCode(),
+                store.getPhone(),
+                store.getEmail(),
+                store.getStreet(),
+                store.getSuburb(),
+                store.getStateCode(),
+                store.getPostcode());
     }
 }

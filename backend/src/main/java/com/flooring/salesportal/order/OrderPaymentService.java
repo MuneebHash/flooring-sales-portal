@@ -17,7 +17,7 @@ import com.flooring.salesportal.common.error.ValidationException;
 import com.flooring.salesportal.common.session.RequestContext;
 import com.flooring.salesportal.common.session.RequestContextGuard;
 import com.flooring.salesportal.common.storage.FileStorageService;
-import com.flooring.salesportal.order.InvoicePdfGenerator.InvoicePdfModel;
+import com.flooring.salesportal.order.InvoicePdfModelAssembler.Inputs;
 import com.flooring.salesportal.order.InvoiceRepository.InvoiceFile;
 import com.flooring.salesportal.order.InvoiceRepository.InvoiceRow;
 import com.flooring.salesportal.order.PaymentTransactionRepository.PaymentRow;
@@ -121,6 +121,7 @@ public class OrderPaymentService {
     private final PaymentTransactionRepository paymentTransactionRepository;
     private final InvoiceRepository invoiceRepository;
     private final InvoicePdfGenerator invoicePdfGenerator;
+    private final InvoicePdfModelAssembler invoicePdfModelAssembler;
     private final FileStorageService fileStorageService;
     private final InvoiceEmailSender invoiceEmailSender;
     private final ObjectMapper objectMapper;
@@ -136,6 +137,7 @@ public class OrderPaymentService {
                                PaymentTransactionRepository paymentTransactionRepository,
                                InvoiceRepository invoiceRepository,
                                InvoicePdfGenerator invoicePdfGenerator,
+                               InvoicePdfModelAssembler invoicePdfModelAssembler,
                                FileStorageService fileStorageService,
                                InvoiceEmailSender invoiceEmailSender,
                                PlatformTransactionManager transactionManager,
@@ -147,6 +149,7 @@ public class OrderPaymentService {
         this.paymentTransactionRepository = paymentTransactionRepository;
         this.invoiceRepository = invoiceRepository;
         this.invoicePdfGenerator = invoicePdfGenerator;
+        this.invoicePdfModelAssembler = invoicePdfModelAssembler;
         this.fileStorageService = fileStorageService;
         this.invoiceEmailSender = invoiceEmailSender;
         this.objectMapper = objectMapper;
@@ -355,9 +358,11 @@ public class OrderPaymentService {
         List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
 
         String fileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
-        byte[] pdfBytes = invoicePdfGenerator.render(new InvoicePdfModel(
-                ctx.business().getName(),
-                order.getOrderNumber(),
+        // Phase 15C: the assembler enriches the carried-forward snapshot with tenant config / store /
+        // salesperson / logo / terms so the payment-regenerated PDF matches the other flows' layout.
+        byte[] pdfBytes = invoicePdfGenerator.render(invoicePdfModelAssembler.assemble(new Inputs(
+                ctx.business(),
+                order,
                 versionNumber,
                 invoiceDate,
                 dueDate,
@@ -368,7 +373,7 @@ public class OrderPaymentService {
                 salePriceIncGst,
                 totalPaidAfter,
                 newBalance,
-                acceptedAt, acceptedCustomerName, signaturePng));
+                acceptedAt, acceptedCustomerName, signaturePng)));
 
         String storagePath = fileStorageService.store(pdfBytes, ctx.businessId(), orderId, PDF_EXTENSION);
         deleteFileOnRollback(storagePath);

@@ -19,7 +19,7 @@ import com.flooring.salesportal.common.error.ValidationException;
 import com.flooring.salesportal.common.session.RequestContext;
 import com.flooring.salesportal.common.session.RequestContextGuard;
 import com.flooring.salesportal.common.storage.FileStorageService;
-import com.flooring.salesportal.order.InvoicePdfGenerator.InvoicePdfModel;
+import com.flooring.salesportal.order.InvoicePdfModelAssembler.Inputs;
 import com.flooring.salesportal.order.InvoiceRepository.InvoiceFile;
 import com.flooring.salesportal.order.InvoiceRepository.InvoiceRow;
 import com.flooring.salesportal.order.dto.InvoiceDetailDto;
@@ -117,6 +117,7 @@ public class OrderInvoiceService {
     private final PaymentTransactionRepository paymentTransactionRepository;
     private final InvoiceRepository invoiceRepository;
     private final InvoicePdfGenerator invoicePdfGenerator;
+    private final InvoicePdfModelAssembler invoicePdfModelAssembler;
     private final FileStorageService fileStorageService;
     private final InvoiceEmailSender invoiceEmailSender;
     private final ObjectMapper objectMapper;
@@ -138,6 +139,7 @@ public class OrderInvoiceService {
                                PaymentTransactionRepository paymentTransactionRepository,
                                InvoiceRepository invoiceRepository,
                                InvoicePdfGenerator invoicePdfGenerator,
+                               InvoicePdfModelAssembler invoicePdfModelAssembler,
                                FileStorageService fileStorageService,
                                InvoiceEmailSender invoiceEmailSender,
                                PlatformTransactionManager transactionManager,
@@ -154,6 +156,7 @@ public class OrderInvoiceService {
         this.paymentTransactionRepository = paymentTransactionRepository;
         this.invoiceRepository = invoiceRepository;
         this.invoicePdfGenerator = invoicePdfGenerator;
+        this.invoicePdfModelAssembler = invoicePdfModelAssembler;
         this.fileStorageService = fileStorageService;
         this.invoiceEmailSender = invoiceEmailSender;
         this.objectMapper = objectMapper;
@@ -318,10 +321,11 @@ public class OrderInvoiceService {
         // stored_file + invoice rows (mirrors OrderAttachmentService).
         String fileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
         // Acceptance fields are null on Create AND Rewrite: a new manual snapshot is always unaccepted
-        // (Phase 13 §7 — Rewrite CLEARS acceptance; the customer must sign the new version again).
-        byte[] pdfBytes = invoicePdfGenerator.render(new InvoicePdfModel(
-                ctx.business().getName(),
-                order.getOrderNumber(),
+        // (Phase 13 §7 — Rewrite CLEARS acceptance; the customer must sign the new version again). The
+        // assembler enriches the snapshot with tenant config / store / salesperson / logo / terms.
+        byte[] pdfBytes = invoicePdfGenerator.render(invoicePdfModelAssembler.assemble(new Inputs(
+                ctx.business(),
+                order,
                 versionNumber,
                 invoiceDate,
                 dueDate,
@@ -332,7 +336,7 @@ public class OrderInvoiceService {
                 salePriceIncGst,
                 totalPaid,
                 balanceDue,
-                null, null, null));
+                null, null, null)));
 
         String storagePath = fileStorageService.store(pdfBytes, ctx.businessId(), orderId, PDF_EXTENSION);
         deleteFileOnRollback(storagePath);
@@ -510,9 +514,9 @@ public class OrderInvoiceService {
             // presentational (mirrors the payment receipt). The acceptance block embeds the signature.
             List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
             String pdfFileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
-            byte[] pdfBytes = invoicePdfGenerator.render(new InvoicePdfModel(
-                    ctx.business().getName(),
-                    order.getOrderNumber(),
+            byte[] pdfBytes = invoicePdfGenerator.render(invoicePdfModelAssembler.assemble(new Inputs(
+                    ctx.business(),
+                    order,
                     versionNumber,
                     invoiceDate,
                     current.dueDate(),
@@ -525,7 +529,7 @@ public class OrderInvoiceService {
                     current.balanceDue(),
                     acceptedAt,
                     acceptedCustomerName,
-                    signatureBytes));
+                    signatureBytes)));
 
             String pdfPath = fileStorageService.store(pdfBytes, ctx.businessId(), orderId, PDF_EXTENSION);
             deleteFileOnRollback(pdfPath);

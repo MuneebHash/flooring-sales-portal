@@ -5,8 +5,13 @@ import org.springframework.data.jpa.repository.Query;
 import org.springframework.data.repository.query.Param;
 
 import java.util.List;
+import java.util.Optional;
 
 public interface StoreRepository extends JpaRepository<Store, Integer> {
+
+    // Phase 15C: load a store tenant-scoped (store id + the session business) for the invoice PDF.
+    // Business-scoped so the PDF assembler cannot read a store from another tenant.
+    Optional<Store> findByStoreIdAndBusinessId(Integer storeId, Long businessId);
 
     @Query(value = """
             SELECT s.*
