@@ -415,6 +415,8 @@ class OrderControllerTest {
                 .andExpect(jsonPath("$.data.created_at").value(matchesPattern(ISO_LOCAL_PATTERN)))
                 .andExpect(jsonPath("$.data.updated_at").value(matchesPattern(ISO_LOCAL_PATTERN)))
                 .andExpect(jsonPath("$.data.locked").value(false))
+                // order-bound salesperson: order 1 is owned by user 1 (Liam Carter), NOT the session user
+                .andExpect(jsonPath("$.data.salesperson_name").value("Liam Carter"))
                 // customer
                 .andExpect(jsonPath("$.data.customer.first_name").value("James"))
                 .andExpect(jsonPath("$.data.customer.middle_name").value(nullValue()))
@@ -456,6 +458,8 @@ class OrderControllerTest {
                 .andExpect(jsonPath("$.data.flooring_type").value("HARD"))
                 .andExpect(jsonPath("$.data.order_status").value("LEAD"))
                 .andExpect(jsonPath("$.data.locked").value(false))
+                // order-bound salesperson resolves even on an otherwise-empty order (order 2 -> user 1)
+                .andExpect(jsonPath("$.data.salesperson_name").value("Liam Carter"))
                 .andExpect(jsonPath("$.data.customer").value(nullValue()))
                 .andExpect(jsonPath("$.data.install_address").value(nullValue()))
                 .andExpect(jsonPath("$.data.billing_address").value(nullValue()))

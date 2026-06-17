@@ -2973,6 +2973,7 @@ components:
         - created_at
         - updated_at
         - locked
+        - salesperson_name
         - customer
         - install_address
         - billing_address
@@ -3019,6 +3020,14 @@ components:
           $ref: '#/components/schemas/Timestamp'
         locked:
           type: boolean
+        salesperson_name:
+          type: string
+          nullable: true
+          description: >-
+            The order-bound salesperson display name (sales_order.user_id ->
+            app_user first_name + last_name), tenant-scoped by business id. The
+            same source the invoice PDF uses, NOT the session user. Null when the
+            user row is missing.
         customer:
           nullable: true
           allOf:

@@ -7,8 +7,6 @@ import com.flooring.salesportal.store.StoreRepository;
 import com.flooring.salesportal.tenant.Business;
 import com.flooring.salesportal.tenant.BusinessInvoiceConfigView;
 import com.flooring.salesportal.tenant.BusinessRepository;
-import com.flooring.salesportal.user.AppUser;
-import com.flooring.salesportal.user.AppUserRepository;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -49,18 +47,18 @@ public class InvoicePdfModelAssembler {
 
     private final BusinessRepository businessRepository;
     private final StoreRepository storeRepository;
-    private final AppUserRepository appUserRepository;
+    private final OrderSalespersonResolver salespersonResolver;
     private final FileStorageService fileStorageService;
     private final InvoiceTermsSanitizer termsSanitizer;
 
     public InvoicePdfModelAssembler(BusinessRepository businessRepository,
                                     StoreRepository storeRepository,
-                                    AppUserRepository appUserRepository,
+                                    OrderSalespersonResolver salespersonResolver,
                                     FileStorageService fileStorageService,
                                     InvoiceTermsSanitizer termsSanitizer) {
         this.businessRepository = businessRepository;
         this.storeRepository = storeRepository;
-        this.appUserRepository = appUserRepository;
+        this.salespersonResolver = salespersonResolver;
         this.fileStorageService = fileStorageService;
         this.termsSanitizer = termsSanitizer;
     }
@@ -83,7 +81,7 @@ public class InvoicePdfModelAssembler {
                 .findByStoreIdAndBusinessId(in.order().getStoreId(), businessId)
                 .orElse(null);
 
-        String salespersonName = resolveSalespersonName(in.order().getUserId(), businessId);
+        String salespersonName = salespersonResolver.resolveName(in.order().getUserId(), businessId);
         String logoDataUri = resolveLogoDataUri(business.getLogoPath());
 
         // Per-flooring-type terms: SOFT -> terms_soft, HARD -> terms_hard. NO fallback to the legacy
@@ -126,20 +124,6 @@ public class InvoicePdfModelAssembler {
                 in.signaturePng(),
                 termsHtml,
                 termsOnSeparatePage);
-    }
-
-    private String resolveSalespersonName(Long userId, Long businessId) {
-        if (userId == null) {
-            return null;
-        }
-        AppUser user = appUserRepository.findByUserIdAndBusinessId(userId, businessId).orElse(null);
-        if (user == null) {
-            return null;
-        }
-        StringBuilder sb = new StringBuilder();
-        appendIfPresent(sb, user.getFirstName());
-        appendIfPresent(sb, user.getLastName());
-        return blankToNull(sb.toString());
     }
 
     /**

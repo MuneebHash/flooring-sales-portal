@@ -80,6 +80,7 @@ public class OrderService {
     private final RequestContextGuard requestContextGuard;
     private final StoreRepository storeRepository;
     private final AppUserRepository appUserRepository;
+    private final OrderSalespersonResolver salespersonResolver;
     private final OrderCreateRepository orderCreateRepository;
     private final SalesOrderRepository salesOrderRepository;
     private final OrderCustomerRepository orderCustomerRepository;
@@ -92,6 +93,7 @@ public class OrderService {
     public OrderService(RequestContextGuard requestContextGuard,
                         StoreRepository storeRepository,
                         AppUserRepository appUserRepository,
+                        OrderSalespersonResolver salespersonResolver,
                         OrderCreateRepository orderCreateRepository,
                         SalesOrderRepository salesOrderRepository,
                         OrderCustomerRepository orderCustomerRepository,
@@ -103,6 +105,7 @@ public class OrderService {
         this.requestContextGuard = requestContextGuard;
         this.storeRepository = storeRepository;
         this.appUserRepository = appUserRepository;
+        this.salespersonResolver = salespersonResolver;
         this.orderCreateRepository = orderCreateRepository;
         this.salesOrderRepository = salesOrderRepository;
         this.orderCustomerRepository = orderCustomerRepository;
@@ -203,6 +206,11 @@ public class OrderService {
 
         boolean locked = STATUS_LAID.equals(order.getOrderStatus());
 
+        // Order-bound salesperson (Phase 15C PR2): resolve from the ORDER's user_id (NOT the session
+        // user) tenant-scoped to the session business, via the shared resolver the invoice PDF also
+        // uses, so the on-screen name and the PDF name come from one source and cannot diverge.
+        String salespersonName = salespersonResolver.resolveName(order.getUserId(), ctx.businessId());
+
         return new OrderWorkspaceResponse(
                 order.getOrderId(),
                 order.getOrderNumber(),
@@ -220,6 +228,7 @@ public class OrderService {
                 order.getCreatedAt(),
                 order.getUpdatedAt(),
                 locked,
+                salespersonName,
                 customer,
                 installAddress,
                 billingAddress,
