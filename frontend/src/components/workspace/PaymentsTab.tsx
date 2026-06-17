@@ -3,11 +3,13 @@ import { Badge } from '../ui/Badge'
 import { Button } from '../ui/Button'
 import { Field } from '../ui/Field'
 import { Input } from '../ui/Input'
+import { Modal } from '../ui/Modal'
 import { Select } from '../ui/Select'
 import { ApiError } from '../../lib/api/ApiError'
 import {
   fetchOrderPayments,
   recordOrderPayment,
+  voidOrderPayment,
   type PaymentMethod,
   type PaymentSummary,
   type PaymentTransaction,
@@ -106,6 +108,11 @@ export function PaymentsTab({ orderId }: Props) {
   const [fieldErrors, setFieldErrors] = useState<string[]>([])
   const [recording, setRecording] = useState(false)
   const [reloadToken, setReloadToken] = useState(0)
+  // Soft-void: `voidTarget` (the row awaiting confirmation) drives the confirm
+  // modal; `voiding` gates a single in-flight void at a time (disables every Void
+  // button + the record-payment form while a void is running).
+  const [voiding, setVoiding] = useState(false)
+  const [voidTarget, setVoidTarget] = useState<PaymentTransaction | null>(null)
 
   const [method, setMethod] = useState<PaymentMethod | ''>('')
   const [amount, setAmount] = useState('')
@@ -181,9 +188,9 @@ export function PaymentsTab({ orderId }: Props) {
     withinBalance &&
     !referenceTooLong
 
-  // The whole record form is disabled while a record is in flight, or until an
-  // invoice exists. It is intentionally NEVER disabled by LAID/`locked`.
-  const formDisabled = recording || !invoiceIssued
+  // The whole record form is disabled while a record OR a void is in flight, or
+  // until an invoice exists. It is intentionally NEVER disabled by LAID/`locked`.
+  const formDisabled = recording || voiding || !invoiceIssued
 
   const formHint = (() => {
     if (!invoiceIssued)
@@ -301,6 +308,86 @@ export function PaymentsTab({ orderId }: Props) {
     } finally {
       if (mountedRef.current) setRecording(false)
     }
+  }
+
+  // Void-specific error handling. PAYMENT_ALREADY_VOIDED / PAYMENT_NOT_FOUND mean
+  // our row drifted under us (e.g. a concurrent void) — surface a clear message and
+  // refetch so the list resyncs. Everything else reuses the verbatim-message pattern.
+  function applyVoidError(err: unknown) {
+    if (err instanceof ApiError) {
+      if (err.code === 'PAYMENT_ALREADY_VOIDED') {
+        setActionError(
+          'This payment has already been voided. The list has been refreshed.',
+        )
+        refetch()
+        return
+      }
+      if (err.code === 'PAYMENT_NOT_FOUND') {
+        setActionError('Payment not found. The list has been refreshed.')
+        refetch()
+        return
+      }
+      if (err.code === 'ORDER_NOT_FOUND') {
+        setActionError('This order is no longer available.')
+        return
+      }
+      if (err.code === 'VALIDATION_FAILED') {
+        setFieldErrors(parseValidationDetails(err.details))
+        setActionError(
+          err.message.length > 0
+            ? err.message
+            : 'Could not void the payment. Please try again.',
+        )
+        return
+      }
+      setActionError(
+        err.message.length > 0
+          ? err.message
+          : 'Could not void the payment. Please try again.',
+      )
+      return
+    }
+    setActionError('Could not void the payment. Please try again.')
+  }
+
+  async function handleVoid() {
+    if (voiding) return
+    const target = voidTarget
+    if (!target) return
+
+    setVoiding(true)
+    setActionError(null)
+    setActionMessage(null)
+    setFieldErrors([])
+    try {
+      // No request body — the backend rejects any body field (400 VALIDATION_FAILED).
+      const res = await voidOrderPayment(orderId, target.payment_transaction_id)
+      if (!mountedRef.current) return
+      // Surface the backend message VERBATIM ("Payment voided. Current invoice
+      // updated."). The response's payment_summary/current_invoice are not consumed
+      // directly — refetch() pulls the authoritative list + summary (active
+      // total_paid already excludes the voided row; never re-summed client-side).
+      setActionMessage(
+        res.message && res.message.length > 0 ? res.message : 'Payment voided.',
+      )
+      refetch()
+    } catch (err) {
+      if (!mountedRef.current) return
+      applyVoidError(err)
+    } finally {
+      // Reset the in-flight flag AND close the confirm modal on BOTH success and
+      // error, so the dialog never sticks open after the request resolves.
+      if (mountedRef.current) {
+        setVoiding(false)
+        setVoidTarget(null)
+      }
+    }
+  }
+
+  // Backdrop/Escape close — ignored while a void is in flight so the dialog can't be
+  // dismissed mid-request (the finally block closes it once the request resolves).
+  function closeVoidModal() {
+    if (!voiding) setVoidTarget(null)
   }
 
   return (
@@ -511,9 +598,10 @@ export function PaymentsTab({ orderId }: Props) {
                   <table className="w-full text-sm table-fixed">
                     <colgroup>
                       <col className="w-[15%]" />
-                      <col className="w-[15%]" />
-                      <col className="w-[45%]" />
-                      <col className="w-[25%]" />
+                      <col className="w-[14%]" />
+                      <col className="w-[33%]" />
+                      <col className="w-[20%]" />
+                      <col className="w-[18%]" />
                     </colgroup>
                     <thead>
                       <tr className="bg-slate-100 text-[11px] uppercase tracking-wider text-slate-600">
@@ -529,36 +617,76 @@ export function PaymentsTab({ orderId }: Props) {
                         <th className="text-right font-semibold px-4 py-2.5">
                           Recorded
                         </th>
+                        <th className="text-right font-semibold px-4 py-2.5">
+                          <span className="sr-only">Status and actions</span>
+                        </th>
                       </tr>
                     </thead>
                     <tbody>
-                      {payments.map((payment) => (
-                        <tr
-                          key={payment.payment_transaction_id}
-                          className="border-t border-slate-200"
-                        >
-                          <td className="px-4 py-3 whitespace-nowrap">
-                            <Badge tone={METHOD_TONES[payment.payment_method]}>
-                              {METHOD_LABELS[payment.payment_method]}
-                            </Badge>
-                          </td>
-                          <td className="px-4 py-3 text-right tabular-nums font-medium text-slate-900 whitespace-nowrap">
-                            {formatMoney(payment.amount)}
-                          </td>
-                          <td className="px-4 py-3 text-left">
-                            {payment.payment_reference ? (
-                              <span className="font-mono text-xs text-slate-700 truncate block">
-                                {payment.payment_reference}
-                              </span>
-                            ) : (
-                              <span className="text-slate-400">—</span>
-                            )}
-                          </td>
-                          <td className="px-4 py-3 text-right text-slate-600 tabular-nums whitespace-nowrap">
-                            {formatTimestamp(payment.created_at)}
-                          </td>
-                        </tr>
-                      ))}
+                      {payments.map((payment) => {
+                        // Voided state is derived (the backend has no is_voided
+                        // field — voided_at != null means voided). Voided rows stay
+                        // visible in history, de-emphasized, with no Void action.
+                        const isVoided = payment.voided_at !== null
+                        return (
+                          <tr
+                            key={payment.payment_transaction_id}
+                            className={`border-t border-slate-200 ${
+                              isVoided ? 'opacity-60' : ''
+                            }`}
+                          >
+                            <td className="px-4 py-3 whitespace-nowrap">
+                              <Badge tone={METHOD_TONES[payment.payment_method]}>
+                                {METHOD_LABELS[payment.payment_method]}
+                              </Badge>
+                            </td>
+                            <td className="px-4 py-3 text-right tabular-nums font-medium text-slate-900 whitespace-nowrap">
+                              {formatMoney(payment.amount)}
+                            </td>
+                            <td className="px-4 py-3 text-left">
+                              {payment.payment_reference ? (
+                                <span className="font-mono text-xs text-slate-700 truncate block">
+                                  {payment.payment_reference}
+                                </span>
+                              ) : (
+                                <span className="text-slate-400">—</span>
+                              )}
+                            </td>
+                            <td className="px-4 py-3 text-right text-slate-600 tabular-nums whitespace-nowrap">
+                              {formatTimestamp(payment.created_at)}
+                            </td>
+                            <td className="px-4 py-3 text-right">
+                              {isVoided ? (
+                                <div className="flex flex-col items-end gap-0.5">
+                                  <Badge tone="bg-rose-100 text-rose-700 border-rose-200">
+                                    Voided
+                                  </Badge>
+                                  {payment.voided_at && (
+                                    <span className="text-[11px] text-slate-500 tabular-nums whitespace-nowrap">
+                                      {formatTimestamp(payment.voided_at)}
+                                    </span>
+                                  )}
+                                  {payment.voided_by_name && (
+                                    <span className="text-[11px] text-slate-500">
+                                      by {payment.voided_by_name}
+                                    </span>
+                                  )}
+                                </div>
+                              ) : (
+                                <Button
+                                  type="button"
+                                  variant="secondary"
+                                  size="sm"
+                                  disabled={voiding}
+                                  onClick={() => setVoidTarget(payment)}
+                                >
+                                  Void
+                                </Button>
+                              )}
+                            </td>
+                          </tr>
+                        )
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -567,6 +695,59 @@ export function PaymentsTab({ orderId }: Props) {
           </div>
         </>
       )}
+
+      <Modal
+        open={voidTarget !== null}
+        onClose={closeVoidModal}
+        labelledBy="void-payment-title"
+      >
+        <div className="p-6">
+          <h3
+            id="void-payment-title"
+            className="text-base font-semibold text-slate-900"
+          >
+            Void this payment?
+          </h3>
+          <div className="mt-2 space-y-1 text-sm text-slate-600">
+            <p>This cannot be undone.</p>
+            <p>Total paid will drop.</p>
+            <p>Balance due will rise.</p>
+          </div>
+          {voidTarget && (
+            <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
+              <span className="font-medium tabular-nums text-slate-900">
+                {formatMoney(voidTarget.amount)}
+              </span>
+              <span className="text-slate-500">
+                {' · '}
+                {METHOD_LABELS[voidTarget.payment_method]}
+                {' · '}
+                {formatTimestamp(voidTarget.created_at)}
+              </span>
+            </div>
+          )}
+          <div className="mt-5 flex items-center justify-end gap-3">
+            <Button
+              type="button"
+              variant="secondary"
+              size="md"
+              onClick={closeVoidModal}
+              disabled={voiding}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="primary"
+              size="md"
+              onClick={handleVoid}
+              disabled={voiding}
+            >
+              {voiding ? 'Voiding…' : 'Void payment'}
+            </Button>
+          </div>
+        </div>
+      </Modal>
     </div>
   )
 }

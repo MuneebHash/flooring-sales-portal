@@ -28,12 +28,19 @@ export type PaymentMethod = 'CASH' | 'CREDIT_CARD' | 'EFTPOS' | 'BANK_TRANSFER'
 // and as the POST data.payment_transaction payload. The backend-only gateway columns are never
 // returned. payment_reference is nullable (always serialized, never omitted); created_at is the
 // "yyyy-MM-dd'T'HH:mm:ss" timestamp.
+//
+// Phase 15D soft-void markers: voided_at (the "yyyy-MM-dd'T'HH:mm:ss" void timestamp; null = active)
+// and voided_by_name (the display name of the session actor who voided it; null = active) are ALWAYS
+// serialized. There is NO is_voided field — derive voided state from voided_at !== null. The raw
+// voided_by_user_id is deliberately never exposed.
 export type PaymentTransaction = {
   payment_transaction_id: number
   payment_method: PaymentMethod
   amount: number
   payment_reference: string | null
   created_at: string
+  voided_at: string | null
+  voided_by_name: string | null
 }
 
 // Current official payment summary (E.4). total_paid = rounded sum of all payments for the order.
@@ -68,11 +75,13 @@ export type RecordPaymentRequest = {
 // details_of_sale_snapshot and sale_price_ex_gst. The Payments tab does not render it (the Invoice
 // tab refetches its own current invoice on remount), so it is typed only for contract completeness.
 //
-// Phase 13: the five acceptance/email fields are ALWAYS present (nullable values serialized as
-// null). A payment on an ACCEPTED invoice carries acceptance forward onto the new version
-// (accepted_at / accepted_customer_name / signature preserved — the customer does NOT re-sign) and
-// the updated signed PDF is re-emailed best-effort; a payment on an unaccepted invoice leaves them
-// null/false and sends no email.
+// Phase 13/15D: the five acceptance/email fields are ALWAYS present (nullable values serialized as
+// null). A payment (or a void) on an ACCEPTED invoice carries acceptance forward onto the new
+// version (accepted_at / accepted_customer_name / signature preserved — the customer does NOT
+// re-sign). Phase 15D: neither recording nor voiding a payment auto-emails — last_emailed_at starts
+// null on the regenerated version (the dashboard mirror is reset to null) and manual Re-send Invoice
+// is the only email action. A payment/void on an unaccepted invoice leaves the acceptance fields
+// null/false.
 export type PaymentCurrentInvoiceSummary = {
   invoice_id: number
   version_number: number
@@ -92,15 +101,24 @@ export type PaymentCurrentInvoiceSummary = {
 }
 
 // POST 201 data envelope: the created payment, the refreshed payment_summary, and the regenerated
-// current invoice, wrapped by the standard ApiSuccess `data` envelope. The top-level message has
-// THREE variants (Phase 13 §6), surfaced VERBATIM by the Payments tab:
-// - unaccepted invoice -> "Payment recorded. Current invoice updated."
-// - accepted + email sent -> "Payment recorded. Current invoice updated and emailed to the
-//   customer."
-// - accepted + email failed -> "Payment recorded. Current invoice updated, but the invoice could
-//   not be emailed — use Re-send Invoice to try again." (the payment STILL succeeds — the email is
-//   best-effort and D.7 never returns 502 for an email failure).
+// current invoice, wrapped by the standard ApiSuccess `data` envelope. Phase 15D: recording a
+// payment NEVER auto-emails — even on an accepted invoice the acceptance/signature carries forward
+// and the signed PDF is regenerated, but no email is sent and last_emailed_at stays null (the
+// dashboard mirror is reset to null); manual Re-send Invoice is the only email action after a
+// payment change. The Payments tab surfaces the backend `message` VERBATIM.
 export type RecordPaymentResponse = {
+  payment_transaction: PaymentTransaction
+  payment_summary: PaymentSummary
+  current_invoice: PaymentCurrentInvoiceSummary
+}
+
+// POST 201 data envelope for D.10 soft-void: the now-voided payment row (voided_at / voided_by_name
+// populated), the recalculated payment_summary (active total_paid EXCLUDES voided rows — always
+// backend-computed, never re-summed client-side), and the regenerated current invoice. Backend
+// `message` (surfaced VERBATIM): "Payment voided. Current invoice updated." Soft void only — the row
+// stays visible in history marked voided; there is no hard delete, no refund/negative row, and no
+// auto-email (manual Re-send Invoice remains the only email action).
+export type VoidPaymentResponse = {
   payment_transaction: PaymentTransaction
   payment_summary: PaymentSummary
   current_invoice: PaymentCurrentInvoiceSummary
@@ -136,5 +154,22 @@ export function recordOrderPayment(
   return post<ApiSuccess<RecordPaymentResponse>>(
     apiPath(getActiveSlug(), `/orders/${orderId}/payments`),
     body,
+  )
+}
+
+// POST /api/v1/{slug}/orders/{orderId}/payments/{paymentTransactionId}/void — soft-void a recorded
+// payment (201) and atomically regenerate the current invoice. Allowed when LAID (the inverse of
+// recording a payment). The endpoint takes NO request body: send {} — the backend rejects any body
+// field with 400 VALIDATION_FAILED (matching the no-body POST pattern in orderInvoicesApi.ts). 404
+// PAYMENT_NOT_FOUND when the payment isn't in this order; 409 PAYMENT_ALREADY_VOIDED on a re-void.
+// Unwrap res.data.payment_transaction / res.data.payment_summary; the active total_paid is
+// backend-recalculated (voided rows excluded) — never re-sum client-side.
+export function voidOrderPayment(
+  orderId: number,
+  paymentTransactionId: number,
+): Promise<ApiSuccess<VoidPaymentResponse>> {
+  return post<ApiSuccess<VoidPaymentResponse>>(
+    apiPath(getActiveSlug(), `/orders/${orderId}/payments/${paymentTransactionId}/void`),
+    {},
   )
 }

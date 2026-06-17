@@ -85,7 +85,11 @@ export type {
 export { fetchQuickDescriptions } from './quickDescriptionsApi'
 export { fetchTenantInvoiceConfig } from './tenantInvoiceConfigApi'
 export type { TenantInvoiceConfig } from './tenantInvoiceConfigApi'
-export { fetchOrderPayments, recordOrderPayment } from './orderPaymentsApi'
+export {
+  fetchOrderPayments,
+  recordOrderPayment,
+  voidOrderPayment,
+} from './orderPaymentsApi'
 export type {
   PaymentMethod,
   PaymentTransaction,
@@ -94,4 +98,5 @@ export type {
   RecordPaymentRequest,
   PaymentCurrentInvoiceSummary,
   RecordPaymentResponse,
+  VoidPaymentResponse,
 } from './orderPaymentsApi'
