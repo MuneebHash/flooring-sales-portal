@@ -98,7 +98,7 @@ The invoice DTOs `current_invoice_summary` (E.1) and `invoice_detail` (E.2) from
 | `accepted_at` | timestamp \| null | null = unaccepted |
 | `accepted_customer_name` | string \| null | |
 | `accepted_signature_present` | boolean | `true` iff a signature is stored |
-| `accepted_signature_download_path` | string \| null | relative URL to `D.10`; null when no signature |
+| `accepted_signature_download_path` | string \| null | relative URL to the signature GET (§5.3); null when no signature |
 | `last_emailed_at` | timestamp \| null | null = never emailed |
 
 Updated **`invoice_detail` (E.2)** example (returned by Phase 12 `D.1`/`D.2`/`D.3` and Phase 13 Accept/Resend):
@@ -219,7 +219,7 @@ The acceptance (signature + `accepted_at`) is **durably persisted even if the em
 
 ---
 
-### 5.3 D.10 — GET `/api/v1/{slug}/orders/{orderId}/invoices/current/signature`
+### 5.3 Signature GET — GET `/api/v1/{slug}/orders/{orderId}/invoices/current/signature`
 
 **Purpose.** Stream the **accepted signature image** for the current invoice (file-binary exception). For displaying the captured signature in the app; **not** an old-version signature-history endpoint.
 
@@ -281,7 +281,7 @@ Payment **edit** remains **not allowed**. Payment **void** (soft void) is implem
 
 - **Manual Rewrite** (`D.2`) re-snapshots the **live** order state and is what makes live edits official. It requires a valid customer email (§12) and stays **blocked when LAID** (422 `ORDER_LOCKED`).
 - **Rewrite after an accepted invoice** produces a **new current invoice version that is unsigned/unaccepted**: `accepted_at`, `accepted_customer_name`, and `accepted_signature_file_id` are **cleared (null)** on the new version, and `last_emailed_at` is **null** on it. The customer **must sign/accept again** (the sale changed, so the prior signature no longer applies). No email is sent by Rewrite. **Critically, the dashboard mirror `sales_order.last_emailed_at` must be reset to `null`** to match the new unemailed current invoice (§11.1) — otherwise the dashboard would keep showing the *previous* accepted version's emailed time for an invoice that now needs re-acceptance.
-- **Acceptance does not mutate** an accepted invoice. Once accepted, the only ways the current invoice changes are: a **payment** (carries acceptance forward, re-emails — §6) or a **manual Rewrite** (clears acceptance, requires re-acceptance — above). There is no "edit accepted invoice" path.
+- **Acceptance does not mutate** an accepted invoice. Once accepted, the only ways the current invoice changes are: a **payment** or **payment void** (carries acceptance forward; *Phase 15D: no auto-email* — §6) or a **manual Rewrite** (clears acceptance, requires re-acceptance — above). There is no "edit accepted invoice" path.
 - Acceptance itself (`D.8`) **appends** a new current version carrying the snapshot forward (it does not re-snapshot live state), so accepting never silently makes unsent live edits official.
 
 Summary of acceptance state per transition (on the resulting **current** invoice):
@@ -292,8 +292,10 @@ Summary of acceptance state per transition (on the resulting **current** invoice
 | Manual Rewrite (`D.2`) | null (cleared) | none (cleared) | no |
 | Accept (`D.8`) | set | stored | yes (auto) |
 | Resend (`D.9`) | unchanged | unchanged | yes (re-send) |
-| Payment (`D.7`) on **accepted** invoice | carried forward | carried forward | yes (auto) |
+| Payment (`D.7`) on **accepted** invoice | carried forward | carried forward | no — Phase 15D (Re-send to email) |
 | Payment (`D.7`) on **unaccepted** invoice | null | none | no |
+| Payment void (`D.10`) on **accepted** invoice | carried forward | carried forward | no — Phase 15D (Re-send to email) |
+| Payment void (`D.10`) on **unaccepted** invoice | null | none | no |
 
 ---
 
@@ -303,7 +305,7 @@ Summary of acceptance state per transition (on the resulting **current** invoice
 - The PDF includes: store logo/header styling, customer details, billing address, details of sale, totals, **total paid**, **balance due**, terms, and a **customer signature area**.
 - **Before acceptance:** the signature area is **blank** (the PDF is still downloadable via `D.4`).
 - **After acceptance:** the PDF **embeds the accepted signature image**, the **accepted customer name**, and the **accepted timestamp**.
-- PDFs are produced **only as side effects** of Create (`D.1`), Rewrite (`D.2`), Payment (`D.7`), and **Accept (`D.8`)** — there is no standalone (re)generate endpoint. Each invoice version has its own UNIQUE `stored_file_id`; the current PDF is always rebuilt fresh, never derived from a previous PDF.
+- PDFs are produced **only as side effects** of Create (`D.1`), Rewrite (`D.2`), Payment (`D.7`), Payment void (`D.10`), and **Accept (`D.8`)** — there is no standalone (re)generate endpoint. Each invoice version has its own UNIQUE `stored_file_id`; the current PDF is always rebuilt fresh, never derived from a previous PDF.
 - Download is `D.4` (`…/invoices/current/file`), `application/pdf`, credentialed blob, `Content-Disposition: inline; filename="invoice-{order_number}-v{version_number}.pdf"`.
 - Implementation extends the existing `templates/invoice.html` (openhtmltopdf-pdfbox + Thymeleaf) with a signature/acceptance block, and the `InvoicePdfGenerator` model with `accepted_customer_name`, `accepted_at`, and the signature image. **Full invoice-history UI is not MVP.**
 
@@ -332,7 +334,7 @@ Behavioural contract (frontend wiring is **not** implemented on this branch):
   - `accepted_at == null` → show the signature pad + Accept Invoice; **Download PDF** allowed; **no** send control.
   - `accepted_at != null && last_emailed_at != null` → show **emailed success** state (with `last_emailed_at`) + **Re-send Invoice**; display the captured signature via `accepted_signature_download_path`.
   - `accepted_at != null && last_emailed_at == null` → accepted but email failed → show a clear "email failed" notice + **Re-send Invoice**.
-- After a **payment** on an accepted invoice, the `D.7` response's `current_invoice` already carries updated `last_emailed_at` + acceptance fields, so the UI updates the emailed state without a re-fetch.
+- After a **payment** (`D.7`) or **payment void** (`D.10`) on an accepted invoice, the response's `current_invoice` carries acceptance/signature forward but `last_emailed_at` is **`null`** (*Phase 15D: payment record/void never auto-email*). The UI therefore shows the **accepted-but-not-emailed** state (the captured signature is still displayed) with **Re-send Invoice** offered — it does **not** show a fresh emailed time until the salesperson Re-sends (`D.9`).
 - **Manual "Send" before acceptance is not offered** in the UI (no endpoint exists). Download PDF is always offered.
 
 ---
@@ -351,8 +353,8 @@ Both fields are **required keys** on the row (`invoice_accepted` always a boolea
 **General rule.** `sales_order.last_emailed_at` is a **dashboard mirror of the CURRENT invoice's `last_emailed_at`** — it must always equal `invoice.last_emailed_at` for the current (`max(version_number)`) invoice, **including `null`**.
 
 - Whenever a **new current invoice version is created** (Create, Rewrite, Accept, payment), the mirror must be set to **that new current invoice's** `last_emailed_at` — which is `null` at the moment the version is created, and only becomes a timestamp if/when that version's email succeeds.
-- On a **successful email** for the current invoice (Accept auto-email, Resend, or payment-after-accepted auto-email), set **both** `invoice.last_emailed_at` and `sales_order.last_emailed_at` to the **same** timestamp.
-- The dashboard must **never** show an old emailed timestamp carried over from a **previous** invoice version when the current invoice has not (yet) been emailed. (This is the failure the rule prevents: e.g. a payment-after-accepted whose email fails leaves the new current invoice `last_emailed_at = null`, so the mirror must also become `null` — not retain the prior version's timestamp.)
+- On a **successful email** for the current invoice (Accept auto-email, or Resend — the only two email paths; *Phase 15D: payment record/void no longer email*), set **both** `invoice.last_emailed_at` and `sales_order.last_emailed_at` to the **same** timestamp.
+- The dashboard must **never** show an old emailed timestamp carried over from a **previous** invoice version when the current invoice has not (yet) been emailed. (This is the failure the rule prevents: e.g. a payment or payment void after acceptance creates a new current invoice version with `last_emailed_at = null` and sends no email, so the mirror must also become `null` — not retain the prior version's timestamp.)
 
 **Per-operation mirror behaviour** (current invoice's `last_emailed_at` == `sales_order.last_emailed_at` in every row):
 
@@ -364,9 +366,9 @@ Both fields are **required keys** on the row (`invoice_accepted` always a boolea
 | Accept (`D.8`) — email fails | `null` (acceptance still persists) | `null` |
 | Resend (`D.9`) — succeeds | `<timestamp>` | `<same timestamp>` |
 | Resend (`D.9`) — fails (502) | unchanged (no new version; no success timestamp written) | unchanged |
-| Payment after **accepted** (`D.7`) — email succeeds | `<timestamp>` | `<same timestamp>` |
-| Payment after **accepted** (`D.7`) — email fails | `null` (payment + version still succeed; `201`; Re-send) | `null` |
+| Payment after **accepted** (`D.7`) | `null` (new version; **no auto-email** — Phase 15D; `201`; Re-send to email) | `null` |
 | Payment **before** acceptance (`D.7`) | `null` (unaccepted/unemailed) | `null` |
+| Payment **void** (`D.10`), accepted or not | `null` (new version; **no auto-email** — Phase 15D; `201`; Re-send to email) | `null` |
 
 Resend is the only operation that does **not** create a new current version, so on a Resend **failure** nothing is written and the current invoice's `last_emailed_at` (and therefore the mirror) is **unchanged**; on Resend success both are set to the new timestamp.
 
@@ -384,7 +386,7 @@ Error envelope is unchanged (conventions §3): `{ "error": { "code", "message", 
 | `SIGNATURE_REQUIRED` | 422 | "A customer signature is required to accept the invoice." | `D.8` |
 | `SIGNATURE_INVALID` | 400 | "Signature must be a PNG image no larger than 2 MB." | `D.8` |
 | `INVOICE_ALREADY_ACCEPTED` | 409 | "This invoice has already been accepted. Use Re-send to email it again." | `D.8` |
-| `INVOICE_NOT_ACCEPTED` | 422 | "This invoice has not been accepted yet." | `D.9`, `D.10` |
+| `INVOICE_NOT_ACCEPTED` | 422 | "This invoice has not been accepted yet." | `D.9`, signature GET |
 | `EMAIL_SEND_FAILED` | 502 | "The invoice could not be emailed. Please try again." | **`D.9` only.** The non-fatal accept-send (`D.8`) and payment-after-accepted (`D.7`) paths surface an email failure via `last_emailed_at = null` + a success message, **without** raising this error and **without** returning 502. |
 
 **Reused** existing codes (do **not** rename or duplicate):
@@ -410,13 +412,13 @@ Clarifications:
 ## 13. Implementation notes / risks
 
 - **Migration `V10` only.** Not created on this branch. Adds the four nullable `invoice` columns (§4); `accepted_signature_file_id` is a **non-unique** FK → `stored_file`. No enum change is needed (`attachment_kind = 'SIGNATURE'` already exists and stays unused by this flow).
-- **Append-only preserved.** Accept and payment **append** new invoice versions; only `last_emailed_at` is updated in place (Resend, and the post-commit email-success stamp on Accept/Payment). Carry-forward on Accept/Payment must copy the acceptance fields; Rewrite must **null** them. Update `OrderPaymentService.regenerateInvoiceVersion` (and the equivalent acceptance path) to copy `accepted_*` forward.
-- **Transaction boundaries.** Persist acceptance + signed PDF **in one transaction** (file-write-first + `TransactionSynchronization` rollback-cleanup, mirroring the existing attachment/invoice write pattern). The **email send happens after commit**; an email failure must **not** roll back acceptance. Set `last_emailed_at` in a short follow-up update on send success. The **same post-commit, non-fatal pattern applies to the payment-after-accepted email** (`D.7`, §6): the payment + new invoice version commit first, then the email is attempted; a send failure leaves `last_emailed_at` null and does **not** roll back the payment or return 502.
+- **Append-only preserved.** Accept and payment **append** new invoice versions; only `last_emailed_at` is updated in place (Resend, and the post-commit email-success stamp on Accept). Carry-forward on Accept/Payment must copy the acceptance fields; Rewrite must **null** them. Update `OrderPaymentService.regenerateInvoiceVersion` (and the equivalent acceptance path) to copy `accepted_*` forward.
+- **Transaction boundaries.** Persist acceptance + signed PDF **in one transaction** (file-write-first + `TransactionSynchronization` rollback-cleanup, mirroring the existing attachment/invoice write pattern). The **email send happens after commit**; an email failure must **not** roll back acceptance. Set `last_emailed_at` in a short follow-up update on send success. *(Phase 15D: payment record (`D.7`) and payment void (`D.10`) **no longer email**, so there is no post-commit email step on those paths — each commits the new invoice version with `last_emailed_at = null` and stops; the salesperson uses Re-send (`D.9`) to email the updated signed PDF.)*
 - **Signature ingestion is invoice-specific.** Reuse `FileStorageService.store(...)` + a `stored_file` row; **do not** create an `order_attachment` row, so the signature never appears in the Notes & Photos list. Validate `image/png` + 2 MB before persisting.
 - **Signed PDF reuse.** `D.4` streams whatever the current invoice's `stored_file` is — once accepted, that's the signed PDF. No separate "signed PDF" endpoint is needed.
 - **Dashboard accuracy (mirror invariant).** The dashboard reads `sales_order.last_emailed_at`, which must always equal the **current** invoice's `last_emailed_at` (§11.1). Whenever a new current invoice version is created (Create, Rewrite, Accept, payment), set the mirror to that new version's value — `null` at creation — and update it to the timestamp only on a successful email; on Resend failure leave it unchanged. Do **not** stamp the mirror only on success: that would leave a stale timestamp on the row when the new current invoice is unemailed (e.g. rewrite-after-accepted, or a payment whose email failed). Also add `invoice_accepted` (derived from the current invoice's `accepted_at`). This touches the Chunk 1 dashboard query/DTO at implementation time (documented here + in `openapi.yaml`; Chunk 1 prose to be updated in the implementation PR).
 - **Email provider.** Keep provider behind an interface; configuration (API key, from-address per business/store) is implementation detail. `EMAIL_SEND_FAILED` (502) is the provider-failure signal for Resend.
-- **Risks:** (a) email deliverability / spam classification (provider + from-domain setup); (b) signature image size/quality from canvas (cap at 2 MB, PNG); (c) a payment immediately after acceptance triggers a second email — acceptable and intended (updated balance), but watch for double-send if Accept's own email and a near-simultaneous payment both fire; (d) ensure the carried-forward signature `stored_file` is **not** deleted while still referenced by a newer version (non-unique FK; only delete orphaned PDF files, never the signature unless no version references it).
+- **Risks:** (a) email deliverability / spam classification (provider + from-domain setup); (b) signature image size/quality from canvas (cap at 2 MB, PNG); (c) *Phase 15D removed payment auto-email, so the earlier double-send risk (Accept's own email plus a near-simultaneous payment email) no longer applies — payment record (`D.7`) and payment void (`D.10`) never email; the only auto-email is Accept (`D.8`), and Re-send (`D.9`) is the explicit manual path*; (d) ensure the carried-forward signature `stored_file` is **not** deleted while still referenced by a newer version (non-unique FK; only delete orphaned PDF files, never the signature unless no version references it).
 
 ---
 

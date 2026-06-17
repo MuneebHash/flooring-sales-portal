@@ -250,11 +250,10 @@ If this list changes in the backend migration/constraint, update the frontend re
 
 Previously merged Flyway migrations are locked by CI. The migration added in the current PR is not added to the lock range until the next migration PR.
 
-Current locked migrations are V1–V13 (CI guards the V1–V13 range). **V14**
-(`V14__add_payment_void_fields.sql`, Phase 15D payment soft-void) is **new in this PR** and is
-deliberately NOT yet in the CI locked-guard range — the guard catches added files too, so locking
-V14 in the same PR that introduces it would fail the locked-migrations job. **Add V14 to the guard
-range in the NEXT migration PR.** Do not write "V1–V14 locked" anywhere yet.
+Current locked migrations are V1–V13 (CI guards the V1–V13 range). V14
+(`V14__add_payment_void_fields.sql`, Phase 15D payment soft-void) exists on main from PR #85 but is
+deliberately NOT yet in the CI locked-guard range. Add V14 to the guard
+range in the NEXT migration PR. Do not write "V1–V14 locked" anywhere yet.
 
 Do not edit old migration files.
 
@@ -502,18 +501,6 @@ handled by the db/dev-seed workflow, not a one-off Terralux script.
 
 ---
 
-## Phase 6 handoff note
-
-`docs/Phase-6-Frontend-Backend-Handoff.md` is historical.
-
-It was written when the frontend was still a static/mock prototype.
-
-Do not treat old statements like “no backend/API integration exists yet” as current truth.
-
-Use `docs/Phases.md` and current code as the live context.
-
----
-
 ## MVP scope — out of scope for now
 
 Do not start these unless explicitly requested:
@@ -558,7 +545,7 @@ Known issues/follow-ups:
 #34 app/database timezone before production
 #55 backend financial summary versioning for concurrent mutations
 #69 backend version precondition on invoice accept
-#74 per-tenant private config (ABN/bank/T&Cs/Stripe link/template) — Phase 15
+#74 per-tenant private config (ABN/bank/T&Cs/Stripe link/template) — CLOSED during Phase 15
 #75 centralize backend auth enforcement (fail-closed) — Phase 16
 ```
 
