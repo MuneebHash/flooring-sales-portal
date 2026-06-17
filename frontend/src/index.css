@@ -1,11 +1,13 @@
 @import "tailwindcss";
 
 /* Phase 15C PR2 — on-screen invoice terms (InvoiceTab `.invoice-terms`). The tenant terms are
-   sanitized HTML (restricted allowlist: p, br, lists, tables, strong/em/u, div/span/small +
-   class only). Tailwind's preflight strips list markers and table borders, so these scoped
-   rules restore readable numbered/structured terms on screen. SCREEN-ONLY — the invoice PDF
-   styles its own terms server-side. Every rule is scoped under `.invoice-terms` so no other
-   part of the app is affected. */
+   sanitized HTML (restricted allowlist: p, br, lists, tables, strong/em/u, div/span/small) with
+   NO tenant-provided attributes (Codex P2: `class` is stripped so tenant terms can't apply app
+   Tailwind utilities to hide/overlay themselves). Tailwind's preflight strips list markers and
+   table borders, so these scoped rules restore readable numbered/structured terms on screen —
+   all terms styling comes from here, not tenant classes. SCREEN-ONLY — the invoice PDF styles
+   its own terms server-side. Every rule is scoped under `.invoice-terms` so no other part of
+   the app is affected. */
 .invoice-terms p {
   margin: 0 0 0.5rem;
 }

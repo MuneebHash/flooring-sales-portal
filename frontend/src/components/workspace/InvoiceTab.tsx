@@ -715,9 +715,13 @@ export function InvoiceTab({
           'span',
           'small',
         ],
-        ALLOWED_ATTR: ['class'],
-        // Lock attributes to literally `class` only: DOMPurify's defaults otherwise let
-        // inert data-*/aria-* attributes through regardless of ALLOWED_ATTR. PR2 rule = class only.
+        // No tenant-provided attributes survive. Codex P2: tenant terms are injected into the
+        // live app DOM with Tailwind loaded, so allowing `class` let tenant terms apply app
+        // utilities (hidden, fixed, inset-0, z-50, …) to hide themselves past the visible-text
+        // check or overlay the acceptance screen. Strip ALL attributes — tenant class, data-*,
+        // aria-*, event handlers, and URLs are all removed. Readability (list markers, table
+        // borders) comes solely from our scoped `.invoice-terms` CSS, never tenant classes.
+        ALLOWED_ATTR: [],
         ALLOW_DATA_ATTR: false,
         ALLOW_ARIA_ATTR: false,
       }),
