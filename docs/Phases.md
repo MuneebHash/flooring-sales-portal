@@ -617,16 +617,22 @@ It does NOT redesign the invoice display (that is Phase 15).
   sample TERMS from InvoiceTab. Do not smear invoice branding across phases.
 - Kill automatic invoice email after a payment update.
   (Manual "Resend invoice" already exists in the Invoice tab — keep it, add nothing.)
-- Payment delete / reversal:
-    delete payment -> paid amount drops -> balance_due increases
+- Payment void (soft void; no hard delete):
+    void payment -> active paid amount drops -> balance_due increases
     invoice stays accepted/signed; NO customer re-sign; NO automatic email
-    salesperson may manually resend if they choose
+    voided payment stays visible in history; salesperson may manually resend if they choose
     (exact mirror of how adding a payment behaves)
 - Stripe payment-link button:
     opens the tenant's external Stripe link in a new tab
     money goes to the tenant's own Stripe account
     NO webhook, NO auto-confirm; salesperson still records the payment manually
 ```
+
+**Phase 15D progress — backend PR1 (DONE):** "kill automatic payment email" + "payment void" are implemented backend-only as a **soft void** (not hard delete):
+- New endpoint `POST /api/v1/{slug}/orders/{orderId}/payments/{paymentTransactionId}/void` (201; takes no body) — soft-voids the payment, drops the active `total_paid`, raises `balance_due`, regenerates the current invoice, carries acceptance/signature forward (no re-sign), resets the email mirror to null, and sends **no email**. LAID-allowed. Errors: `PAYMENT_NOT_FOUND` (404), `PAYMENT_ALREADY_VOIDED` (409).
+- Recording a payment (`D.7`) no longer auto-emails (even on an accepted invoice). Manual **Resend** is the only email action after a payment change.
+- Migration `V14__add_payment_void_fields.sql` adds `payment_transaction.voided_at` + `voided_by_user_id` (soft-void markers; `amount > 0` CHECK untouched). Voided payments stay visible in history; excluded from the active `total_paid`.
+- **Still TODO for the void feature:** the frontend void button / PaymentsTab UI remains **PR2** (the void workflow is **not yet usable from the app** until it lands); the Stripe / payment-link button remains a later item if still applicable.
 
 ### Phase 16 — Deploy & Hardening (no revamp here)
 
@@ -660,7 +666,7 @@ It does NOT redesign the invoice display (that is Phase 15).
 ```text
 - Fresh-DB rebuild from zero.
 - Tenant isolation test.
-- Full E2E: order -> invoice -> payment -> reversal -> signature.
+- Full E2E: order -> invoice -> payment -> void -> signature.
 - Production smoke test.
 - Confirm no untracked follow-ups remain.
 ```
@@ -722,7 +728,7 @@ advanced quote comparison
 room-level complexity
 AI features
 invoice version-history UI / old signed invoice download
-payment void/edit beyond the Phase 15 delete/reversal flow
+payment edit / hard delete (beyond the Phase 15 soft-void flow)
 ```
 
 ---

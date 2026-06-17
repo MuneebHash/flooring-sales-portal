@@ -34,6 +34,12 @@ public enum ErrorCode {
     INVOICE_NOT_FOUND(HttpStatus.NOT_FOUND, "Invoice not found."),
     INVOICE_PRECONDITIONS_NOT_MET(HttpStatus.UNPROCESSABLE_ENTITY, "Complete required fields before creating invoice."),
     PAYMENT_EXCEEDS_BALANCE(HttpStatus.UNPROCESSABLE_ENTITY, "Payment amount cannot exceed the current balance due."),
+    // Phase 15D payment void codes (D.10 POST /payments/{paymentTransactionId}/void). PAYMENT_NOT_FOUND
+    // is the scoped not-found for a payment id that is missing or belongs to another order (resolved only
+    // after the order itself is in scope — so it never leaks cross-tenant/cross-store existence).
+    // PAYMENT_ALREADY_VOIDED (409, parallel to INVOICE_ALREADY_ACCEPTED) covers a double-void.
+    PAYMENT_NOT_FOUND(HttpStatus.NOT_FOUND, "Payment not found."),
+    PAYMENT_ALREADY_VOIDED(HttpStatus.CONFLICT, "This payment has already been voided."),
     // Phase 13 customer-email gate (contract §12): evaluated on D.1 Create / D.2 Rewrite BEFORE the 9
     // invoice preconditions, and reused by D.8 Accept / D.9 Resend (where it runs last, after the
     // invoice-state and signature checks).

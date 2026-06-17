@@ -17,7 +17,7 @@
 
 ## 1. Purpose
 
-Phase 12 lets a salesperson create the current invoice, rewrite it, record payments, view it, and download its PDF. Phase 13 closes the in-home sale: the **customer signs the invoice on the iPad, the salesperson accepts it, and the accepted PDF is emailed to the customer automatically.** A post-acceptance payment re-emails an updated signed PDF without re-signing.
+Phase 12 lets a salesperson create the current invoice, rewrite it, record payments, view it, and download its PDF. Phase 13 closes the in-home sale: the **customer signs the invoice on the iPad, the salesperson accepts it, and the accepted PDF is emailed to the customer automatically.** A post-acceptance payment carries the signature forward without re-signing. *(Phase 15D update: a post-acceptance payment — and a payment void — no longer auto-emails; manual Re-send is the only email action after a payment change. See §6.)*
 
 Phase 13 is a **practical MVP signature-capture + email workflow**, not a full legal e-sign platform. It keeps the Phase 12 *current-invoice-only* model: no invoice-status enum, no version history UI, no old-version access.
 
@@ -26,7 +26,7 @@ Concretely, Phase 13 adds:
 - **Accept current invoice** — capture a customer signature + accepted name, regenerate a **signed** PDF, and **auto-email** it to the customer.
 - **Resend current accepted invoice** — re-email the current accepted PDF.
 - **Signature image download** — stream the accepted signature for display.
-- **Payment ↔ email** rules — a payment on an accepted invoice carries acceptance forward and re-emails; a payment on an unaccepted invoice does not email.
+- **Payment ↔ email** rules — a payment (or payment void) on an accepted invoice carries acceptance/signature forward; *(Phase 15D)* it does **not** email. Manual Re-send is the only email path after a payment change. See §6.
 - **PDF redesign** — a customer-facing invoice layout that matches the Invoice tab, with a signature area (blank before acceptance, embedded signature after).
 - **Dashboard** — `invoice_accepted` + the existing `last_emailed_at`.
 
@@ -40,7 +40,7 @@ Concretely, Phase 13 adds:
 - Accepted invoice is **not directly mutated** afterward (see §4, §7).
 - **Re-send Invoice**: re-emails the current accepted invoice PDF; updates `last_emailed_at`. Re-send Invoice is shown once the current invoice is **accepted**, including when the initial automatic email failed — it does **not** depend on a prior successful email (an accepted invoice with `last_emailed_at = null` can still be re-sent).
 - **Download PDF** remains available before acceptance (Phase 12 `D.4`). **Manual send before signature/acceptance is not allowed** (there is no pre-acceptance send endpoint).
-- **Payments** remain allowed before and after acceptance (do **not** require acceptance). Each payment still creates a new current invoice version with updated `total_paid` / `balance_due`. If the invoice was accepted, acceptance carries forward and the updated PDF is re-emailed; if not, no email is sent.
+- **Payments** remain allowed before and after acceptance (do **not** require acceptance). Each payment (and Phase 15D payment **void**) still creates a new current invoice version with updated `total_paid` / `balance_due`. If the invoice was accepted, acceptance/signature carries forward (no re-sign); *(Phase 15D)* **no email is sent** on payment record or void — manual Re-send is the only email path.
 - **Signature image download** for display in the app.
 - **PDF** shows store header, customer details, billing address, details of sale, totals, total paid, balance due, terms, and a signature area (embedded signature + accepted name + accepted timestamp after acceptance).
 - **Dashboard** exposes `invoice_accepted` (boolean) and the already-present `last_emailed_at`.
@@ -53,7 +53,7 @@ Concretely, Phase 13 adds:
 These stay **out** of Phase 13:
 - Full invoice revision/history dropdown; viewing or downloading **old** invoice versions or **old** signed PDFs; signed-invoice history list.
 - A separate **invoice-status enum** / invoice-status state machine (Draft / Created / Accepted / Sent). Phase 13 uses explicit nullable fields instead (§4). The order status enum (`LEAD`, `NEW_ACHIEVED_SALE`, `FOLLOW_UP`, `ACCEPTED`, `LAID`, `CANCELLED`) is unchanged and is **not** reused for invoice state — note `ACCEPTED` is an **order** status and is unrelated to invoice acceptance.
-- Payment edit/delete; refunds/reversals; finance products; surcharges; overpayment/credit workflows.
+- Payment edit; refunds; finance products; surcharges; overpayment/credit workflows. *(Phase 15D update: payment **void** (soft void) is now implemented; see Chunk 4 D.10. Hard delete and payment edit remain out of scope.)*
 - Advanced **email audit trail** / per-send history; advanced legal **e-sign** workflow (witnessing, certificates, tamper-evidence, audit packets).
 - **Stripe** (Phase 14) and deployment (Phase 15).
 - Installer / laybook workflows.
@@ -83,7 +83,7 @@ Notes:
 - **Dashboard mirror.** `sales_order.last_emailed_at` already exists (`V2`) and already feeds the dashboard row. Phase 13 redefines it as a **mirror of the CURRENT invoice's `last_emailed_at`** — it must always equal `invoice.last_emailed_at` for the current version, **including `null`**: it is set to the new current invoice's value (`null`) whenever a new version is created, and to the timestamp on a successful email. This prevents the dashboard from showing a stale "emailed" time from a previous version after a new, unemailed current invoice is created. See the **§11.1 mirror invariant** for the per-operation table. `invoice.last_emailed_at` remains the authoritative per-invoice marker shown on the Invoice tab.
 - Money stays `DECIMAL(10,2)`, scale 2, `HALF_UP`. Timestamps are `YYYY-MM-DDTHH:mm:ss` (server-local, no timezone). Dates are `YYYY-MM-DD`.
 
-**No** invoice-status column is added. **No** `V*` change to `order_customer`, `payment_transaction`, or `stored_file` is required.
+**No** invoice-status column is added. **No** `V*` change to `order_customer`, `payment_transaction`, or `stored_file` is required *for Phase 13*. *(Phase 15D adds the soft-void columns `voided_at` + `voided_by_user_id` to `payment_transaction` via migration `V14` — see Chunk 4 D.10.)*
 
 ---
 
@@ -246,34 +246,34 @@ Errors use the standard JSON error wrapper (conventions §3).
 
 - **`D.1` POST `…/invoices` (Create).** Now requires a valid customer email (§12) — evaluated **before** the 9 invoice preconditions; failure → 422 `CUSTOMER_EMAIL_REQUIRED` / `CUSTOMER_EMAIL_INVALID`. Still creates an **unsigned/unaccepted** invoice (`accepted_at` null, `last_emailed_at` null). **No email is sent on Create.** Sets the dashboard mirror `sales_order.last_emailed_at = null` (§11.1). Response `invoice_detail` now carries the five acceptance/email fields (all null/false).
 - **`D.2` POST `…/invoices/rewrite` (Rewrite).** Now requires a valid customer email (§12). See §7 for the full rewrite-after-acceptance behaviour. Rewrite remains **blocked when LAID** → 422 `ORDER_LOCKED`.
-- **`D.7` POST `…/payments` (Record payment).** See §6. A payment never requires acceptance; if the current invoice was accepted, acceptance carries forward and the updated signed PDF is re-emailed. That email is **best-effort and non-fatal**: an email-provider failure does **not** roll back the payment or the new invoice version and does **not** make `D.7` return `502` — the payment still succeeds (`201`), `last_emailed_at` stays null, and the message tells the user to Re-send (`D.9`).
+- **`D.7` POST `…/payments` (Record payment).** See §6. A payment never requires acceptance; if the current invoice was accepted, acceptance/signature carries forward (the customer does not re-sign) and the regenerated signed PDF is produced — but **Phase 15D: no email is sent** (the old "re-email after a payment on an accepted invoice" behaviour was removed). `last_emailed_at` stays null and the message is `"Payment recorded. Current invoice updated."`. To email the updated PDF, use Re-send (`D.9`).
+- **`D.10` POST `…/payments/{paymentTransactionId}/void` (Void payment — Phase 15D).** See §6 and Chunk 4 D.10. Soft-voids a payment and regenerates the current invoice exactly like `D.7` (acceptance/signature carries forward, no re-sign, no email); the voided payment is excluded from the active `total_paid`.
 - **`D.3` GET `…/invoices/current`**, **`D.4` GET `…/invoices/current/file`** — unchanged behaviour; `D.3`'s `invoice_detail` now carries the five new fields. `D.4` continues to stream the current PDF (which is the **signed** PDF once accepted).
 
 ---
 
 ## 6. Payment interaction rules
 
+> **Phase 15D update.** Recording a payment (`D.7`) and **voiding** a payment (`D.10`) **never auto-email** — the earlier "re-email the updated signed PDF after a payment on an accepted invoice" behaviour was **removed**. Manual **Re-send** (`D.9`) is the only email action after a payment change. Acceptance/signature still carries forward (the customer never re-signs) and the regenerated signed PDF is still produced and downloadable — it is just not emailed. The rules below reflect this.
+
 Payments are independent of acceptance:
-- A payment is **allowed before and after** acceptance. **Recording a payment does not require the invoice to be accepted.**
-- Every payment still **appends a new current invoice version** with updated `total_paid` / `balance_due` (Chunk 4 F.4), carrying the sale snapshot forward. Overpayment stays blocked (422 `PAYMENT_EXCEEDS_BALANCE`); **no refunds/credits** are introduced.
-- **If the current invoice was accepted** when the payment is recorded:
-  - the payment is recorded and a **new current invoice version is created**;
-  - the new version **carries forward** the acceptance/signature metadata (`accepted_at`, `accepted_customer_name`, `accepted_signature_file_id`) — the customer does **not** re-accept;
+- A payment is **allowed before and after** acceptance. **Recording a payment does not require the invoice to be accepted.** Voiding a payment is likewise allowed regardless of acceptance, and both are **allowed when LAID**.
+- Every payment **appends a new current invoice version** with updated `total_paid` / `balance_due` (Chunk 4 F.4), carrying the sale snapshot forward. A **void** does the same, recalculating `total_paid` from the **active (non-voided)** payments so it drops and `balance_due` rises. Overpayment stays blocked (422 `PAYMENT_EXCEEDS_BALANCE`); **no refunds/credits** are introduced.
+- **If the current invoice was accepted** when a payment is **recorded or voided**:
+  - a **new current invoice version is created**;
+  - it **carries forward** the acceptance/signature metadata (`accepted_at`, `accepted_customer_name`, `accepted_signature_file_id`) — the customer does **not** re-accept/re-sign;
   - the regenerated PDF embeds the carried-forward signature;
-  - on creating the new version, `last_emailed_at` starts `null` and the dashboard mirror `sales_order.last_emailed_at` is set to that new version's value (`null`) — see §11.1;
-  - the backend then **attempts to email** the updated signed PDF to the customer. **The email send is best-effort and does NOT gate the payment** (same model as Accept, §5.1):
-    - **email succeeds** → `last_emailed_at` is set to the send timestamp on **both** the new current invoice and the `sales_order` mirror; response message: `"Payment recorded. Current invoice updated and emailed to the customer."`
-    - **email fails** → the **payment still succeeds**, the **new current invoice version still succeeds**, the **acceptance/signature metadata still carries forward**, but `last_emailed_at` **remains null** on the new current invoice **and the `sales_order` mirror is `null`** (it was set to the new version's `null` and not updated). The endpoint **still returns its success status (`201`), not `502`**, and the message tells the user the payment was recorded but the updated invoice email could not be sent — use **Re-send** (`D.9`): `"Payment recorded. Current invoice updated, but the invoice could not be emailed — use Re-send Invoice to try again."` The backend **must not roll back the payment (or the new invoice version) because the email failed.**
-- **If the current invoice was not accepted** when the payment is recorded:
-  - the payment is still allowed and a new version is created;
-  - the new version stays **unaccepted** (`accepted_at` null), with `last_emailed_at = null` and the `sales_order` mirror set to `null`;
-  - **no email is sent** (and no email is attempted) until the customer later accepts the invoice.
+  - `last_emailed_at` starts `null` and the dashboard mirror `sales_order.last_emailed_at` is reset to that new version's value (`null`) — see §11.1;
+  - **no email is sent.** The response message is `"Payment recorded. Current invoice updated."` (record) or `"Payment voided. Current invoice updated."` (void). To email the updated signed PDF, the salesperson uses **Re-send** (`D.9`).
+- **If the current invoice was not accepted**:
+  - the payment is still recorded / voided and a new **unaccepted** version is created (`accepted_at` null, `last_emailed_at` null, mirror null);
+  - **no email is sent.**
 
-This preserves both invariants: **(1)** payments do not require acceptance, and **(2)** invoices are not emailed before signature/acceptance except via the accepted/signed flows.
+This preserves both invariants: **(1)** payments do not require acceptance, and **(2)** invoices are emailed **only** via the explicit accepted-flow actions — **Accept** auto-emails on acceptance, and **Re-send** re-emails on demand; payment record/void never email.
 
-**Email-failure model is consistent across endpoints.** A payment-after-accepted email failure is **non-fatal** (payment + invoice version persist; `last_emailed_at` null; `201`; Re-send to retry) — exactly like **Accept** (§5.1, §9), where acceptance persists even if the email fails. `EMAIL_SEND_FAILED` / **502** is reserved for an **explicit Re-send** (`D.9`) failure, where emailing is the *whole* operation; **`D.7` never returns `502`** for an email failure.
+**Email model.** `EMAIL_SEND_FAILED` / **502** is raised **only** by an explicit **Re-send** (`D.9`) failure, where emailing is the whole operation. `D.7` (record) and `D.10` (void) never email and so never return `502` for an email reason.
 
-Payment edit/delete remain **not allowed**.
+Payment **edit** remains **not allowed**. Payment **void** (soft void) is implemented in Phase 15D (`D.10`); the original `payment_transaction` row is preserved (never hard-deleted) and stays visible in payment history with `voided_at` / `voided_by_name`.
 
 ---
 

@@ -1418,13 +1418,13 @@ paths:
         creates the next official invoice version carrying forward sale snapshot
         fields from the latest official invoice while updating only total_paid and
         balance_due. This endpoint is allowed when order status is LAID.
-        Phase 13: when the current invoice was already accepted, the new version also
-        carries forward the acceptance/signature metadata and the backend attempts to
-        email the updated signed PDF. That email is best-effort and NON-FATAL: if the
-        email provider fails, the payment and the new invoice version still succeed and
-        this endpoint still returns 201 (never 502) with last_emailed_at null and a
-        message telling the user to use Resend; the payment is never rolled back because
-        of an email failure. When the current invoice was not accepted, no email is sent.
+        Phase 15D: recording a payment NEVER emails. When the current invoice was already
+        accepted, the new version still carries forward the acceptance/signature metadata
+        (the customer does not re-sign) and the regenerated PDF embeds the carried
+        signature, but no email is sent and last_emailed_at stays null (the dashboard
+        mirror is reset to null with the new version). Manual Resend is the only email
+        action after a payment change. The response message is always
+        "Payment recorded. Current invoice updated." regardless of acceptance state.
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1435,10 +1435,7 @@ paths:
               $ref: '#/components/schemas/PaymentCreateRequest'
       responses:
         '201':
-          description: >
-            Payment recorded and current invoice updated. If the current invoice was accepted,
-            the updated signed PDF is emailed (best-effort); on email failure the response is
-            still 201 with last_emailed_at null and a message indicating Resend should be used.
+          description: Payment recorded and current invoice updated. No email is sent.
           content:
             application/json:
               schema:
@@ -1451,6 +1448,65 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
+  /orders/{orderId}/payments/{paymentTransactionId}/void:
+    post:
+      tags:
+        - Payments
+      summary: Void payment
+      operationId: voidPayment
+      description: >
+        Phase 15D. Soft-voids a recorded payment (the original row is preserved, never hard
+        deleted) and atomically creates the next official invoice version, exactly mirroring how
+        recording a payment behaves: the voided payment is excluded from the active total_paid so
+        total_paid drops and balance_due rises, sale snapshot fields are carried forward, and when
+        the current invoice was accepted the acceptance/signature metadata is carried forward (the
+        customer does NOT re-sign). No email is sent and last_emailed_at stays null (the dashboard
+        mirror is reset to null with the new version); manual Resend remains the only email action.
+        This endpoint takes no request body and is allowed when order status is LAID. The voided
+        payment stays visible in payment history with voided_at and voided_by_name populated.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - name: paymentTransactionId
+          in: path
+          required: true
+          schema:
+            type: integer
+            format: int64
+          description: The payment transaction to void.
+      responses:
+        '201':
+          description: >
+            Payment voided and current invoice updated (a new version is created). No email is sent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentVoidResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: >
+            Order not found (out of the session's business/store, ORDER_NOT_FOUND) or the payment
+            does not exist for this order (PAYMENT_NOT_FOUND). Existence of another tenant's data is
+            never confirmed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardErrorResponse'
+        '409':
+          description: The payment has already been voided (PAYMENT_ALREADY_VOIDED).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardErrorResponse'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
         '500':
@@ -2405,6 +2461,8 @@ components:
         - amount
         - payment_reference
         - created_at
+        - voided_at
+        - voided_by_name
       properties:
         payment_transaction_id:
           type: integer
@@ -2418,6 +2476,19 @@ components:
           nullable: true
         created_at:
           $ref: '#/components/schemas/Timestamp'
+        voided_at:
+          nullable: true
+          description: >
+            Phase 15D. When the payment was voided (soft void); null when active. A voided
+            payment stays visible in payment history but is excluded from the active total_paid.
+          allOf:
+            - $ref: '#/components/schemas/Timestamp'
+        voided_by_name:
+          type: string
+          nullable: true
+          description: >
+            Phase 15D. Display name of the session actor who voided the payment
+            (app_user first + last name); null when active. The raw user id is never exposed.
 
     PaymentSummary:
       type: object
@@ -2505,6 +2576,37 @@ components:
       properties:
         data:
           $ref: '#/components/schemas/PaymentCreateResponse'
+        message:
+          type: string
+
+    PaymentVoidResponse:
+      type: object
+      additionalProperties: false
+      description: >
+        Phase 15D void result. Same shape as PaymentCreateResponse: payment_transaction is the
+        now-voided row (voided_at / voided_by_name populated), payment_summary reflects the
+        recalculated active total_paid and risen balance_due, and current_invoice is the new
+        version created by the void.
+      required:
+        - payment_transaction
+        - payment_summary
+        - current_invoice
+      properties:
+        payment_transaction:
+          $ref: '#/components/schemas/PaymentTransactionRead'
+        payment_summary:
+          $ref: '#/components/schemas/PaymentSummary'
+        current_invoice:
+          $ref: '#/components/schemas/CurrentInvoiceSummary'
+
+    PaymentVoidResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/PaymentVoidResponse'
         message:
           type: string
 

@@ -6,10 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.flooring.salesportal.common.api.ApiResponse;
 import com.flooring.salesportal.common.api.ErrorDetail;
 import com.flooring.salesportal.common.api.PaginationMeta;
-import com.flooring.salesportal.common.email.InvoiceEmailException;
-import com.flooring.salesportal.common.email.InvoiceEmailRequest;
-import com.flooring.salesportal.common.email.InvoiceEmailSender;
 import com.flooring.salesportal.common.error.BusinessRuleException;
+import com.flooring.salesportal.common.error.ConflictException;
 import com.flooring.salesportal.common.error.ErrorCode;
 import com.flooring.salesportal.common.error.MalformedJsonException;
 import com.flooring.salesportal.common.error.NotFoundException;
@@ -26,9 +24,8 @@ import com.flooring.salesportal.order.dto.PaymentSummaryDto;
 import com.flooring.salesportal.order.dto.PaymentTransactionReadDto;
 import com.flooring.salesportal.order.dto.PaymentsListResponse;
 import com.flooring.salesportal.order.dto.RecordPaymentResponse;
+import com.flooring.salesportal.order.dto.VoidPaymentResponse;
 import jakarta.servlet.http.HttpServletRequest;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -76,16 +73,13 @@ import java.util.Set;
 @Service
 public class OrderPaymentService {
 
-    private static final Logger log = LoggerFactory.getLogger(OrderPaymentService.class);
-
-    // Locked D.7 response messages (Phase 13 contract §6): the email-success / email-failure variants
-    // apply ONLY when the paid invoice was accepted (the carry-forward + best-effort re-email path);
-    // a payment on an unaccepted invoice keeps the original Chunk 4 message and sends nothing.
+    // D.7 record-payment message. Phase 15D: recording a payment NEVER emails — even on an accepted
+    // invoice the acceptance/signature carries forward and the signed PDF is regenerated, but no email is
+    // sent and last_emailed_at is not stamped. Manual Re-send (D.9) is the only email path after a payment
+    // change. So a single message applies regardless of acceptance state.
     private static final String PAYMENT_RECORDED_MESSAGE = "Payment recorded. Current invoice updated.";
-    private static final String PAYMENT_EMAILED_MESSAGE =
-            "Payment recorded. Current invoice updated and emailed to the customer.";
-    private static final String PAYMENT_EMAIL_FAILED_MESSAGE =
-            "Payment recorded. Current invoice updated, but the invoice could not be emailed — use Re-send Invoice to try again.";
+    // D.10 void-payment message (Phase 15D).
+    private static final String PAYMENT_VOIDED_MESSAGE = "Payment voided. Current invoice updated.";
 
     private static final int DEFAULT_PAGE = 1;
     private static final int DEFAULT_PAGE_SIZE = 20;
@@ -123,11 +117,11 @@ public class OrderPaymentService {
     private final InvoicePdfGenerator invoicePdfGenerator;
     private final InvoicePdfModelAssembler invoicePdfModelAssembler;
     private final FileStorageService fileStorageService;
-    private final InvoiceEmailSender invoiceEmailSender;
     private final ObjectMapper objectMapper;
-    // Programmatic transaction for D.7 (mirrors OrderInvoiceService): the payment-after-accepted email
-    // must run AFTER the payment + new invoice version commit (and the email-success stamp in its own
-    // follow-up transaction), so recordPayment cannot be @Transactional.
+    // Programmatic transaction for D.7 record / D.10 void (mirrors OrderInvoiceService): the payment +
+    // new invoice version + §11.1 mirror reset commit atomically inside one transactionTemplate block
+    // that holds the order row FOR UPDATE. No post-commit email step (Phase 15D), so the persist is the
+    // only transactional work.
     private final TransactionTemplate transactionTemplate;
 
     public OrderPaymentService(RequestContextGuard requestContextGuard,
@@ -139,7 +133,6 @@ public class OrderPaymentService {
                                InvoicePdfGenerator invoicePdfGenerator,
                                InvoicePdfModelAssembler invoicePdfModelAssembler,
                                FileStorageService fileStorageService,
-                               InvoiceEmailSender invoiceEmailSender,
                                PlatformTransactionManager transactionManager,
                                ObjectMapper objectMapper) {
         this.requestContextGuard = requestContextGuard;
@@ -151,7 +144,6 @@ public class OrderPaymentService {
         this.invoicePdfGenerator = invoicePdfGenerator;
         this.invoicePdfModelAssembler = invoicePdfModelAssembler;
         this.fileStorageService = fileStorageService;
-        this.invoiceEmailSender = invoiceEmailSender;
         this.objectMapper = objectMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
@@ -209,20 +201,16 @@ public class OrderPaymentService {
      * {@code ORDER_NOT_FOUND}, no existence leak) -> body parse + field validation (400) -> require an
      * existing invoice (else 422 {@code INVOICE_REQUIRED}) -> amount {@literal <=} latest balance (else
      * 422 {@code PAYMENT_EXCEEDS_BALANCE}) -> persist payment + regenerate invoice. The {@code FOR UPDATE}
-     * lock serialises version allocation against a concurrent payment / rewrite / accept so
+     * lock serialises version allocation against a concurrent payment / void / rewrite / accept so
      * {@code uq_invoice_order_version} cannot be raced.
      *
-     * <p>Phase 13 §6: when the paid invoice was ACCEPTED, the new version carries the acceptance/
-     * signature metadata forward (the customer does NOT re-sign), the regenerated PDF embeds the
-     * carried signature, and after commit the updated signed PDF is emailed BEST-EFFORT — the email
-     * NEVER gates the payment: there is no customer-email validation here, a missing/unusable email at
-     * send time is a non-fatal failure, and D.7 never returns 502. On send success the delivery
-     * timestamp is stamped on the invoice + §11.1 mirror (same timestamp, one follow-up transaction);
-     * on failure both stay null and the message points at Re-send. Deliberately NOT
-     * {@code @Transactional} for that reason (mirrors {@code OrderInvoiceService.acceptCurrentInvoice});
-     * the persist runs in one programmatic transaction below. The response is built from the FINAL
-     * post-email state. A payment on an UNACCEPTED invoice is unchanged: no acceptance fields, no
-     * signature, no email attempted.
+     * <p>Phase 15D: recording a payment NEVER emails. When the paid invoice was ACCEPTED, the new version
+     * still carries the acceptance/signature metadata forward (the customer does NOT re-sign) and the
+     * regenerated PDF embeds the carried signature — but no email is sent and {@code last_emailed_at}
+     * stays null (the §11.1 mirror is reset to null with the new version). Manual Re-send (D.9) is the
+     * only email path after a payment change, so a single response message applies regardless of
+     * acceptance state. The payment + new invoice version + mirror reset commit in one programmatic
+     * transaction.
      */
     public ApiResponse<RecordPaymentResponse> recordPayment(String slug,
                                                             String orderIdRaw,
@@ -234,24 +222,12 @@ public class OrderPaymentService {
         PaymentPersisted persisted = transactionTemplate.execute(
                 status -> validateAndPersistPayment(orderId, ctx, body));
 
-        // Post-commit best-effort email — ONLY when acceptance was carried forward (§6). Never fatal.
-        boolean emailed = persisted.carriedAcceptanceForward()
-                && sendPaymentEmailQuietly(ctx, orderId, persisted);
-
-        InvoiceRow finalRow = emailed
-                ? transactionTemplate.execute(status ->
-                        stampEmailSuccess(orderId, ctx, persisted.newVersion().invoiceId(), LocalDateTime.now()))
-                : persisted.newVersion();
-
-        String message = !persisted.carriedAcceptanceForward()
-                ? PAYMENT_RECORDED_MESSAGE
-                : (emailed ? PAYMENT_EMAILED_MESSAGE : PAYMENT_EMAIL_FAILED_MESSAGE);
-
+        InvoiceRow newVersion = persisted.newVersion();
         RecordPaymentResponse data = new RecordPaymentResponse(
                 toReadDto(persisted.payment()),
-                new PaymentSummaryDto(finalRow.totalPaid(), finalRow.balanceDue()),
-                toSummaryDto(slug, orderId, finalRow));
-        return ApiResponse.ok(data, message);
+                new PaymentSummaryDto(newVersion.totalPaid(), newVersion.balanceDue()),
+                toSummaryDto(slug, orderId, newVersion));
+        return ApiResponse.ok(data, PAYMENT_RECORDED_MESSAGE);
     }
 
     /**
@@ -288,23 +264,10 @@ public class OrderPaymentService {
         BigDecimal totalPaidAfter = paymentTransactionRepository.sumAmountByOrderId(orderId);
         BigDecimal newBalance = latest.salePriceIncGst().subtract(totalPaidAfter).setScale(MONEY_SCALE, ROUNDING);
 
-        RegeneratedInvoice regenerated =
+        InvoiceRow newVersion =
                 regenerateInvoiceVersion(ctx, order, orderId, latest, totalPaidAfter, newBalance);
 
-        // Deliberately NO email validation: payment never blocks on the customer email (§6). The raw
-        // value is carried out for the post-commit send; null/blank is handled there as a non-fatal
-        // email failure.
-        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
-        String recipientEmail = customer == null ? null : customer.getEmail();
-
-        return new PaymentPersisted(
-                payment,
-                regenerated.row(),
-                order.getOrderNumber(),
-                recipientEmail,
-                regenerated.pdfBytes(),
-                regenerated.pdfFileName(),
-                latest.acceptedAt() != null);
+        return new PaymentPersisted(payment, newVersion);
     }
 
     /**
@@ -324,14 +287,15 @@ public class OrderPaymentService {
      * read from the existing stored_file. A signature row missing from the database or its file missing
      * on disk is a data-integrity failure -> 500 and full rollback (consistent with D.4). When
      * {@code latest} is unaccepted, all acceptance fields stay null. {@code last_emailed_at} starts
-     * null on EVERY payment-created version; the email-success stamp is post-commit.
+     * null on EVERY payment- and void-created version and stays null (Phase 15D: these flows never
+     * email; manual Re-send is the only email path).
      */
-    private RegeneratedInvoice regenerateInvoiceVersion(RequestContext ctx,
-                                                        SalesOrder order,
-                                                        long orderId,
-                                                        InvoiceRow latest,
-                                                        BigDecimal totalPaidAfter,
-                                                        BigDecimal newBalance) {
+    private InvoiceRow regenerateInvoiceVersion(RequestContext ctx,
+                                                SalesOrder order,
+                                                long orderId,
+                                                InvoiceRow latest,
+                                                BigDecimal totalPaidAfter,
+                                                BigDecimal newBalance) {
         int versionNumber = latest.versionNumber() + 1;
         LocalDate invoiceDate = LocalDate.now();
         LocalDate dueDate = latest.dueDate();                       // carried forward
@@ -387,11 +351,11 @@ public class OrderPaymentService {
 
             // Dashboard mirror invariant (Phase 13 §11.1): whenever a new current invoice version is
             // created, sales_order.last_emailed_at is set to that version's last_emailed_at — null here
-            // (a payment-created version starts unemailed; on a carried-forward acceptance the
-            // post-commit email-success stamp sets both columns to the same timestamp). Same transaction
-            // as the insert; the order row is held FOR UPDATE.
+            // (Phase 15D: a payment- or void-created version is never emailed, so it stays unemailed and
+            // the mirror stays null; manual Re-send is the only way to email it). Same transaction as the
+            // insert; the order row is held FOR UPDATE.
             invoiceRepository.updateSalesOrderLastEmailedAt(orderId, newVersion.lastEmailedAt());
-            return new RegeneratedInvoice(newVersion, pdfBytes, fileName);
+            return newVersion;
         } catch (RuntimeException ex) {
             fileStorageService.deleteQuietly(storagePath);
             throw ex;
@@ -399,68 +363,108 @@ public class OrderPaymentService {
     }
 
     // ------------------------------------------------------------------
-    // Phase 13 §6 — post-commit best-effort email + delivery stamp (mirrors OrderInvoiceService)
+    // D.10 POST /orders/{orderId}/payments/{paymentTransactionId}/void — soft-void a payment (Phase 15D)
     // ------------------------------------------------------------------
 
     /**
-     * Attempt the payment-after-accepted email; report success/failure WITHOUT throwing. The payment
-     * NEVER gates on the customer email: a missing/blank recipient at send time is treated exactly like
-     * a provider failure (non-fatal — payment + carried acceptance persist, both {@code last_emailed_at}
-     * columns stay null, the message points at Re-send). Only the transport failure
-     * ({@link InvoiceEmailException}) is swallowed — anything else is a real bug and propagates as 500.
-     * D.7 never returns 502 for an email failure (§6).
+     * Soft-void a recorded payment and atomically regenerate the current invoice. The void is the exact
+     * mirror of recording a payment: the ACTIVE {@code total_paid} drops (the voided row is excluded),
+     * {@code balance_due} rises, a new invoice version is appended carrying the sale snapshot AND the
+     * acceptance/signature metadata forward (the customer does NOT re-sign), and NO email is sent. The
+     * original payment row is preserved (never hard-deleted) and stays visible in payment history with its
+     * {@code voided_at} / {@code voided_by_name} populated.
+     *
+     * <p>No meaningful request body — empty / blank / {@code {}} is accepted; a non-empty JSON object (or
+     * a non-object / malformed body) is rejected (400) so unexpected fields cannot ride along (matches the
+     * no-body invoice endpoints). 201 Created (a void creates a new current invoice version). Allowed when
+     * LAID (the inverse of recording a payment — conventions §16). Gate order: guard -> orderId /
+     * paymentTransactionId parse (400 {@code VALIDATION_FAILED}) -> scoped {@code FOR UPDATE} order lookup
+     * (404 {@code ORDER_NOT_FOUND}, no existence leak) -> reject non-empty body (400 {@code
+     * VALIDATION_FAILED} / {@code MALFORMED_JSON}, after the scope gate so existence wins) -> payment-in-order
+     * lookup (404 {@code PAYMENT_NOT_FOUND}) -> already-voided check (409 {@code PAYMENT_ALREADY_VOIDED}) ->
+     * require an existing invoice (else 422 {@code INVOICE_REQUIRED}) -> soft void + regenerate. The
+     * {@code voided_by_user_id} is the SESSION actor ({@code ctx.userId()}), never the order-bound
+     * salesperson. The persist runs in one programmatic transaction holding the order row FOR UPDATE.
      */
-    private boolean sendPaymentEmailQuietly(RequestContext ctx, long orderId, PaymentPersisted persisted) {
-        String recipient = persisted.recipientEmail();
-        if (recipient == null || recipient.isBlank()) {
-            log.warn("Payment-after-accepted email skipped for order {} invoice v{}: no usable customer email",
-                    orderId, persisted.newVersion().versionNumber());
-            return false;
-        }
-        try {
-            invoiceEmailSender.send(new InvoiceEmailRequest(
-                    recipient.trim(),
-                    emailSubject(ctx.business().getName()),
-                    emailBody(persisted.orderNumber(), ctx.business().getName()),
-                    persisted.pdfBytes(),
-                    persisted.pdfFileName(),
-                    orderId,
-                    persisted.newVersion().versionNumber()));
-            return true;
-        } catch (InvoiceEmailException ex) {
-            log.warn("Payment-after-accepted email failed for order {} invoice v{} (non-fatal; payment persisted)",
-                    orderId, persisted.newVersion().versionNumber(), ex);
-            return false;
-        }
+    public ApiResponse<VoidPaymentResponse> voidPayment(String slug,
+                                                        String orderIdRaw,
+                                                        String paymentIdRaw,
+                                                        String body,
+                                                        HttpServletRequest httpRequest) {
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+        long orderId = parsePositiveLong(orderIdRaw, "order_id");
+        long paymentId = parsePositiveLong(paymentIdRaw, "payment_transaction_id");
+
+        VoidPersisted persisted = transactionTemplate.execute(
+                status -> validateAndVoidPayment(orderId, paymentId, body, ctx));
+
+        InvoiceRow newVersion = persisted.newVersion();
+        VoidPaymentResponse data = new VoidPaymentResponse(
+                toReadDto(persisted.voidedPayment()),
+                new PaymentSummaryDto(newVersion.totalPaid(), newVersion.balanceDue()),
+                toSummaryDto(slug, orderId, newVersion));
+        return ApiResponse.ok(data, PAYMENT_VOIDED_MESSAGE);
     }
 
     /**
-     * Email-success stamp (one short transaction; mirrors {@code OrderInvoiceService.stampEmailSuccess}):
-     * the scoped order row is taken {@code FOR UPDATE} FIRST so the current-invoice re-read cannot race
-     * a concurrent rewrite/payment/accept, then {@code invoice.last_emailed_at} is set in place and the
-     * §11.1 mirror is set to the CURRENT invoice's value — both columns carry the SAME timestamp.
+     * The D.10 validation chain + single-transaction soft void (mark voided + regenerated invoice version
+     * + §11.1 mirror reset). Runs inside {@code transactionTemplate.execute} so the order row is held
+     * {@code FOR UPDATE} for the whole block (serialising version allocation against a concurrent payment /
+     * void / rewrite / accept).
      */
-    private InvoiceRow stampEmailSuccess(long orderId, RequestContext ctx, long invoiceId, LocalDateTime sentAt) {
-        salesOrderRepository
+    private VoidPersisted validateAndVoidPayment(long orderId, long paymentId, String body, RequestContext ctx) {
+        // Scope the ORDER first (FOR UPDATE). Missing / cross-store / cross-business -> 404. No LAID gate:
+        // voiding a payment is LAID-allowed (the inverse of recording one).
+        SalesOrder order = salesOrderRepository
                 .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
-                .orElseThrow(() -> new IllegalStateException(
-                        "Order disappeared while stamping last_emailed_at: " + orderId));
-        invoiceRepository.updateInvoiceLastEmailedAt(invoiceId, sentAt);
-        InvoiceRow current = invoiceRepository.findCurrentByOrderId(orderId)
-                .orElseThrow(() -> new IllegalStateException(
-                        "Current invoice disappeared while stamping last_emailed_at for order " + orderId));
-        invoiceRepository.updateSalesOrderLastEmailedAt(orderId, current.lastEmailedAt());
-        return current;
-    }
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
 
-    // Simple MVP wording (contract §9), duplicated per service by the locked Branch D convention.
-    private static String emailSubject(String businessName) {
-        return "Your invoice from " + businessName;
-    }
+        // Body must be empty ({} / blank) — any field -> 400 VALIDATION_FAILED, a non-object body -> 400 on
+        // `body`, a malformed body -> 400 MALFORMED_JSON. AFTER the scope gate so a cross-store order with a
+        // body still 404s (existence wins), and BEFORE any persistence so a rejected body never voids.
+        rejectNonEmptyBody(body);
 
-    private static String emailBody(String orderNumber, String businessName) {
-        return "Hi,\n\nPlease find your invoice " + orderNumber + " from " + businessName
-                + " attached.\n\nThank you.";
+        // Resolve the void target WITHIN the now-scoped order. Missing / other-order -> 404
+        // PAYMENT_NOT_FOUND (no cross-tenant/cross-store existence leak — the order is already in scope).
+        PaymentRow payment = paymentTransactionRepository.findByPaymentIdAndOrderId(paymentId, orderId)
+                .orElseThrow(() -> new NotFoundException(ErrorCode.PAYMENT_NOT_FOUND, "Payment not found."));
+
+        // Already voided (read side) -> 409. (The UPDATE guard below also catches a concurrent double-void.)
+        if (payment.voidedAt() != null) {
+            throw new ConflictException(
+                    ErrorCode.PAYMENT_ALREADY_VOIDED, ErrorCode.PAYMENT_ALREADY_VOIDED.defaultMessage());
+        }
+
+        // A payment implies an invoice, but guard defensively (mirrors the D.7 invoice-first rule).
+        InvoiceRow latest = invoiceRepository.findCurrentByOrderId(orderId)
+                .orElseThrow(() -> new BusinessRuleException(
+                        ErrorCode.INVOICE_REQUIRED, ErrorCode.INVOICE_REQUIRED.defaultMessage()));
+
+        // Soft void IN PLACE using the SESSION actor; scoped by (paymentId, orderId). The repo's
+        // "AND voided_at IS NULL" guard makes a concurrent double-void safe: 0 rows updated -> 409 and NO
+        // second invoice version is regenerated.
+        int updated = paymentTransactionRepository.voidPayment(paymentId, orderId, LocalDateTime.now(), ctx.userId());
+        if (updated == 0) {
+            throw new ConflictException(
+                    ErrorCode.PAYMENT_ALREADY_VOIDED, ErrorCode.PAYMENT_ALREADY_VOIDED.defaultMessage());
+        }
+
+        // Recompute the ACTIVE total_paid (now excludes the just-voided row) + risen balance, then
+        // regenerate the current invoice exactly like a payment (carry acceptance/signature forward,
+        // last_emailed_at + §11.1 mirror reset to null). No email is sent.
+        BigDecimal totalPaidAfter = paymentTransactionRepository.sumAmountByOrderId(orderId);
+        BigDecimal newBalance = latest.salePriceIncGst().subtract(totalPaidAfter).setScale(MONEY_SCALE, ROUNDING);
+
+        InvoiceRow newVersion =
+                regenerateInvoiceVersion(ctx, order, orderId, latest, totalPaidAfter, newBalance);
+
+        // Re-read the now-voided row so the response payment_transaction shows voided_at + the joined
+        // voided_by_name.
+        PaymentRow voidedPayment = paymentTransactionRepository.findByPaymentIdAndOrderId(paymentId, orderId)
+                .orElseThrow(() -> new IllegalStateException(
+                        "Voided payment disappeared during void for order " + orderId + ": " + paymentId));
+
+        return new VoidPersisted(voidedPayment, newVersion);
     }
 
     // ------------------------------------------------------------------
@@ -521,6 +525,42 @@ public class OrderPaymentService {
             return objectMapper.readTree(rawBody);
         } catch (JsonProcessingException ex) {
             throw new MalformedJsonException();
+        }
+    }
+
+    /**
+     * No-body endpoints (D.10 void): the body must be empty. Identical semantics to
+     * {@code OrderInvoiceService.rejectNonEmptyBody} (Create/Rewrite/Resend): {@code null} / blank /
+     * whitespace-only / explicit JSON {@code null} / {@code {}} are accepted (no-op); a non-object body
+     * (array / scalar) -> 400 {@code VALIDATION_FAILED} on {@code body}; a JSON object with ANY field ->
+     * 400 {@code VALIDATION_FAILED} (one detail per field); an unparseable body -> 400
+     * {@code MALFORMED_JSON}. Throwing before any persistence guarantees a rejected body never voids.
+     */
+    private void rejectNonEmptyBody(String body) {
+        if (body == null || body.isBlank()) {
+            return;
+        }
+        JsonNode node;
+        try {
+            node = objectMapper.readTree(body);
+        } catch (JsonProcessingException ex) {
+            throw new MalformedJsonException();
+        }
+        if (node == null || node.isNull()) {
+            return;
+        }
+        if (!node.isObject()) {
+            throw new ValidationException(
+                    ErrorCode.VALIDATION_FAILED.defaultMessage(),
+                    List.of(new ErrorDetail(null, "body", "Request body must be empty.")));
+        }
+        List<ErrorDetail> errors = new ArrayList<>();
+        Iterator<String> names = node.fieldNames();
+        while (names.hasNext()) {
+            errors.add(new ErrorDetail(null, names.next(), "Not allowed."));
+        }
+        if (!errors.isEmpty()) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
         }
     }
 
@@ -676,7 +716,9 @@ public class OrderPaymentService {
                 row.paymentMethod(),
                 row.amount(),
                 row.paymentReference(),
-                row.createdAt());
+                row.createdAt(),
+                row.voidedAt(),
+                row.voidedByName());
     }
 
     private static CurrentInvoiceSummaryDto toSummaryDto(String slug, long orderId, InvoiceRow row) {
@@ -762,17 +804,11 @@ public class OrderPaymentService {
     private record PaymentInput(String paymentMethod, BigDecimal amount, String paymentReference) {
     }
 
-    /**
-     * Committed D.7 result + what the post-commit §6 email needs (never serialized).
-     * {@code recipientEmail} is the RAW customer email (possibly null/blank — payment never gates on
-     * it); {@code carriedAcceptanceForward} is true iff the PAID invoice was accepted.
-     */
-    private record PaymentPersisted(PaymentRow payment, InvoiceRow newVersion, String orderNumber,
-                                    String recipientEmail, byte[] pdfBytes, String pdfFileName,
-                                    boolean carriedAcceptanceForward) {
+    /** Committed D.7 result: the inserted payment + the regenerated current invoice version. */
+    private record PaymentPersisted(PaymentRow payment, InvoiceRow newVersion) {
     }
 
-    /** A freshly persisted payment-created invoice version + its rendered PDF (never serialized). */
-    private record RegeneratedInvoice(InvoiceRow row, byte[] pdfBytes, String pdfFileName) {
+    /** Committed D.10 result: the now-voided payment row + the regenerated current invoice version. */
+    private record VoidPersisted(PaymentRow voidedPayment, InvoiceRow newVersion) {
     }
 }

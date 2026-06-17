@@ -248,16 +248,20 @@ If this list changes in the backend migration/constraint, update the frontend re
 
 ## Migration rules
 
-All committed Flyway migrations are locked.
+Previously merged Flyway migrations are locked by CI. The migration added in the current PR is not added to the lock range until the next migration PR.
 
-Current locked migrations include V1–V12 (CI guards the V1–V12 range).
+Current locked migrations are V1–V13 (CI guards the V1–V13 range). **V14**
+(`V14__add_payment_void_fields.sql`, Phase 15D payment soft-void) is **new in this PR** and is
+deliberately NOT yet in the CI locked-guard range — the guard catches added files too, so locking
+V14 in the same PR that introduces it would fail the locked-migrations job. **Add V14 to the guard
+range in the NEXT migration PR.** Do not write "V1–V14 locked" anywhere yet.
 
 Do not edit old migration files.
 
 Rule:
 
 ```text
-Never edit V1–V12.
+Never edit V1–V13 (and V14 once committed).
 Any schema change must be a new migration.
 ```
 
@@ -279,7 +283,7 @@ so dev-seed files never auto-apply. Run them MANUALLY after Flyway, in order:
 
 ```text
 1. start Postgres
-2. start backend (Flyway applies V1–V12)
+2. start backend (Flyway applies V1–V14)
 3. psql -f db/dev-seed/quick_descriptions_demo.sql
 4. psql -f db/dev-seed/multi_store_user_demo.sql
 5. verify login / store-selection / quick-adds / products / charges
@@ -378,8 +382,29 @@ Allowed when LAID where implemented:
 - photo upload/list/preview
 - status change from dashboard
 - invoice/signature/payment flows where explicitly supported (accept/resend/signature-download allowed when LAID)
+- payment **void** (Phase 15D) — LAID-allowed, the inverse of recording a payment
 
 Backend returns 422 `ORDER_LOCKED` ("Order is laid and cannot be edited.") for blocked protected edits.
+
+### Payment void rule (Phase 15D — backend PR1)
+
+Removing a payment is a **SOFT VOID, never a hard delete**:
+
+- `POST /api/v1/{slug}/orders/{orderId}/payments/{paymentTransactionId}/void` (201; no body). Use the
+  word **void/voided** consistently — NOT "reverse/reversal" — in API/errors/docs.
+- The original `payment_transaction` row is preserved; `V14` adds `voided_at` + `voided_by_user_id`
+  (the **session actor**, not the order-bound salesperson; `voided_by_name` is exposed, the raw user id
+  is not). The `amount > 0` CHECK is never weakened; no negative payment rows.
+- **Active `total_paid` excludes voided payments** (`sumAmountByOrderId` filters `voided_at IS NULL`);
+  **payment history (list/count) still includes voided rows** (do NOT filter the list).
+- Void recalculates `total_paid`/`balance_due`, regenerates the current invoice version, carries
+  acceptance/signature forward (customer does **not** re-sign), resets the email mirror to null.
+- **Payment record AND payment void never auto-email.** Manual **Re-send Invoice** is the ONLY email
+  action after a payment change (the old "re-email after a payment on an accepted invoice" is removed).
+- New error codes: `PAYMENT_NOT_FOUND` (404), `PAYMENT_ALREADY_VOIDED` (409). Double-void is caught by
+  the `WHERE voided_at IS NULL` update guard (0 rows → 409, no second invoice version).
+- Backend PR1 only; the frontend void button (PaymentsTab) is PR2 — the workflow is not usable in-app
+  until PR2 lands.
 
 ### GP rule
 
@@ -468,8 +493,8 @@ Scope (see docs/Phases.md §11 for full detail):
 - Render per-tenant invoice data ONCE on screen + PDF (logo, ABN, bank, T&Cs);
   remove the hardcoded Aussie Floors / sample ABN / sample TERMS from InvoiceTab.tsx.
 - Kill automatic invoice email after a payment update (keep manual Resend).
-- Payment delete / reversal (paid drops, balance rises, stays accepted/signed,
-  no re-sign, no auto-email).
+- Payment void (soft void — paid drops, balance rises, stays accepted/signed,
+  no re-sign, no auto-email; no hard delete). Backend PR1 DONE; frontend void button is PR2.
 - Stripe payment-link button (opens tenant's external link, manual recording, no webhook).
 
 Note: the old "Terralux" demo seed was created then removed. Real tenant onboarding is
@@ -499,7 +524,8 @@ Do not start these unless explicitly requested:
 - advanced quote comparison
 - room-level complexity
 - AI features
-- refunds/reversals beyond the Phase 15 payment delete/reversal flow
+- refunds beyond the Phase 15 payment void flow
+- payment edit / hard delete (only soft void is in scope)
 - finance products
 - Stripe Connect/full payment gateway build
 - major deployment work

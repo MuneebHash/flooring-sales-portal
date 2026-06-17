@@ -72,6 +72,7 @@ class OrderPaymentControllerTest {
     private static final long ORDER_OTHER_STORE = 5L;     // store 2, business 1 (cross-store)
     private static final long ORDER_OTHER_BUSINESS = 9L;  // business 2 (cross-business)
     private static final long ORDER_DOES_NOT_EXIST = 99_999L;
+    private static final long SEEDED_PAYMENT_ID = 1L;     // order 1's seeded 500.00 EFTPOS payment
 
     private static final String ORDER_FULL_NUMBER = "SYD-CBD.LC1.00001";
     private static final String EXPECTED_PDF_PATH = "/api/v1/" + SLUG_AUSSIE + "/orders/1/invoices/current/file";
@@ -126,6 +127,26 @@ class OrderPaymentControllerTest {
 
     private static String currentFileUrl(Object orderId) {
         return "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/invoices/current/file";
+    }
+
+    private static String voidUrl(Object orderId, Object paymentId) {
+        return "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/payments/" + paymentId + "/void";
+    }
+
+    private static String voidUrl(String slug, Object orderId, Object paymentId) {
+        return "/api/v1/" + slug + "/orders/" + orderId + "/payments/" + paymentId + "/void";
+    }
+
+    private Timestamp paymentVoidedAt(long paymentId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT voided_at FROM payment_transaction WHERE payment_transaction_id = ?",
+                Timestamp.class, paymentId);
+    }
+
+    private Long paymentVoidedByUserId(long paymentId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT voided_by_user_id FROM payment_transaction WHERE payment_transaction_id = ?",
+                Long.class, paymentId);
     }
 
     private void laidOrder(long orderId) {
@@ -983,13 +1004,15 @@ class OrderPaymentControllerTest {
     }
 
     // ================================================================
-    // Scope guard: no Stripe / edit / delete / by-id endpoint creep
+    // Scope guard: no Stripe / hard-delete / edit / by-id GET endpoint creep
     // ================================================================
 
     @Test
-    void noPaymentEditDeleteOrByIdEndpointsImplemented() throws Exception {
-        // Branch D adds ONLY GET + POST /payments. There is no edit / delete / by-id payment route, and no
-        // Stripe/gateway endpoint — these must remain unmapped (4xx, no handler), never a 2xx.
+    void noPaymentEditDeleteOrByIdGetEndpointsImplemented() throws Exception {
+        // Phase 15D adds POST /payments/{id}/void (soft void) as the ONLY by-id payment route. There is
+        // still no by-id GET / PUT edit / DELETE hard-delete and no Stripe/gateway endpoint — these must
+        // remain unmapped (4xx, no handler), never a 2xx. (Hard delete in particular must never exist —
+        // a payment is soft-voided, never removed.)
         mockMvc.perform(get(paymentsUrl(ORDER_FULL) + "/1").session(liamStore1Session()))
                 .andExpect(status().is4xxClientError());
         mockMvc.perform(put(paymentsUrl(ORDER_FULL) + "/1").session(liamStore1Session())
@@ -997,5 +1020,321 @@ class OrderPaymentControllerTest {
                 .andExpect(status().is4xxClientError());
         mockMvc.perform(delete(paymentsUrl(ORDER_FULL) + "/1").session(liamStore1Session()))
                 .andExpect(status().is4xxClientError());
+    }
+
+    // ================================================================
+    // D.10 POST /payments/{paymentTransactionId}/void — soft void (Phase 15D)
+    // ================================================================
+
+    @Test
+    void void_seededPayment_returns201_dropsActiveTotalPaid_raisesBalance() throws Exception {
+        // Order 1's only payment is the seeded 500.00. Voiding it drops the ACTIVE total_paid to 0.00 and
+        // raises balance_due to the full inc-GST 924.00, on a NEW invoice version.
+        int versionsBefore = countInvoices(ORDER_FULL);
+
+        MvcResult result = mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value("Payment voided. Current invoice updated."))
+                .andExpect(jsonPath("$.data.payment_summary.total_paid").value(0.00))
+                .andExpect(jsonPath("$.data.payment_summary.balance_due").value(924.00))
+                .andExpect(jsonPath("$.data.current_invoice.total_paid").value(0.00))
+                .andExpect(jsonPath("$.data.current_invoice.balance_due").value(924.00))
+                .andExpect(jsonPath("$.data.payment_transaction.payment_transaction_id").value((int) SEEDED_PAYMENT_ID))
+                .andExpect(jsonPath("$.data.payment_transaction.voided_at").isNotEmpty())
+                .andExpect(jsonPath("$.data.payment_transaction.voided_by_name").value("Liam Carter"))
+                .andReturn();
+
+        Assertions.assertEquals(versionsBefore + 1, countInvoices(ORDER_FULL), "void appends a new version");
+        long newInvoiceId = latestInvoiceId(ORDER_FULL);
+        assertMoney("0.00", invoiceMoney("total_paid", newInvoiceId));
+        assertMoney("924.00", invoiceMoney("balance_due", newInvoiceId));
+
+        // The raw voided_by_user_id is never serialized.
+        String json = result.getResponse().getContentAsString();
+        Assertions.assertFalse(json.contains("voided_by_user_id"), () -> "must not leak voided_by_user_id: " + json);
+    }
+
+    @Test
+    void void_preservesOriginalRow_setsVoidedAtAndSessionActor() throws Exception {
+        // Soft void, never hard delete: the original payment row stays, with voided_at + voided_by_user_id
+        // (the SESSION actor, user 1) stamped.
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isCreated());
+
+        Assertions.assertEquals(1, countPayments(ORDER_FULL), "payment row is preserved (soft void, not deleted)");
+        Assertions.assertNotNull(paymentVoidedAt(SEEDED_PAYMENT_ID), "voided_at stamped");
+        Assertions.assertEquals(USER_LIAM, paymentVoidedByUserId(SEEDED_PAYMENT_ID),
+                "voided_by_user_id is the session actor, not the order-bound salesperson");
+    }
+
+    @Test
+    void void_listStillShowsVoidedRow_butSummaryExcludesIt() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isCreated());
+
+        // History still lists the voided row (with its void markers); the summary total_paid excludes it.
+        mockMvc.perform(get(paymentsUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.payments.length()").value(1))
+                .andExpect(jsonPath("$.data.payments[0].payment_transaction_id").value((int) SEEDED_PAYMENT_ID))
+                .andExpect(jsonPath("$.data.payments[0].voided_at").isNotEmpty())
+                .andExpect(jsonPath("$.data.payments[0].voided_by_name").value("Liam Carter"))
+                .andExpect(jsonPath("$.data.payment_summary.total_paid").value(0.00));
+    }
+
+    @Test
+    void void_activeRowsHaveNullVoidMarkers() throws Exception {
+        // Before any void, the seeded payment is active: voided_at + voided_by_name are null in the list.
+        mockMvc.perform(get(paymentsUrl(ORDER_FULL)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.payments[0].voided_at").value(org.hamcrest.Matchers.nullValue()))
+                .andExpect(jsonPath("$.data.payments[0].voided_by_name").value(org.hamcrest.Matchers.nullValue()));
+    }
+
+    @Test
+    void void_allowedWhenLaid() throws Exception {
+        laidOrder(ORDER_FULL);
+        int versionsBefore = countInvoices(ORDER_FULL);
+
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.current_invoice.version_number").value(versionsBefore + 1));
+
+        Assertions.assertEquals(versionsBefore + 1, countInvoices(ORDER_FULL),
+                "void creates a new version even when LAID");
+    }
+
+    @Test
+    void void_alreadyVoided_returns409_andDoesNotAppendASecondVersion() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isCreated());
+        int versionsAfterFirstVoid = countInvoices(ORDER_FULL);
+
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error.code").value("PAYMENT_ALREADY_VOIDED"));
+
+        Assertions.assertEquals(versionsAfterFirstVoid, countInvoices(ORDER_FULL),
+                "a double-void must not regenerate a second invoice");
+    }
+
+    @Test
+    void void_paymentNotFound_returns404() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_FULL, 999_999L)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("PAYMENT_NOT_FOUND"));
+    }
+
+    @Test
+    void void_paymentFromAnotherOrder_returns404_paymentNotFound() throws Exception {
+        // Payment 1 belongs to order 1. Voiding it via order 2 (in scope, but not its order) is scoped out
+        // as PAYMENT_NOT_FOUND — never voids another order's payment.
+        mockMvc.perform(post(voidUrl(ORDER_EMPTY, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("PAYMENT_NOT_FOUND"));
+        Assertions.assertNull(paymentVoidedAt(SEEDED_PAYMENT_ID), "payment 1 must stay active");
+    }
+
+    @Test
+    void void_crossStoreOrder_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_OTHER_STORE, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void void_crossBusinessOrder_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_OTHER_BUSINESS, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void void_nonexistentOrder_returns404_orderNotFound() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_DOES_NOT_EXIST, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void void_crossBusinessSlug_returns404NotFound() throws Exception {
+        mockMvc.perform(post(voidUrl(SLUG_PREMIER, ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    @Test
+    void void_invalidOrderId_returns400() throws Exception {
+        mockMvc.perform(post(voidUrl("abc", SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+    }
+
+    @Test
+    void void_invalidPaymentId_returns400() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_FULL, "abc")).session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+    }
+
+    @Test
+    void void_noInvoice_returns422_invoiceRequired() throws Exception {
+        // Defensive: a payment exists but its invoice was removed -> INVOICE_REQUIRED, and the payment is
+        // left active (no void, no new version).
+        clearSeededInvoice();
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_REQUIRED"));
+        Assertions.assertNull(paymentVoidedAt(SEEDED_PAYMENT_ID), "payment stays active when the void cannot proceed");
+    }
+
+    @Test
+    void void_resetsSalesOrderLastEmailedAtMirrorToNull() throws Exception {
+        // Like a payment, the void creates a new unemailed version, so the §11.1 mirror resets to null.
+        setOrderLastEmailedAt(ORDER_FULL, "2026-01-05 09:30:00");
+
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isCreated());
+
+        Assertions.assertNull(orderLastEmailedAt(ORDER_FULL), "mirror reset to the new version's null value");
+    }
+
+    @Test
+    void void_noSession_returns401_andNoStore_returns403() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamSessionNoStore()))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void void_transactionRollback_rollsBackVoidAndNewInvoiceVersion() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isCreated());
+
+        long newInvoiceId = latestInvoiceId(ORDER_FULL);
+        String storagePath = jdbcTemplate.queryForObject(
+                "SELECT sf.storage_path FROM invoice i JOIN stored_file sf ON sf.stored_file_id = i.stored_file_id "
+                        + "WHERE i.invoice_id = ?", String.class, newInvoiceId);
+        Assertions.assertTrue(diskFileExists(storagePath), "PDF written by the void");
+        Assertions.assertEquals(2, countInvoices(ORDER_FULL));
+        Assertions.assertNotNull(paymentVoidedAt(SEEDED_PAYMENT_ID));
+
+        TestTransaction.flagForRollback();
+        TestTransaction.end();
+
+        Assertions.assertEquals(1, countInvoices(ORDER_FULL), "void's invoice version rolled back to the seed");
+        Assertions.assertNull(paymentVoidedAt(SEEDED_PAYMENT_ID), "void flag rolled back");
+        Assertions.assertFalse(diskFileExists(storagePath), "PDF removed on rollback (no orphan)");
+    }
+
+    // ================================================================
+    // D.10 void — request-body rejection (no-body endpoint; Codex P2)
+    // ================================================================
+
+    @Test
+    void void_noBody_returns201_andVoids() throws Exception {
+        // No body at all is the canonical happy path — still voids.
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session()))
+                .andExpect(status().isCreated());
+        Assertions.assertNotNull(paymentVoidedAt(SEEDED_PAYMENT_ID), "no-body void must succeed");
+    }
+
+    @Test
+    void void_emptyJsonObjectBody_returns201_andVoids() throws Exception {
+        // {} is an empty body and must still void (parity with the no-body invoice endpoints).
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value("Payment voided. Current invoice updated."));
+        Assertions.assertNotNull(paymentVoidedAt(SEEDED_PAYMENT_ID), "{} body still voids");
+    }
+
+    @Test
+    void void_whitespaceOnlyBody_returns201_andVoids() throws Exception {
+        // Whitespace-only body is treated as empty.
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("   "))
+                .andExpect(status().isCreated());
+        Assertions.assertNotNull(paymentVoidedAt(SEEDED_PAYMENT_ID), "whitespace-only body still voids");
+    }
+
+    @Test
+    void void_bodyWithUnexpectedField_returns400_andDoesNotVoid() throws Exception {
+        int versionsBefore = countInvoices(ORDER_FULL);
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"unexpected\":\"field\"}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("unexpected"));
+        Assertions.assertNull(paymentVoidedAt(SEEDED_PAYMENT_ID), "payment must not be voided on a rejected body");
+        Assertions.assertEquals(versionsBefore, countInvoices(ORDER_FULL),
+                "no new invoice version on a rejected body");
+    }
+
+    @Test
+    void void_nonObjectArrayBody_returns400_onBody_andDoesNotVoid() throws Exception {
+        int versionsBefore = countInvoices(ORDER_FULL);
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("[]"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("body"));
+        Assertions.assertNull(paymentVoidedAt(SEEDED_PAYMENT_ID));
+        Assertions.assertEquals(versionsBefore, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void void_nonObjectStringBody_returns400_onBody_andDoesNotVoid() throws Exception {
+        int versionsBefore = countInvoices(ORDER_FULL);
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("\"x\""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("body"));
+        Assertions.assertNull(paymentVoidedAt(SEEDED_PAYMENT_ID));
+        Assertions.assertEquals(versionsBefore, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void void_malformedJsonBody_returns400_malformedJson_andDoesNotVoid() throws Exception {
+        int versionsBefore = countInvoices(ORDER_FULL);
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{not valid json"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+        Assertions.assertNull(paymentVoidedAt(SEEDED_PAYMENT_ID));
+        Assertions.assertEquals(versionsBefore, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void void_plainTextBody_returns400_malformedJson_andDoesNotVoid() throws Exception {
+        int versionsBefore = countInvoices(ORDER_FULL);
+        mockMvc.perform(post(voidUrl(ORDER_FULL, SEEDED_PAYMENT_ID)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("please void this"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+        Assertions.assertNull(paymentVoidedAt(SEEDED_PAYMENT_ID));
+        Assertions.assertEquals(versionsBefore, countInvoices(ORDER_FULL));
+    }
+
+    @Test
+    void void_crossStoreOrderWithBody_returns404_existenceWins() throws Exception {
+        // Gate ordering: order scope (404) precedes body rejection (400), so a cross-store order with a
+        // body still 404s ORDER_NOT_FOUND — never leaks existence via a body-validation 400.
+        mockMvc.perform(post(voidUrl(ORDER_OTHER_STORE, SEEDED_PAYMENT_ID)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"unexpected\":\"field\"}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void void_crossBusinessOrderWithBody_returns404_existenceWins() throws Exception {
+        mockMvc.perform(post(voidUrl(ORDER_OTHER_BUSINESS, SEEDED_PAYMENT_ID)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"unexpected\":\"field\"}"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
     }
 }

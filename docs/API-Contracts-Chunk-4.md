@@ -15,7 +15,7 @@
 
 **File-binary exception (accepted in conventions §3):** file upload endpoints may accept `multipart/form-data`; file download endpoints may return raw binary bytes. Chunk 4 uses this exception only for the invoice PDF download endpoint (D.4).
 
-> **Phase 13 update (Invoice Acceptance + Signature + Email).** Chunk 4 is the locked **Phase 12** core (invoices + payments). After Chunk 4 was locked, invoice **acceptance + customer signature capture + emailing the accepted PDF** moved out of "deferred post-MVP" and into MVP scope as **Phase 13**. The full Phase 13 endpoint, data-model, PDF, email, and error contracts live in **`docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`** and are additive to this chunk. Where this document still said acceptance/signature/email was deferred, that wording is corrected below to point at Phase 13. What remains deferred post-MVP is unchanged: multi-version invoice **history** (list, detail-by-id, old-version PDF download), refunds/reversals, payment edit/delete, and any separate invoice-status enum.
+> **Phase 13 update (Invoice Acceptance + Signature + Email).** Chunk 4 is the locked **Phase 12** core (invoices + payments). After Chunk 4 was locked, invoice **acceptance + customer signature capture + emailing the accepted PDF** moved out of "deferred post-MVP" and into MVP scope as **Phase 13**. The full Phase 13 endpoint, data-model, PDF, email, and error contracts live in **`docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`** and are additive to this chunk. Where this document still said acceptance/signature/email was deferred, that wording is corrected below to point at Phase 13. What remains deferred post-MVP is unchanged: multi-version invoice **history** (list, detail-by-id, old-version PDF download), refunds, payment **edit**, and any separate invoice-status enum. (**Phase 15D update:** payment **void** (soft void) is now implemented as D.10; it is no longer deferred. There is no hard delete and no payment edit.)
 
 ---
 
@@ -79,6 +79,7 @@ All endpoints are **Standard protected** (all 7 checks from conventions §9). Ev
 | GET  | `/api/v1/{slug}/orders/{orderId}/invoices/current/file` | Download the current invoice PDF binary | D.4 |
 | GET  | `/api/v1/{slug}/orders/{orderId}/payments` | List payments + current official payment summary | D.6 |
 | POST | `/api/v1/{slug}/orders/{orderId}/payments` | Record a payment against the current invoice; atomically regenerate the current invoice | D.7 |
+| POST | `/api/v1/{slug}/orders/{orderId}/payments/{paymentTransactionId}/void` | Soft-void a payment; atomically regenerate the current invoice (Phase 15D) | D.10 |
 
 **Added in Phase 13 (Invoice Acceptance + Signature + Email — full contracts in `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`):**
 
@@ -88,7 +89,7 @@ All endpoints are **Standard protected** (all 7 checks from conventions §9). Ev
 | POST | `/api/v1/{slug}/orders/{orderId}/invoices/current/resend` | Re-send the current accepted invoice PDF | Phase 13 |
 | GET  | `/api/v1/{slug}/orders/{orderId}/invoices/current/signature` | Stream the accepted signature image | Phase 13 |
 
-Phase 13 also adds a customer-email precondition to D.1 / D.2 (and to Accept / Resend), and makes D.7 carry acceptance/signature metadata forward and re-email when the current invoice was already accepted. See the Phase 13 contract for the deltas.
+Phase 13 also adds a customer-email precondition to D.1 / D.2 (and to Accept / Resend), and makes D.7 carry acceptance/signature metadata forward when the current invoice was already accepted. See the Phase 13 contract for the deltas. **Phase 15D update:** recording a payment (D.7) and voiding a payment (D.10) **never auto-email** — manual Resend is the only email action after a payment change. (The old "re-email on payment after acceptance" behaviour was removed.)
 
 **Deferred to post-MVP (NOT implemented in MVP — see D.5):** `GET .../invoices` (history
 list), `GET .../invoices/{invoiceId}` (detail by id), `GET .../invoices/{invoiceId}/file`
@@ -545,6 +546,60 @@ current-invoice acceptance endpoints. No older-version invoice or signature endp
 
 ---
 
+### D.10 POST /api/v1/{slug}/orders/{orderId}/payments/{paymentTransactionId}/void  *(Phase 15D)*
+
+**Purpose.** **Soft-void** a recorded payment and atomically regenerate the current invoice — the exact mirror of recording a payment (D.7). A void is **never a hard delete**: the original `payment_transaction` row is preserved (an immutable financial record) and stays visible in payment history. The voided payment is excluded from the **active** `total_paid`, so `total_paid` drops and `balance_due` rises. There is **no request body**.
+
+**Scope class.** Standard protected. Additionally enforces `payment_transaction.order_id = path.orderId` (the payment is resolved only after the order is in scope).
+
+**Path params.** `orderId` — positive integer. `paymentTransactionId` — positive integer.
+
+**Response DTO — 201 Created** (same shape as D.7)
+```json
+{
+  "data": {
+    "payment_transaction": {
+      "payment_transaction_id": 1,
+      "payment_method": "EFTPOS",
+      "amount": 500.00,
+      "payment_reference": "EFTPOS-20260414",
+      "created_at": "2026-04-14T11:05:00",
+      "voided_at": "2026-04-22T15:10:00",
+      "voided_by_name": "Liam Carter"
+    },
+    "payment_summary": { "total_paid": 0.00, "balance_due": 924.00 },
+    "current_invoice": { "...see E.1 current_invoice_summary..." }
+  },
+  "message": "Payment voided. Current invoice updated."
+}
+```
+
+**Business rules**
+1. Scope the order (`FOR UPDATE`). Missing / cross-store / cross-business → **404 `ORDER_NOT_FOUND`** (no existence leak).
+2. Resolve the payment by `(paymentTransactionId, orderId)`. Missing / belongs to another order → **404 `PAYMENT_NOT_FOUND`**.
+3. If the payment is already voided → **409 `PAYMENT_ALREADY_VOIDED`** (idempotent; a concurrent double-void is caught by the `WHERE voided_at IS NULL` update guard and also returns 409 — no second invoice version is created).
+4. Require an existing current invoice, else **422 `INVOICE_REQUIRED`** (defensive).
+5. Stamp `voided_at = now`, `voided_by_user_id = session.user_id` (the **session actor**, NOT the order-bound salesperson).
+6. Recompute `total_paid_after = round(sum(active payment_transaction.amount), 2)` (excludes the just-voided row) and regenerate the current invoice (new `version_number = max + 1`) carrying forward the sale snapshot fields and — when the current invoice was accepted — the acceptance/signature metadata (the customer does **NOT** re-sign; the same signature `stored_file` is referenced).
+7. The new version starts `last_emailed_at = null` and the dashboard mirror (`sales_order.last_emailed_at`) is reset to null. **No email is sent.** Manual Resend remains available.
+8. **Atomicity:** the void stamp + new invoice version + PDF write are one DB transaction with a rollback-cleanup hook (no orphan PDF).
+
+**LAID lock.** **Allowed when LAID** (the inverse of recording a payment — conventions §16).
+
+**Status codes**
+| Code | When |
+|------|------|
+| 201 | Payment voided and a new current invoice version created. No email sent. |
+| 400 | Invalid `orderId` or `paymentTransactionId` (`VALIDATION_FAILED`) |
+| 401 | No session |
+| 403 | Session has no active store / user does not have access |
+| 404 | Order not in scope (`ORDER_NOT_FOUND`) or payment not in this order (`PAYMENT_NOT_FOUND`); or business slug not found / inactive (`NOT_FOUND`) |
+| 409 | Payment already voided (`PAYMENT_ALREADY_VOIDED`) |
+| 422 | No current invoice (`INVOICE_REQUIRED`) |
+| 500 | Unexpected (atomic rollback) |
+
+---
+
 ## E. Shared DTOs
 
 ### E.1 `current_invoice_summary`
@@ -610,13 +665,16 @@ Used in D.6 list rows and D.7 response.
   "payment_method": "EFTPOS",
   "amount": 500.00,
   "payment_reference": "EFTPOS-20260414",
-  "created_at": "2026-04-14T11:05:00"
+  "created_at": "2026-04-14T11:05:00",
+  "voided_at": null,
+  "voided_by_name": null
 }
 ```
 
 **Field rules**
 - Sourced from `payment_transaction`. Gateway fields (`gateway_transaction_id`, `response_status`, `response_message`) are NOT exposed in MVP — they remain backend-only and stay `null` for manual payments.
 - `payment_reference` may be `null`.
+- **Phase 15D void markers** (always present): `voided_at` — timestamp the payment was voided, or `null` when active. `voided_by_name` — display name (`app_user` first + last) of the session actor who voided it, or `null` when active. The raw `voided_by_user_id` is never exposed. A voided payment stays visible in payment history (D.6) but is excluded from the active `total_paid`.
 
 ### E.4 `payment_summary`
 
@@ -630,8 +688,8 @@ Used in D.6 and D.7 responses.
 ```
 
 **Field rules**
-- `total_paid` — sum of all `payment_transaction.amount` for the order, rounded to 2 decimals.
-- `balance_due` — `latest_invoice.balance_due` (latest **official** invoice version, regardless of whether it was created manually or auto-created by a payment). May be `null` on D.6 when no invoice exists yet. On D.7 an invoice always exists (D.7 returns the auto-created version), so `balance_due` is never `null` on D.7.
+- `total_paid` — sum of all **active (non-voided)** `payment_transaction.amount` for the order, rounded to 2 decimals (Phase 15D: voided payments are excluded).
+- `balance_due` — `latest_invoice.balance_due` (latest **official** invoice version, regardless of whether it was created manually or auto-created by a payment/void). May be `null` on D.6 when no invoice exists yet. On D.7 / D.10-void an invoice always exists (they return the auto-created version), so `balance_due` is never `null` there.
 
 ---
 
