@@ -661,12 +661,13 @@ When an order is LAID, the backend must reject any attempt to:
 ### What is still allowed when LAID
 These actions are allowed even when the order is LAID:
 - add payment (and the automatic invoice version that comes with it)
+- void a payment (Phase 15D: `POST .../payments/{paymentTransactionId}/void`, and the automatic invoice version that comes with it)
 - add note
 - add attachment
 - accept the current invoice (Phase 13: `POST .../invoices/current/accept`)
 - re-send the current accepted invoice (Phase 13: `POST .../invoices/current/resend`)
 
-Reason: LAID does not require full payment. Final payments may still be collected after job completion. Notes and attachments may still need to be added for record-keeping after the job is done.
+Reason: LAID does not require full payment. Final payments may still be collected after job completion. **Payment void is a financial / payment-history correction, not a protected order edit** — it changes only `total_paid` / `balance_due` (and the carried-forward invoice version), never the live order's customer / address / lines / sale price — so, like adding a payment, it is allowed when LAID. Notes and attachments may still need to be added for record-keeping after the job is done.
 
 ### What "editable" means
 When an order is not LAID, all order data can be modified freely.

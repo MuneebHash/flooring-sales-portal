@@ -3,6 +3,7 @@ package com.flooring.salesportal.order;
 import com.flooring.salesportal.common.api.ApiResponse;
 import com.flooring.salesportal.order.dto.PaymentsListResponse;
 import com.flooring.salesportal.order.dto.RecordPaymentResponse;
+import com.flooring.salesportal.order.dto.VoidPaymentResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -58,5 +59,27 @@ public class OrderPaymentController {
             HttpServletRequest httpRequest) {
 
         return orderPaymentService.recordPayment(slug, orderId, body, httpRequest);
+    }
+
+    /**
+     * D.10 (Phase 15D) soft-void a recorded payment + regenerate the current invoice. 201 Created (the
+     * void creates a new current invoice version). The endpoint takes no meaningful body: like the no-body
+     * invoice endpoints (Create/Rewrite/Resend) the raw body is bound {@code required = false} and parsed
+     * in the service — an empty / blank / {@code {}} body is accepted, but a non-empty JSON object (or a
+     * non-object / malformed body) is rejected (400) so unexpected fields cannot ride along. {@code
+     * paymentTransactionId} is a {@code String} (matching {@code orderId}) so a non-numeric / non-positive
+     * value becomes VALIDATION_FAILED on {@code payment_transaction_id} in the service rather than a
+     * path-binding error.
+     */
+    @PostMapping("/payments/{paymentTransactionId}/void")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ApiResponse<VoidPaymentResponse> voidPayment(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @PathVariable("paymentTransactionId") String paymentTransactionId,
+            @RequestBody(required = false) String body,
+            HttpServletRequest httpRequest) {
+
+        return orderPaymentService.voidPayment(slug, orderId, paymentTransactionId, body, httpRequest);
     }
 }
