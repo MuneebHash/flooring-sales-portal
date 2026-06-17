@@ -15,6 +15,10 @@ import {
   type PaymentTransaction,
   type RecordPaymentRequest,
 } from '../../lib/api/orderPaymentsApi'
+import {
+  fetchTenantInvoiceConfig,
+  type TenantInvoiceConfig,
+} from '../../lib/api/tenantInvoiceConfigApi'
 
 type Props = {
   // orderId drives the payments fetch + record POST. NOTE: LAID/`locked` is
@@ -94,6 +98,31 @@ function parseValidationDetails(details: unknown): string[] {
   return out
 }
 
+// Phase 15E — trim a nullable/optional string and return it only when it has visible
+// content; otherwise null. Mirrors InvoiceTab's nonBlank so the payment helpers hide blank
+// tenant-config rows rather than render an empty label or a "—" placeholder.
+function nonBlank(value: string | null | undefined): string | null {
+  const trimmed = value?.trim()
+  return trimmed && trimmed.length > 0 ? trimmed : null
+}
+
+// Phase 15E — the tenant Stripe payment link is rendered as a real external anchor, so it
+// must be a safe absolute HTTPS URL before it ever reaches href. Parse with the URL
+// constructor and require protocol EXACTLY "https:": blank, malformed, http:, javascript:,
+// data:, mailto:, etc. all return null (and the helper then hides). HTTPS-only by design.
+function safeStripePaymentLinkUrl(
+  value: string | null | undefined,
+): string | null {
+  const trimmed = nonBlank(value)
+  if (trimmed === null) return null
+  try {
+    const url = new URL(trimmed)
+    return url.protocol === 'https:' ? trimmed : null
+  } catch {
+    return null
+  }
+}
+
 export function PaymentsTab({ orderId }: Props) {
   const [payments, setPayments] = useState<PaymentTransaction[]>([])
   const [summary, setSummary] = useState<PaymentSummary | null>(null)
@@ -113,6 +142,13 @@ export function PaymentsTab({ orderId }: Props) {
   // button + the record-payment form while a void is running).
   const [voiding, setVoiding] = useState(false)
   const [voidTarget, setVoidTarget] = useState<PaymentTransaction | null>(null)
+
+  // Phase 15E — the tenant's private invoice config (bank details + Stripe payment link)
+  // for the Record-payment helpers. Loaded by a SEPARATE, fail-soft effect below; stays
+  // null until it resolves and null forever on failure (both helpers simply hide).
+  const [tenantConfig, setTenantConfig] = useState<TenantInvoiceConfig | null>(
+    null,
+  )
 
   const [method, setMethod] = useState<PaymentMethod | ''>('')
   const [amount, setAmount] = useState('')
@@ -160,6 +196,29 @@ export function PaymentsTab({ orderId }: Props) {
     }
   }, [orderId, reloadToken])
 
+  // Phase 15E — load the tenant's private invoice config for the Record-payment helpers
+  // (Stripe link + bank details). SEPARATE from the payments fetch and FULLY FAIL-SOFT:
+  // a failure just leaves tenantConfig null so both helpers hide. It NEVER sets
+  // loadError/actionError, never blocks recording a payment, and shows no error. The
+  // config is tenant-scoped and order-independent, so it loads once on mount; its own
+  // `cancelled` guard prevents a state update after a tab-switch unmount.
+  useEffect(() => {
+    let cancelled = false
+    fetchTenantInvoiceConfig()
+      .then((config) => {
+        if (cancelled) return
+        setTenantConfig(config)
+      })
+      .catch(() => {
+        if (cancelled) return
+        // Fail soft: no config -> helpers hide. Deliberately no error surface.
+        setTenantConfig(null)
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   function refetch() {
     setReloadToken((token) => token + 1)
   }
@@ -170,6 +229,25 @@ export function PaymentsTab({ orderId }: Props) {
   }
   const balanceDue = summaryView.balance_due
   const invoiceIssued = balanceDue !== null
+
+  // --- Phase 15E payment helpers (display-only). ---
+  // Derived from the fail-soft tenantConfig + the selected method. Both helpers render
+  // inside the Record-payment card (below the input grid, above the submit row) and NEVER
+  // affect recording a payment, the totals, or the void flow.
+  const stripePaymentLinkUrl = safeStripePaymentLinkUrl(
+    tenantConfig?.stripe_payment_link_url,
+  )
+  const bankName = nonBlank(tenantConfig?.bank_name)
+  const bsb = nonBlank(tenantConfig?.bsb)
+  const accountNumber = nonBlank(tenantConfig?.account_number)
+  const accountName = nonBlank(tenantConfig?.account_name)
+  const hasBankDetails = Boolean(bankName || bsb || accountNumber || accountName)
+  // Stripe link shows for CREDIT_CARD only (when a safe HTTPS link exists); bank details
+  // show for BANK_TRANSFER only (when at least one field is configured). Never for
+  // EFTPOS or CASH.
+  const showStripeHelper =
+    method === 'CREDIT_CARD' && stripePaymentLinkUrl !== null
+  const showBankTransferHelper = method === 'BANK_TRANSFER' && hasBankDetails
 
   // --- Client-side validation (the backend remains the authority). ---
   const trimmedReference = reference.trim()
@@ -557,6 +635,80 @@ export function PaymentsTab({ orderId }: Props) {
                     />
                   </Field>
                 </div>
+
+                {/* Phase 15E — display-only payment helpers, method-specific. The card
+                    grows naturally only when one of these renders. Neither records a
+                    payment, mutates the invoice, or implies a payment happened. */}
+                {showStripeHelper && (
+                  <div className="mt-4 rounded-lg border border-indigo-100 bg-indigo-50/60 p-4 text-center">
+                    <p className="text-sm text-slate-600">
+                      Use the tenant's Stripe payment link for card payments. The
+                      salesperson still records the payment manually below.
+                    </p>
+                    {/* Button.tsx renders a real <button> only, so an external link
+                        cannot use it — this is a Stripe-themed styled anchor. A plain
+                        anchor only opens the link (no onClick). */}
+                    <a
+                      href={stripePaymentLinkUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="mt-3 inline-flex items-center justify-center rounded-md bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm transition hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:ring-offset-2"
+                    >
+                      Open Stripe payment link
+                    </a>
+                  </div>
+                )}
+
+                {showBankTransferHelper && (
+                  <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-4 text-center">
+                    <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
+                      Bank transfer details
+                    </div>
+                    <div className="mx-auto mt-3 max-w-md space-y-2 text-left">
+                      {bankName && (
+                        <div className="flex items-center justify-between gap-4 rounded-md bg-white/70 px-3 py-2">
+                          <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            Bank
+                          </span>
+                          <span className="text-sm font-semibold text-slate-900">
+                            {bankName}
+                          </span>
+                        </div>
+                      )}
+                      {bsb && (
+                        <div className="flex items-center justify-between gap-4 rounded-md bg-white/70 px-3 py-2">
+                          <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            BSB
+                          </span>
+                          <span className="text-sm font-semibold text-slate-900 tabular-nums">
+                            {bsb}
+                          </span>
+                        </div>
+                      )}
+                      {accountNumber && (
+                        <div className="flex items-center justify-between gap-4 rounded-md bg-white/70 px-3 py-2">
+                          <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            Account No.
+                          </span>
+                          <span className="text-sm font-semibold text-slate-900 tabular-nums">
+                            {accountNumber}
+                          </span>
+                        </div>
+                      )}
+                      {accountName && (
+                        <div className="flex items-center justify-between gap-4 rounded-md bg-white/70 px-3 py-2">
+                          <span className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                            Account Name
+                          </span>
+                          <span className="text-sm font-semibold text-slate-900">
+                            {accountName}
+                          </span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 <div className="mt-4 flex items-center justify-end gap-3">
                   {formHint && (
                     <span className="text-[11px] text-slate-500">
