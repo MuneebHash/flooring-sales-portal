@@ -32,8 +32,10 @@ type Props = {
   locked: boolean
   enquiry?: OrderEnquiry | null
   // Lifts the server-confirmed enquiry row up so workspace state stays in sync
-  // without a refetch (mirrors the customer-save lift).
-  onSaved: (enquiry: OrderEnquiry) => void
+  // without a refetch (mirrors the customer-save lift). The payload carries the
+  // order id the PUT was addressed to so the parent can drop a late callback from
+  // a previous order.
+  onSaved: (payload: { orderId: number; enquiry: OrderEnquiry }) => void
 }
 
 // Controlled-form mirror of OrderEnquiry: text fields are strings (never null) so
@@ -260,12 +262,17 @@ export function LeadEnquirySection({ orderId, locked, enquiry, onSaved }: Props)
       setSaved(false)
       setError(null)
     }
+    // Capture the order id this PUT is addressed to BEFORE awaiting, and lift it
+    // with the result — never read orderIdRef.current inside the .then, since by
+    // then the order may have changed.
+    const saveOrderId = orderIdRef.current
     try {
-      const res = await saveEnquiry(orderIdRef.current, body)
+      const res = await saveEnquiry(saveOrderId, body)
       lastSavedBodyRef.current = JSON.stringify(body)
       // Lift to workspace state — safe even if this component already unmounted,
-      // because the parent (OrderWorkspace) outlives it.
-      onSavedRef.current(res.data.enquiry)
+      // because the parent (OrderWorkspace) outlives it. The parent drops the
+      // callback if saveOrderId is no longer the loaded order.
+      onSavedRef.current({ orderId: saveOrderId, enquiry: res.data.enquiry })
       if (mountedRef.current) setSaved(true)
     } catch (err) {
       if (mountedRef.current) setError(apiErrorMessage(err))
@@ -359,8 +366,13 @@ export function LeadEnquirySection({ orderId, locked, enquiry, onSaved }: Props)
         pendingBodyRef.current = body
         return
       }
-      saveEnquiry(orderIdRef.current, body)
-        .then((res) => onSavedRef.current(res.data.enquiry))
+      // Capture the order id before sending; never read orderIdRef.current inside
+      // the .then (the order may have changed by the time it resolves).
+      const saveOrderId = orderIdRef.current
+      saveEnquiry(saveOrderId, body)
+        .then((res) =>
+          onSavedRef.current({ orderId: saveOrderId, enquiry: res.data.enquiry }),
+        )
         .catch(() => {})
     }
   }, [])

@@ -578,9 +578,14 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
   // installation rows persist even when a later billing step fails, and sibling
   // tabs see fresh data without a refetch.
   function handleCustomerSaved(saved: CustomerSavedPayload) {
-    setWorkspace((prev) => {
-      if (!prev) return prev
-      const next = { ...prev }
+    setWorkspace((current) => {
+      if (!current) return current
+      // ExistingOrderWorkspace persists across /orders/:orderId changes. Ignore late
+      // async save callbacks from a previous order so Order A data cannot pollute
+      // Order B's workspace state. Guards customer / address / enquiry merges alike.
+      if (current.order_id !== saved.orderId) return current
+
+      const next = { ...current }
       if (saved.customer !== undefined) next.customer = saved.customer
       if (saved.installAddress !== undefined) {
         next.install_address = saved.installAddress

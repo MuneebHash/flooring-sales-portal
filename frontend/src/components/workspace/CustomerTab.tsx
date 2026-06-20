@@ -25,7 +25,12 @@ import type {
 // billing step fails). Each field is optional and always sourced from the
 // server response — billing from the billing PUT / copy response, never the
 // local form.
+//
+// orderId is the id the save was ADDRESSED to (captured before the await). The
+// parent uses it to drop late callbacks from a previous order — see
+// ExistingOrderWorkspace.handleCustomerSaved.
 export type CustomerSavedPayload = {
+  orderId: number
   customer?: OrderCustomer
   installAddress?: OrderAddress
   billingAddress?: OrderAddress
@@ -452,6 +457,11 @@ export function CustomerTab({
     }
     setErrors({})
 
+    // Capture the order id the save is addressed to BEFORE any await, so a late
+    // lift (after the component may have unmounted / the order may have changed)
+    // still carries the correct source order id for the parent's guard.
+    const saveOrderId = orderId
+
     // Always send the complete field set (full-replace PUT). Optionals collapse
     // blank -> null here so omitted-as-empty does not get written as "".
     const customerBody = buildCustomerBody(customerForm)
@@ -488,7 +498,7 @@ export function CustomerTab({
       setCustomerForm(customerFromProps(savedCustomer))
       // Lift the confirmed customer row up immediately — it must survive even if
       // a later section (installation/billing) fails in this same run.
-      onSaved({ customer: savedCustomer })
+      onSaved({ orderId: saveOrderId, customer: savedCustomer })
 
       // 2. Installation address (must persist before any copy-from-installation).
       let savedInstall: OrderAddress
@@ -502,7 +512,7 @@ export function CustomerTab({
       if (!mountedRef.current) return
       setInstallForm(addressFromProps(savedInstall))
       // Lift the confirmed installation row up — survives a later billing failure.
-      onSaved({ installAddress: savedInstall })
+      onSaved({ orderId: saveOrderId, installAddress: savedInstall })
 
       // 3. Billing — copy-from-installation when "same as installation" is
       //    checked (the installation row exists from step 2), otherwise a full
@@ -520,7 +530,7 @@ export function CustomerTab({
       if (!mountedRef.current) return
       setBillingForm(addressFromProps(savedBilling))
       // Lift the confirmed billing row up.
-      onSaved({ billingAddress: savedBilling })
+      onSaved({ orderId: saveOrderId, billingAddress: savedBilling })
 
       // Every required call in this run succeeded — only now a global success.
       // Parent state was already updated per-section above (per-step only —
@@ -888,7 +898,9 @@ export function CustomerTab({
           orderId={orderId}
           locked={locked}
           enquiry={enquiry}
-          onSaved={(savedEnquiry) => onSaved({ enquiry: savedEnquiry })}
+          // LeadEnquirySection captures the order id used for its PUT and passes
+          // it through, so the parent can drop a late callback from a prior order.
+          onSaved={(payload) => onSaved(payload)}
         />
       </div>
 
