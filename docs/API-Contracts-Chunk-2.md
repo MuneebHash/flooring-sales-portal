@@ -14,12 +14,13 @@
 ## A. Chunk 2 Scope — Included
 
 - Create order shell.
-- Read full order workspace state for the sections owned by Chunk 2 (header + customer + addresses + details of sale).
+- Read full order workspace state for the sections owned by Chunk 2 (header + customer + addresses + details of sale + lead enquiry (Phase 15F)).
 - Create or replace the one customer row per order.
 - Create or replace the installation address.
 - Create or replace the billing address.
 - Copy installation address into billing address ("billing same as install" workflow).
 - Update the non-line, non-payment "details of sale" fields stored on `sales_order`.
+- Create or replace the one lead-enquiry row per order (Phase 15F lead enquiry form, shown in the Customer tab; read back on the workspace state under `enquiry` — R1, no standalone GET).
 
 ---
 
@@ -54,12 +55,13 @@ All endpoints below are **Standard protected** (all 7 checks from conventions §
 | # | Method | Path | Purpose |
 |---|--------|------|---------|
 | 1 | POST | `/api/v1/{slug}/orders` | Create a new order shell |
-| 2 | GET  | `/api/v1/{slug}/orders/{orderId}` | Read order header + customer + addresses + details of sale |
+| 2 | GET  | `/api/v1/{slug}/orders/{orderId}` | Read order header + customer + addresses + details of sale + lead enquiry |
 | 3 | PUT  | `/api/v1/{slug}/orders/{orderId}/customer` | Create or replace the order's customer row |
 | 4 | PUT  | `/api/v1/{slug}/orders/{orderId}/addresses/installation` | Create or replace the installation address |
 | 5 | PUT  | `/api/v1/{slug}/orders/{orderId}/addresses/billing` | Create or replace the billing address |
 | 6 | POST | `/api/v1/{slug}/orders/{orderId}/addresses/billing/copy-from-installation` | Copy installation into billing |
 | 7 | PUT  | `/api/v1/{slug}/orders/{orderId}/details-of-sale` | Update non-line, non-payment details of sale |
+| 8 | PUT  | `/api/v1/{slug}/orders/{orderId}/enquiry` | Create or replace the order's lead-enquiry row (Phase 15F) |
 
 ---
 
@@ -138,7 +140,7 @@ All endpoints below are **Standard protected** (all 7 checks from conventions §
 
 ### D.2 GET /api/v1/{slug}/orders/{orderId}
 
-**Purpose.** Return the order workspace state needed for Chunk 2 sections: header, customer (if any), installation address (if any), billing address (if any), details of sale.
+**Purpose.** Return the order workspace state needed for Chunk 2 sections: header, customer (if any), installation address (if any), billing address (if any), details of sale, and the lead enquiry (Phase 15F, R1 — `enquiry` is `null` until first saved).
 
 **Scope class.** Standard protected.
 
@@ -204,10 +206,34 @@ All endpoints below are **Standard protected** (all 7 checks from conventions §
       "total_cost": 432.00,
       "gp": 408.00,
       "gp_percent": 48.57
+    },
+
+    "enquiry": {
+      "lead_type": "FLOOR",
+      "carpet": true,
+      "hard_floor": false,
+      "product_fit_timing": "Within 4 weeks",
+      "product_usage_context": "Family home, two children and a dog",
+      "rooms_to_cover": "Lounge, hallway, three bedrooms",
+      "textured_or_plain": "Textured",
+      "light_or_dark_tones": "Light",
+      "colours_interested": "Beige and soft grey",
+      "current_flooring_and_reason": "Old worn carpet, replacing before sale",
+      "products_discussed": "Wool twist, hybrid plank",
+      "fully_installed": true,
+      "uplift": false,
+      "furniture": true,
+      "stairs": null,
+      "subfloor_concrete": true,
+      "subfloor_timber": false,
+      "subfloor_tile": false,
+      "brief_summary": "Keen buyer, follow up with quote next week"
     }
   }
 }
 ```
+
+`enquiry` is the Phase 15F lead-enquiry object (R1, written via D.8) — `null` when no enquiry row has been saved for the order yet. `lead_type` is a single choice `FLOOR` / `PHONE` / `INTERNET` or `null` (unanswered); the four tri-state fields (`fully_installed`, `uplift`, `furniture`, `stairs`) are `true` / `false` / `null` (unanswered).
 
 **Field rules**
 - All header fields are sourced from `sales_order` and follow the locked schema's nullability.
@@ -628,6 +654,116 @@ The response intentionally does NOT include the `order_financial_summary` block 
   }
 }
 ```
+
+---
+
+### D.8 PUT /api/v1/{slug}/orders/{orderId}/enquiry
+
+**Added in Phase 15F (lead enquiry form).** Lives in Chunk 2 because it is read back on the order workspace (D.2) and edited from the Customer tab.
+
+**Purpose.** Create or replace the one lead-enquiry row per order (`order_enquiry`, V15) — the job/order enquiry captured inside the Customer tab. This is order-specific enquiry data, **not** generic customer identity, and is stored in its own one-to-one table (not on `order_customer`, and `sales_order` is not widened).
+
+**Scope class.** Standard protected.
+
+**Read shape (R1).** There is **no standalone GET enquiry endpoint.** The current enquiry is embedded on the GET workspace read (D.2) as the nullable `enquiry` object — `null` until the first save.
+
+**Path params**
+- `orderId` — positive integer.
+
+**Request DTO** (all 19 data fields; every field is optional)
+```json
+{
+  "lead_type": "FLOOR",
+  "carpet": true,
+  "hard_floor": false,
+  "product_fit_timing": "Within 4 weeks",
+  "product_usage_context": "Family home, two children and a dog",
+  "rooms_to_cover": "Lounge, hallway, three bedrooms",
+  "textured_or_plain": "Textured",
+  "light_or_dark_tones": "Light",
+  "colours_interested": "Beige and soft grey",
+  "current_flooring_and_reason": "Old worn carpet, replacing before sale",
+  "products_discussed": "Wool twist, hybrid plank",
+  "fully_installed": true,
+  "uplift": false,
+  "furniture": true,
+  "stairs": null,
+  "subfloor_concrete": true,
+  "subfloor_timber": false,
+  "subfloor_tile": false,
+  "brief_summary": "Keen buyer, follow up with quote next week"
+}
+```
+
+**Field rules — grounded in `order_enquiry` (V15)**
+- `lead_type` — how the lead came in. `VARCHAR(20)`, nullable. **Single choice:** exactly `FLOOR`, `PHONE`, or `INTERNET`, or `null`/blank (→ `null` = unanswered). Validated in `OrderService` (the primary path — invalid value → **400 `VALIDATION_FAILED`, field `lead_type`**; exact case only, never silently coerced/upper-cased); `chk_order_enquiry_lead_type` is the DB backstop.
+- `carpet`, `hard_floor` — the products the customer is looking for. `BOOLEAN NOT NULL DEFAULT FALSE`. **Independent of each other and of the order's SOFT/HARD `flooring_type`** — both or neither may be true; never auto-filled from `flooring_type`.
+- `product_fit_timing`, `product_usage_context`, `rooms_to_cover`, `textured_or_plain`, `light_or_dark_tones`, `colours_interested`, `current_flooring_and_reason`, `products_discussed`, `brief_summary` — optional free-text (`TEXT`, no length cap). Trimmed; **blank-after-trim is stored as `null`** (mirrors the customer optional-field handling).
+- `fully_installed`, `uplift`, `furniture`, `stairs` — **tri-state nullable** `BOOLEAN` (no DB default): `true` = Yes, `false` = No, **`null` = unanswered**. Serialized even when `null`; a `null` is **never** coerced to `false`.
+- `subfloor_concrete`, `subfloor_timber`, `subfloor_tile` — `BOOLEAN NOT NULL DEFAULT FALSE`. **Independent multi-select** flags: any combination may be true (including none). Not modelled as a single enum/radio.
+
+**Replace semantics (full replace / upsert on `uq_order_enquiry_order`).**
+- Omitted `lead_type` → `null` (so a full replace can clear a previously-set lead type).
+- Omitted text fields → `null`.
+- Omitted NOT NULL flags (`carpet`, `hard_floor`, `subfloor_*`) → `false`.
+- Omitted tri-state fields (`fully_installed`, `uplift`, `furniture`, `stairs`) → `null` (unanswered).
+- There are no required fields, so the request body is **optional**: a `{}` body — or an **absent / blank body** — is valid and writes an all-default row (all flags `false`, all tri-state `null`, all text `null`). It does **not** 400. (This is why the endpoint's `requestBody` is `required: false`, unlike customer/details which have required fields.)
+
+**No client-sent ids.** `business_id` / `store_id` / `order_id` are **not** accepted in the body — `order_id` comes from the path. Like the customer endpoint there is no reject-scan: such keys are unknown properties and are **ignored** (Jackson), not a 400.
+
+**Response DTO — 200 OK** (`data.enquiry`, the server-normalised row)
+```json
+{
+  "data": {
+    "enquiry": {
+      "lead_type": "FLOOR",
+      "carpet": true,
+      "hard_floor": false,
+      "product_fit_timing": "Within 4 weeks",
+      "product_usage_context": "Family home, two children and a dog",
+      "rooms_to_cover": "Lounge, hallway, three bedrooms",
+      "textured_or_plain": "Textured",
+      "light_or_dark_tones": "Light",
+      "colours_interested": "Beige and soft grey",
+      "current_flooring_and_reason": "Old worn carpet, replacing before sale",
+      "products_discussed": "Wool twist, hybrid plank",
+      "fully_installed": true,
+      "uplift": false,
+      "furniture": true,
+      "stairs": null,
+      "subfloor_concrete": true,
+      "subfloor_timber": false,
+      "subfloor_tile": false,
+      "brief_summary": "Keen buyer, follow up with quote next week"
+    }
+  },
+  "message": "Enquiry saved."
+}
+```
+
+**Business rules**
+- Order must exist within the session's `(business_id, store_id)`. Otherwise 404 (no existence leak).
+- One enquiry row per order (`uq_order_enquiry_order`); the upsert can never create a second row.
+- Backend writes `created_at` (insert only) and `updated_at` automatically.
+
+**Tenant / session / store scoping.** All 7 checks from conventions §9, plus the order-belongs-to-store check.
+
+**LAID lock.**
+- **Read** (workspace GET, D.2) is **allowed** when the order is `LAID`.
+- **Write** (this PUT) is **blocked** when the order is `LAID` → **422 `ORDER_LOCKED`**. The LAID check runs before the body is parsed and before `lead_type` validation, so a LAID order with a malformed body **or an invalid `lead_type`** still returns 422, not 400.
+
+**Validation ordering.** guard (401/403) → slug/order scope (404) → **LAID (422)** → parse body (400 MALFORMED_JSON) → **`lead_type` validation (400 VALIDATION_FAILED, field `lead_type`)** → upsert.
+
+**Status codes**
+| Code | When |
+|------|------|
+| 200 | Lead enquiry created or replaced |
+| 400 | Malformed JSON, invalid `orderId` format, or invalid `lead_type` (VALIDATION_FAILED, field `lead_type`) |
+| 401 | No session |
+| 403 | Session has no active store / user does not have access |
+| 404 | Order not in session's `(business_id, store_id)`, or business slug not found / inactive |
+| 422 | Order is `LAID` (`ORDER_LOCKED`) |
+| 500 | Unexpected |
 
 ---
 

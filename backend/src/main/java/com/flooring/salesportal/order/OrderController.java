@@ -5,6 +5,7 @@ import com.flooring.salesportal.order.dto.BillingAddressResponse;
 import com.flooring.salesportal.order.dto.CreateOrderRequest;
 import com.flooring.salesportal.order.dto.CustomerSaveResponse;
 import com.flooring.salesportal.order.dto.DetailsOfSaleSaveResponse;
+import com.flooring.salesportal.order.dto.EnquirySaveResponse;
 import com.flooring.salesportal.order.dto.InstallationAddressResponse;
 import com.flooring.salesportal.order.dto.OrderHeaderResponse;
 import com.flooring.salesportal.order.dto.OrderWorkspaceResponse;
@@ -122,5 +123,19 @@ public class OrderController {
         return ApiResponse.ok(
                 orderService.saveDetailsOfSale(slug, orderId, body, httpRequest),
                 "Details of sale saved.");
+    }
+
+    // Phase 15F lead enquiry form. orderId is captured as a String (see saveCustomer) so non-numeric
+    // values produce VALIDATION_FAILED with field "order_id". Raw String body: JSON parsing happens
+    // inside the service, after the guard / orderId / scoped-lookup / 404 / LAID gates, so malformed
+    // JSON cannot 400 ahead of them. The enquiry is read back via the GET workspace (data.enquiry);
+    // there is deliberately no standalone GET enquiry endpoint.
+    @PutMapping("/{orderId}/enquiry")
+    public ApiResponse<EnquirySaveResponse> saveEnquiry(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestBody(required = false) String body,
+            HttpServletRequest httpRequest) {
+        return ApiResponse.ok(orderService.saveEnquiry(slug, orderId, body, httpRequest), "Enquiry saved.");
     }
 }

@@ -14,6 +14,10 @@ import java.time.LocalDateTime;
  * <p>{@code salespersonName} (Phase 15C PR2) is the order's salesperson — {@code sales_order.user_id}
  * resolved to {@code app_user.first_name + last_name} via {@code OrderSalespersonResolver}, the same
  * source the invoice PDF uses, NOT the session user. Null when the user row is missing.
+ *
+ * <p>{@code enquiry} (Phase 15F lead enquiry form) is the nullable one-per-order {@code order_enquiry}
+ * object — {@code null} when no enquiry row has been saved yet (read-only here; the write is the
+ * separate {@code PUT /orders/{orderId}/enquiry}).
  */
 public record OrderWorkspaceResponse(
         long orderId,
@@ -36,6 +40,7 @@ public record OrderWorkspaceResponse(
         CustomerDto customer,
         AddressDto installAddress,
         AddressDto billingAddress,
-        PersistedFinancialsDto persistedFinancials
+        PersistedFinancialsDto persistedFinancials,
+        EnquiryDto enquiry
 ) {
 }

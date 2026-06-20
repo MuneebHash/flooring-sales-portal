@@ -33,6 +33,7 @@ import type {
   DetailsOfSaleSaveRequest,
   OrderAddress,
   OrderCustomer,
+  OrderEnquiry,
   OrderWorkspace as OrderWorkspaceData,
 } from '../lib/api/orderWorkspaceApi'
 import { fetchOrderLines } from '../lib/api/orderLinesApi'
@@ -83,11 +84,13 @@ type ShellProps = {
   customer: OrderCustomer | null
   installationAddress: OrderAddress | null
   billingAddress: OrderAddress | null
+  // Phase 15F lead enquiry (nullable until first saved), shown in the Customer tab.
+  enquiry: OrderEnquiry | null
   saleDetails: DetailsOfSaleFields | null
   // Order-bound salesperson name for the invoice document header (Phase 15C PR2).
   salespersonName: string | null
-  // Lifts confirmed server-saved customer/address data up so workspace state
-  // (and sibling tabs) stay in sync without a refetch.
+  // Lifts confirmed server-saved customer/address/enquiry data up so workspace
+  // state (and sibling tabs) stay in sync without a refetch.
   onCustomerSaved: (saved: CustomerSavedPayload) => void
   // Lifts the server-confirmed details-of-sale fields (and refreshed updated_at)
   // up so workspace state stays in sync without a refetch.
@@ -106,6 +109,7 @@ function WorkspaceShell({
   customer,
   installationAddress,
   billingAddress,
+  enquiry,
   saleDetails,
   salespersonName,
   onCustomerSaved,
@@ -418,6 +422,7 @@ function WorkspaceShell({
                 customer={customer}
                 installationAddress={installationAddress}
                 billingAddress={billingAddress}
+                enquiry={enquiry}
                 onSaved={onCustomerSaved}
               />
             )}
@@ -576,6 +581,7 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
       if (saved.billingAddress !== undefined) {
         next.billing_address = saved.billingAddress
       }
+      if (saved.enquiry !== undefined) next.enquiry = saved.enquiry
       return next
     })
   }
@@ -614,6 +620,7 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
       customer={workspace.customer}
       installationAddress={workspace.install_address}
       billingAddress={workspace.billing_address}
+      enquiry={workspace.enquiry}
       saleDetails={saleDetails}
       salespersonName={workspace.salesperson_name}
       onCustomerSaved={handleCustomerSaved}

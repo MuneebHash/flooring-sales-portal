@@ -476,6 +476,62 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/enquiry:
+    put:
+      tags:
+        - Customer
+      summary: Save order lead enquiry
+      operationId: saveOrderEnquiry
+      description: >
+        Creates or replaces the single lead-enquiry row for an order (Phase 15F
+        lead enquiry form, shown inside the Customer tab). PUT is a full
+        replacement: text fields omitted in the request are written as null, the
+        NOT NULL product/subfloor flags (carpet, hard_floor, subfloor_concrete,
+        subfloor_timber, subfloor_tile) omitted default to false, and the four
+        tri-state fields (fully_installed, uplift, furniture, stairs) omitted are
+        written as null = unanswered (true = Yes, false = No, null = unanswered;
+        a null is never coerced to false). carpet and hard_floor are the products
+        the customer is looking for — independent booleans (both/neither may be
+        true) and deliberately decoupled from the order's SOFT/HARD flooring_type.
+        subfloor_concrete/timber/tile are independent multi-select booleans. The
+        enquiry is READ back on the GET order workspace under `enquiry` (there is
+        no standalone GET enquiry endpoint). No business_id/store_id/order_id is
+        accepted in the body — order_id comes from the path and any such keys are
+        ignored. This endpoint is blocked when the order is LAID and returns 422
+        ORDER_LOCKED. The order must belong to the session business/store.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      requestBody:
+        required: false
+        description: >-
+          Optional. Because the enquiry has no required fields, an absent or blank
+          body is accepted and writes an all-default row (all flags false, all
+          tri-state fields null, all text null) — it does NOT 400. In normal use the
+          client sends the full field set (full-replace upsert).
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnquiryUpsertRequest'
+      responses:
+        '200':
+          description: Lead enquiry created or replaced
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnquiryResponseWrapper'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/UnprocessableEntity'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
 
   /orders/{orderId}/available-products:
     get:
@@ -3080,6 +3136,7 @@ components:
         - install_address
         - billing_address
         - persisted_financials
+        - enquiry
       properties:
         order_id:
           type: integer
@@ -3144,6 +3201,13 @@ components:
             - $ref: '#/components/schemas/OrderAddress'
         persisted_financials:
           $ref: '#/components/schemas/PersistedFinancials'
+        enquiry:
+          nullable: true
+          description: >-
+            Phase 15F lead enquiry — the one-per-order order_enquiry row, or null
+            when none has been saved yet. Written via PUT /orders/{orderId}/enquiry.
+          allOf:
+            - $ref: '#/components/schemas/OrderEnquiry'
 
     OrderWorkspaceResponseWrapper:
       type: object
@@ -3342,6 +3406,191 @@ components:
         message:
           type: string
 
+    OrderEnquiry:
+      type: object
+      additionalProperties: false
+      description: >-
+        Phase 15F lead enquiry — the one-per-order order_enquiry row. Embedded as
+        the nullable `enquiry` object on the workspace read and returned under
+        data.enquiry on save.
+      required:
+        - lead_type
+        - carpet
+        - hard_floor
+        - product_fit_timing
+        - product_usage_context
+        - rooms_to_cover
+        - textured_or_plain
+        - light_or_dark_tones
+        - colours_interested
+        - current_flooring_and_reason
+        - products_discussed
+        - fully_installed
+        - uplift
+        - furniture
+        - stairs
+        - subfloor_concrete
+        - subfloor_timber
+        - subfloor_tile
+        - brief_summary
+      properties:
+        lead_type:
+          nullable: true
+          description: >-
+            How the lead came in — single choice (FLOOR / PHONE / INTERNET) or null
+            = unanswered. An invalid value is a 400 VALIDATION_FAILED on field
+            lead_type (exact case only; never silently coerced).
+          allOf:
+            - $ref: '#/components/schemas/LeadType'
+        carpet:
+          type: boolean
+          description: >-
+            A product the customer is looking for. Independent of hard_floor and
+            of the order's SOFT/HARD flooring_type (both/neither may be true).
+        hard_floor:
+          type: boolean
+          description: >-
+            A product the customer is looking for. Independent of carpet and of
+            the order's SOFT/HARD flooring_type (both/neither may be true).
+        product_fit_timing:
+          type: string
+          nullable: true
+        product_usage_context:
+          type: string
+          nullable: true
+        rooms_to_cover:
+          type: string
+          nullable: true
+        textured_or_plain:
+          type: string
+          nullable: true
+        light_or_dark_tones:
+          type: string
+          nullable: true
+        colours_interested:
+          type: string
+          nullable: true
+        current_flooring_and_reason:
+          type: string
+          nullable: true
+        products_discussed:
+          type: string
+          nullable: true
+        fully_installed:
+          type: boolean
+          nullable: true
+          description: 'Tri-state: true = Yes, false = No, null = unanswered.'
+        uplift:
+          type: boolean
+          nullable: true
+          description: 'Tri-state: true = Yes, false = No, null = unanswered.'
+        furniture:
+          type: boolean
+          nullable: true
+          description: 'Tri-state: true = Yes, false = No, null = unanswered.'
+        stairs:
+          type: boolean
+          nullable: true
+          description: 'Tri-state: true = Yes, false = No, null = unanswered.'
+        subfloor_concrete:
+          type: boolean
+          description: Independent multi-select subfloor flag (any combination, incl. none).
+        subfloor_timber:
+          type: boolean
+          description: Independent multi-select subfloor flag (any combination, incl. none).
+        subfloor_tile:
+          type: boolean
+          description: Independent multi-select subfloor flag (any combination, incl. none).
+        brief_summary:
+          type: string
+          nullable: true
+
+    EnquiryUpsertRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Full-replace body for PUT /orders/{orderId}/enquiry. No field is required:
+        omitted text is written as null, omitted NOT NULL flags (carpet, hard_floor,
+        subfloor_*) default to false, omitted tri-state fields (fully_installed,
+        uplift, furniture, stairs) are written as null (unanswered), and an omitted
+        lead_type is written as null. lead_type must be FLOOR / PHONE / INTERNET or
+        null/blank — any other value is a 400 VALIDATION_FAILED on field lead_type.
+        No business_id/store_id/order_id is accepted — order_id comes from the path.
+      properties:
+        lead_type:
+          nullable: true
+          allOf:
+            - $ref: '#/components/schemas/LeadType'
+        carpet:
+          type: boolean
+        hard_floor:
+          type: boolean
+        product_fit_timing:
+          type: string
+          nullable: true
+        product_usage_context:
+          type: string
+          nullable: true
+        rooms_to_cover:
+          type: string
+          nullable: true
+        textured_or_plain:
+          type: string
+          nullable: true
+        light_or_dark_tones:
+          type: string
+          nullable: true
+        colours_interested:
+          type: string
+          nullable: true
+        current_flooring_and_reason:
+          type: string
+          nullable: true
+        products_discussed:
+          type: string
+          nullable: true
+        fully_installed:
+          type: boolean
+          nullable: true
+        uplift:
+          type: boolean
+          nullable: true
+        furniture:
+          type: boolean
+          nullable: true
+        stairs:
+          type: boolean
+          nullable: true
+        subfloor_concrete:
+          type: boolean
+        subfloor_timber:
+          type: boolean
+        subfloor_tile:
+          type: boolean
+        brief_summary:
+          type: string
+          nullable: true
+
+    EnquiryResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - enquiry
+      properties:
+        enquiry:
+          $ref: '#/components/schemas/OrderEnquiry'
+
+    EnquiryResponseWrapper:
+      type: object
+      additionalProperties: false
+      required:
+        - data
+      properties:
+        data:
+          $ref: '#/components/schemas/EnquiryResponse'
+        message:
+          type: string
+
     FlooringType:
       type: string
       enum:
@@ -3363,6 +3612,14 @@ components:
       enum:
         - CONFIRMED
         - TO_BE_CONFIRMED
+
+    LeadType:
+      type: string
+      description: How the Phase 15F lead enquiry came in. Single choice; the field is null when unanswered.
+      enum:
+        - FLOOR
+        - PHONE
+        - INTERNET
 
     PaymentMethod:
       type: string

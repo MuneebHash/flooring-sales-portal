@@ -4,6 +4,7 @@ import { Field } from '../ui/Field'
 import { Input } from '../ui/Input'
 import { Tabs } from '../ui/Tabs'
 import { CheckCircleIcon } from '../icons'
+import { LeadEnquirySection } from './LeadEnquirySection'
 import { ApiError } from '../../lib/api/ApiError'
 import {
   copyBillingFromInstallation,
@@ -16,6 +17,7 @@ import type {
   CustomerSaveRequest,
   OrderAddress,
   OrderCustomer,
+  OrderEnquiry,
 } from '../../lib/api/orderWorkspaceApi'
 
 // Confirmed server-saved data lifted to the parent, one section at a time as
@@ -27,6 +29,9 @@ export type CustomerSavedPayload = {
   customer?: OrderCustomer
   installAddress?: OrderAddress
   billingAddress?: OrderAddress
+  // Phase 15F: confirmed lead-enquiry row, lifted through the same channel so the
+  // workspace stays in sync without a refetch.
+  enquiry?: OrderEnquiry
 }
 
 type Props = {
@@ -35,6 +40,7 @@ type Props = {
   customer?: OrderCustomer | null
   installationAddress?: OrderAddress | null
   billingAddress?: OrderAddress | null
+  enquiry?: OrderEnquiry | null
   onSaved: (saved: CustomerSavedPayload) => void
 }
 
@@ -58,11 +64,12 @@ type AddressForm = {
   postcode: string
 }
 
-type SubTabId = 'details' | 'addresses'
+type SubTabId = 'details' | 'addresses' | 'enquiry'
 
 const SUB_TABS: Array<{ id: SubTabId; label: string }> = [
   { id: 'details', label: 'Details' },
   { id: 'addresses', label: 'Addresses' },
+  { id: 'enquiry', label: 'Lead Enquiry' },
 ]
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -254,6 +261,7 @@ export function CustomerTab({
   customer,
   installationAddress,
   billingAddress,
+  enquiry,
   onSaved,
 }: Props) {
   const [customerForm, setCustomerForm] = useState<CustomerForm>(() =>
@@ -872,6 +880,21 @@ export function CustomerTab({
         </div>
       )}
 
+      {/* Kept mounted (toggled with `hidden`) so unsaved enquiry edits survive a
+          sub-tab switch, the same way the customer/address fields persist via
+          CustomerTab state. */}
+      <div className={activeSubTab === 'enquiry' ? '' : 'hidden'}>
+        <LeadEnquirySection
+          orderId={orderId}
+          locked={locked}
+          enquiry={enquiry}
+          onSaved={(savedEnquiry) => onSaved({ enquiry: savedEnquiry })}
+        />
+      </div>
+
+      {/* Customer/address save footer — only for the Details/Addresses sub-tabs.
+          The Lead enquiry sub-tab has its own separate Save Lead Enquiry button. */}
+      {activeSubTab !== 'enquiry' && (
       <div className="mt-8 pt-5 border-t border-slate-200 space-y-4">
         {locked && (
           <p className="text-xs text-slate-500">
@@ -930,6 +953,7 @@ export function CustomerTab({
           </Button>
         </div>
       </div>
+      )}
     </div>
   )
 }
