@@ -415,8 +415,15 @@ function WorkspaceShell({
         <Panel className="overflow-hidden">
           <Tabs tabs={TABS} active={activeTab} onChange={setActiveTab} />
           <div className="p-6">
-            {activeTab === 'customer' && (
+            {/* Customer is ALWAYS mounted (hidden when not active), unlike the other
+                tabs which stay conditionally rendered. This keeps the Lead Enquiry
+                autosave draft / local form state alive across top-level tab switches
+                (Customer -> Products & Charges -> Customer must NOT remount
+                LeadEnquirySection), so an in-flight unmount-flush can't race a fresh
+                stale-prop seed. Uses the same `activeTab === 'customer'` condition. */}
+            <div className={activeTab === 'customer' ? '' : 'hidden'}>
               <CustomerTab
+                key={orderId}
                 orderId={orderId}
                 locked={locked}
                 customer={customer}
@@ -425,7 +432,7 @@ function WorkspaceShell({
                 enquiry={enquiry}
                 onSaved={onCustomerSaved}
               />
-            )}
+            </div>
             {activeTab === 'products' && (
               <ProductsChargesTab
                 orderId={orderId}

@@ -228,8 +228,10 @@ export function LeadEnquirySection({ orderId, locked, enquiry, onSaved }: Props)
   const [error, setError] = useState<string | null>(null)
 
   // Latest values mirrored into refs so the debounce / blur / unmount-flush paths
-  // read the freshest data and lift correctly even after this component unmounts
-  // (CustomerTab unmounts when the top-level workspace tab changes).
+  // read the freshest data and lift correctly even after this component unmounts.
+  // CustomerTab is kept mounted across top-level workspace tab switches (it is
+  // hidden, not unmounted, in OrderWorkspace), so a normal tab switch no longer
+  // unmounts this section — the refs matter for actual order/page unmount.
   const formRef = useRef(form)
   formRef.current = form
   const lockedRef = useRef(locked)
@@ -339,9 +341,11 @@ export function LeadEnquirySection({ orderId, locked, enquiry, onSaved }: Props)
     void runSave(body)
   }
 
-  // Flush the latest dirty edit when the section unmounts (top-level tab switch or
-  // leaving the workspace) so click-away never loses data. Fire-and-forget: the
-  // lift target (workspace) outlives this component. No prop re-seed effect exists.
+  // Flush the latest dirty edit when the section truly unmounts — i.e. the order
+  // changes or the user leaves the workspace/page (CustomerTab is kept mounted
+  // across top-level tab switches, so this no longer fires on a normal tab switch).
+  // The debounce already covers in-tab/in-sub-tab edits. Fire-and-forget: the lift
+  // target (workspace) outlives this component. No prop re-seed effect exists.
   useEffect(() => {
     mountedRef.current = true
     return () => {
