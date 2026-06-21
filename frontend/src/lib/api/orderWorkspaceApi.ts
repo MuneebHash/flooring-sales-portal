@@ -64,6 +64,44 @@ export type PersistedFinancials = {
   gp_percent: number | null
 }
 
+// Phase 15F lead enquiry form — the one-per-order order_enquiry row, embedded as
+// the nullable `enquiry` object on the workspace read (null when no row saved yet)
+// and the body/response of PUT /orders/{orderId}/enquiry. Mirrors the backend
+// EnquiryDto (19 data fields, snake_case).
+//
+// carpet / hard_floor are the products the customer is looking for — independent
+// booleans (both/neither may be true) and deliberately decoupled from the order's
+// SOFT/HARD flooring_type. subfloor_* are independent multi-select booleans.
+// fully_installed / uplift / furniture / stairs are TRI-STATE: true = Yes,
+// false = No, null = unanswered — the null must round-trip, never collapse to false.
+// lead_type is a SINGLE choice (or null = unanswered).
+
+// How the lead came in. Single-select; null = unanswered. Mirrors the backend
+// order_enquiry.lead_type CHECK (FLOOR / PHONE / INTERNET or NULL).
+export type LeadType = 'FLOOR' | 'PHONE' | 'INTERNET'
+
+export type OrderEnquiry = {
+  lead_type: LeadType | null
+  carpet: boolean
+  hard_floor: boolean
+  product_fit_timing: string | null
+  product_usage_context: string | null
+  rooms_to_cover: string | null
+  textured_or_plain: string | null
+  light_or_dark_tones: string | null
+  colours_interested: string | null
+  current_flooring_and_reason: string | null
+  products_discussed: string | null
+  fully_installed: boolean | null
+  uplift: boolean | null
+  furniture: boolean | null
+  stairs: boolean | null
+  subfloor_concrete: boolean
+  subfloor_timber: boolean
+  subfloor_tile: boolean
+  brief_summary: string | null
+}
+
 // Order header — returned by POST /orders and embedded in the workspace read.
 // Mirrors the backend OrderHeaderResponse. order_id is the internal numeric
 // identifier used for routing and all order-scoped endpoints.
@@ -101,6 +139,8 @@ export type OrderWorkspace = OrderHeader & {
   install_address: OrderAddress | null
   billing_address: OrderAddress | null
   persisted_financials: PersistedFinancials
+  // Phase 15F: nullable when no enquiry row has been saved for this order yet.
+  enquiry: OrderEnquiry | null
 }
 
 // --- Save request / response surface for later Phase 10E sub-branches. ---
@@ -134,6 +174,16 @@ export type DetailsOfSaleSaveRequest = DetailsOfSaleFields
 export type DetailsOfSaleSaveResponse = {
   details_of_sale_fields: DetailsOfSaleFields
   updated_at: string
+}
+
+// PUT /orders/{orderId}/enquiry — full-replace upsert of the one order_enquiry
+// row. Body is the complete OrderEnquiry field set; omitted text clears to null,
+// omitted NOT NULL flags default false, omitted tri-state fields become null
+// (unanswered). The enquiry is READ back via the workspace GET (R1) — there is no
+// standalone GET enquiry endpoint.
+export type EnquirySaveRequest = OrderEnquiry
+export type EnquirySaveResponse = {
+  enquiry: OrderEnquiry
 }
 
 // POST /api/v1/{slug}/orders — create an order shell for the chosen flooring
@@ -221,6 +271,19 @@ export function saveDetailsOfSale(
 ): Promise<ApiSuccess<DetailsOfSaleSaveResponse>> {
   return put<ApiSuccess<DetailsOfSaleSaveResponse>>(
     apiPath(getActiveSlug(), `/orders/${orderId}/details-of-sale`),
+    body,
+  )
+}
+
+// PUT /api/v1/{slug}/orders/{orderId}/enquiry — full-replace upsert of the one
+// lead-enquiry row (Phase 15F). The caller sends the complete OrderEnquiry field
+// set (see EnquirySaveRequest); the response returns the server-normalised row.
+export function saveEnquiry(
+  orderId: number,
+  body: EnquirySaveRequest,
+): Promise<ApiSuccess<EnquirySaveResponse>> {
+  return put<ApiSuccess<EnquirySaveResponse>>(
+    apiPath(getActiveSlug(), `/orders/${orderId}/enquiry`),
     body,
   )
 }

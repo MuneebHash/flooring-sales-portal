@@ -21,6 +21,9 @@ import com.flooring.salesportal.order.dto.CustomerSaveResponse;
 import com.flooring.salesportal.order.dto.DetailsOfSaleFieldsDto;
 import com.flooring.salesportal.order.dto.DetailsOfSaleSaveRequest;
 import com.flooring.salesportal.order.dto.DetailsOfSaleSaveResponse;
+import com.flooring.salesportal.order.dto.EnquiryDto;
+import com.flooring.salesportal.order.dto.EnquirySaveRequest;
+import com.flooring.salesportal.order.dto.EnquirySaveResponse;
 import com.flooring.salesportal.order.dto.InstallationAddressResponse;
 import com.flooring.salesportal.order.dto.OrderHeaderResponse;
 import com.flooring.salesportal.order.dto.OrderWorkspaceResponse;
@@ -41,6 +44,7 @@ import java.time.format.ResolverStyle;
 import java.time.temporal.IsoFields;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 
 @Service
 public class OrderService {
@@ -56,6 +60,10 @@ public class OrderService {
     // value is a VALIDATION_FAILED on field lay_date_status, never a Jackson parse error.
     private static final String LAY_DATE_CONFIRMED = "CONFIRMED";
     private static final String LAY_DATE_TO_BE_CONFIRMED = "TO_BE_CONFIRMED";
+
+    // order_enquiry.lead_type accepted values (Phase 15F). Exact-case only — an app-level
+    // VALIDATION_FAILED is raised for anything else; the DB chk_order_enquiry_lead_type is a backstop.
+    private static final Set<String> VALID_LEAD_TYPES = Set.of("FLOOR", "PHONE", "INTERNET");
 
     // Strict ISO YYYY-MM-DD parsing for proposed_lay_date: "uuuu-MM-dd" + ResolverStyle.STRICT
     // rejects impossible dates (e.g. 2026-02-30) and non-zero-padded / malformed forms, so an
@@ -88,6 +96,8 @@ public class OrderService {
     private final OrderAddressRepository orderAddressRepository;
     private final OrderAddressWriteRepository orderAddressWriteRepository;
     private final SalesOrderDetailsWriteRepository salesOrderDetailsWriteRepository;
+    private final OrderEnquiryRepository orderEnquiryRepository;
+    private final OrderEnquiryWriteRepository orderEnquiryWriteRepository;
     private final ObjectMapper objectMapper;
 
     public OrderService(RequestContextGuard requestContextGuard,
@@ -101,6 +111,8 @@ public class OrderService {
                         OrderAddressRepository orderAddressRepository,
                         OrderAddressWriteRepository orderAddressWriteRepository,
                         SalesOrderDetailsWriteRepository salesOrderDetailsWriteRepository,
+                        OrderEnquiryRepository orderEnquiryRepository,
+                        OrderEnquiryWriteRepository orderEnquiryWriteRepository,
                         ObjectMapper objectMapper) {
         this.requestContextGuard = requestContextGuard;
         this.storeRepository = storeRepository;
@@ -113,6 +125,8 @@ public class OrderService {
         this.orderAddressRepository = orderAddressRepository;
         this.orderAddressWriteRepository = orderAddressWriteRepository;
         this.salesOrderDetailsWriteRepository = salesOrderDetailsWriteRepository;
+        this.orderEnquiryRepository = orderEnquiryRepository;
+        this.orderEnquiryWriteRepository = orderEnquiryWriteRepository;
         this.objectMapper = objectMapper;
     }
 
@@ -197,6 +211,11 @@ public class OrderService {
         AddressDto installAddress = toAddressDto(findAddress(addresses, ADDRESS_INSTALLATION));
         AddressDto billingAddress = toAddressDto(findAddress(addresses, ADDRESS_BILLING));
 
+        // Phase 15F lead enquiry: nullable one-per-order object, null when no row saved yet.
+        EnquiryDto enquiry = orderEnquiryRepository.findByOrderId(orderId)
+                .map(OrderService::toEnquiryDto)
+                .orElse(null);
+
         // 5. persisted_financials is always present; each scalar is null until Chunk 3 writes it.
         PersistedFinancialsDto persistedFinancials = new PersistedFinancialsDto(
                 order.getSalePriceExGst(),
@@ -232,7 +251,8 @@ public class OrderService {
                 customer,
                 installAddress,
                 billingAddress,
-                persistedFinancials);
+                persistedFinancials,
+                enquiry);
     }
 
     /**
@@ -487,6 +507,77 @@ public class OrderService {
                 now);
 
         return new DetailsOfSaleSaveResponse(fields, now);
+    }
+
+    /**
+     * PUT /orders/{orderId}/enquiry. Insert-or-full-replace the one {@code order_enquiry} row
+     * (Phase 15F lead enquiry form). Same gate-first ordering as {@link #saveCustomer}: guard →
+     * parse orderId → scoped FOR UPDATE lookup (missing/cross-store/cross-business → 404
+     * ORDER_NOT_FOUND, no existence leak) → LAID (422 ORDER_LOCKED) → only then parse the raw JSON
+     * body and upsert. A LAID in-scope order with a malformed/invalid body still returns 422 before
+     * the body is parsed. The body arrives as a raw String (parsed here, not by Spring) so malformed
+     * JSON cannot 400 ahead of the gates; a null/blank body parses to a null DTO and is normalised as
+     * all-fields-empty (no required enquiry fields), never an NPE. Enquiry has no cost fields, so —
+     * exactly like customer — the request DTO simply has no id fields and there is no reject-scan:
+     * any {@code order_id}/{@code business_id}/{@code store_id} in the body is an ignored unknown key
+     * ({@code order_id} comes from the path).
+     */
+    @Transactional
+    public EnquirySaveResponse saveEnquiry(String slug,
+                                           String orderIdRaw,
+                                           String body,
+                                           HttpServletRequest httpRequest) {
+        // 1. Standard-protected guard.
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+
+        // 2. Validate the path variable as a positive integer.
+        long orderId = parseOrderId(orderIdRaw);
+
+        // 3. Scope to the session's (business_id, store_id) with a pessimistic write lock.
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        // 4. Only after the order is confirmed in-scope: LAID is locked for enquiry edits.
+        if (STATUS_LAID.equals(order.getOrderStatus())) {
+            throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
+        }
+
+        // 5. Parse the raw JSON body (malformed -> 400 MALFORMED_JSON), then validate + normalise.
+        //    lead_type must be FLOOR/PHONE/INTERNET or null/blank (else 400 VALIDATION_FAILED, field
+        //    lead_type) — this runs AFTER the LAID gate, so a LAID order with an invalid lead_type
+        //    still returns 422. Otherwise no required fields: text trimmed (blank -> null), NOT NULL
+        //    flags coerce null -> false, the four tri-state flags preserve null. Full-replace.
+        EnquirySaveRequest request = parseBodyAfterGates(body, EnquirySaveRequest.class);
+        EnquiryDto enquiry = normalizeEnquiry(request);
+
+        // 6. One clock for created_at (insert only) / updated_at. Native upsert respects
+        //    uq_order_enquiry_order, preserves created_at on replace, refreshes updated_at.
+        LocalDateTime now = LocalDateTime.now();
+        orderEnquiryWriteRepository.upsert(
+                orderId,
+                enquiry.leadType(),
+                enquiry.carpet(),
+                enquiry.hardFloor(),
+                enquiry.productFitTiming(),
+                enquiry.productUsageContext(),
+                enquiry.roomsToCover(),
+                enquiry.texturedOrPlain(),
+                enquiry.lightOrDarkTones(),
+                enquiry.coloursInterested(),
+                enquiry.currentFlooringAndReason(),
+                enquiry.productsDiscussed(),
+                enquiry.fullyInstalled(),
+                enquiry.uplift(),
+                enquiry.furniture(),
+                enquiry.stairs(),
+                enquiry.subfloorConcrete(),
+                enquiry.subfloorTimber(),
+                enquiry.subfloorTile(),
+                enquiry.briefSummary(),
+                now);
+
+        return new EnquirySaveResponse(enquiry);
     }
 
     private static String validateFlooringType(CreateOrderRequest body) {
@@ -758,6 +849,98 @@ public class OrderService {
                 .filter(a -> addressType.equals(a.getAddressType()))
                 .findFirst()
                 .orElse(null);
+    }
+
+    /**
+     * Normalise the enquiry body into an {@link EnquiryDto} (Phase 15F). The only validated field is
+     * {@code lead_type}: it must be exactly {@code FLOOR} / {@code PHONE} / {@code INTERNET} or
+     * null/blank (→ null) — any other value is a 400 VALIDATION_FAILED on field {@code lead_type}
+     * (never silently coerced/upper-cased). All other fields only normalise: each text field is
+     * trimmed and a blank-after-trim value becomes {@code null} (mirrors customer optional handling;
+     * no length cap — TEXT columns); the NOT NULL product/subfloor flags coerce a missing/null/false
+     * value to {@code false}; the four tri-state flags ({@code fully_installed}, {@code uplift},
+     * {@code furniture}, {@code stairs}) PRESERVE {@code null} (= unanswered) — never coerced to
+     * {@code false}. A {@code null} body (null/blank raw request) normalises to lead_type-null,
+     * all-flags-false, all-tri-state-null, all-text-null.
+     */
+    private static EnquiryDto normalizeEnquiry(EnquirySaveRequest body) {
+        List<ErrorDetail> errors = new ArrayList<>();
+        String leadType = normalizeLeadType(body == null ? null : body.leadType(), errors);
+        if (!errors.isEmpty()) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
+        }
+        return new EnquiryDto(
+                leadType,
+                Boolean.TRUE.equals(body == null ? null : body.carpet()),
+                Boolean.TRUE.equals(body == null ? null : body.hardFloor()),
+                trimToNull(body == null ? null : body.productFitTiming()),
+                trimToNull(body == null ? null : body.productUsageContext()),
+                trimToNull(body == null ? null : body.roomsToCover()),
+                trimToNull(body == null ? null : body.texturedOrPlain()),
+                trimToNull(body == null ? null : body.lightOrDarkTones()),
+                trimToNull(body == null ? null : body.coloursInterested()),
+                trimToNull(body == null ? null : body.currentFlooringAndReason()),
+                trimToNull(body == null ? null : body.productsDiscussed()),
+                body == null ? null : body.fullyInstalled(),
+                body == null ? null : body.uplift(),
+                body == null ? null : body.furniture(),
+                body == null ? null : body.stairs(),
+                Boolean.TRUE.equals(body == null ? null : body.subfloorConcrete()),
+                Boolean.TRUE.equals(body == null ? null : body.subfloorTimber()),
+                Boolean.TRUE.equals(body == null ? null : body.subfloorTile()),
+                trimToNull(body == null ? null : body.briefSummary()));
+    }
+
+    /** Trim a nullable free-text value; a {@code null} or blank-after-trim value becomes {@code null}. */
+    private static String trimToNull(String raw) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.trim();
+        return trimmed.isEmpty() ? null : trimmed;
+    }
+
+    /**
+     * Validate + normalise {@code lead_type}: {@code null} or blank-after-trim → {@code null}; an
+     * exact {@code FLOOR} / {@code PHONE} / {@code INTERNET} → itself; anything else adds a
+     * VALIDATION_FAILED on field {@code lead_type} (no silent case-folding or coercion).
+     */
+    private static String normalizeLeadType(String raw, List<ErrorDetail> errors) {
+        if (raw == null) {
+            return null;
+        }
+        String trimmed = raw.trim();
+        if (trimmed.isEmpty()) {
+            return null;
+        }
+        if (!VALID_LEAD_TYPES.contains(trimmed)) {
+            errors.add(new ErrorDetail(null, "lead_type", "Must be one of FLOOR, PHONE, INTERNET."));
+            return null;
+        }
+        return trimmed;
+    }
+
+    private static EnquiryDto toEnquiryDto(OrderEnquiry e) {
+        return new EnquiryDto(
+                e.getLeadType(),
+                e.isCarpet(),
+                e.isHardFloor(),
+                e.getProductFitTiming(),
+                e.getProductUsageContext(),
+                e.getRoomsToCover(),
+                e.getTexturedOrPlain(),
+                e.getLightOrDarkTones(),
+                e.getColoursInterested(),
+                e.getCurrentFlooringAndReason(),
+                e.getProductsDiscussed(),
+                e.getFullyInstalled(),
+                e.getUplift(),
+                e.getFurniture(),
+                e.getStairs(),
+                e.isSubfloorConcrete(),
+                e.isSubfloorTimber(),
+                e.isSubfloorTile(),
+                e.getBriefSummary());
     }
 
     private static CustomerDto toCustomerDto(OrderCustomer c) {

@@ -33,6 +33,7 @@ import type {
   DetailsOfSaleSaveRequest,
   OrderAddress,
   OrderCustomer,
+  OrderEnquiry,
   OrderWorkspace as OrderWorkspaceData,
 } from '../lib/api/orderWorkspaceApi'
 import { fetchOrderLines } from '../lib/api/orderLinesApi'
@@ -83,11 +84,13 @@ type ShellProps = {
   customer: OrderCustomer | null
   installationAddress: OrderAddress | null
   billingAddress: OrderAddress | null
+  // Phase 15F lead enquiry (nullable until first saved), shown in the Customer tab.
+  enquiry: OrderEnquiry | null
   saleDetails: DetailsOfSaleFields | null
   // Order-bound salesperson name for the invoice document header (Phase 15C PR2).
   salespersonName: string | null
-  // Lifts confirmed server-saved customer/address data up so workspace state
-  // (and sibling tabs) stay in sync without a refetch.
+  // Lifts confirmed server-saved customer/address/enquiry data up so workspace
+  // state (and sibling tabs) stay in sync without a refetch.
   onCustomerSaved: (saved: CustomerSavedPayload) => void
   // Lifts the server-confirmed details-of-sale fields (and refreshed updated_at)
   // up so workspace state stays in sync without a refetch.
@@ -106,6 +109,7 @@ function WorkspaceShell({
   customer,
   installationAddress,
   billingAddress,
+  enquiry,
   saleDetails,
   salespersonName,
   onCustomerSaved,
@@ -411,16 +415,24 @@ function WorkspaceShell({
         <Panel className="overflow-hidden">
           <Tabs tabs={TABS} active={activeTab} onChange={setActiveTab} />
           <div className="p-6">
-            {activeTab === 'customer' && (
+            {/* Customer is ALWAYS mounted (hidden when not active), unlike the other
+                tabs which stay conditionally rendered. This keeps the Lead Enquiry
+                autosave draft / local form state alive across top-level tab switches
+                (Customer -> Products & Charges -> Customer must NOT remount
+                LeadEnquirySection), so an in-flight unmount-flush can't race a fresh
+                stale-prop seed. Uses the same `activeTab === 'customer'` condition. */}
+            <div className={activeTab === 'customer' ? '' : 'hidden'}>
               <CustomerTab
+                key={orderId}
                 orderId={orderId}
                 locked={locked}
                 customer={customer}
                 installationAddress={installationAddress}
                 billingAddress={billingAddress}
+                enquiry={enquiry}
                 onSaved={onCustomerSaved}
               />
-            )}
+            </div>
             {activeTab === 'products' && (
               <ProductsChargesTab
                 orderId={orderId}
@@ -566,9 +578,14 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
   // installation rows persist even when a later billing step fails, and sibling
   // tabs see fresh data without a refetch.
   function handleCustomerSaved(saved: CustomerSavedPayload) {
-    setWorkspace((prev) => {
-      if (!prev) return prev
-      const next = { ...prev }
+    setWorkspace((current) => {
+      if (!current) return current
+      // ExistingOrderWorkspace persists across /orders/:orderId changes. Ignore late
+      // async save callbacks from a previous order so Order A data cannot pollute
+      // Order B's workspace state. Guards customer / address / enquiry merges alike.
+      if (current.order_id !== saved.orderId) return current
+
+      const next = { ...current }
       if (saved.customer !== undefined) next.customer = saved.customer
       if (saved.installAddress !== undefined) {
         next.install_address = saved.installAddress
@@ -576,6 +593,7 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
       if (saved.billingAddress !== undefined) {
         next.billing_address = saved.billingAddress
       }
+      if (saved.enquiry !== undefined) next.enquiry = saved.enquiry
       return next
     })
   }
@@ -614,6 +632,7 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
       customer={workspace.customer}
       installationAddress={workspace.install_address}
       billingAddress={workspace.billing_address}
+      enquiry={workspace.enquiry}
       saleDetails={saleDetails}
       salespersonName={workspace.salesperson_name}
       onCustomerSaved={handleCustomerSaved}

@@ -4,6 +4,7 @@ import { Field } from '../ui/Field'
 import { Input } from '../ui/Input'
 import { Tabs } from '../ui/Tabs'
 import { CheckCircleIcon } from '../icons'
+import { LeadEnquirySection } from './LeadEnquirySection'
 import { ApiError } from '../../lib/api/ApiError'
 import {
   copyBillingFromInstallation,
@@ -16,6 +17,7 @@ import type {
   CustomerSaveRequest,
   OrderAddress,
   OrderCustomer,
+  OrderEnquiry,
 } from '../../lib/api/orderWorkspaceApi'
 
 // Confirmed server-saved data lifted to the parent, one section at a time as
@@ -23,10 +25,18 @@ import type {
 // billing step fails). Each field is optional and always sourced from the
 // server response — billing from the billing PUT / copy response, never the
 // local form.
+//
+// orderId is the id the save was ADDRESSED to (captured before the await). The
+// parent uses it to drop late callbacks from a previous order — see
+// ExistingOrderWorkspace.handleCustomerSaved.
 export type CustomerSavedPayload = {
+  orderId: number
   customer?: OrderCustomer
   installAddress?: OrderAddress
   billingAddress?: OrderAddress
+  // Phase 15F: confirmed lead-enquiry row, lifted through the same channel so the
+  // workspace stays in sync without a refetch.
+  enquiry?: OrderEnquiry
 }
 
 type Props = {
@@ -35,6 +45,7 @@ type Props = {
   customer?: OrderCustomer | null
   installationAddress?: OrderAddress | null
   billingAddress?: OrderAddress | null
+  enquiry?: OrderEnquiry | null
   onSaved: (saved: CustomerSavedPayload) => void
 }
 
@@ -58,11 +69,12 @@ type AddressForm = {
   postcode: string
 }
 
-type SubTabId = 'details' | 'addresses'
+type SubTabId = 'details' | 'addresses' | 'enquiry'
 
 const SUB_TABS: Array<{ id: SubTabId; label: string }> = [
   { id: 'details', label: 'Details' },
   { id: 'addresses', label: 'Addresses' },
+  { id: 'enquiry', label: 'Lead Enquiry' },
 ]
 
 const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -254,6 +266,7 @@ export function CustomerTab({
   customer,
   installationAddress,
   billingAddress,
+  enquiry,
   onSaved,
 }: Props) {
   const [customerForm, setCustomerForm] = useState<CustomerForm>(() =>
@@ -444,6 +457,11 @@ export function CustomerTab({
     }
     setErrors({})
 
+    // Capture the order id the save is addressed to BEFORE any await, so a late
+    // lift (after the component may have unmounted / the order may have changed)
+    // still carries the correct source order id for the parent's guard.
+    const saveOrderId = orderId
+
     // Always send the complete field set (full-replace PUT). Optionals collapse
     // blank -> null here so omitted-as-empty does not get written as "".
     const customerBody = buildCustomerBody(customerForm)
@@ -480,7 +498,7 @@ export function CustomerTab({
       setCustomerForm(customerFromProps(savedCustomer))
       // Lift the confirmed customer row up immediately — it must survive even if
       // a later section (installation/billing) fails in this same run.
-      onSaved({ customer: savedCustomer })
+      onSaved({ orderId: saveOrderId, customer: savedCustomer })
 
       // 2. Installation address (must persist before any copy-from-installation).
       let savedInstall: OrderAddress
@@ -494,7 +512,7 @@ export function CustomerTab({
       if (!mountedRef.current) return
       setInstallForm(addressFromProps(savedInstall))
       // Lift the confirmed installation row up — survives a later billing failure.
-      onSaved({ installAddress: savedInstall })
+      onSaved({ orderId: saveOrderId, installAddress: savedInstall })
 
       // 3. Billing — copy-from-installation when "same as installation" is
       //    checked (the installation row exists from step 2), otherwise a full
@@ -512,7 +530,7 @@ export function CustomerTab({
       if (!mountedRef.current) return
       setBillingForm(addressFromProps(savedBilling))
       // Lift the confirmed billing row up.
-      onSaved({ billingAddress: savedBilling })
+      onSaved({ orderId: saveOrderId, billingAddress: savedBilling })
 
       // Every required call in this run succeeded — only now a global success.
       // Parent state was already updated per-section above (per-step only —
@@ -872,6 +890,23 @@ export function CustomerTab({
         </div>
       )}
 
+      {/* Kept mounted (toggled with `hidden`) so unsaved enquiry edits survive a
+          sub-tab switch, the same way the customer/address fields persist via
+          CustomerTab state. */}
+      <div className={activeSubTab === 'enquiry' ? '' : 'hidden'}>
+        <LeadEnquirySection
+          orderId={orderId}
+          locked={locked}
+          enquiry={enquiry}
+          // LeadEnquirySection captures the order id used for its PUT and passes
+          // it through, so the parent can drop a late callback from a prior order.
+          onSaved={(payload) => onSaved(payload)}
+        />
+      </div>
+
+      {/* Customer/address save footer — only for the Details/Addresses sub-tabs.
+          The Lead enquiry sub-tab has its own separate Save Lead Enquiry button. */}
+      {activeSubTab !== 'enquiry' && (
       <div className="mt-8 pt-5 border-t border-slate-200 space-y-4">
         {locked && (
           <p className="text-xs text-slate-500">
@@ -930,6 +965,7 @@ export function CustomerTab({
           </Button>
         </div>
       </div>
+      )}
     </div>
   )
 }
