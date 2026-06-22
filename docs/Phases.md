@@ -15,10 +15,11 @@ Flooring Sales Portal is a vertical SaaS sales application for flooring stores. 
 3. products and charges added
 4. pricing / costing / GP calculated
 5. notes and photos recorded
-6. invoice created
-7. customer accepts/signs
-8. payment recorded
-9. the full sale record stays in the portal
+6. quotation created/sent where needed
+7. invoice created after the customer proceeds
+8. customer accepts/signs
+9. payment recorded
+10. the full sale record stays in the portal
 
 This is **not** a generic CRM. The product is multi-tenant: each customer business has its own business slug and isolated data.
 
@@ -94,7 +95,7 @@ Phase 13     Invoice acceptance / signature / resend / email.
 Issue #27    Dynamic business slug routing.
 Phase 14     Rebaseline & tenant foundation: per-tenant data model (V12), slug validation,
              tenant quick-adds, db/dev-seed workflow (14A–14D).
-Phase 15     Invoice & payment correctness (15A–15E):
+Phase 15     Invoice & payment correctness + Lead Enquiry (15A–15F) — FULLY COMPLETE:
              - per-tenant invoice rendered once on screen + PDF (logo/ABN/bank/per-type terms);
                hardcoded sample branding removed.
              - per-flooring-type terms terms_hard / terms_soft (V13).
@@ -105,6 +106,10 @@ Phase 15     Invoice & payment correctness (15A–15E):
                post-payment email action.
              - PaymentsTab payment helpers (display-only): Stripe payment-link button
                (credit card, HTTPS only, opens tenant's external link) + bank-transfer details.
+             - 15F Lead Enquiry form (V15 order_enquiry): one-per-order enquiry inside the
+               Customer tab — lead type (FLOOR/PHONE/INTERNET), product interest, subfloor,
+               install questions, narrative fields. PUT upsert, embedded on workspace GET,
+               autosave (debounce + flush + single-flight), LAID-locked writes.
 ```
 
 ---
@@ -134,6 +139,7 @@ LM/SQM:          default 1 LM = 3.66 SQM; per-product sqm_per_lm (V8) MUST be re
                  where available — do not hardcode 3.66 over the per-product factor.
 LAID:            locked from protected edits; reads allowed; status still changeable from
                  dashboard; notes/photos/signature reads allowed where explicitly implemented.
+                 Lead Enquiry: read allowed, write blocked (422 ORDER_LOCKED).
 ```
 
 **GP rule**
@@ -160,21 +166,24 @@ Bank / ABN:      business-level.
 Logo:            file path/URL (local in dev, S3 URL in prod).
 Public tenant endpoint: name / logo / accent ONLY.
 Private invoice/legal (ABN, bank, T&Cs, quick-adds): AUTHENTICATED only, never public.
+Lead Enquiry:    order_enquiry (V15), one row per order, UNIQUE(order_id); order-specific data,
+                 NOT customer identity — never stored on order_customer, never widens sales_order.
 ```
 
 **Migration rules**
 
 ```text
-Current migrations are V1–V14. Never edit any committed migration; any schema change is a NEW migration.
+Current migrations are V1–V15. Never edit any committed migration; any schema change is a NEW migration.
   V1–V7 base · V8 LM/SQM factor · V9 negative-price constraint · V10 invoice accept/signature/email
   V11 reserved slug words · V12 per-tenant branding/invoice-legal/quick-add · V13 per-type terms
-  V14 payment void fields (voided_at + voided_by_user_id)
-CI "Locked migration protection" currently guards V1–V13. V14 is on main but NOT yet in the
-  guard range — add it in the next migration/CI PR, unless the Phase 16 squash/baseline replaces this.
+  V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
+CI "Locked migration protection" guards V1–V13 only (latest-known). V14 and V15 are on main but NOT
+  yet in the guard range — add them in the next migration/CI PR, unless the Phase 17 squash/baseline
+  replaces this. Verify the live CI guard range if it matters.
 Schema = Flyway migration. Demo/dev data = db/dev-seed (manual, idempotent, never auto-runs).
   New tests must self-seed and must NOT depend on the V4 legacy seed.
 Do NOT create a Flyway migration per customer/tenant. Production starts schema-only;
-  the V4 demo seed must not run in prod. Schema-only baseline/squash is a Phase 16 task.
+  the V4 demo seed must not run in prod. Schema-only baseline/squash is a Phase 17 task.
 ```
 
 **Tenant / slug security**
@@ -203,7 +212,8 @@ db/dev-seed demo files (run manually after Flyway, idempotent): quick descriptio
 Twilio remote invoice signing · real Stripe webhook/auto-confirm/Connect · Operations Portal ·
 Store Portal / analytics dashboard · installer/laybook workflows · advanced quote comparison ·
 room-level complexity · AI features · invoice version-history UI / old signed-invoice download ·
-payment edit / hard delete (beyond the Phase 15 soft-void flow).
+payment edit / hard delete (beyond the Phase 15 soft-void flow) ·
+lead-source field in Customer Details (small, unscheduled — distinct from the 15F Lead Enquiry form).
 ```
 
 ---
@@ -247,11 +257,26 @@ Footguns — must not break:
 
 ## 7. Roadmap
 
-### Phase 16 — Deploy & Hardening (no revamp)
+### Phase 16 — Quotation PDF / quote sending
 
 ```text
-- Schema-only migration squash/baseline (deferred from 14D): collapse V1–V14 into one clean
-  baseline before any production data exists; re-lock the new baseline in CI.
+- Create and send a quotation to the customer (quote on the spot), BEFORE invoice/payment.
+- Quotation PDF generation — DISTINCT from the invoice PDF. Do NOT reuse invoice
+  acceptance / signature / payment rules blindly.
+- Send / resend the quote to the customer (email).
+- Possible in-app quote editor/canvas to adjust the quote before sending.
+
+SCOPE NOT LOCKED. First decide the quote model: separate versioned entity vs. draft-invoice
+view vs. new model. Lock the API contract (openapi.yaml + contract docs) BEFORE any branch.
+This is its own phase, not a sub-task — it will need more than one branch.
+```
+
+### Phase 17 — Deployment & Hardening (no revamp)
+
+```text
+- Schema-only migration squash/baseline (deferred from 14D): collapse all committed pre-production
+  migrations into one clean baseline, including V1–V15 and any Phase 16 quotation migrations, before
+  any production data exists; re-lock the new baseline in CI.
 - Repeatable per-tenant ONBOARDING seed: parameterised script/process to insert a real
   business -> its stores -> its users (login/codes) -> invoice-legal (ABN/bank/terms/stripe link).
   Real data, separate from the throwaway db/dev-seed demo scripts.
@@ -262,19 +287,12 @@ Footguns — must not break:
 - Secrets / env config. Seed the real launch tenant into production (using the onboarding seed).
 ```
 
-### Phase 17 — Revamp (app chrome only)
+### Phase 18 — Revamp (app chrome only)
 
 ```text
 - FloorxTack identity + per-tenant logo/name/accent on login/dashboard/workspace + clean payment screen.
 - Invoice is ALREADY branded (Phase 15) — do not redo it.
 - Light skin only: preserve workflow, placeholders, backend wiring. iPad-friendly, compact. No CRM redesign.
-```
-
-### Phase 18 — Pitch features
-
-```text
-- Quotation PDF (quote on the spot — pitch-critical).
-- Lead-source field in Customer Details.
 ```
 
 ### Phase 19 — Final audit gate
@@ -290,12 +308,15 @@ Footguns — must not break:
 ## 8. Open / deferred issues
 
 ```text
-#75  centralize backend auth enforcement (fail-closed) before production   -> Phase 16
-#29  CSRF protection before production                                     -> Phase 16
-#30  production CORS origins                                               -> Phase 16
-#34  app/database timezone before production                              -> Phase 16
+#75  centralize backend auth enforcement (fail-closed) before production   -> Phase 17
+#29  CSRF protection before production                                     -> Phase 17
+#30  production CORS origins                                               -> Phase 17
+#34  app/database timezone before production                              -> Phase 17
 #55  financial summary versioning (concurrent mutations)                  -> deferred-hardening (post-pilot)
 #69  backend version precondition on invoice accept                       -> deferred-hardening (post-pilot)
+
+NOTE: docs are authoritative for phase numbering. GitHub issue labels may still read phase-16 for
+  #29/#30/#34/#75 — these are Phase 17 now; update the labels to match when convenient.
 
 Known follow-up needing ticket:
 W1  business_quick_description has a FK to business with no ON DELETE — the tenant seed/wipe
@@ -306,4 +327,4 @@ W1  business_quick_description has a FK to business with no ON DELETE — the te
 
 ## 9. Next step
 
-**Phase 16 — Deploy & Hardening.** Begin with detailed Phase 16 planning. Early tasks: the schema-only **migration squash/baseline** (collapse V1–V14, re-lock in CI) and designing the **repeatable real-tenant onboarding seed**. Then proceed through the AWS/hardening items.
+**Phase 16 — Quotation PDF / quote sending.** Scope is **NOT yet locked**. Before any branch: decide the quote model (separate versioned entity vs. draft-invoice view vs. new model), then lock the API contract (`openapi.yaml` + contract docs) first. Do NOT reuse invoice acceptance/signature/payment rules blindly. Discuss and lock exact scope before implementation.

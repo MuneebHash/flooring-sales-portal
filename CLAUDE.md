@@ -15,11 +15,12 @@ Flooring Sales Portal is a vertical SaaS sales application for flooring stores. 
 3. add flooring products and charge/labour lines
 4. calculate totals, costings, GP, sale price
 5. record notes and photos
-6. create/rewrite invoice
-7. capture customer signature and accept invoice
-8. resend/email accepted invoice
-9. record (and void) payments
-10. keep the full sale record inside the portal
+6. create/send quotation where needed
+7. create/rewrite invoice after customer proceeds
+8. capture customer signature and accept invoice
+9. resend/email accepted invoice
+10. record (and void) payments
+11. keep the full sale record inside the portal
 
 Not a generic CRM — a specialised flooring sales workflow product. Multi-tenant: each business has its own slug and isolated data.
 
@@ -33,6 +34,8 @@ Not a generic CRM — a specialised flooring sales workflow product. Multi-tenan
 - Keep scope tiny. Do exactly the requested task. Do not freelance future features into it.
 - Do not modify `backend/`, `docs/`, migrations, or `openapi.yaml` unless explicitly asked.
 - Run the correct build/test command before claiming done. Report changed files, validation result, and any risk. Never say "done" if build/test is broken.
+- For serious verify/implementation/review work, Claude Code must create a Desktop `.md` audit/report file (e.g. `/Users/muneebsmacbook/Desktop/<task>-audit.md`) — never inside the repo.
+- For major PRs after Phase 15F, run a read-only local Claude Code audit BEFORE PR/Codex review, focused on lifecycle bugs, async callbacks, stale state, autosave races, tenancy scoping, validation ordering, docs/OpenAPI parity, and regression risk.
 
 The user controls all approvals, commits, pushes, merges, and all product/UI decisions. Claude Code may run build/test/terminal commands during implementation, but never commits, pushes, or creates audit files inside the repo.
 
@@ -41,11 +44,19 @@ The user controls all approvals, commits, pushes, merges, and all product/UI dec
 ## Status
 
 ```text
-Phase 15 (Invoice & Payment Correctness) is COMPLETE — see docs/Phases.md §4.
-Current focus: Phase 16 — Deploy & Hardening. See docs/Phases.md §7.
+Phase 15 (Invoice & Payment correctness + Lead Enquiry, 15A–15F) is COMPLETE — see docs/Phases.md §4.
+Current focus: Phase 16 — Quotation PDF / quote sending. See docs/Phases.md §7/§9.
+
+Phase 16 scope is NOT locked. Before any Phase 16 branch: decide the quote model
+  (separate versioned entity vs draft-invoice view vs new model), then lock the API contract
+  (openapi.yaml + contract docs) FIRST. Do NOT reuse invoice acceptance/signature/payment rules
+  blindly. No quotation implementation details exist yet — scope and contract come first.
+
+Roadmap: 16 Quotation PDF · 17 Deploy & Hardening · 18 Revamp/app chrome · 19 Final audit gate
+  (full roadmap in docs/Phases.md §7).
 ```
 
-The app is wired to the Spring Boot backend across the full MVP sales workflow: auth/login/logout/store-selection; dashboard order list + status update; create order shell; order workspace; customer + address save; details-of-sale autosave; product search + product lines; charge/labour lines; financial summary, GP, sale-price override/reset, target-GP price control; notes; photo upload/list/preview/delete; invoice create/rewrite/view/download; payment list/record/**void**; invoice acceptance with customer signature; resend/email state; per-tenant invoice on screen + PDF; per-flooring-type terms; PaymentsTab Stripe-link + bank-transfer helpers; dynamic business-slug routing; reserved-slug blocking; slug validation + Business-Not-Found; per-tenant quick-adds; go-forward db/dev-seed workflow + MS1 multi-store demo user.
+The app is wired to the Spring Boot backend across the full MVP sales workflow: auth/login/logout/store-selection; dashboard order list + status update; create order shell; order workspace; customer + address save; details-of-sale autosave; product search + product lines; charge/labour lines; financial summary, GP, sale-price override/reset, target-GP price control; notes; photo upload/list/preview/delete; invoice create/rewrite/view/download; payment list/record/**void**; invoice acceptance with customer signature; resend/email state; per-tenant invoice on screen + PDF; per-flooring-type terms; PaymentsTab Stripe-link + bank-transfer helpers; **Lead Enquiry form (one-per-order order_enquiry) in the Customer tab**; dynamic business-slug routing; reserved-slug blocking; slug validation + Business-Not-Found; per-tenant quick-adds; go-forward db/dev-seed workflow + MS1 multi-store demo user.
 
 ---
 
@@ -66,7 +77,7 @@ Local DB:  Docker Postgres 17 (infra/docker-compose.yml) —
 ```bash
 # local DB
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal && docker compose -f infra/docker-compose.yml up -d
-# backend (Flyway applies V1–V14 on boot)
+# backend (Flyway applies V1–V15 on boot)
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal/backend && ./mvnw spring-boot:run
 # frontend
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal/frontend && npm run dev
@@ -118,15 +129,18 @@ The frontend guard (`RESERVED_BUSINESS_SLUGS` in `frontend/src/lib/tenant.ts`, v
 ## Migration rules
 
 ```text
-Current migrations are V1–V14:
+Current migrations are V1–V15:
   V1–V7 base · V8 LM/SQM factor · V9 negative-price constraint · V10 invoice accept/signature/email
   V11 reserved slug words · V12 per-tenant branding/invoice-legal/quick-add · V13 per-type terms
-  V14 payment void fields (voided_at + voided_by_user_id)
+  V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
 
 Never edit any committed migration. Any schema change is a NEW migration.
-CI "Locked migration protection" currently guards V1–V13. V14 is on main (PR #85) but NOT yet in
-  the guard range — add it in the next migration/CI PR. Do not write "V1–V14 locked" yet.
-  (The Phase 16 schema-only squash/baseline may supersede this.)
+CI "Locked migration protection" guards V1–V13 only (latest-known). V14 and V15 are on main but
+  NOT yet locked unless live CI says otherwise. Any migration/CI work before the Phase 17 squash must
+  explicitly account for V14/V15. Do not casually expand or rewrite the guard if the Phase 17
+  squash/baseline will supersede it.
+The Phase 17 schema-only squash/baseline must collapse ALL committed pre-production migrations —
+  including V1–V15 and any Phase 16 quotation migrations — into one clean baseline and re-lock it in CI.
 Do NOT create a Flyway migration per customer/tenant — onboarding seeds are not product migrations.
 ```
 
@@ -142,7 +156,7 @@ Dev-seed scripts live in `backend/src/main/resources/db/dev-seed/` (sibling of `
 
 ```text
 1. start Postgres
-2. start backend (Flyway applies V1–V14)
+2. start backend (Flyway applies V1–V15)
 3. psql -f db/dev-seed/quick_descriptions_demo.sql
 4. psql -f db/dev-seed/multi_store_user_demo.sql
 5. psql -f db/dev-seed/payment_helpers_demo.sql      # bank + Stripe-link demo data (Phase 15E)
@@ -150,7 +164,7 @@ Dev-seed scripts live in `backend/src/main/resources/db/dev-seed/` (sibling of `
 7. verify login / store-selection / quick-adds / products / charges / payment helpers / terms
 ```
 
-The production-safe schema-only baseline/squash (separating the V4 demo seed from schema) is deferred to Phase 16 / pre-deploy. Legacy V4–V7 demo data stays for now (locked + test-dependent).
+The production-safe schema-only baseline/squash (separating the V4 demo seed from schema) is deferred to Phase 17 / pre-deploy. Legacy V4–V7 demo data stays for now (locked + test-dependent).
 
 ---
 
@@ -187,11 +201,29 @@ When `order_status = LAID`, protected edits are locked. Backend returns 422 `ORD
 
 ```text
 Blocked when LAID:  customer/address/details protected saves · product/charge mutations ·
-                    sale-price mutations · attachment delete
+                    sale-price mutations · attachment delete · Lead Enquiry write
 Allowed when LAID:  reads · notes (append-only) · photo upload/list/preview ·
-                    status change from dashboard ·
+                    status change from dashboard · Lead Enquiry read ·
                     invoice/signature/payment flows where explicitly supported
                     (accept / resend / signature-download) · payment VOID (inverse of recording)
+```
+
+### Lead Enquiry (Phase 15F — shipped)
+
+Order-specific enquiry captured inside the Customer tab. Schema: `order_enquiry` (V15), one row per order, `UNIQUE(order_id)`. This is order/job enquiry data, **not** customer identity — never stored on `order_customer`, never widens `sales_order`.
+
+```text
+- Embedded on the workspace GET (nullable data.enquiry). No standalone GET enquiry endpoint.
+- PUT /api/v1/{slug}/orders/{orderId}/enquiry is a FULL-REPLACE upsert — the whole body is sent
+  on every save (autosave and manual).
+- Autosave: debounce + blur flush + unmount flush + single-flight + queue. Manual Save button kept.
+- LAID: read allowed; write blocked with 422 ORDER_LOCKED.
+- lead_type: FLOOR / PHONE / INTERNET / null (exact-case only). Invalid on an editable order ->
+  400 VALIDATION_FAILED (field lead_type); on a LAID order the 422 ORDER_LOCKED fires first.
+- carpet / hard_floor: independent booleans, decoupled from order flooring_type (never auto-filled).
+- fully_installed / uplift / furniture / stairs: tri-state nullable booleans — NULL is "unanswered"
+  and is NEVER coerced to false.
+- subfloor_concrete / subfloor_timber / subfloor_tile: independent multi-select booleans.
 ```
 
 ### Payment void rule (Phase 15D — fully shipped, backend + frontend)
@@ -297,7 +329,7 @@ full Operations Portal · Store Portal/dashboard · installer/laybook workflows 
 advanced quote comparison · room-level complexity · AI features ·
 payment edit / hard delete (only soft void is in scope) · refunds · finance products ·
 Stripe Connect / full payment-gateway build / webhooks ·
-major frontend redesign / FloorxTack chrome (Phase 17) · invoice version-history UI
+major frontend redesign / FloorxTack chrome (Phase 18) · invoice version-history UI
 ```
 
 ---
@@ -305,13 +337,15 @@ major frontend redesign / FloorxTack chrome (Phase 17) · invoice version-histor
 ## Open / deferred issues
 
 ```text
-#75  centralize backend auth enforcement (fail-closed) before production   -> Phase 16
-#29  CSRF protection before production                                     -> Phase 16
-#30  production CORS origins                                               -> Phase 16
-#34  app/database timezone before production                              -> Phase 16
+#75  centralize backend auth enforcement (fail-closed) before production   -> Phase 17
+#29  CSRF protection before production                                     -> Phase 17
+#30  production CORS origins                                               -> Phase 17
+#34  app/database timezone before production                              -> Phase 17
 #55  financial summary versioning (concurrent mutations)                  -> deferred-hardening (post-pilot)
 #69  backend version precondition on invoice accept                       -> deferred-hardening (post-pilot)
 ```
+
+GitHub issue labels may still read `phase-16` for #29/#30/#34/#75 — these are Phase 17 now; update the labels when convenient. Docs are authoritative for phase numbering.
 
 Other deferred-hardening (not all ticketed): secure cookies for HTTPS, production email provider (SES), DB backup strategy, S3/object storage for production uploads.
 
