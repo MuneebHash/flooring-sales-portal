@@ -55,3 +55,35 @@
 .invoice-terms > :last-child {
   margin-bottom: 0;
 }
+
+/* Phase 16A PR1 — CarpetCall-style dense two-column terms on wider screens (iPad/desktop).
+   The single numbered list flows into two columns; list items never split across the column
+   gap. `list-style-position: inside` keeps the number visible at the top of BOTH columns
+   (outside markers can clip at a column start in WebKit). Narrow screens keep the
+   single-column outside-marker layout above. Scoped under `.invoice-terms` only. */
+@media (min-width: 768px) {
+  .invoice-terms ol,
+  .invoice-terms ul {
+    column-count: 2;
+    column-gap: 2.5rem;
+    padding-left: 0;
+    list-style-position: inside;
+  }
+  .invoice-terms li {
+    margin: 0.2rem 0;
+  }
+}
+.invoice-terms li,
+.invoice-terms p,
+.invoice-terms table {
+  break-inside: avoid;
+  -webkit-column-break-inside: avoid;
+}
+
+/* Phase 16A PR1 (pass 3) — shallower on-screen signature pad. The shared SignaturePad canvas
+   ships a fixed h-40 (160px); this scoped, unlayered rule overrides it to a proportionate ~136px
+   without editing the SignaturePad component (the pad's ResizeObserver re-reads this CSS height
+   and re-fits its backing store). Screen-only; affects only the invoice signature pad. */
+.invoice-signature-pad canvas {
+  height: 6.5rem;
+}

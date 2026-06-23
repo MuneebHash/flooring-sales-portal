@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="268" height="56" viewBox="0 0 268 56" role="img" aria-label="Aussie Floors Group">
+  <title>Aussie Floors Group</title>
+  <desc>Original demo wordmark for the Aussie Floors Group demo tenant — not a real or third-party brand.</desc>
+  <!-- Stacked-plank mark (suggests flooring); original geometric shapes, no third-party logo. -->
+  <g>
+    <polygon points="16,8 46,8 38,18 8,18" fill="#0f766e"/>
+    <polygon points="16,21 46,21 38,31 8,31" fill="#0d9488"/>
+    <polygon points="16,34 46,34 38,44 8,44" fill="#14b8a6"/>
+  </g>
+  <!-- Wordmark -->
+  <text x="60" y="31" font-family="Helvetica, Arial, sans-serif" font-size="21" font-weight="700" letter-spacing="0.5" fill="#1e293b">AUSSIE FLOORS</text>
+  <text x="61" y="46" font-family="Helvetica, Arial, sans-serif" font-size="10" font-weight="600" letter-spacing="5" fill="#0f766e">GROUP</text>
+</svg>
