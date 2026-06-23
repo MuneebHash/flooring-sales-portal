@@ -22,9 +22,8 @@ import {
   type TenantInvoiceConfig,
 } from '../../lib/api/tenantInvoiceConfigApi'
 import { fetchPublicBusiness } from '../../lib/api/tenantApi'
-import { useAuth } from '../../lib/auth'
 import { getActiveSlug } from '../../lib/tenant'
-import { FLOORING_LABELS, type FlooringType } from '../../lib/flooring'
+import type { FlooringType } from '../../lib/flooring'
 
 type Props = {
   orderId: number
@@ -117,29 +116,6 @@ function composeAddressLines(
   return [line1, line2].filter((line) => line.length > 0)
 }
 
-// Store contact block for the document header — mirrors the PDF store address
-// (street on line 1; suburb / state / postcode on line 2). Blank parts are dropped
-// and an all-blank store yields no lines, so the block hides like any other optional row.
-function composeStoreAddressLines(
-  store:
-    | {
-        street?: string
-        suburb?: string
-        state_code?: string
-        postcode?: string
-      }
-    | null
-    | undefined,
-): string[] {
-  if (!store) return []
-  const line1 = store.street?.trim() ?? ''
-  const line2 = [store.suburb, store.state_code, store.postcode]
-    .map((part) => part?.trim() ?? '')
-    .filter((part) => part.length > 0)
-    .join(' ')
-  return [line1, line2].filter((line) => line.length > 0)
-}
-
 // Download filename mirrors the backend Content-Disposition pattern
 // (invoice-{order_number}-v{version}.pdf). A blob object URL does not carry the
 // server's Content-Disposition, so the anchor sets the name explicitly.
@@ -172,7 +148,6 @@ export function InvoiceTab({
   customer,
   billingAddress,
   saleDetails,
-  salespersonName,
   onGoToCustomer,
 }: Props) {
   // Only ever the CURRENT/latest invoice — no version list, no history.
@@ -190,16 +165,21 @@ export function InvoiceTab({
   const [resending, setResending] = useState(false)
   const [reloadToken, setReloadToken] = useState(0)
 
-  // Phase 15B — per-tenant invoice metadata for the document header / terms / bank
-  // section. The store name comes from the already-loaded auth context (no fetch). The
-  // business name + private invoice-config are fetched in a SEPARATE, order-independent
-  // effect below and FAIL SOFT: a failure hides the affected rows, never blocks the
-  // invoice document, and never routes through loadError.
-  const { activeStore } = useAuth()
+  // Phase 15B — per-tenant invoice metadata for the document terms. The business name +
+  // private invoice-config are fetched in a SEPARATE, order-independent effect below and FAIL
+  // SOFT: a failure hides the affected rows, never blocks the invoice document, and never
+  // routes through loadError. (Phase 16A PR1: store details are no longer shown on this screen,
+  // so the auth store context is no longer read here.)
   const [tenantConfig, setTenantConfig] = useState<TenantInvoiceConfig | null>(
     null,
   )
   const [businessName, setBusinessName] = useState<string | null>(null)
+  // Phase 16A PR1 — demo/tenant logo for the document header. Sourced from the fail-soft
+  // public-business lookup (NOT the acceptance-gating tenant config), rendered as a browser
+  // <img> that fails soft to the business-name text. logoFailed flips on an <img> load error
+  // and resets whenever the path changes (effect below).
+  const [logoPath, setLogoPath] = useState<string | null>(null)
+  const [logoFailed, setLogoFailed] = useState(false)
   // Legal-risk gate (Codex P1): Accept must be unavailable until the tenant invoice
   // config is SAFELY known. Configured per-type terms (terms_soft/terms_hard) may exist
   // but not yet have rendered, so the customer must not sign/accept while the config is
@@ -214,6 +194,14 @@ export function InvoiceTab({
   // order's saved customer (see derivedAcceptedName below).
   const [hasInk, setHasInk] = useState(false)
   const padRef = useRef<SignaturePadHandle | null>(null)
+
+  // Phase 16A PR1 — acceptance checkboxes (frontend-only gate; NEVER sent to the backend —
+  // the accept contract stays exactly { accepted_customer_name, signature }). One boolean per
+  // ACCEPTANCE_LINES entry. Reset structurally on invoice identity/version change (effect
+  // below) so a tick never leaks across a reload, rewrite, or payment/void regeneration.
+  const [acceptanceChecked, setAcceptanceChecked] = useState<boolean[]>(() =>
+    Array(ACCEPTANCE_LINES.length).fill(false),
+  )
 
   // Stored accepted-signature display (object URL owned by the effect below).
   // While the fetch is in flight, signatureUrl is null and signatureFailed false —
@@ -315,10 +303,12 @@ export function InvoiceTab({
       .then((business) => {
         if (cancelled) return
         setBusinessName(nonBlank(business.name))
+        setLogoPath(nonBlank(business.logo_path))
       })
       .catch(() => {
         if (cancelled) return
         setBusinessName(null)
+        setLogoPath(null)
       })
 
     return () => {
@@ -340,6 +330,20 @@ export function InvoiceTab({
       setHasInk(false)
     }
   }, [tenantConfigLoading, tenantConfigError])
+
+  // Phase 16A PR1 — reset the acceptance checkboxes whenever the invoice IDENTITY or VERSION
+  // changes (initial load, accept, drift resync, rewrite, payment/void regeneration). A keyed
+  // reset, NOT a manual list of setHasInk(false) sites, so it cannot drift if those sites
+  // change. The ACCEPTED branch shows the boxes checked/read-only from the persisted
+  // acceptance, never from this state (which has just been reset).
+  useEffect(() => {
+    setAcceptanceChecked(Array(ACCEPTANCE_LINES.length).fill(false))
+  }, [invoice?.invoice_id, invoice?.version_number])
+
+  // Phase 16A PR1 — a new logo path is a fresh chance to load; clear any prior <img> failure.
+  useEffect(() => {
+    setLogoFailed(false)
+  }, [logoPath])
 
   function refetch() {
     setReloadToken((token) => token + 1)
@@ -472,7 +476,8 @@ export function InvoiceTab({
       accepting ||
       resending ||
       invoice === null ||
-      !tenantConfigReadyForAcceptance
+      !tenantConfigReadyForAcceptance ||
+      !acceptanceChecked.every(Boolean)
     )
       return
     const displayed = invoice
@@ -658,21 +663,11 @@ export function InvoiceTab({
   const dueDateText =
     invoice && invoice.due_date ? formatDocDate(invoice.due_date) : ''
 
-  // Phase 15B tenant document fields — each hidden when null/blank (never "—"/sample).
-  // Store name + contact/address from auth; business name + abn/bank from the tenant fetch above.
-  const storeName = nonBlank(activeStore?.name)
-  // Phase 15C PR2 — store contact/address + order-bound salesperson + flooring-type label,
-  // mirroring the PDF header. All fail-soft via nonBlank() / empty list (no "—"/sample).
-  const storePhone = nonBlank(activeStore?.phone)
-  const storeEmail = nonBlank(activeStore?.email)
-  const storeAddressLines = composeStoreAddressLines(activeStore)
-  const salesperson = nonBlank(salespersonName)
-  const flooringTypeLabel = FLOORING_LABELS[flooringType]
-  const abn = nonBlank(tenantConfig?.abn)
-  const bankName = nonBlank(tenantConfig?.bank_name)
-  const bsb = nonBlank(tenantConfig?.bsb)
-  const accountNumber = nonBlank(tenantConfig?.account_number)
-  const accountName = nonBlank(tenantConfig?.account_name)
+  // Phase 16A PR1 — the on-screen Invoice header is intentionally minimal to match the
+  // CarpetCall reference: business logo (or business-name fallback) on the left, and
+  // TAX INVOICE + number on the right. Store name/address/phone/email, ABN, bank/payment
+  // details, Flooring Type and Salesperson are deliberately NOT rendered on this screen. All of
+  // that data is unchanged in auth/workspace/tenant-config and still appears on the PDF.
   // Per-flooring-type terms (Phase 15B-2): a SOFT order shows terms_soft, a HARD order
   // shows terms_hard. Exactly one block renders. NO fallback to the legacy single-block
   // terms_and_conditions — an unset per-type terms block hides like any other null/blank
@@ -736,11 +731,6 @@ export function InvoiceTab({
     if (!doc.body.textContent?.trim()) return null
     return sanitized
   }, [termsText])
-  const hasBankDetails =
-    bankName !== null ||
-    bsb !== null ||
-    accountNumber !== null ||
-    accountName !== null
 
   // Accept is gated on the tenant invoice config being SAFELY loaded (Codex P1): not
   // loading and not errored. Configured terms may exist but not yet have rendered, so
@@ -748,6 +738,11 @@ export function InvoiceTab({
   // soft and never affects this flag.)
   const tenantConfigReadyForAcceptance =
     !tenantConfigLoading && !tenantConfigError
+  // Phase 16A PR1 — all acceptance checkboxes ticked (frontend-only gate for Accept).
+  const allAcceptanceChecked = acceptanceChecked.every(Boolean)
+  // Phase 16A PR1 — drives the bottom composition (checkbox read-only state + Accept vs
+  // Re-send action bar). Persisted by the invoice acceptance event, never by local state.
+  const invoiceAccepted = invoice !== null && invoice.accepted_at !== null
 
   return (
     <div>
@@ -771,22 +766,9 @@ export function InvoiceTab({
             >
               {downloading ? 'Preparing…' : 'Download PDF'}
             </Button>
-            {/* Re-send is gated on accepted_at ONLY — never on last_emailed_at.
-                It shows for every accepted invoice: when the Accept auto-email
-                failed (last_emailed_at null) AND after a successful email
-                (sending another copy). A second, in-context Re-send lives in
-                the accepted signature block below. */}
-            {invoice.accepted_at !== null && (
-              <Button
-                type="button"
-                variant="success"
-                size="md"
-                onClick={handleResend}
-                disabled={resending || accepting}
-              >
-                {resending ? 'Re-sending…' : 'Re-send Invoice'}
-              </Button>
-            )}
+            {/* Phase 16A PR1 — the top action area holds ONLY Download PDF. Re-send is no
+                longer duplicated here; it lives solely in the accepted signature block below
+                (near the signature), matching the CarpetCall layout. */}
           </div>
         )}
       </div>
@@ -840,45 +822,36 @@ export function InvoiceTab({
           </div>
         </div>
       ) : invoice !== null ? (
-        <article className="rounded-lg border border-slate-200 bg-white shadow-sm p-6 sm:p-8">
+        <article className="rounded-lg border border-slate-200 bg-white shadow-sm px-6 py-6 sm:px-8 sm:py-8 lg:px-10 lg:py-8">
           <header className="grid grid-cols-1 sm:grid-cols-3 gap-6 items-start">
             <div className="sm:col-span-1">
-              {/* Logo is business-name TEXT only (PR2): logo_path is a server-internal
-                  storage key, not a browser URL — no <img>, no logo route. */}
-              {businessName && (
-                <div className="text-base font-bold text-slate-900 tracking-tight">
-                  {businessName}
-                </div>
+              {/* Phase 16A PR1 — render the tenant/demo logo as a browser <img> when a
+                  non-blank path is present and has not failed to load; otherwise fall back to
+                  the business-name text. The path comes from the fail-soft public-business
+                  lookup, so a logo problem never affects the acceptance gate, and there is no
+                  hardcoded /demo-logos value here (the value is whatever the API returns). */}
+              {logoPath && !logoFailed ? (
+                <img
+                  src={logoPath}
+                  alt={businessName ?? 'Business logo'}
+                  className="h-auto w-auto max-h-16 max-w-[240px] object-contain"
+                  onError={() => setLogoFailed(true)}
+                />
+              ) : (
+                businessName && (
+                  <div className="text-base font-bold text-slate-900 tracking-tight">
+                    {businessName}
+                  </div>
+                )
               )}
-              {storeName && (
-                <div className="mt-0.5 text-xs font-medium text-slate-700">
-                  {storeName}
-                </div>
-              )}
-              {storeAddressLines.length > 0 && (
-                <div className="mt-0.5 text-[11px] text-slate-600 leading-relaxed">
-                  {storeAddressLines.map((line) => (
-                    <div key={line}>{line}</div>
-                  ))}
-                </div>
-              )}
-              {storePhone && (
-                <div className="mt-0.5 text-[11px] text-slate-600">
-                  Phone: {storePhone}
-                </div>
-              )}
-              {storeEmail && (
-                <div className="text-[11px] text-slate-600">
-                  Email: {storeEmail}
-                </div>
-              )}
-              {abn && (
-                <div className="mt-2 text-[11px] text-slate-500">ABN: {abn}</div>
-              )}
+              {/* Phase 16A PR1 — store name/address/phone/email + ABN are intentionally NOT
+                  shown in the header (closer to the CarpetCall reference): logo, or the
+                  business-name fallback, only. The store/ABN data is unchanged in
+                  auth/workspace/tenant-config and on the PDF. */}
             </div>
             <div className="hidden sm:block sm:col-span-1" />
             <div className="sm:col-span-1 sm:text-right">
-              <div className="text-2xl font-bold text-slate-900 tracking-tight">
+              <div className="text-3xl font-bold text-slate-900 tracking-tight">
                 TAX INVOICE
               </div>
               {orderNumber && (
@@ -931,49 +904,6 @@ export function InvoiceTab({
                   {dueDateText || '—'}
                 </span>
               </div>
-              <div className="text-sm text-slate-600">
-                Flooring Type :{' '}
-                <span className="text-slate-900">{flooringTypeLabel}</span>
-              </div>
-              {salesperson && (
-                <div className="text-sm text-slate-600">
-                  Salesperson :{' '}
-                  <span className="text-slate-900">{salesperson}</span>
-                </div>
-              )}
-              {hasBankDetails && (
-                <div className="pt-2 space-y-0.5">
-                  <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
-                    Payment Details
-                  </div>
-                  {bankName && (
-                    <div className="text-sm text-slate-600">
-                      Bank :{' '}
-                      <span className="text-slate-900">{bankName}</span>
-                    </div>
-                  )}
-                  {bsb && (
-                    <div className="text-sm text-slate-600">
-                      BSB :{' '}
-                      <span className="text-slate-900 tabular-nums">{bsb}</span>
-                    </div>
-                  )}
-                  {accountNumber && (
-                    <div className="text-sm text-slate-600">
-                      Account No. :{' '}
-                      <span className="text-slate-900 tabular-nums">
-                        {accountNumber}
-                      </span>
-                    </div>
-                  )}
-                  {accountName && (
-                    <div className="text-sm text-slate-600">
-                      Account Name :{' '}
-                      <span className="text-slate-900">{accountName}</span>
-                    </div>
-                  )}
-                </div>
-              )}
             </div>
           </div>
 
@@ -1025,113 +955,121 @@ export function InvoiceTab({
             </div>
           )}
 
-          <div className="mt-8 grid grid-cols-1 sm:grid-cols-2 gap-6">
-            <div className="space-y-2">
-              {ACCEPTANCE_LINES.map((line) => (
-                <label
-                  key={line}
-                  className="flex items-start gap-2 text-xs text-slate-700 leading-relaxed"
-                >
-                  <input
-                    type="checkbox"
-                    defaultChecked
-                    disabled
-                    className="mt-0.5 h-4 w-4 rounded border-slate-300 text-teal-600"
-                  />
-                  <span className="uppercase tracking-wide font-medium">
-                    {line}
-                  </span>
-                </label>
-              ))}
-              <p className="pt-3 text-xs font-semibold uppercase tracking-wider text-slate-800">
+          {/* Phase 16A PR1 — CarpetCall-style bottom composition: acceptance checkboxes +
+              bold agreement on the left, the customer signature (centered) on the right, and a
+              full-width Accept / Re-send action bar that anchors the document. Dense spacing,
+              top-aligned (sm:items-start) so the signature sits beside the checkboxes with no
+              float gap; the signature is NOT wrapped in a large empty box. */}
+          <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-5 sm:items-start">
+            {/* LEFT — responsibility line + acceptance checkboxes + bold agreement */}
+            <div>
+              <p className="text-[11px] text-slate-600 leading-snug">
+                Furniture removal and replacement, take up of old floor coverings,
+                floor preparation and adjustment of door heights are the
+                customer's responsibility unless otherwise stated above.
+              </p>
+              <div className="mt-3 space-y-1.5">
+                {ACCEPTANCE_LINES.map((line, index) => (
+                  <label
+                    key={line}
+                    className="flex items-start gap-2 text-[11px] text-slate-800 leading-snug"
+                  >
+                    <input
+                      type="checkbox"
+                      // ACCEPTED is persisted by the invoice acceptance event, so the boxes
+                      // show ticked + read-only regardless of local state (which was reset on
+                      // the version change). UNACCEPTED: real interactive controls gating Accept.
+                      checked={invoiceAccepted || acceptanceChecked[index]}
+                      disabled={invoiceAccepted || accepting}
+                      onChange={(event) =>
+                        setAcceptanceChecked((prev) => {
+                          const next = [...prev]
+                          next[index] = event.target.checked
+                          return next
+                        })
+                      }
+                      className="mt-0.5 h-4 w-4 shrink-0 rounded border-slate-300 text-teal-600"
+                    />
+                    <span className="uppercase tracking-wide font-semibold">
+                      {line}
+                    </span>
+                  </label>
+                ))}
+              </div>
+              <p className="mt-3 text-xs font-bold uppercase tracking-wide text-slate-900 leading-snug">
+                This agreement is for the sale and installation of the goods
+                described above at the value shown on this invoice and upon the
+                terms and conditions stated herein.
+              </p>
+              <p className="mt-2 text-xs font-bold uppercase tracking-wider text-slate-900">
                 I accept the terms and conditions of this invoice.
               </p>
             </div>
-            <div>
-              <div className="text-xs uppercase tracking-wider text-slate-500 font-semibold">
+
+            {/* RIGHT — customer signature, centered like CarpetCall */}
+            <div className="flex flex-col items-center">
+              <div className="text-sm font-semibold text-slate-700">
                 Customer Signature
               </div>
               {invoice.accepted_at !== null ? (
-                <>
-                  {/* Accepted state — render the stored signature + acceptance
-                      metadata. No re-signing after acceptance. */}
-                  <div className="mt-2 rounded-md border border-slate-300 bg-slate-50/60 px-6 py-6 min-h-[140px] flex items-center justify-center">
+                <div className="mt-2 flex w-full max-w-[340px] flex-col items-center text-center">
+                  {/* Accepted — the stored signature sits on a thin signature line (no large
+                      empty box); the customer name is centered directly below it. */}
+                  <div className="flex h-16 w-full items-end justify-center border-b border-slate-300">
                     {signatureUrl !== null ? (
                       <img
                         src={signatureUrl}
                         alt={`Signature of ${invoice.accepted_customer_name ?? 'the customer'}`}
-                        className="max-h-24 w-auto"
+                        className="max-h-14 w-auto pb-0.5"
                       />
                     ) : signatureFailed ? (
-                      <p className="text-xs text-slate-500">
+                      <p className="pb-2 text-[11px] text-slate-500">
                         The signature image could not be loaded.
                       </p>
                     ) : invoice.accepted_signature_present ? (
-                      <p className="text-xs text-slate-500">
+                      <p className="pb-2 text-[11px] text-slate-500">
                         Loading signature…
                       </p>
                     ) : (
-                      <p className="text-xs text-slate-500">
+                      <p className="pb-2 text-[11px] text-slate-500">
                         No signature image stored.
                       </p>
                     )}
                   </div>
-                  <div className="mt-2 text-sm font-medium text-slate-800">
+                  <div className="mt-1.5 text-sm font-medium text-slate-800">
                     {invoice.accepted_customer_name || '—'}
                   </div>
-                  <div className="mt-0.5 text-xs text-slate-500 tabular-nums">
+                  {/* Email state derives from last_emailed_at, never from message text. */}
+                  <div className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
                     Accepted on {formatTimestamp(invoice.accepted_at)}
                   </div>
-                  {/* Email state derives from last_emailed_at, never from
-                      message text: null = this version has not been emailed. */}
                   {invoice.last_emailed_at !== null ? (
-                    <div className="mt-0.5 text-xs text-teal-700 tabular-nums">
+                    <div className="mt-0.5 text-[11px] text-teal-700 tabular-nums">
                       Emailed to the customer on{' '}
                       {formatTimestamp(invoice.last_emailed_at)}
                     </div>
                   ) : (
-                    <div className="mt-0.5 text-xs font-medium text-amber-700">
-                      Accepted but not emailed yet — use Re-send Invoice to
-                      email it to the customer.
+                    <div className="mt-0.5 text-[11px] font-medium text-amber-700">
+                      Accepted but not emailed yet — use Re-send Invoice below.
                     </div>
                   )}
-                  {/* In-context Re-send — rendered for EVERY accepted invoice
-                      (this whole branch is accepted_at !== null), emailed or
-                      not: re-sending is also how another copy is sent after a
-                      successful email. Never gated on last_emailed_at. The
-                      header carries the same action, but it sits a full
-                      document-height away from this block, so the affordance
-                      must live here too. */}
-                  <div className="mt-3">
-                    <Button
-                      type="button"
-                      variant="success"
-                      size="sm"
-                      onClick={handleResend}
-                      disabled={resending || accepting}
-                    >
-                      {resending ? 'Re-sending…' : 'Re-send Invoice'}
-                    </Button>
-                  </div>
-                </>
+                </div>
               ) : (
-                <>
-                  {/* Unaccepted — capture a real signature (pointer events:
-                      touch, pen and mouse). The accepted customer name is
-                      derived from the order's saved customer and shown
-                      read-only below the signature box (like the printed
-                      document) — the customer never types it. */}
-                  <div className="mt-2 rounded-md border border-slate-300 bg-slate-50/60 p-2">
+                <div className="mt-2 w-full max-w-[380px]">
+                  {/* Unaccepted — capture a real signature (pointer events: touch, pen and
+                      mouse). Shallow pad with a light border; the derived customer name sits
+                      directly below it (the customer never types it). */}
+                  <div className="invoice-signature-pad rounded-md border border-slate-200 bg-white px-1.5 pt-1.5 pb-1">
                     <SignaturePad
                       ref={padRef}
                       disabled={accepting || !tenantConfigReadyForAcceptance}
                       onInkChange={setHasInk}
                     />
                   </div>
-                  <div className="mt-2 flex items-center justify-between gap-3">
-                    <p className="text-[11px] text-slate-500">
-                      The customer signs above — touch, pen or mouse.
-                    </p>
+                  <div className="mt-1 flex items-center justify-between gap-3">
+                    <span className="text-sm font-medium text-slate-800">
+                      {derivedAcceptedName || '—'}
+                    </span>
                     <Button
                       type="button"
                       variant="ghost"
@@ -1142,12 +1080,9 @@ export function InvoiceTab({
                       Clear signature
                     </Button>
                   </div>
-                  <div className="mt-2 text-sm font-medium text-slate-800">
-                    {derivedAcceptedName || '—'}
-                  </div>
                   {derivedAcceptedName.length === 0 ? (
-                    <div className="mt-2 flex flex-col sm:flex-row sm:items-center gap-2">
-                      <p className="text-xs font-medium text-amber-700">
+                    <div className="mt-2 flex flex-col items-center gap-2 text-center">
+                      <p className="text-[11px] font-medium text-amber-700">
                         Save the customer's name on the Customer tab before
                         accepting this invoice.
                       </p>
@@ -1163,8 +1098,8 @@ export function InvoiceTab({
                       )}
                     </div>
                   ) : derivedNameTooLong ? (
-                    <div className="mt-2 flex flex-col sm:flex-row sm:items-center gap-2">
-                      <p className="text-xs font-medium text-amber-700">
+                    <div className="mt-2 flex flex-col items-center gap-2 text-center">
+                      <p className="text-[11px] font-medium text-amber-700">
                         The customer name is longer than{' '}
                         {ACCEPTED_NAME_MAX_LENGTH} characters, so the invoice
                         cannot be accepted. Shorten it on the Customer tab.
@@ -1181,16 +1116,15 @@ export function InvoiceTab({
                       )}
                     </div>
                   ) : null}
-                  {/* Codex P1 legal-risk gate — exactly one state: loading XOR error,
-                      never both. Sits by the Accept button (outside the invoice terms
-                      body). Accept stays disabled until tenant config is safely loaded. */}
+                  {/* Codex P1 legal-risk gate — exactly one state: loading XOR error, never
+                      both. Accept stays disabled until tenant config is safely loaded. */}
                   {tenantConfigLoading ? (
-                    <p className="mt-2 text-xs text-slate-500">
+                    <p className="mt-2 text-center text-[11px] text-slate-500">
                       Loading invoice terms and business details…
                     </p>
                   ) : tenantConfigError ? (
-                    <div className="mt-2 flex flex-col sm:flex-row sm:items-center gap-2">
-                      <p className="text-xs font-medium text-amber-700">
+                    <div className="mt-2 flex flex-col items-center gap-2 text-center">
+                      <p className="text-[11px] font-medium text-amber-700">
                         Invoice terms and business details could not be loaded.
                         Try again before accepting.
                       </p>
@@ -1204,27 +1138,50 @@ export function InvoiceTab({
                       </Button>
                     </div>
                   ) : null}
-                  <div className="mt-3 flex justify-end">
-                    <Button
-                      type="button"
-                      variant="success"
-                      size="md"
-                      onClick={handleAccept}
-                      disabled={
-                        accepting ||
-                        resending ||
-                        !hasInk ||
-                        derivedAcceptedName.length === 0 ||
-                        derivedNameTooLong ||
-                        !tenantConfigReadyForAcceptance
-                      }
-                    >
-                      {accepting ? 'Accepting…' : 'Accept Invoice'}
-                    </Button>
-                  </div>
-                </>
+                </div>
               )}
             </div>
+          </div>
+
+          {/* Full-width bottom action bar — anchors the document (CarpetCall-style). Unaccepted
+              => Accept Invoice (same handler/gates as before); accepted => Re-send Invoice (the
+              ONLY Re-send; the top one was removed). Native button for precise full-width sizing. */}
+          <div className="mt-3">
+            {invoiceAccepted ? (
+              <button
+                type="button"
+                onClick={handleResend}
+                disabled={resending || accepting}
+                className="flex w-full items-center justify-center gap-2 rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <svg
+                  viewBox="0 0 20 20"
+                  fill="currentColor"
+                  aria-hidden="true"
+                  className="h-4 w-4"
+                >
+                  <path d="M1.7 9.1 17.3 2.2c.7-.3 1.4.4 1.1 1.1l-6.9 15.6c-.3.7-1.3.6-1.5-.1l-1.7-5.3a1 1 0 0 0-.6-.6L2.4 11c-.8-.3-.8-1.3-.1-1.6Z" />
+                </svg>
+                {resending ? 'Re-sending…' : 'Re-send Invoice'}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={handleAccept}
+                disabled={
+                  accepting ||
+                  resending ||
+                  !hasInk ||
+                  !allAcceptanceChecked ||
+                  derivedAcceptedName.length === 0 ||
+                  derivedNameTooLong ||
+                  !tenantConfigReadyForAcceptance
+                }
+                className="flex w-full items-center justify-center rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {accepting ? 'Accepting…' : 'Accept Invoice'}
+              </button>
+            )}
           </div>
         </article>
       ) : (

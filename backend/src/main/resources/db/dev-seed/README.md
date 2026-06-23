@@ -41,7 +41,17 @@ relying on the legacy V4 demo data remaining in the migration path.
    psql "postgresql://flooring_user:flooring_pass@localhost:5432/flooring_sales_portal" \
      -f backend/src/main/resources/db/dev-seed/multi_store_user_demo.sql
    ```
-5. Verify in the app: login, store selection, quick-adds, products, and charges.
+5. Run the per-flooring-type invoice terms seed (HTML numbered terms for the Invoice tab):
+   ```
+   psql "postgresql://flooring_user:flooring_pass@localhost:5432/flooring_sales_portal" \
+     -f backend/src/main/resources/db/dev-seed/terms_demo.sql
+   ```
+6. Run the demo invoice logo (screen-only branding) seed:
+   ```
+   psql "postgresql://flooring_user:flooring_pass@localhost:5432/flooring_sales_portal" \
+     -f backend/src/main/resources/db/dev-seed/branding_demo.sql
+   ```
+7. Verify in the app: login, store selection, quick-adds, products, and charges.
    - Login at `/aussie-floors-group/login` as **`MS1` / `password123`**.
    - Store selection shows **SYD-CBD** and **SYD-PARR** (two stores).
    - Details of Sale tab shows the **7** quick-add descriptions.
@@ -55,6 +65,15 @@ relying on the legacy V4 demo data remaining in the migration path.
 - `multi_store_user_demo.sql` — recreates the **MS1** (Morgan Shaw) multi-store demo user
   in Aussie Floors Group, then grants every user access to every store in their own
   business (Phase 14D).
+- `terms_demo.sql` — seeds the demo per-flooring-type invoice terms (`terms_soft` /
+  `terms_hard`) for every business as **safe HTML ordered lists**, so the Invoice tab renders
+  proper numbered, two-column terms. Updates every business; business name is substituted
+  from `business.name`.
+- `branding_demo.sql` — sets `business.logo_path` for the **`aussie-floors-group`** demo
+  business to a frontend public asset (`/demo-logos/aussie-floors-logo.svg`) so the Invoice
+  tab shows a demo logo. **Screen-only** for now — the backend PDF treats `logo_path` as a
+  server file path (PNG/JPEG only), so the PDF logo is out of scope and falls back to the
+  business-name text (Phase 16A PR1).
 
 ## Idempotency convention
 
