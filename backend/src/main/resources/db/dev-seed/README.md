@@ -46,10 +46,15 @@ relying on the legacy V4 demo data remaining in the migration path.
    psql "postgresql://flooring_user:flooring_pass@localhost:5432/flooring_sales_portal" \
      -f backend/src/main/resources/db/dev-seed/terms_demo.sql
    ```
-6. Run the demo invoice logo (screen-only branding) seed:
+6. Run the demo invoice logo branding seed:
    ```
    psql "postgresql://flooring_user:flooring_pass@localhost:5432/flooring_sales_portal" \
      -f backend/src/main/resources/db/dev-seed/branding_demo.sql
+   ```
+   Then copy the demo logo PNG into backend file storage so the invoice **PDF** can render it
+   (the SQL seed alone is not enough — the PDF reads the file from disk). Run from the repo root:
+   ```
+   bash backend/src/main/resources/db/dev-seed/copy_demo_logo.sh
    ```
 7. Verify in the app: login, store selection, quick-adds, products, and charges.
    - Login at `/aussie-floors-group/login` as **`MS1` / `password123`**.
@@ -69,11 +74,20 @@ relying on the legacy V4 demo data remaining in the migration path.
   `terms_hard`) for every business as **safe HTML ordered lists**, so the Invoice tab renders
   proper numbered, two-column terms. Updates every business; business name is substituted
   from `business.name`.
-- `branding_demo.sql` — sets `business.logo_path` for the **`aussie-floors-group`** demo
-  business to a frontend public asset (`/demo-logos/aussie-floors-logo.svg`) so the Invoice
-  tab shows a demo logo. **Screen-only** for now — the backend PDF treats `logo_path` as a
-  server file path (PNG/JPEG only), so the PDF logo is out of scope and falls back to the
-  business-name text (Phase 16A PR1).
+- `branding_demo.sql` — sets `business.logo_path = '/uploads/1/branding/logo.png'` for the
+  **`aussie-floors-group`** demo business (business_id 1). One value drives **both** surfaces:
+  - **Screen:** the Invoice tab renders it as a browser `<img>`; the PNG is committed at
+    `frontend/public/uploads/1/branding/logo.png`, so Vite serves it directly (no copy needed).
+  - **PDF:** the backend reads `logo_path` as a server file path (PNG/JPEG only) from local
+    storage and base64-embeds it. The physical file must be copied into backend storage with
+    `copy_demo_logo.sh` (below) — the SQL seed alone does not place the file. If the backend
+    copy is missing/invalid the PDF fails soft to the business-name text (no error).
+- `copy_demo_logo.sh` — copies `frontend/public/uploads/1/branding/logo.png` into local backend
+  storage at `$HOME/flooring-sales-portal-data/uploads/uploads/1/branding/logo.png`. The doubled
+  `uploads/uploads` is **intentional**: `app.storage.base-dir` already ends in `/uploads` and
+  stored virtual paths start with `/uploads/...`, so `FileStorageService` resolves them under the
+  base dir (same as attachments at `…/uploads/uploads/{businessId}/orders/…`). Dev/demo only —
+  real per-tenant logo upload/storage/serving is deferred to Phase 17.
 
 ## Idempotency convention
 
