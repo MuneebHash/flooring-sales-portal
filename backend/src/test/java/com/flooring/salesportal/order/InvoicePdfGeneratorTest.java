@@ -227,7 +227,9 @@ class InvoicePdfGeneratorTest {
         byte[] pdf = GENERATOR.render(new M().build());
         assertPdfHeader(pdf);
         String text = extractText(pdf).replaceAll("\\s+", " ");
-        Assertions.assertFalse(text.contains("Payment details"), () -> "bank heading shown with no bank data: " + text);
+        // Phase 16A PR3: the payment heading was renamed "Payment details" -> "Payment Methods"
+        // (rendered uppercase by the section-title text-transform, which PDFBox extracts uppercased).
+        Assertions.assertFalse(text.contains("PAYMENT METHODS"), () -> "bank heading shown with no bank data: " + text);
         Assertions.assertFalse(text.contains("Sales person"), () -> "salesperson label shown with no name: " + text);
     }
 
@@ -238,8 +240,11 @@ class InvoicePdfGeneratorTest {
         byte[] pdf = GENERATOR.render(m.build());
         assertPdfHeader(pdf);
         Assertions.assertTrue(countImages(pdf) >= 1, "logo data URI must embed an image");
-        // Business name still renders alongside the logo.
-        Assertions.assertTrue(extractText(pdf).contains("Aussie Floors Group"));
+        // Phase 16A PR3: when a logo is present the logo carries the brand, so the plain business-name
+        // text is intentionally suppressed (the no-logo fallback is covered by
+        // render_withNullLogo_rendersBusinessNameAndNoImage).
+        Assertions.assertFalse(extractText(pdf).contains("Aussie Floors Group"),
+                "plain business name should be suppressed when a logo is present");
     }
 
     @Test
@@ -251,11 +256,12 @@ class InvoicePdfGeneratorTest {
     }
 
     // ------------------------------------------------------------------
-    // Phase 15C — per-flooring-type terms (SOFT inline page 1 / HARD page 2)
+    // Phase 16A PR3 — terms ALWAYS start on a dedicated page 2 (SOFT and HARD); page 1 never has terms
     // ------------------------------------------------------------------
 
     @Test
-    void render_softTermsInline_onSinglePage() throws IOException {
+    void render_softTerms_onDedicatedSecondPage_page1HasNoTerms() throws IOException {
+        // Phase 16A PR3: SOFT terms no longer render inline on page 1 — they start on page 2 like HARD.
         M m = new M();
         m.flooringTypeLabel = "Soft Flooring";
         m.termsOnSeparatePage = false;
@@ -263,10 +269,14 @@ class InvoicePdfGeneratorTest {
         byte[] pdf = GENERATOR.render(m.build());
         assertPdfHeader(pdf);
 
-        Assertions.assertEquals(1, pageCount(pdf), "SOFT invoice must stay on a single page");
-        String text = extractText(pdf).replaceAll("\\s+", " ");
-        Assertions.assertTrue(text.contains("Soft flooring stain warranty"), () -> "missing soft terms: " + text);
-        Assertions.assertTrue(text.contains("TERMS"), () -> "missing terms heading: " + text);
+        Assertions.assertEquals(2, pageCount(pdf), "terms must start on a dedicated second page");
+        String page1 = extractPageText(pdf, 1).replaceAll("\\s+", " ");
+        String page2 = extractPageText(pdf, 2).replaceAll("\\s+", " ");
+        Assertions.assertFalse(page1.contains("Soft flooring stain warranty"), () -> "page 1 must NOT contain soft terms: " + page1);
+        Assertions.assertFalse(page1.contains("TERMS"), () -> "page 1 must NOT contain a terms heading: " + page1);
+        Assertions.assertTrue(page2.contains("Soft flooring stain warranty"), () -> "page 2 must contain soft terms: " + page2);
+        Assertions.assertTrue(page2.contains("TERMS"), () -> "page 2 must contain the terms heading: " + page2);
+        Assertions.assertTrue(noSpace(page1).contains("SYD-CBD.LC1.00001"), () -> "page 1 must keep the invoice summary: " + page1);
     }
 
     @Test

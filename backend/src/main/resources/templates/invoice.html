@@ -2,180 +2,247 @@
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
 <head>
     <title>Tax Invoice</title>
+    <!-- Phase 16A PR3: "Aire Compact" invoice layout. Rendered by Thymeleaf + openhtmltopdf (XML
+         parser, no JS, no external fonts/images). Tables + conservative CSS only (no flexbox/grid/
+         CSS-multi-column). All ${...} values are server-supplied; user text is escaped via th:text;
+         sanitized terms HTML is injected via th:utext. Revision/version is intentionally NOT rendered
+         (Phase 15C decision, preserved). The logo and signature are real data-URI images
+         (logoDataUri / signatureDataUri); there is no placeholder box and no cursive signature font.
+         Only XML-built-in (&amp; &lt; &gt;) or numeric (&#183; &#8212;) entities are used. -->
     <style type="text/css">
-        @page { size: A4; margin: 1.6cm; }
-        body { font-family: Helvetica, Arial, sans-serif; font-size: 10.5pt; color: #1a1a1a; }
-        .header { width: 100%; border-bottom: 2pt solid #1f3a5f; padding-bottom: 10pt; margin-bottom: 16pt; }
-        .header td { vertical-align: top; }
-        .header .brand { width: 55%; }
-        .header .doc { width: 45%; }
-        .logo { max-width: 200pt; max-height: 70pt; margin-bottom: 6pt; }
-        .company { font-size: 16pt; font-weight: bold; color: #1f3a5f; }
-        .muted { color: #6b7280; font-size: 9pt; margin-top: 2pt; }
-        .doc-title { font-size: 18pt; font-weight: bold; text-align: right; letter-spacing: 1pt; color: #1f3a5f; }
-        .doc-sub { text-align: right; font-size: 9pt; color: #6b7280; text-transform: uppercase; letter-spacing: 0.5pt; margin-bottom: 6pt; }
-        .meta { width: 100%; margin-top: 4pt; }
-        .meta td { padding: 1pt 0; font-size: 9.5pt; }
-        .meta .label { color: #6b7280; text-align: right; padding-right: 8pt; width: 55%; }
-        .meta .value { font-weight: bold; text-align: right; }
+        @page { size: A4; margin: 12mm; }
+        body { font-family: Helvetica, Arial, sans-serif; font-size: 9pt; color: #34423d; line-height: 1.45; }
+
+        /* letter-spacing kept small (0.5pt max): wider tracking makes openhtmltopdf space the glyphs
+           far enough that PDFBox text extraction inserts a space between every letter, which would
+           break heading text and the terms/acceptance text-presence guards. */
+        .eyebrow { font-size: 7pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4pt; color: #5d716d; }
+        .eyebrow-hi { color: #0e7a70; }
+        .ink { color: #0f3d36; }
         .mono { font-family: 'Courier New', monospace; }
-        .section-title { font-size: 8.5pt; font-weight: bold; text-transform: uppercase; color: #6b7280; margin-bottom: 4pt; letter-spacing: 0.5pt; }
-        .parties { width: 100%; margin-bottom: 16pt; }
-        .parties td { vertical-align: top; width: 50%; padding-right: 12pt; }
-        .addr-line { margin: 1pt 0; }
-        .details { margin-bottom: 16pt; }
-        .details-body { border: 1pt solid #e5e7eb; padding: 10pt; background-color: #f9fafb; white-space: pre-wrap; }
-        .pay { width: 100%; margin-bottom: 8pt; }
-        .pay td { vertical-align: top; }
-        .pay .bank { width: 50%; padding-right: 12pt; }
-        .pay .totals-cell { width: 50%; }
-        .totals { width: 100%; }
-        .totals td { padding: 4pt 0; }
-        .totals .t-label { color: #374151; }
-        .totals .t-value { text-align: right; font-weight: bold; }
-        .totals .balance td { border-top: 2pt solid #1f3a5f; padding-top: 8pt; font-size: 13pt; color: #1f3a5f; }
-        .acceptance { margin-top: 24pt; }
-        .signature-box { border: 1pt solid #9ca3af; width: 220pt; height: 60pt; }
-        .signature-image { max-width: 220pt; max-height: 60pt; }
-        .signature-caption { font-size: 8pt; color: #6b7280; margin-top: 3pt; }
-        .footer { margin-top: 24pt; font-size: 8pt; color: #9ca3af; text-align: center; }
-        .terms { margin-top: 22pt; }
-        .terms.page-break { page-break-before: always; margin-top: 0; }
-        .terms-body { font-size: 9pt; color: #374151; line-height: 1.4; }
-        .terms-body p { margin: 0 0 6pt 0; }
-        .terms-body ol, .terms-body ul { margin: 0 0 6pt 18pt; padding: 0; }
-        .terms-body li { margin-bottom: 3pt; }
+
+        /* header — three zones: brand (logo/name/abn) | document */
+        .top { width: 100%; border-collapse: collapse; }
+        .top td { vertical-align: top; }
+        .top .brand { width: 56%; }
+        .top .doc { width: 44%; text-align: right; }
+        .mark { font-size: 15pt; font-weight: bold; color: #0f3d36; letter-spacing: 0.2pt; }
+        .abn { font-size: 8pt; color: #5d716d; margin-top: 3pt; letter-spacing: 0.3pt; }
+        .logo { display: block; max-width: 150pt; max-height: 42pt; margin: 0; }
+        .kicker { font-size: 7.5pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.8pt; color: #0e7a70; }
+        .title { font-size: 20pt; font-weight: bold; color: #0f3d36; letter-spacing: 0.5pt; margin-top: 2pt; }
+        .no { font-size: 10pt; font-family: 'Courier New', monospace; color: #5d6b64; margin-top: 4pt; letter-spacing: 0.8pt; }
+
+        .accent { border-top: 1.5pt solid #0e7a70; margin: 11pt 0 13pt 0; }
+        .hair { border-top: 1pt solid #e7ebe8; margin: 13pt 0; }
+
+        /* three-column meta row: Invoice To | Issued/Due | Sales Person/Store (anchored right) */
+        .grid { width: 100%; border-collapse: collapse; }
+        .grid td { vertical-align: top; }
+        .grid .c-to { width: 39%; padding-right: 16pt; }
+        .grid .c-when { width: 27%; padding-right: 16pt; }
+        .grid .c-who { width: 34%; text-align: right; }
+        .name { font-size: 11.5pt; font-weight: bold; color: #0f3d36; margin-top: 5pt; }
+        .who-name { font-size: 10.5pt; font-weight: bold; color: #0f3d36; margin-top: 5pt; }
+        .when-date { font-size: 10.5pt; font-weight: bold; color: #0f3d36; margin-top: 5pt; }
+        .line { font-size: 9pt; color: #3c4a44; margin-top: 2pt; line-height: 1.5; }
+
+        /* details of sale */
+        .sec-h { font-size: 7pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4pt; color: #5d716d; margin-bottom: 6pt; }
+        .details-body { font-size: 9.5pt; line-height: 1.6; color: #27332e; white-space: pre-wrap; }
+
+        /* payment + totals — borderless, clean rules only */
+        .money { width: 100%; border-collapse: collapse; }
+        .money td { vertical-align: top; }
+        .money .left { width: 54%; padding-right: 22pt; }
+        .pm-line { font-size: 9pt; color: #3c4a44; line-height: 1.7; }
+        .pm-line .k { color: #5d716d; display: inline-block; width: 78pt; }
+        .money .right { width: 46%; }
+        .tline { width: 100%; border-collapse: collapse; }
+        .tline td { padding: 6.5pt 0; font-size: 9.5pt; border-bottom: 1pt solid #e7ebe8; }
+        .tline .k { color: #3c4a44; }
+        .tline .v { text-align: right; font-weight: bold; color: #0f3d36; }
+        .tline .bal td { border-bottom: none; border-top: 2pt solid #0f3d36; font-size: 14pt; padding-top: 9pt; }
+        .tline .bal .k { color: #0f3d36; font-weight: bold; }
+
+        /* acceptance — both columns top-aligned so the wording and the signature start at the same height */
+        .accept { width: 100%; border-collapse: collapse; margin-top: 4pt; }
+        .accept td { vertical-align: top; }
+        .accept .agree { width: 54%; padding-right: 22pt; }
+        .accept .sign { width: 46%; }
+        .agree-lead { font-size: 8.5pt; line-height: 1.5; color: #0f3d36; font-weight: bold; margin-bottom: 7pt; }
+        .agree-accept { font-size: 8.5pt; line-height: 1.5; color: #3c4a44; }
+        .sig-box { border-bottom: 1pt solid #aebab3; height: 44pt; }
+        /* Accepted signature: a fixed-height slot whose cell is bottom-aligned, so the signature ink
+           sits just above the line (the cell's bottom border) — even if the source PNG has transparent
+           top-whitespace. The slot's TOP still begins at the cell top (the row is vertical-align:top),
+           so the left wording and the right signature area start at the same height; only the ink within
+           the slot is pulled down toward the line. The caption sits directly under the line. */
+        .sig-area { width: 100%; border-collapse: collapse; }
+        .sig-area td { height: 44pt; vertical-align: bottom; border-bottom: 1pt solid #aebab3; padding-bottom: 2pt; }
+        .sig-img { display: block; max-width: 200pt; max-height: 42pt; margin: 0; }
+        .sig-cap { font-size: 7.5pt; color: #5d716d; margin-top: 4pt; }
+
+        /* footer */
+        .footer { text-align: center; font-size: 7.5pt; color: #5d716d; margin-top: 16pt; letter-spacing: 0.3pt; }
+
+        /* terms (single column). SOFT terms are separated from acceptance by the hair below the
+           acceptance block (no own top border, to avoid a double rule). */
+        .terms { margin-top: 14pt; }
+        .terms-h { font-size: 7pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4pt; color: #5d716d; text-align: center; }
+        .terms-body { font-size: 7.5pt; line-height: 1.5; color: #3c4a44; margin-top: 8pt; }
+        .terms-body p { margin: 0 0 4pt 0; }
+        .terms-body ol, .terms-body ul { margin: 0 0 4pt 15pt; padding: 0; }
+        .terms-body li { margin-bottom: 3.5pt; }
         .terms-body table { width: 100%; border-collapse: collapse; }
-        .terms-body th, .terms-body td { border: 1pt solid #d1d5db; padding: 4pt; text-align: left; vertical-align: top; }
+        .terms-body th, .terms-body td { border: 1pt solid #d1d5db; padding: 3pt; text-align: left; vertical-align: top; }
+
+        /* HARD terms page (page 2): a near-full-height table so the terms sit at the top and the footer
+           is pinned to the bottom of the page (not floating mid-page). Height is kept just under the A4
+           content area (297mm - 2*12mm = 273mm) so it never spills to a third page. No fixed positioning. */
+        .tpage { width: 100%; height: 264mm; border-collapse: collapse; page-break-before: always; }
+        .tpage .tp-body { vertical-align: top; height: 100%; }
+        .tpage .tp-foot { vertical-align: bottom; }
     </style>
 </head>
 <body>
-    <table class="header">
+    <!-- HEADER. Left stack: the real logo when a tenant logo resolves (the logo carries the brand, so
+         the plain business name is NOT shown above it), otherwise the business name as a fallback; then
+         the ABN directly beneath. The img MUST stay self-closed (openhtmltopdf parses this document with
+         an XML parser). No revision/version is rendered. -->
+    <table class="top">
         <tr>
             <td class="brand">
-                <!-- Logo when a tenant logo resolves; otherwise the business name carries the brand.
-                     The img MUST stay self-closed: openhtmltopdf parses this document with an XML parser. -->
                 <img class="logo" alt="Business logo"
                      th:if="${logoDataUri != null}" th:src="${logoDataUri}" />
-                <div class="company" th:text="${businessName}">Business Name</div>
-                <div class="muted" th:if="${abn != null}">ABN <span th:text="${abn}">00 000 000 000</span></div>
+                <div class="mark" th:if="${logoDataUri == null}" th:text="${businessName}">Business Name</div>
+                <div class="abn" th:if="${abn != null}">ABN <span th:text="${abn}">00 000 000 000</span></div>
             </td>
             <td class="doc">
-                <div class="doc-title">TAX INVOICE</div>
-                <div class="doc-sub" th:if="${flooringTypeLabel != null}" th:text="${flooringTypeLabel}">Flooring</div>
-                <table class="meta">
-                    <tr>
-                        <td class="label">Invoice no.</td>
-                        <td class="value mono" th:text="${orderNumber}">ORDER-NUMBER</td>
-                    </tr>
-                    <tr>
-                        <td class="label">Invoice date</td>
-                        <td class="value" th:text="${invoiceDate}">01/01/2026</td>
-                    </tr>
-                    <tr>
-                        <td class="label">Due date</td>
-                        <td class="value" th:text="${dueDate}">01/01/2026</td>
-                    </tr>
-                    <tr th:if="${salespersonName != null}">
-                        <td class="label">Sales person</td>
-                        <td class="value" th:text="${salespersonName}">Sales Person</td>
-                    </tr>
-                </table>
+                <div class="kicker" th:if="${flooringTypeLabel != null}" th:text="${flooringTypeLabel}">Flooring</div>
+                <div class="title">TAX INVOICE</div>
+                <div class="no" th:text="${orderNumber}">ORDER-NUMBER</div>
             </td>
         </tr>
     </table>
 
-    <table class="parties">
+    <div class="accent"></div>
+
+    <!-- THREE-COLUMN META ROW -->
+    <table class="grid">
         <tr>
-            <td>
-                <div class="section-title">Bill to</div>
-                <div class="addr-line" th:text="${customerName}">Customer Name</div>
-                <div class="addr-line" th:text="${billingLine1}">Address line 1</div>
-                <div class="addr-line" th:text="${billingLine2}">Address line 2</div>
+            <td class="c-to">
+                <div class="eyebrow eyebrow-hi">Invoice To</div>
+                <div class="name" th:text="${customerName}">Customer Name</div>
+                <div class="line" th:text="${billingLine1}">Address line 1</div>
+                <div class="line" th:text="${billingLine2}">Address line 2</div>
             </td>
-            <td>
-                <div class="section-title">Store</div>
-                <div class="addr-line" th:if="${storeName != null}" th:text="${storeName}">Store Name</div>
-                <div class="addr-line" th:if="${storeAddressLine1 != null}" th:text="${storeAddressLine1}">Street</div>
-                <div class="addr-line" th:if="${storeAddressLine2 != null}" th:text="${storeAddressLine2}">Suburb State Postcode</div>
-                <div class="addr-line" th:if="${storePhone != null}">Ph <span th:text="${storePhone}">Phone</span></div>
-                <div class="addr-line" th:if="${storeEmail != null}" th:text="${storeEmail}">Email</div>
+            <td class="c-when">
+                <div class="eyebrow">Issued / Due</div>
+                <div class="when-date" th:text="${invoiceDate}">01/01/2026</div>
+                <div class="line">Due <span th:text="${dueDate}">01/01/2026</span></div>
+            </td>
+            <td class="c-who">
+                <div class="eyebrow">Sales Person / Store</div>
+                <div class="who-name" th:if="${salespersonName != null}" th:text="${salespersonName}">Sales Person</div>
+                <div class="line" th:if="${storeName != null}" th:text="${storeName}">Store Name</div>
+                <div class="line" th:if="${storeAddressLine1 != null}" th:text="${storeAddressLine1}">Street</div>
+                <div class="line" th:if="${storeAddressLine2 != null}" th:text="${storeAddressLine2}">Suburb State Postcode</div>
+                <div class="line" th:if="${storePhone != null}" th:text="${storePhone}">Phone</div>
+                <div class="line" th:if="${storeEmail != null}" th:text="${storeEmail}">Email</div>
             </td>
         </tr>
     </table>
 
-    <div class="details">
-        <div class="section-title">Details of sale</div>
-        <div class="details-body" th:text="${detailsOfSale}">Details of sale text.</div>
-    </div>
+    <div class="hair"></div>
 
-    <table class="pay">
+    <!-- DETAILS OF SALE -->
+    <div class="sec-h">Details of Sale</div>
+    <div class="details-body" th:text="${detailsOfSale}">Details of sale text.</div>
+
+    <div class="hair"></div>
+
+    <!-- PAYMENT METHODS (borderless) + TOTALS (clean rules, no box). Totals use server-formatted model
+         values verbatim (never recomputed); Payment Made carries a literal "(-)" prefix. -->
+    <table class="money">
         <tr>
-            <td class="bank">
+            <td class="left">
                 <div th:if="${bankName != null or bsb != null or accountName != null or accountNumber != null}">
-                    <div class="section-title">Payment details</div>
-                    <div class="addr-line" th:if="${bankName != null}">Bank <span th:text="${bankName}">Bank</span></div>
-                    <div class="addr-line" th:if="${bsb != null}">BSB <span th:text="${bsb}">000-000</span></div>
-                    <div class="addr-line" th:if="${accountName != null}">Account name <span th:text="${accountName}">Account Name</span></div>
-                    <div class="addr-line" th:if="${accountNumber != null}">Account no. <span th:text="${accountNumber}">00000000</span></div>
+                    <div class="sec-h">Payment Methods &#8212; Direct Deposit</div>
+                    <div class="pm-line" th:if="${accountName != null}"><span class="k">Account</span><span th:text="${accountName}">Account Name</span></div>
+                    <div class="pm-line" th:if="${bankName != null}"><span class="k">Bank</span><span th:text="${bankName}">Bank</span></div>
+                    <div class="pm-line" th:if="${bsb != null}"><span class="k">BSB</span><span th:text="${bsb}">000-000</span></div>
+                    <div class="pm-line" th:if="${accountNumber != null}"><span class="k">Account No.</span><span th:text="${accountNumber}">00000000</span></div>
+                    <div class="pm-line"><span class="k">Reference</span><span class="mono" th:text="${orderNumber}">REF</span></div>
                 </div>
             </td>
-            <td class="totals-cell">
-                <table class="totals">
-                    <tr>
-                        <td class="t-label">Total (inc. GST)</td>
-                        <td class="t-value" th:text="${salePriceIncGst}">$0.00</td>
-                    </tr>
-                    <tr>
-                        <td class="t-label">Payment made</td>
-                        <td class="t-value" th:text="${totalPaid}">$0.00</td>
-                    </tr>
-                    <tr class="balance">
-                        <td class="t-label">Balance due</td>
-                        <td class="t-value" th:text="${balanceDue}">$0.00</td>
-                    </tr>
+            <td class="right">
+                <table class="tline">
+                    <tr><td class="k">Total Inc. GST</td><td class="v" th:text="${salePriceIncGst}">$0.00</td></tr>
+                    <tr><td class="k">Payment Made</td><td class="v">(-) <span th:text="${totalPaid}">$0.00</span></td></tr>
+                    <tr class="bal"><td class="k">Balance Due</td><td class="v" th:text="${balanceDue}">$0.00</td></tr>
                 </table>
             </td>
         </tr>
     </table>
 
-    <!-- Phase 13 §8 customer acceptance: blank signature area before acceptance; after acceptance the
-         signature image (base64 data URI — the renderer has a null baseUri), the accepted customer
-         name, and the accepted timestamp render. The img MUST stay self-closed (XML parser). -->
-    <div class="acceptance">
-        <div class="section-title">Customer acceptance</div>
-        <div th:unless="${accepted}">
-            <div class="signature-box"></div>
-            <div class="signature-caption">Customer signature</div>
-        </div>
-        <div th:if="${accepted}">
-            <img class="signature-image" alt="Customer signature"
-                 th:if="${signatureDataUri != null}" th:src="${signatureDataUri}" />
-            <div class="signature-caption">
-                Accepted by <span th:text="${acceptedCustomerName}">Customer Name</span>
-                on <span th:text="${acceptedAtDisplay}">01/01/2026 00:00</span>
-            </div>
-        </div>
-    </div>
+    <div class="hair"></div>
 
-    <!-- SOFT flooring: sanitized terms render INLINE on page 1. Hidden entirely when there are no
-         terms (no empty heading). Rendered with th:utext — the value is pre-sanitized, XML-well-formed
-         HTML from InvoiceTermsSanitizer. -->
-    <div class="terms" th:if="${termsHtml != null and !termsOnSeparatePage}">
-        <div class="section-title">Terms &amp; Conditions</div>
-        <div class="terms-body" th:utext="${termsHtml}">Terms</div>
-    </div>
+    <!-- CUSTOMER ACCEPTANCE. Static responsibility wording + a lowercase acceptance sentence (never
+         uppercased, so it cannot place the word "TERMS" on a HARD invoice's page 1). Right side: a blank
+         signature line before acceptance; after acceptance the real signature image (signatureDataUri)
+         plus accepted name + timestamp. The img MUST stay self-closed (XML parser). -->
+    <div class="sec-h">Customer Acceptance</div>
+    <table class="accept">
+        <tr>
+            <td class="agree">
+                <div class="agree-lead">This agreement is for the sale and installation of the goods described above at the value shown on this invoice and upon the terms and conditions stated herein.</div>
+                <div class="agree-accept">I accept the terms and conditions of this invoice.</div>
+            </td>
+            <td class="sign">
+                <div th:unless="${accepted}">
+                    <div class="sig-box"></div>
+                    <div class="sig-cap">Customer signature</div>
+                </div>
+                <div th:if="${accepted}">
+                    <table class="sig-area">
+                        <tr>
+                            <td>
+                                <img class="sig-img" alt="Customer signature"
+                                     th:if="${signatureDataUri != null}" th:src="${signatureDataUri}" />
+                            </td>
+                        </tr>
+                    </table>
+                    <div class="sig-cap">
+                        Accepted by <span th:text="${acceptedCustomerName}">Customer Name</span>
+                        on <span th:text="${acceptedAtDisplay}">01/01/2026 00:00</span>
+                    </div>
+                </div>
+            </td>
+        </tr>
+    </table>
 
-    <div class="footer">
-        This tax invoice was generated by the Flooring Sales Portal. All amounts are in AUD and include 10% GST where applicable.
-    </div>
+    <!-- Subtle separator below the entire Customer Acceptance block (matches the rule above it), placed
+         after both columns so it spans the full width — not inside a single column, not a boxed card. -->
+    <div class="hair"></div>
 
-    <!-- HARD flooring: full sanitized terms render alone on a dedicated SECOND page. Page 1 carries no
-         terms block and no terms heading; the whole block (heading + body) is pushed to page 2 by the
-         page break, and is omitted entirely when there are no terms (no empty page). -->
-    <div class="terms page-break" th:if="${termsHtml != null and termsOnSeparatePage}">
-        <div class="section-title">Terms &amp; Conditions</div>
-        <div class="terms-body" th:utext="${termsHtml}">Terms</div>
-    </div>
+    <!-- TERMS — ALWAYS on a dedicated page after the invoice content, for SOFT and HARD alike; page 1
+         never carries a terms section or the footer. Near-full-height table so the terms sit at the top
+         and the footer is pinned to the bottom of the page. Omitted entirely (with its footer) when
+         there are no terms. th:utext — value is pre-sanitized, XML-well-formed HTML from
+         InvoiceTermsSanitizer; terms are never split or hardcoded. -->
+    <table class="tpage" th:if="${termsHtml != null}">
+        <tr>
+            <td class="tp-body">
+                <div class="terms-h">Terms &amp; Conditions</div>
+                <div class="terms-body" th:utext="${termsHtml}">Terms</div>
+            </td>
+        </tr>
+        <tr>
+            <td class="tp-foot">
+                <div class="footer">Generated by the Flooring Sales Portal &#183; GST included where applicable</div>
+            </td>
+        </tr>
+    </table>
 </body>
 </html>
