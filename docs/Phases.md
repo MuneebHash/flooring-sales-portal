@@ -43,6 +43,7 @@ Tenant URL shape:
 Frontend:  Vite · React 19 · TypeScript · Tailwind v4 · React Router ·
            React Hook Form · Zod · TanStack Table · shadcn-style local UI primitives
 Backend:   Spring Boot · PostgreSQL 17 · Flyway migrations · HttpSession auth (no JWT)
+PDF:       Thymeleaf + openhtmltopdf (server-rendered HTML -> PDF). NOT React PDF.
 
 Local DB (Docker Postgres 17, infra/docker-compose.yml):
   database: flooring_sales_portal
@@ -110,6 +111,19 @@ Phase 15     Invoice & payment correctness + Lead Enquiry (15A–15F) — FULLY 
                Customer tab — lead type (FLOOR/PHONE/INTERNET), product interest, subfloor,
                install questions, narrative fields. PUT upsert, embedded on workspace GET,
                autosave (debounce + flush + single-flight), LAID-locked writes.
+Phase 16A    Invoice presentation pass (layout foundation for later quotation reuse) — COMPLETE:
+             - PR1 (#89): Invoice TAB screen redesign (CarpetCall-style). Header reduced to
+               logo + TAX INVOICE/number; store/ABN/bank/flooring-type/salesperson removed from
+               the SCREEN. Screen logo is an <img> fail-soft to business-name text.
+             - PR2 (#90): demo PDF logo path enablement. business.logo_path is now a
+               backend-resolvable storage path '/uploads/1/branding/logo.png'; backend PDF renders
+               a real PNG via FileStorageService local storage; committed frontend public mirror
+               keeps the screen logo working. NO upload UI / S3 yet (deferred to Phase 17 storage).
+             - PR3 (#91): backend invoice PDF redesigned to custom "Aire Compact" layout.
+               Terms ALWAYS start on page 2 (both SOFT and HARD); page 1 never shows a terms block.
+               Footer renders exactly once whether or not terms exist. Template-only —
+               no production Java / migration / OpenAPI changes.
+             NO migration added in 16A (migrations remain V1–V15).
 ```
 
 ---
@@ -163,7 +177,10 @@ T&Cs:            legacy terms_and_conditions kept for compatibility but NOT used
 Quick-adds:      business_quick_description(business_id, description, sort_order).
 Invoice template: invoice_template_key DEFAULT 'standard'.
 Bank / ABN:      business-level.
-Logo:            file path/URL (local in dev, S3 URL in prod).
+Logo:            business.logo_path. In the current dev/demo setup it is seeded as
+                 '/uploads/1/branding/logo.png'. The screen can render it via the committed frontend
+                 public mirror, and the backend PDF can render it via FileStorageService local storage
+                 after copy_demo_logo.sh is run. Production upload/serving/storage is deferred to Phase 17.
 Public tenant endpoint: name / logo / accent ONLY.
 Private invoice/legal (ABN, bank, T&Cs, quick-adds): AUTHENTICATED only, never public.
 Lead Enquiry:    order_enquiry (V15), one row per order, UNIQUE(order_id); order-specific data,
@@ -177,6 +194,7 @@ Current migrations are V1–V15. Never edit any committed migration; any schema 
   V1–V7 base · V8 LM/SQM factor · V9 negative-price constraint · V10 invoice accept/signature/email
   V11 reserved slug words · V12 per-tenant branding/invoice-legal/quick-add · V13 per-type terms
   V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
+Phase 16A added NO migration (invoice tab + PDF logo path + Aire Compact PDF were app/template only).
 CI "Locked migration protection" guards V1–V13 only (latest-known). V14 and V15 are on main but NOT
   yet in the guard range — add them in the next migration/CI PR, unless the Phase 17 squash/baseline
   replaces this. Verify the live CI guard range if it matters.
@@ -203,16 +221,21 @@ Aussie Floors Group (business 1) + Premier Flooring Co (business 2):
   LC1 / SN1 / JW1 / EP1 / OS1 / MJ1 / NB1 / CT1 / EL1   (all password123)   — not old LC01.
 MS1 multi-store user exists only if manually inserted locally — check the DB before relying on it.
 db/dev-seed demo files (run manually after Flyway, idempotent): quick descriptions,
-  MS1 multi-store access, payment helpers, hard/soft invoice terms.
+  MS1 multi-store access, payment helpers, hard/soft invoice terms, branding (logo path + ABN).
+Demo logo: branding_demo.sql sets logo_path '/uploads/1/branding/logo.png'; for the backend PDF
+  to render it locally you must run copy_demo_logo.sh (copies the committed PNG into local storage at
+  $HOME/flooring-sales-portal-data/uploads/uploads/1/branding/logo.png — the double 'uploads' is
+  intentional). Old stored invoice PDFs do NOT auto-update; rewrite/regenerate to see template changes.
 ```
 
 **Deferred — features, not bugs (do not start unless explicitly requested)**
 
 ```text
-Twilio remote invoice signing · real Stripe webhook/auto-confirm/Connect · Operations Portal ·
+Twilio remote invoice/quote signing · real Stripe webhook/auto-confirm/Connect · Operations Portal ·
 Store Portal / analytics dashboard · installer/laybook workflows · advanced quote comparison ·
 room-level complexity · AI features · invoice version-history UI / old signed-invoice download ·
-payment edit / hard delete (beyond the Phase 15 soft-void flow) ·
+payment edit / hard delete (beyond the Phase 15 soft-void flow) · tenant logo upload UI / S3 serving ·
+configurable per-store guarantee text above terms (noted in PR3 as a possible future addition) ·
 lead-source field in Customer Details (small, unscheduled — distinct from the 15F Lead Enquiry form).
 ```
 
@@ -230,19 +253,25 @@ Settled decisions — do **not** re-litigate or "fix" these; they are deliberate
 - Payment AND payment-void carry acceptance/signature forward (no re-sign) and send NO email.
   Manual Resend is the only post-payment email action.
 - Blank per-type terms display is CORRECT (terms_hard / terms_soft are nullable; no backfill).
-- Logo display is fail-soft to business-name TEXT — there is no logo upload route/pipeline yet.
-- Quick-adds: DetailsOfSaleTab reads the tenant list; EMPTY if none — no hardcoded fallback.
+- Logo is fail-soft to business-name TEXT on BOTH surfaces: the screen renders an <img> that
+  falls back to the business name, and the backend PDF embeds a safe PNG/JPEG data URI
+  (magic-byte + size validated) that falls back to the business name. There is still no logo
+  upload UI / pipeline — the dev demo uses a seeded path + local-storage copy (Phase 17 storage).
 - Invoice table is APPEND-ONLY: Create / Rewrite / Payment / Void each INSERT a new version;
   current invoice = max(version_number). last_emailed_at is the only in-place update.
 - Negative sale_price_ex_gst persists through line CRUD; only invoice creation blocks a
   negative FINAL sale price.
+- Invoice PDF style is custom "Aire Compact" (PR3): modern, compact, low-whitespace, print-friendly.
+  Do NOT clone the CarpetCall PDF — it was used only for content order; a direct clone was tried,
+  disliked, and reverted. Terms always render on page 2 (SOFT and HARD), single column.
 ```
 
 Footguns — must not break:
 
 ```text
-- Cost visibility: costs appear only in controlled salesperson UI; line cost snapshots are
-  SERVER-created; the client must NEVER send cost_snapshot fields; catalog search stays cost-free.
+- Cost visibility: costs are stored server-side and used for GP calculations; do not expose
+  new cost surfaces casually. Catalog search stays cost-free and the client must NEVER send
+  cost_snapshot fields (line cost snapshots are SERVER-created).
 - business_quick_description column is `description`, NOT `text` (Postgres type-name footgun).
 - Auth model: HttpSession only — no JWT, no Spring principal. Spring Security is
   anyRequest().permitAll(); protection is enforced via RequestContextGuard.requireStandardProtected.
@@ -250,6 +279,9 @@ Footguns — must not break:
 - Use apiPath(slug, …) for tenant-scoped endpoints; bypass only for genuinely public endpoints.
 - Accepted customer name comes from the SAVED customer record — the customer does not type it
   at accept time.
+- openhtmltopdf (1.0.10) is XML-strict and CSS-limited: tables/conservative CSS only — no
+  flexbox/grid; no true CSS multi-column (column-count is parsed but ignored). Use literal chars
+  or numeric entities (e.g. &#183;), NOT named HTML entities (&middot; / &nbsp; / &hellip;).
 - Never leave follow-ups untracked — file a GitHub issue (the PR #71 lesson).
 ```
 
@@ -257,18 +289,22 @@ Footguns — must not break:
 
 ## 7. Roadmap
 
-### Phase 16 — Quotation PDF / quote sending
+### Phase 16 — Quotation PDF / quote sending  (16A done; 16B = quotation, NOT started)
 
 ```text
+16A — Invoice presentation foundation — COMPLETE (PR1 invoice tab, PR2 PDF logo path,
+      PR3 Aire Compact invoice PDF). This established the reusable Aire Compact document style.
+
+16B — Quotation feature — NOT STARTED, SCOPE NOT LOCKED:
 - Create and send a quotation to the customer (quote on the spot), BEFORE invoice/payment.
-- Quotation PDF generation — DISTINCT from the invoice PDF. Do NOT reuse invoice
-  acceptance / signature / payment rules blindly.
+- Quotation PDF generation — DISTINCT from the invoice PDF (may reuse the Aire Compact document
+  style, but must NOT reuse invoice acceptance / signature / payment rules blindly).
 - Send / resend the quote to the customer (email).
 - Possible in-app quote editor/canvas to adjust the quote before sending.
 
-SCOPE NOT LOCKED. First decide the quote model: separate versioned entity vs. draft-invoice
-view vs. new model. Lock the API contract (openapi.yaml + contract docs) BEFORE any branch.
-This is its own phase, not a sub-task — it will need more than one branch.
+First decide the quote model: separate versioned entity vs. draft-invoice view vs. new model.
+Lock the API contract (openapi.yaml + contract docs) BEFORE any branch. This is its own
+multi-branch effort, not a sub-task.
 ```
 
 ### Phase 17 — Deployment & Hardening (no revamp)
@@ -280,6 +316,7 @@ This is its own phase, not a sub-task — it will need more than one branch.
 - Repeatable per-tenant ONBOARDING seed: parameterised script/process to insert a real
   business -> its stores -> its users (login/codes) -> invoice-legal (ABN/bank/terms/stripe link).
   Real data, separate from the throwaway db/dev-seed demo scripts.
+- Tenant logo upload + serving/storage design (S3) — replaces the dev-only seeded-path + local-copy demo.
 - AWS: App Runner + RDS + S3 + Secrets Manager + domain + HTTPS.
 - CSRF (#29), production CORS (#30), secure cookies, timezone (#34).
 - Centralize backend auth enforcement / fail-closed filter (#75) before production.
@@ -291,7 +328,7 @@ This is its own phase, not a sub-task — it will need more than one branch.
 
 ```text
 - FloorxTack identity + per-tenant logo/name/accent on login/dashboard/workspace + clean payment screen.
-- Invoice is ALREADY branded (Phase 15) — do not redo it.
+- Invoice is ALREADY branded (Phase 15/16A) — do not redo it.
 - Light skin only: preserve workflow, placeholders, backend wiring. iPad-friendly, compact. No CRM redesign.
 ```
 
@@ -327,4 +364,4 @@ W1  business_quick_description has a FK to business with no ON DELETE — the te
 
 ## 9. Next step
 
-**Phase 16 — Quotation PDF / quote sending.** Scope is **NOT yet locked**. Before any branch: decide the quote model (separate versioned entity vs. draft-invoice view vs. new model), then lock the API contract (`openapi.yaml` + contract docs) first. Do NOT reuse invoice acceptance/signature/payment rules blindly. Discuss and lock exact scope before implementation.
+**Phase 16B — Quotation PDF / quote sending.** Phase 16A (invoice tab + PDF logo path + Aire Compact invoice PDF) is complete on `main`. Scope for the quotation feature is **NOT yet locked**. Before any branch: decide the quote model (separate versioned entity vs. draft-invoice view vs. new model), then lock the API contract (`openapi.yaml` + contract docs) first. The quote PDF may reuse the Aire Compact document style but must NOT reuse invoice acceptance/signature/payment rules blindly. Discuss and lock exact scope before implementation.

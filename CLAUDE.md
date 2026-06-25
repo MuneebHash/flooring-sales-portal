@@ -45,12 +45,21 @@ The user controls all approvals, commits, pushes, merges, and all product/UI dec
 
 ```text
 Phase 15 (Invoice & Payment correctness + Lead Enquiry, 15A–15F) is COMPLETE — see docs/Phases.md §4.
-Current focus: Phase 16 — Quotation PDF / quote sending. See docs/Phases.md §7/§9.
+Phase 16A (invoice presentation foundation) is COMPLETE on main:
+  - PR1 (#89): Invoice TAB screen redesign (CarpetCall-style); screen logo is an <img> fail-soft
+    to business-name text; store/ABN/bank/flooring-type/salesperson removed from the SCREEN.
+  - PR2 (#90): demo PDF logo path — business.logo_path seeded as '/uploads/1/branding/logo.png';
+    backend PDF renders a real PNG via FileStorageService local storage (no upload UI / S3 yet).
+  - PR3 (#91): backend invoice PDF redesigned to custom "Aire Compact" layout; terms ALWAYS on
+    page 2 (SOFT and HARD); footer renders exactly once with or without terms. Template-only.
+  Phase 16A added NO migration (still V1–V15) and NO production Java in PR3.
 
-Phase 16 scope is NOT locked. Before any Phase 16 branch: decide the quote model
+Current focus: Phase 16B — Quotation PDF / quote sending. See docs/Phases.md §7/§9.
+
+Phase 16B scope is NOT locked. Before any branch: decide the quote model
   (separate versioned entity vs draft-invoice view vs new model), then lock the API contract
-  (openapi.yaml + contract docs) FIRST. Do NOT reuse invoice acceptance/signature/payment rules
-  blindly. No quotation implementation details exist yet — scope and contract come first.
+  (openapi.yaml + contract docs) FIRST. The quote PDF may reuse the Aire Compact document style
+  but must NOT reuse invoice acceptance/signature/payment rules blindly. Scope and contract first.
 
 Roadmap: 16 Quotation PDF · 17 Deploy & Hardening · 18 Revamp/app chrome · 19 Final audit gate
   (full roadmap in docs/Phases.md §7).
@@ -90,8 +99,9 @@ cd backend && ./mvnw test          # backend changes
 ```text
 - Do NOT suggest `docker compose down -v` unless the user intentionally wants to wipe the local DB
   (it deletes the Postgres volume).
-- Backend local tests may show ~48 known failures from accumulated dirty local-DB state.
-  CI fresh-DB is the authoritative gate. Compare against the known baseline; do not chase these.
+- Backend local tests may show a varying number of known failures (observed ~48–108) from
+  accumulated dirty local-DB state. CI fresh-DB is the authoritative gate. Compare against the
+  known baseline; do not chase these. A fresh DB is needed for a clean local full-suite run.
 ```
 
 ---
@@ -135,6 +145,7 @@ Current migrations are V1–V15:
   V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
 
 Never edit any committed migration. Any schema change is a NEW migration.
+Phase 16A added NO migration (invoice tab + PDF logo path + Aire Compact PDF were app/template only).
 CI "Locked migration protection" guards V1–V13 only (latest-known). V14 and V15 are on main but
   NOT yet locked unless live CI says otherwise. Any migration/CI work before the Phase 17 squash must
   explicitly account for V14/V15. Do not casually expand or rewrite the guard if the Phase 17
@@ -161,7 +172,9 @@ Dev-seed scripts live in `backend/src/main/resources/db/dev-seed/` (sibling of `
 4. psql -f db/dev-seed/multi_store_user_demo.sql
 5. psql -f db/dev-seed/payment_helpers_demo.sql      # bank + Stripe-link demo data (Phase 15E)
 6. psql -f db/dev-seed/terms_demo.sql                # demo hard/soft invoice terms
-7. verify login / store-selection / quick-adds / products / charges / payment helpers / terms
+7. psql -f db/dev-seed/branding_demo.sql             # demo logo_path '/uploads/1/branding/logo.png' (Phase 16A)
+8. bash db/dev-seed/copy_demo_logo.sh                # copy PNG into local storage so the backend PDF logo renders
+9. verify login / store-selection / quick-adds / products / charges / payment helpers / terms / invoice PDF logo
 ```
 
 The production-safe schema-only baseline/squash (separating the V4 demo seed from schema) is deferred to Phase 17 / pre-deploy. Legacy V4–V7 demo data stays for now (locked + test-dependent).
@@ -277,7 +290,16 @@ Costs are NEVER exposed in the salesperson frontend; catalog search is cost-free
 - Terms are FROZEN at acceptance; changing business terms needs a NEW invoice + re-sign (do not re-raise).
 - Rewrite-after-accept CLEARS acceptance/signature by design (new customer-facing invoice; re-accept).
 - Blank per-type terms display is CORRECT (terms_hard/terms_soft nullable; no backfill).
-- Logo display is fail-soft to business-name TEXT — no logo upload route/pipeline yet.
+- Logo is fail-soft to business-name TEXT on BOTH surfaces (screen <img> and backend PDF data URI).
+  Dev/demo uses a seeded logo_path '/uploads/1/branding/logo.png' + copy_demo_logo.sh local copy;
+  there is no logo upload UI / pipeline yet (prod upload/serving/storage deferred to Phase 17).
+- Invoice PDF style is custom "Aire Compact" (PR3): terms ALWAYS render on page 2 (SOFT and HARD),
+  page 1 never shows a terms block, footer renders exactly once with or without terms. Do NOT clone
+  the CarpetCall PDF (tried, disliked, reverted) — it was used only for content order.
+- openhtmltopdf (1.0.10) is XML-strict and CSS-limited: tables/conservative CSS only — no flexbox/grid,
+  no true CSS multi-column (column-count is parsed but ignored). Use literal chars or numeric entities
+  (e.g. &#183;), NOT named HTML entities (&middot; / &nbsp; / &hellip;). Old stored PDFs do NOT
+  auto-update on template change — rewrite/regenerate to see changes.
 - Quick-adds: DetailsOfSaleTab reads the tenant list; EMPTY if none — no hardcoded fallback.
 - Accepted customer name comes from the SAVED customer record — not typed at accept time.
 - Never leave follow-ups untracked — file a GitHub issue (the PR #71 lesson).
@@ -294,6 +316,7 @@ Aussie Floors Group (business 1) + Premier Flooring Co (business 2):
   LC1 · SN1 · JW1 · EP1 · OS1 · MJ1 · NB1 · CT1 · EL1   (all password123)   — not old LC01.
 MS1 multi-store user exists only if manually inserted locally — check the DB before relying on it.
 Demo bank/Stripe + hard/soft terms appear only after running payment_helpers_demo.sql + terms_demo.sql.
+Demo invoice-PDF logo appears only after running branding_demo.sql + copy_demo_logo.sh (Phase 16A).
 ```
 
 ---
@@ -329,7 +352,8 @@ full Operations Portal · Store Portal/dashboard · installer/laybook workflows 
 advanced quote comparison · room-level complexity · AI features ·
 payment edit / hard delete (only soft void is in scope) · refunds · finance products ·
 Stripe Connect / full payment-gateway build / webhooks ·
-major frontend redesign / FloorxTack chrome (Phase 18) · invoice version-history UI
+major frontend redesign / FloorxTack chrome (Phase 18) · invoice version-history UI ·
+tenant logo upload UI / S3 serving (Phase 17) · configurable per-store guarantee text above terms
 ```
 
 ---
