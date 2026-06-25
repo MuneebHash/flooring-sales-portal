@@ -195,9 +195,11 @@ Current migrations are V1–V15. Never edit any committed migration; any schema 
   V11 reserved slug words · V12 per-tenant branding/invoice-legal/quick-add · V13 per-type terms
   V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
 Phase 16A added NO migration (invoice tab + PDF logo path + Aire Compact PDF were app/template only).
+The Phase 16 quotation feature will add its first quote migration at V16+ (see §7).
 CI "Locked migration protection" guards V1–V13 only (latest-known). V14 and V15 are on main but NOT
   yet in the guard range — add them in the next migration/CI PR, unless the Phase 17 squash/baseline
-  replaces this. Verify the live CI guard range if it matters.
+  replaces this. Any Phase 16 quote migration (V16+) is also outside the current guard and must be
+  folded into the Phase 17 squash. Verify the live CI guard range if it matters.
 Schema = Flyway migration. Demo/dev data = db/dev-seed (manual, idempotent, never auto-runs).
   New tests must self-seed and must NOT depend on the V4 legacy seed.
 Do NOT create a Flyway migration per customer/tenant. Production starts schema-only;
@@ -231,12 +233,15 @@ Demo logo: branding_demo.sql sets logo_path '/uploads/1/branding/logo.png'; for 
 **Deferred — features, not bugs (do not start unless explicitly requested)**
 
 ```text
-Twilio remote invoice/quote signing · real Stripe webhook/auto-confirm/Connect · Operations Portal ·
+real Stripe webhook/auto-confirm/Connect · Operations Portal ·
 Store Portal / analytics dashboard · installer/laybook workflows · advanced quote comparison ·
 room-level complexity · AI features · invoice version-history UI / old signed-invoice download ·
 payment edit / hard delete (beyond the Phase 15 soft-void flow) · tenant logo upload UI / S3 serving ·
 configurable per-store guarantee text above terms (noted in PR3 as a possible future addition) ·
 lead-source field in Customer Details (small, unscheduled — distinct from the 15F Lead Enquiry form).
+
+NOTE: Twilio SMS remote quote signing is NO LONGER a vague deferral — it is now planned as part of
+  the Phase 16 quotation feature (designed in 16B, delivered in 16E/16F). See §7.
 ```
 
 ---
@@ -275,7 +280,8 @@ Footguns — must not break:
 - business_quick_description column is `description`, NOT `text` (Postgres type-name footgun).
 - Auth model: HttpSession only — no JWT, no Spring principal. Spring Security is
   anyRequest().permitAll(); protection is enforced via RequestContextGuard.requireStandardProtected.
-  Do NOT touch this model.
+  Do NOT touch this model. (NOTE: Phase 16 public tokenized quote links are a NEW, separate
+  unauthenticated surface — they must NOT reuse or weaken this session model; see §7 16B.)
 - Use apiPath(slug, …) for tenant-scoped endpoints; bypass only for genuinely public endpoints.
 - Accepted customer name comes from the SAVED customer record — the customer does not type it
   at accept time.
@@ -289,22 +295,58 @@ Footguns — must not break:
 
 ## 7. Roadmap
 
-### Phase 16 — Quotation PDF / quote sending  (16A done; 16B = quotation, NOT started)
+### Phase 16 — Quotation PDF / quote sending  (16A done; 16B–16F = quotation feature)
 
 ```text
-16A — Invoice presentation foundation — COMPLETE (PR1 invoice tab, PR2 PDF logo path,
-      PR3 Aire Compact invoice PDF). This established the reusable Aire Compact document style.
+16A — Invoice presentation foundation — COMPLETE
+      PR1 invoice tab · PR2 PDF logo path · PR3 Aire Compact invoice PDF.
+      Established the reusable Aire Compact document style for the quote PDF.
 
-16B — Quotation feature — NOT STARTED, SCOPE NOT LOCKED:
-- Create and send a quotation to the customer (quote on the spot), BEFORE invoice/payment.
-- Quotation PDF generation — DISTINCT from the invoice PDF (may reuse the Aire Compact document
-  style, but must NOT reuse invoice acceptance / signature / payment rules blindly).
-- Send / resend the quote to the customer (email).
-- Possible in-app quote editor/canvas to adjust the quote before sending.
+16B — Quote planning + contract lock — NEXT. Planning/contract only, NO product-code implementation.
+      This is the heavy decision phase. Lock, in order, BEFORE any code:
+      1. MONEY MODEL (the real risk, not the PDF):
+         - quote total = order sale-price override.
+         - the ACCEPTED quote snapshot (NOT the live override) is the legal billing number.
+         - below-cost block fires at quote SAVE/ACCEPT (not invoice creation).
+         - define the full quote <-> order <-> invoice money flow and what is snapshotted when.
+      2. QUOTE MODEL: separate versioned entity vs. draft-invoice view vs. new table.
+         Decide single-current / append-only shape (mirror the invoice append-only model or not).
+      3. QUOTE STATUSES + lifecycle (do NOT invent order-status variants; quote has its own states).
+      4. VERSIONING rules (current quote = max version; what create/rewrite do).
+      5. PUBLIC TOKENIZED QUOTE-LINK DESIGN (for Twilio remote signing, implemented later):
+         token model, expiry, rate limiting, NO logged-in session, public read-only surface.
+         Must NOT reuse or weaken the HttpSession auth model. DESIGNED in 16B, built in 16E/16F.
+      6. PDF / EMAIL / SMS / SIGNATURE / INVOICE-CONVERSION rules:
+         - quote PDF reuses the Aire Compact document style, title "QUOTE" (DISTINCT from invoice).
+         - delivery channels (email and/or SMS via Twilio) — lock exact channel rules here.
+         - signature/acceptance rules — do NOT reuse invoice acceptance/signature/payment rules blindly.
+         - invoice-conversion + signature-inheritance rules: does the accepted quote signature carry
+           into the created invoice (no re-sign), like payment-void carry-forward, or fresh acceptance?
+      Lock the API contract (openapi.yaml + contract docs) FIRST. Decisions are discussed one at a time.
 
-First decide the quote model: separate versioned entity vs. draft-invoice view vs. new model.
-Lock the API contract (openapi.yaml + contract docs) BEFORE any branch. This is its own
-multi-branch effort, not a sub-task.
+16C — Backend quote foundation:
+      Migration V16, quote create / rewrite / get-current, quote PDF generate/download,
+      quote total snapshot rules, backend tests. No email / SMS / signing yet.
+
+16D — Frontend salesperson Quote tab:
+      Quote tab/screen, create/rewrite quote, preview/download PDF, show quote status.
+      No sending / signing yet.
+
+16E — Quote delivery link:
+      Send / resend the quote by email and/or SMS (Twilio) link (exact channel rules per the 16B lock);
+      public tokenized quote-view page; READ-ONLY customer view. Track sent_at / last_emailed_at.
+      No signing / acceptance yet.
+
+16F — Remote quote acceptance + invoice conversion:
+      Customer signs the quote remotely on their phone via the tokenized link; the accepted quote
+      snapshot is locked as the legal number; store notification email on accept; manual Create Invoice
+      button (NO auto-invoice); the created invoice inherits the accepted quote signature/snapshot per
+      the 16B-locked rules.
+      Do NOT merge 16E and 16F — public-token remote signing is its own security + legal-state surface,
+      Phase-13-sized on its own.
+
+Migration note: the quote schema is V16+, outside the current V1–V13 CI guard, and MUST be folded
+  into the Phase 17 squash/baseline.
 ```
 
 ### Phase 17 — Deployment & Hardening (no revamp)
@@ -336,7 +378,7 @@ multi-branch effort, not a sub-task.
 
 ```text
 - Fresh-DB rebuild from zero. Tenant isolation test.
-- Full E2E: order -> invoice -> payment -> void -> signature. Production smoke test.
+- Full E2E: order -> quote -> remote sign -> invoice -> payment -> void -> signature. Production smoke test.
 - Confirm no untracked follow-ups remain.
 ```
 
@@ -364,4 +406,4 @@ W1  business_quick_description has a FK to business with no ON DELETE — the te
 
 ## 9. Next step
 
-**Phase 16B — Quotation PDF / quote sending.** Phase 16A (invoice tab + PDF logo path + Aire Compact invoice PDF) is complete on `main`. Scope for the quotation feature is **NOT yet locked**. Before any branch: decide the quote model (separate versioned entity vs. draft-invoice view vs. new model), then lock the API contract (`openapi.yaml` + contract docs) first. The quote PDF may reuse the Aire Compact document style but must NOT reuse invoice acceptance/signature/payment rules blindly. Discuss and lock exact scope before implementation.
+**Phase 16B — Quote planning + contract lock.** Phase 16A (invoice tab + PDF logo path + Aire Compact invoice PDF) is complete on `main`. 16B is **planning + contract only — no product-code implementation** (it may still update `openapi.yaml`/contract docs). Lock the decisions in order: (1) the money model — quote total = order override, accepted quote snapshot = legal billing number, below-cost block at quote save/accept; (2) the quote model — versioned entity vs. draft-invoice view vs. new table — plus statuses and versioning; (3) the public tokenized quote-link design for later Twilio remote signing (token/expiry/rate-limit, no session, never weakens the HttpSession model); (4) PDF / email / SMS / signature / invoice-conversion + signature-inheritance rules. Update `openapi.yaml` + contract docs FIRST, before any 16C code. Discuss each decision one at a time. Do NOT merge 16E and 16F.
