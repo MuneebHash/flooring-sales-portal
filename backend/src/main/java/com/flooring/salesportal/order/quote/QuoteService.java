@@ -71,6 +71,9 @@ public class QuoteService {
     private static final String MONEY_MAX_LABEL = "99999999.99";
     // sales_order.gp_percent is DECIMAL(5,2): persist NULL when the true value would overflow (R4).
     private static final BigDecimal MAX_DB_GP_PERCENT = new BigDecimal("999.99");
+    // Upper bound on a line's sort_order. Caps client input so the auto-inserted ADJUSTMENT line's
+    // sort_order (max(existing) + 1, QuoteDraftCalculator) can never overflow Integer (Codex finding).
+    private static final int MAX_SORT_ORDER = 1_000_000;
 
     private static final String FIELD_ITEMISED = "itemised";
     private static final String FIELD_FINAL_TOTAL = "final_total_inc_gst";
@@ -444,6 +447,12 @@ public class QuoteService {
         return text;
     }
 
+    /**
+     * Required sort_order: an integer in {@code [0, MAX_SORT_ORDER]}. The upper bound caps client
+     * input so the auto-inserted ADJUSTMENT line's {@code max(sort_order) + 1} can never overflow
+     * Integer (Codex finding). An out-of-range value is a clean 400 — never a silent wrap, never a
+     * DB-CHECK 500.
+     */
     private static Integer readRequiredNonNegativeInt(JsonNode node, String key, String field, List<ErrorDetail> errors) {
         JsonNode v = node.get(key);
         if (v == null || v.isNull()) {
@@ -451,12 +460,12 @@ public class QuoteService {
             return null;
         }
         if (!v.isIntegralNumber() || !v.canConvertToInt()) {
-            errors.add(new ErrorDetail(null, field, "Must be a non-negative integer."));
+            errors.add(new ErrorDetail(null, field, "Must be an integer between 0 and " + MAX_SORT_ORDER + "."));
             return null;
         }
         int value = v.intValue();
-        if (value < 0) {
-            errors.add(new ErrorDetail(null, field, "Must be a non-negative integer."));
+        if (value < 0 || value > MAX_SORT_ORDER) {
+            errors.add(new ErrorDetail(null, field, "Must be an integer between 0 and " + MAX_SORT_ORDER + "."));
             return null;
         }
         return value;

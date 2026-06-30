@@ -384,11 +384,15 @@ class QuoteControllerTest {
         assertMoney("200.00", draftDecimal(orderId, "quote_total_ex_gst"));
         assertMoney("220.00", draftDecimal(orderId, "quote_total_inc_gst"));
         Assertions.assertEquals(0, draftDecimal(orderId, "quote_total_ex_gst").compareTo(sumLineTotals(orderId)));
-        // The adjustment is a visible negative line.
+        // The adjustment is a visible negative line, appended at sort_order = max(existing) + 1 (= 2).
         BigDecimal adjTotal = jdbcTemplate.queryForObject(
                 "SELECT line_total_ex_gst FROM quote_draft_line l JOIN quote_draft d ON l.quote_draft_id = d.quote_draft_id "
                         + "WHERE d.order_id = ? AND l.line_type = 'ADJUSTMENT'", BigDecimal.class, orderId);
         assertMoney("-50.00", adjTotal);
+        Integer adjSortOrder = jdbcTemplate.queryForObject(
+                "SELECT sort_order FROM quote_draft_line l JOIN quote_draft d ON l.quote_draft_id = d.quote_draft_id "
+                        + "WHERE d.order_id = ? AND l.line_type = 'ADJUSTMENT'", Integer.class, orderId);
+        Assertions.assertEquals(2, adjSortOrder, "adjustment sort_order is max(0,1) + 1");
     }
 
     @Test
@@ -718,5 +722,52 @@ class QuoteControllerTest {
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
 
         Assertions.assertEquals(0, draftRowCount(orderId));
+    }
+
+    // ================================================================
+    // PUT draft — sort_order bound (Codex fix: adjustment sort_order overflow)
+    // ================================================================
+
+    @Test
+    void putDraft_sortOrderOverflow_withForcedAdjustment_returns400_notPersisted() throws Exception {
+        long orderId = leadOrderInSession();
+        jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = 88.80 WHERE order_id = ?", orderId);
+
+        // sort_order = Integer.MAX_VALUE would make the auto-adjustment's max+1 overflow; the cap
+        // rejects it at validation (before compute), so the adjustment path is never reached.
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "final_total_inc_gst": 100, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":2,"unit_price_ex_gst":100,"line_total_ex_gst":200,"sort_order":2147483647}
+                                ]}"""))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("lines[0].sort_order"));
+
+        Assertions.assertEquals(0, draftRowCount(orderId), "rejected save must not persist a draft");
+        Assertions.assertEquals(0, lineCount(orderId));
+        assertMoney("88.80", orderDecimal(orderId, "price_adjustment_inc_gst")); // override untouched
+    }
+
+    @Test
+    void putDraft_sortOrderAtMax_noAdjustment_saves() throws Exception {
+        long orderId = leadOrderInSession();
+
+        // sort_order at the cap (1000000) with no direct total => no adjustment => save succeeds.
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":1,"unit_price_ex_gst":100,"line_total_ex_gst":100,"sort_order":1000000}
+                                ]}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.lines", hasSize(1)));
+
+        Assertions.assertEquals(1, draftRowCount(orderId));
+        Integer sortOrder = jdbcTemplate.queryForObject(
+                "SELECT sort_order FROM quote_draft_line l JOIN quote_draft d ON l.quote_draft_id = d.quote_draft_id "
+                        + "WHERE d.order_id = ?", Integer.class, orderId);
+        Assertions.assertEquals(1_000_000, sortOrder);
     }
 }
