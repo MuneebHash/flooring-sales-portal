@@ -9,7 +9,9 @@ import org.springframework.stereotype.Component;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Pure quote-draft money computation (Phase 16C PR1; contract §6). No persistence, no Spring deps
@@ -50,6 +52,15 @@ public class QuoteDraftCalculator {
     // quote_total_*/line_total_ex_gst are DECIMAL(10,2): a 2dp value fits iff |value| <= 99999999.99.
     private static final int MONEY_MAX_INTEGER_DIGITS = 10 - MONEY_SCALE;
     private static final String MONEY_MAX_LABEL = "99999999.99";
+
+    /**
+     * Upper bound on a line's {@code sort_order} — the SINGLE source of truth for both the generated
+     * ADJUSTMENT sort_order (here) and the request-validation cap ({@code QuoteService} references this
+     * constant). A persisted/generated sort_order is always in {@code [0, MAX_SORT_ORDER]} so a returned
+     * draft is always resaveable: {@code QuoteService}'s body validation rejects any client value above
+     * this, and {@link #nextSortOrder} never generates a value above it (the resave-lockout fix-forward).
+     */
+    public static final int MAX_SORT_ORDER = 1_000_000;
 
     /**
      * Recompute and validate the draft money. Returns the final line set (including any auto-inserted
@@ -176,12 +187,41 @@ public class QuoteDraftCalculator {
         return sum.setScale(MONEY_SCALE, ROUNDING);
     }
 
+    /**
+     * The {@code sort_order} for an auto-inserted ADJUSTMENT line. Normally one past the current max so
+     * the adjustment appends after every customer line ({@code max + 1}). EDGE: when a customer line
+     * already sits at the {@link #MAX_SORT_ORDER} cap, {@code max + 1} would be {@code MAX_SORT_ORDER + 1}
+     * — out of range — and the returned draft would then be REJECTED on an unchanged resave (the
+     * resave-lockout: {@code QuoteService.readRequiredNonNegativeInt} rejects {@code > MAX_SORT_ORDER}).
+     * In that edge we take the LOWEST UNUSED sort_order in {@code [0, MAX_SORT_ORDER]} instead: always a
+     * valid, resaveable, non-duplicate value — never {@code 1_000_001} and never a duplicate of the cap
+     * (a duplicate is what {@code Math.min(max + 1, MAX_SORT_ORDER)} would produce). Existing customer
+     * lines are never reordered.
+     */
     private static int nextSortOrder(List<QuoteComputedLine> lines) {
         int max = -1;
         for (QuoteComputedLine line : lines) {
             max = Math.max(max, line.sortOrder());
         }
-        return max + 1;
+        if (max < MAX_SORT_ORDER) {
+            return max + 1;
+        }
+        return lowestUnusedSortOrder(lines);
+    }
+
+    /** Lowest {@code sort_order} in {@code [0, MAX_SORT_ORDER]} not already used by a line (in range, no duplicate). */
+    private static int lowestUnusedSortOrder(List<QuoteComputedLine> lines) {
+        Set<Integer> used = new HashSet<>(Math.max(8, lines.size() * 2));
+        for (QuoteComputedLine line : lines) {
+            used.add(line.sortOrder());
+        }
+        for (int candidate = 0; candidate <= MAX_SORT_ORDER; candidate++) {
+            if (!used.contains(candidate)) {
+                return candidate;
+            }
+        }
+        // Unreachable with any realistic line count (all 1,000,001 slots filled); deterministic backstop.
+        return MAX_SORT_ORDER;
     }
 
     private static void requireFitsMoney(BigDecimal value, String field) {
