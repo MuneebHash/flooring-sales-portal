@@ -24,6 +24,7 @@ import com.flooring.salesportal.order.quote.dto.QuoteDraftLineDto;
 import com.flooring.salesportal.order.quote.dto.QuoteWorkspaceDto;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
@@ -185,8 +186,14 @@ public class QuoteService {
      * VALIDATION_FAILED, strictly AFTER the scoped lookup) → load draft (404 QUOTE_NOT_FOUND when absent).
      * LAID is allowed (no requireNotLaid) and below-cost is allowed (the persisted draft totals are read;
      * the QUOTE_BELOW_COST guard in {@link QuoteDraftCalculator#compute} is never invoked on preview).
+     *
+     * <p><b>Consistent snapshot (REPEATABLE_READ).</b> The draft header, draft lines, order, customer,
+     * address, store, and terms are read in separate statements; under READ COMMITTED a concurrent
+     * {@code PUT /quote/draft} could commit between them and the PDF would mix stale totals with newer
+     * lines. REPEATABLE_READ pins every read to one snapshot. It stays read-only and takes NO row locks
+     * (no {@code FOR UPDATE}), so it never blocks a concurrent draft save.
      */
-    @Transactional(readOnly = true)
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public QuotePreviewResult previewPdf(String slug, String orderIdRaw, String body, HttpServletRequest httpRequest) {
         RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
         long orderId = parseOrderId(orderIdRaw);

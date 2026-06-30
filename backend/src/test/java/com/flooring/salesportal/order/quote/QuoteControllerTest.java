@@ -1045,6 +1045,21 @@ class QuoteControllerTest {
     }
 
     @Test
+    void previewPdf_transactionContract_isReadOnlyRepeatableRead() throws NoSuchMethodException {
+        // Codex fix: the preview reads draft header, lines, order, customer/address/store/terms in
+        // separate statements; REPEATABLE_READ pins them to one consistent snapshot (read-only, no locks).
+        java.lang.reflect.Method m = QuoteService.class.getMethod(
+                "previewPdf", String.class, String.class, String.class,
+                jakarta.servlet.http.HttpServletRequest.class);
+        org.springframework.transaction.annotation.Transactional tx =
+                m.getAnnotation(org.springframework.transaction.annotation.Transactional.class);
+        Assertions.assertNotNull(tx, "previewPdf must be @Transactional");
+        Assertions.assertTrue(tx.readOnly(), "previewPdf must stay read-only");
+        Assertions.assertEquals(org.springframework.transaction.annotation.Isolation.REPEATABLE_READ,
+                tx.isolation(), "previewPdf must use REPEATABLE_READ for a consistent snapshot");
+    }
+
+    @Test
     void previewPdf_isReadOnly_writesNothing() throws Exception {
         long orderId = leadOrderInSession();
         seedSimpleDraft(orderId, "100.00", "110.00");
