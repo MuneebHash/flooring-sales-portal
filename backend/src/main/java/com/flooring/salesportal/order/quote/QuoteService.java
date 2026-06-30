@@ -72,8 +72,10 @@ public class QuoteService {
     // sales_order.gp_percent is DECIMAL(5,2): persist NULL when the true value would overflow (R4).
     private static final BigDecimal MAX_DB_GP_PERCENT = new BigDecimal("999.99");
     // Upper bound on a line's sort_order. Caps client input so the auto-inserted ADJUSTMENT line's
-    // sort_order (max(existing) + 1, QuoteDraftCalculator) can never overflow Integer (Codex finding).
-    private static final int MAX_SORT_ORDER = 1_000_000;
+    // sort_order can never overflow Integer (Codex finding). SINGLE SOURCE OF TRUTH lives on
+    // QuoteDraftCalculator so the validation cap (here) and the generation cap (the adjustment
+    // sort_order in QuoteDraftCalculator.nextSortOrder) can never drift apart.
+    private static final int MAX_SORT_ORDER = QuoteDraftCalculator.MAX_SORT_ORDER;
 
     private static final String FIELD_ITEMISED = "itemised";
     private static final String FIELD_FINAL_TOTAL = "final_total_inc_gst";
@@ -97,6 +99,8 @@ public class QuoteService {
     private final QuoteDraftLineRepository quoteDraftLineRepository;
     private final QuoteDraftWriteRepository quoteDraftWriteRepository;
     private final QuoteDraftCalculator quoteDraftCalculator;
+    private final QuotePdfModelAssembler quotePdfModelAssembler;
+    private final QuotePdfGenerator quotePdfGenerator;
     private final ObjectMapper objectMapper;
 
     public QuoteService(RequestContextGuard requestContextGuard,
@@ -109,6 +113,8 @@ public class QuoteService {
                         QuoteDraftLineRepository quoteDraftLineRepository,
                         QuoteDraftWriteRepository quoteDraftWriteRepository,
                         QuoteDraftCalculator quoteDraftCalculator,
+                        QuotePdfModelAssembler quotePdfModelAssembler,
+                        QuotePdfGenerator quotePdfGenerator,
                         ObjectMapper objectMapper) {
         this.requestContextGuard = requestContextGuard;
         this.salesOrderRepository = salesOrderRepository;
@@ -120,6 +126,8 @@ public class QuoteService {
         this.quoteDraftLineRepository = quoteDraftLineRepository;
         this.quoteDraftWriteRepository = quoteDraftWriteRepository;
         this.quoteDraftCalculator = quoteDraftCalculator;
+        this.quotePdfModelAssembler = quotePdfModelAssembler;
+        this.quotePdfGenerator = quotePdfGenerator;
         this.objectMapper = objectMapper;
     }
 
@@ -162,6 +170,84 @@ public class QuoteService {
                 toLineDtos(lineEntities),
                 draft.getUpdatedAt());
         return QuoteWorkspaceDto.draftOnly(draftDto);
+    }
+
+    // ------------------------------------------------------------------
+    // POST /orders/{orderId}/quote/preview-pdf
+    // ------------------------------------------------------------------
+
+    /**
+     * Render the current quote DRAFT to a preview PDF (Phase 16C PR2, contract §7.1). Read-only and
+     * side-effect-free: NOTHING is persisted (no stored_file, no quote_version, no quote_token, no draft
+     * timestamp touch, no sale-price override write). The gate order mirrors the workspace read —
+     * standard-protected guard → orderId parse (400 VALIDATION_FAILED) → scoped NON-LOCKING order lookup
+     * (404 ORDER_NOT_FOUND; never 403/leak) → empty-body validation (400 MALFORMED_JSON /
+     * VALIDATION_FAILED, strictly AFTER the scoped lookup) → load draft (404 QUOTE_NOT_FOUND when absent).
+     * LAID is allowed (no requireNotLaid) and below-cost is allowed (the persisted draft totals are read;
+     * the QUOTE_BELOW_COST guard in {@link QuoteDraftCalculator#compute} is never invoked on preview).
+     */
+    @Transactional(readOnly = true)
+    public QuotePreviewResult previewPdf(String slug, String orderIdRaw, String body, HttpServletRequest httpRequest) {
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+        long orderId = parseOrderId(orderIdRaw);
+
+        // Scoped, non-locking read. Out-of-scope / missing → 404 (never confirms cross-tenant existence).
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        // Body validated AFTER the scoped lookup (so malformed JSON cannot 400 ahead of the 404). The
+        // preview takes no meaningful body: missing/blank/{} are accepted; any field or a non-object is
+        // 400 VALIDATION_FAILED; malformed JSON is 400 MALFORMED_JSON.
+        validatePreviewBody(body);
+
+        QuoteDraft draft = quoteDraftRepository.findByOrderId(orderId)
+                .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_NOT_FOUND,
+                        ErrorCode.QUOTE_NOT_FOUND.defaultMessage()));
+        List<QuoteDraftLine> lines =
+                quoteDraftLineRepository.findByQuoteDraftIdOrderBySortOrderAsc(draft.getQuoteDraftId());
+
+        QuotePdfModel model = quotePdfModelAssembler.assemble(ctx.business(), order, orderId, draft, lines);
+        byte[] bytes = quotePdfGenerator.render(model);
+        String fileName = "quote-preview-" + order.getOrderNumber() + ".pdf";
+        return new QuotePreviewResult(fileName, bytes);
+    }
+
+    /** Rendered preview PDF + the inline file name the controller streams (never a stored file). */
+    public record QuotePreviewResult(String fileName, byte[] bytes) {
+    }
+
+    /**
+     * Validate the preview request body: missing/blank/{@code {}} accepted; malformed JSON →
+     * MALFORMED_JSON; a non-empty object (any field) or ANY non-object JSON (literal {@code null},
+     * {@code []}, string, number, boolean) → VALIDATION_FAILED. Mirrors the OpenAPI EmptyObjectRequest
+     * (type object, additionalProperties false) but never REQUIRES a body.
+     */
+    private void validatePreviewBody(String body) {
+        if (body == null || body.isBlank()) {
+            return;
+        }
+        JsonNode root;
+        try {
+            root = objectMapper.readTree(body);
+        } catch (JsonProcessingException ex) {
+            throw new MalformedJsonException();
+        }
+        // root == null / MissingNode means nothing parseable (defensive) -> treat as no body. A JSON
+        // literal `null` parses to a NullNode (isNull()), which is NOT an object -> validation failure.
+        if (root == null || root.isMissingNode()) {
+            return;
+        }
+        List<ErrorDetail> errors = new ArrayList<>();
+        if (!root.isObject()) {
+            errors.add(new ErrorDetail(null, null, "Request body must be an empty JSON object."));
+        } else {
+            Iterator<String> names = root.fieldNames();
+            while (names.hasNext()) {
+                errors.add(new ErrorDetail(null, names.next(), "Not allowed."));
+            }
+        }
+        throwIfErrors(errors);
     }
 
     // ------------------------------------------------------------------

@@ -190,4 +190,55 @@ class QuoteDraftCalculatorTest {
         assertFalse(calc.belowCost(bd("50.00"), bd("50.00")));
         assertFalse(calc.belowCost(bd("60.00"), bd("50.00")));
     }
+
+    // ================================================================
+    // Sort-order fix-forward (PR1 resave-lockout): the generated ADJUSTMENT sort_order must never
+    // exceed MAX_SORT_ORDER, so a returned draft is always resaveable unchanged.
+    // ================================================================
+
+    @Test
+    void maxSortOrder_constant_isOneMillion() {
+        assertEquals(1_000_000, QuoteDraftCalculator.MAX_SORT_ORDER);
+    }
+
+    @Test
+    void directReduction_lineAtMaxSortOrder_adjustmentUsesLowestUnused_notMaxPlusOne() {
+        // A single ITEM at the cap (1,000,000) + a direct reduction forces an ADJUSTMENT. The OLD code
+        // generated max+1 = 1,000,001 (out of range -> unsaveable on resave). The fix uses the lowest
+        // unused sort_order in [0, MAX] -> 0 here (only 1,000,000 is used).
+        QuoteDraftComputation c = calc.compute(true,
+                List.of(item("Carpet", "1.00", "100.00", 1_000_000)),
+                bd("55.00"), NO_COST); // target ex 50 => adjustment -50
+        assertEquals(2, c.lines().size());
+        QuoteComputedLine adj = c.lines().get(1);
+        assertEquals("ADJUSTMENT", adj.lineType());
+        assertMoney("-50.00", adj.lineTotalExGst());
+        assertEquals(0, adj.sortOrder(), "adjustment must take the lowest unused slot, not 1,000,001");
+        assertTrue(adj.sortOrder() >= 0 && adj.sortOrder() <= QuoteDraftCalculator.MAX_SORT_ORDER,
+                "generated adjustment sort_order must stay in [0, MAX_SORT_ORDER]");
+    }
+
+    @Test
+    void directReduction_lineAtMaxSortOrder_lowestUnusedSkipsUsedSlots() {
+        // Two ITEMs at sort 0 and the cap: lowest unused is 1 (0 is taken), never a duplicate, never max+1.
+        QuoteDraftComputation c = calc.compute(true,
+                List.of(item("A", "1.00", "60.00", 0), item("B", "1.00", "40.00", 1_000_000)),
+                bd("55.00"), NO_COST); // line sum 100, target ex 50 => adjustment -50
+        assertEquals(3, c.lines().size());
+        QuoteComputedLine adj = c.lines().get(2);
+        assertEquals("ADJUSTMENT", adj.lineType());
+        assertEquals(1, adj.sortOrder(), "lowest unused slot skips the used 0 and the used cap");
+    }
+
+    @Test
+    void directReduction_normalCase_stillAppendsAdjustmentAtMaxPlusOne() {
+        // Unchanged normal behavior: max existing sort < cap => append at max+1.
+        QuoteDraftComputation c = calc.compute(true,
+                List.of(item("Carpet", "2.00", "100.00", 0), item("Underlay", "1.00", "50.00", 1)),
+                bd("220.00"), NO_COST);
+        assertEquals(3, c.lines().size());
+        QuoteComputedLine adj = c.lines().get(2);
+        assertEquals("ADJUSTMENT", adj.lineType());
+        assertEquals(2, adj.sortOrder(), "max existing (1) + 1");
+    }
 }

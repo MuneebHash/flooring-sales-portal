@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>Quote</title>
+    <!-- Phase 16C PR2: quote PREVIEW document. Reuses the invoice "Aire Compact" style but is a
+         SEPARATE template (title QUOTE, never TAX INVOICE; no payment made / balance due; no customer
+         acceptance / signature). Rendered by Thymeleaf + openhtmltopdf (XML parser, no JS, no external
+         fonts/images). Tables + conservative CSS only (no flexbox/grid/CSS-multi-column). All ${...}
+         values are server-supplied; user text is escaped via th:text; sanitized terms HTML is injected
+         via th:utext. The logo is a real data-URI image (logoDataUri); there is no placeholder box.
+         Only XML-built-in (&amp; &lt; &gt;) or numeric (&#183; &#8212;) entities are used. -->
+    <style type="text/css">
+        @page { size: A4; margin: 12mm; }
+        body { font-family: Helvetica, Arial, sans-serif; font-size: 9pt; color: #34423d; line-height: 1.45; }
+
+        /* letter-spacing kept small (0.5pt max): wider tracking makes openhtmltopdf space the glyphs
+           far enough that PDFBox text extraction inserts a space between every letter, which would
+           break heading text and the terms text-presence guards. */
+        .eyebrow { font-size: 7pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4pt; color: #5d716d; }
+        .eyebrow-hi { color: #0e7a70; }
+        .mono { font-family: 'Courier New', monospace; }
+
+        /* header — two zones: brand (logo/name/abn) | document */
+        .top { width: 100%; border-collapse: collapse; }
+        .top td { vertical-align: top; }
+        .top .brand { width: 56%; }
+        .top .doc { width: 44%; text-align: right; }
+        .mark { font-size: 15pt; font-weight: bold; color: #0f3d36; letter-spacing: 0.2pt; }
+        .abn { font-size: 8pt; color: #5d716d; margin-top: 3pt; letter-spacing: 0.3pt; }
+        .logo { display: block; max-width: 150pt; max-height: 42pt; margin: 0; }
+        .kicker { font-size: 7.5pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.8pt; color: #0e7a70; }
+        .title { font-size: 20pt; font-weight: bold; color: #0f3d36; letter-spacing: 0.5pt; margin-top: 2pt; }
+        .no { font-size: 10pt; font-family: 'Courier New', monospace; color: #5d6b64; margin-top: 4pt; letter-spacing: 0.8pt; }
+
+        .accent { border-top: 1.5pt solid #0e7a70; margin: 11pt 0 13pt 0; }
+        .hair { border-top: 1pt solid #e7ebe8; margin: 13pt 0; }
+
+        /* two-column meta row: Quote To | Sales Person/Store (anchored right) */
+        .grid { width: 100%; border-collapse: collapse; }
+        .grid td { vertical-align: top; }
+        .grid .c-to { width: 60%; padding-right: 16pt; }
+        .grid .c-who { width: 40%; text-align: right; }
+        .name { font-size: 11.5pt; font-weight: bold; color: #0f3d36; margin-top: 5pt; }
+        .who-name { font-size: 10.5pt; font-weight: bold; color: #0f3d36; margin-top: 5pt; }
+        .line { font-size: 9pt; color: #3c4a44; margin-top: 2pt; line-height: 1.5; }
+
+        /* details of sale */
+        .sec-h { font-size: 7pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4pt; color: #5d716d; margin-bottom: 6pt; }
+        .details-body { font-size: 9.5pt; line-height: 1.6; color: #27332e; white-space: pre-wrap; }
+
+        /* quote line items table */
+        .items { width: 100%; border-collapse: collapse; margin-top: 2pt; }
+        .items th { font-size: 7pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4pt;
+                    color: #5d716d; text-align: left; border-bottom: 1pt solid #cbd5d0; padding: 0 0 5pt 0; }
+        .items td { font-size: 9pt; color: #27332e; padding: 5.5pt 0; border-bottom: 1pt solid #e7ebe8; vertical-align: top; }
+        .items .num { text-align: right; }
+        .items .desc { width: 52%; padding-right: 12pt; }
+
+        /* payment methods + totals — borderless, clean rules only */
+        .money { width: 100%; border-collapse: collapse; margin-top: 4pt; }
+        .money td { vertical-align: top; }
+        .money .left { width: 54%; padding-right: 22pt; }
+        .pm-line { font-size: 9pt; color: #3c4a44; line-height: 1.7; }
+        .pm-line .k { color: #5d716d; display: inline-block; width: 78pt; }
+        .money .right { width: 46%; }
+        .tline { width: 100%; border-collapse: collapse; }
+        .tline td { padding: 6.5pt 0; font-size: 9.5pt; border-bottom: 1pt solid #e7ebe8; }
+        .tline .k { color: #3c4a44; }
+        .tline .v { text-align: right; font-weight: bold; color: #0f3d36; }
+        .tline .tot td { border-bottom: none; border-top: 2pt solid #0f3d36; font-size: 14pt; padding-top: 9pt; }
+        .tline .tot .k { color: #0f3d36; font-weight: bold; }
+
+        /* footer */
+        .footer { text-align: center; font-size: 7.5pt; color: #5d716d; margin-top: 16pt; letter-spacing: 0.3pt; }
+
+        /* terms (single column) on a dedicated page. */
+        .terms-h { font-size: 7pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4pt; color: #5d716d; text-align: center; }
+        .terms-body { font-size: 7.5pt; line-height: 1.5; color: #3c4a44; margin-top: 8pt; }
+        .terms-body p { margin: 0 0 4pt 0; }
+        .terms-body ol, .terms-body ul { margin: 0 0 4pt 15pt; padding: 0; }
+        .terms-body li { margin-bottom: 3.5pt; }
+        .terms-body table { width: 100%; border-collapse: collapse; }
+        .terms-body th, .terms-body td { border: 1pt solid #d1d5db; padding: 3pt; text-align: left; vertical-align: top; }
+
+        /* terms page (page 2): a near-full-height table so the terms sit at the top and the footer is
+           pinned to the bottom of the page. Height kept just under the A4 content area so it never
+           spills to a third page. No fixed positioning. */
+        .tpage { width: 100%; height: 264mm; border-collapse: collapse; page-break-before: always; }
+        .tpage .tp-body { vertical-align: top; height: 100%; }
+        .tpage .tp-foot { vertical-align: bottom; }
+    </style>
+</head>
+<body>
+    <!-- HEADER. Left stack: the real logo when a tenant logo resolves (the logo carries the brand, so
+         the plain business name is NOT shown above it), otherwise the business name as a fallback; then
+         the ABN directly beneath. The img MUST stay self-closed (openhtmltopdf XML parser). -->
+    <table class="top">
+        <tr>
+            <td class="brand">
+                <img class="logo" alt="Business logo"
+                     th:if="${logoDataUri != null}" th:src="${logoDataUri}" />
+                <div class="mark" th:if="${logoDataUri == null}" th:text="${businessName}">Business Name</div>
+                <div class="abn" th:if="${abn != null}">ABN <span th:text="${abn}">00 000 000 000</span></div>
+            </td>
+            <td class="doc">
+                <div class="kicker" th:if="${flooringTypeLabel != null}" th:text="${flooringTypeLabel}">Flooring</div>
+                <div class="title">QUOTE</div>
+                <div class="no" th:text="${orderNumber}">ORDER-NUMBER</div>
+            </td>
+        </tr>
+    </table>
+
+    <div class="accent"></div>
+
+    <!-- TWO-COLUMN META ROW -->
+    <table class="grid">
+        <tr>
+            <td class="c-to">
+                <div class="eyebrow eyebrow-hi">Quote To</div>
+                <div class="name" th:if="${customerName != null}" th:text="${customerName}">Customer Name</div>
+                <div class="line" th:if="${billingLine1 != null}" th:text="${billingLine1}">Address line 1</div>
+                <div class="line" th:if="${billingLine2 != null}" th:text="${billingLine2}">Address line 2</div>
+            </td>
+            <td class="c-who">
+                <div class="eyebrow">Sales Person / Store</div>
+                <div class="who-name" th:if="${salespersonName != null}" th:text="${salespersonName}">Sales Person</div>
+                <div class="line" th:if="${storeName != null}" th:text="${storeName}">Store Name</div>
+                <div class="line" th:if="${storeAddressLine1 != null}" th:text="${storeAddressLine1}">Street</div>
+                <div class="line" th:if="${storeAddressLine2 != null}" th:text="${storeAddressLine2}">Suburb State Postcode</div>
+                <div class="line" th:if="${storePhone != null}" th:text="${storePhone}">Phone</div>
+                <div class="line" th:if="${storeEmail != null}" th:text="${storeEmail}">Email</div>
+            </td>
+        </tr>
+    </table>
+
+    <div class="hair"></div>
+
+    <!-- DETAILS OF SALE (hidden when blank) -->
+    <div th:if="${detailsOfSale != null}">
+        <div class="sec-h">Details of Sale</div>
+        <div class="details-body" th:text="${detailsOfSale}">Details of sale text.</div>
+        <div class="hair"></div>
+    </div>
+
+    <!-- ITEMISED: line table. Each row is a server-formatted map (description / qty / unit / amount).
+         ADJUSTMENT rows carry empty qty/unit and a signed amount. -->
+    <table class="items" th:if="${itemised}">
+        <tr>
+            <th class="desc">Description</th>
+            <th class="num">Qty</th>
+            <th class="num">Unit (ex GST)</th>
+            <th class="num">Amount (ex GST)</th>
+        </tr>
+        <tr th:each="line : ${lines}">
+            <td class="desc" th:text="${line.description}">Item</td>
+            <td class="num" th:text="${line.qty}"></td>
+            <td class="num" th:text="${line.unit}"></td>
+            <td class="num" th:text="${line.amount}">$0.00</td>
+        </tr>
+    </table>
+
+    <!-- NON-ITEMISED: a single quoted amount; the work itself is described in Details of Sale above. -->
+    <div th:unless="${itemised}">
+        <div class="sec-h">Quoted Works</div>
+        <div class="details-body">A single quoted amount for the works described above.</div>
+    </div>
+
+    <!-- PAYMENT METHODS (borderless) + QUOTE TOTALS (clean rules, no box). Totals use server-formatted
+         model values verbatim (never recomputed in the template). -->
+    <table class="money">
+        <tr>
+            <td class="left">
+                <div th:if="${bankName != null or bsb != null or accountName != null or accountNumber != null}">
+                    <div class="sec-h">Payment Methods &#8212; Direct Deposit</div>
+                    <div class="pm-line" th:if="${accountName != null}"><span class="k">Account</span><span th:text="${accountName}">Account Name</span></div>
+                    <div class="pm-line" th:if="${bankName != null}"><span class="k">Bank</span><span th:text="${bankName}">Bank</span></div>
+                    <div class="pm-line" th:if="${bsb != null}"><span class="k">BSB</span><span th:text="${bsb}">000-000</span></div>
+                    <div class="pm-line" th:if="${accountNumber != null}"><span class="k">Account No.</span><span th:text="${accountNumber}">00000000</span></div>
+                    <div class="pm-line"><span class="k">Reference</span><span class="mono" th:text="${orderNumber}">REF</span></div>
+                </div>
+            </td>
+            <td class="right">
+                <table class="tline">
+                    <tr><td class="k">Subtotal (ex GST)</td><td class="v" th:text="${subtotalExGst}">$0.00</td></tr>
+                    <tr><td class="k">GST</td><td class="v" th:text="${gstAmount}">$0.00</td></tr>
+                    <tr class="tot"><td class="k">Total (inc GST)</td><td class="v" th:text="${totalIncGst}">$0.00</td></tr>
+                </table>
+            </td>
+        </tr>
+    </table>
+
+    <!-- TERMS — when present, on a dedicated page after the quote content (SOFT and HARD alike); page 1
+         never carries a terms section. Near-full-height table so the terms sit at the top and the footer
+         is pinned to the bottom of the page. th:utext — value is pre-sanitized, XML-well-formed HTML
+         from InvoiceTermsSanitizer; terms are never split or hardcoded. -->
+    <table class="tpage" th:if="${termsHtml != null}">
+        <tr>
+            <td class="tp-body">
+                <div class="terms-h">Terms &amp; Conditions</div>
+                <div class="terms-body" th:utext="${termsHtml}">Terms</div>
+            </td>
+        </tr>
+        <tr>
+            <td class="tp-foot">
+                <div class="footer">Generated by the Flooring Sales Portal &#183; Quote &#183; GST included where applicable</div>
+            </td>
+        </tr>
+    </table>
+
+    <!-- No-terms fallback: when there are no terms there is no terms page (and no terms-page footer), so
+         the footer renders ONCE here at the very end. This and the terms-page footer are mutually
+         exclusive (termsHtml != null vs == null), so exactly one footer ever renders. -->
+    <div class="footer" th:if="${termsHtml == null}">Generated by the Flooring Sales Portal &#183; Quote &#183; GST included where applicable</div>
+</body>
+</html>

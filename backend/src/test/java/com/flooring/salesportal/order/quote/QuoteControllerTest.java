@@ -19,10 +19,14 @@ import org.springframework.web.context.WebApplicationContext;
 
 import java.math.BigDecimal;
 
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -176,6 +180,43 @@ class QuoteControllerTest {
     private static void assertMoney(String expected, BigDecimal actual) {
         Assertions.assertTrue(actual != null && new BigDecimal(expected).compareTo(actual) == 0,
                 "expected " + expected + " but was " + actual);
+    }
+
+    private static String previewUrl(Object orderId) {
+        return "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/quote/preview-pdf";
+    }
+
+    /** Insert a draft + one ITEM line directly (no save-path guards) so preview can be exercised in isolation. */
+    private long seedSimpleDraft(long orderId, String totalEx, String totalInc) {
+        long draftId = jdbcTemplate.queryForObject(
+                "INSERT INTO quote_draft (order_id, itemised, quote_total_ex_gst, quote_total_inc_gst) "
+                        + "VALUES (?, TRUE, ?, ?) RETURNING quote_draft_id",
+                Long.class, orderId, new BigDecimal(totalEx), new BigDecimal(totalInc));
+        jdbcTemplate.update(
+                "INSERT INTO quote_draft_line "
+                        + "(quote_draft_id, line_type, description, quantity, unit_price_ex_gst, line_total_ex_gst, sort_order) "
+                        + "VALUES (?, 'ITEM', 'Carpet', 1, ?, ?, 0)",
+                draftId, new BigDecimal(totalEx), new BigDecimal(totalEx));
+        return draftId;
+    }
+
+    private String orderNumber(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT order_number FROM sales_order WHERE order_id = ?", String.class, orderId);
+    }
+
+    private int countRows(String table) {
+        return jdbcTemplate.queryForObject("SELECT COUNT(*) FROM " + table, Integer.class);
+    }
+
+    private int quoteVersionCountForOrder(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM quote_version WHERE order_id = ?", Integer.class, orderId);
+    }
+
+    private java.sql.Timestamp draftUpdatedAt(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT updated_at FROM quote_draft WHERE order_id = ?", java.sql.Timestamp.class, orderId);
     }
 
     // ================================================================
@@ -769,5 +810,266 @@ class QuoteControllerTest {
                 "SELECT sort_order FROM quote_draft_line l JOIN quote_draft d ON l.quote_draft_id = d.quote_draft_id "
                         + "WHERE d.order_id = ?", Integer.class, orderId);
         Assertions.assertEquals(1_000_000, sortOrder);
+    }
+
+    @Test
+    void putDraft_directReductionWithLineAtMaxSortOrder_savesAndResavesUnchanged() throws Exception {
+        long orderId = leadOrderInSession();
+
+        // ITEM at the cap (1,000,000) + a direct reduction forces an ADJUSTMENT. Before the fix the
+        // adjustment got sort_order 1,000,001 (out of range) and the returned draft could not be resaved.
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "final_total_inc_gst": 55, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":1,"unit_price_ex_gst":100,"line_total_ex_gst":100,"sort_order":1000000}
+                                ]}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.lines", hasSize(2)));
+
+        Integer adjSortOrder = jdbcTemplate.queryForObject(
+                "SELECT sort_order FROM quote_draft_line l JOIN quote_draft d ON l.quote_draft_id = d.quote_draft_id "
+                        + "WHERE d.order_id = ? AND l.line_type = 'ADJUSTMENT'", Integer.class, orderId);
+        Assertions.assertNotNull(adjSortOrder);
+        Assertions.assertTrue(adjSortOrder >= 0 && adjSortOrder <= 1_000_000,
+                "generated adjustment sort_order must stay in [0, 1000000], was " + adjSortOrder);
+        Assertions.assertEquals(0, adjSortOrder, "lowest unused slot (only 1,000,000 used) is 0");
+
+        // The returned draft (ITEM@1,000,000 + ADJUSTMENT@0) must resave unchanged -> 200, not 400.
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":1,"unit_price_ex_gst":100,"line_total_ex_gst":100,"sort_order":1000000},
+                                  {"line_type":"ADJUSTMENT","description":"Adjustment","line_total_ex_gst":-50,"sort_order":0}
+                                ]}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.lines", hasSize(2)));
+    }
+
+    // ================================================================
+    // POST preview-pdf (Phase 16C PR2) — security / content / no-draft / LAID / below-cost / body
+    // ================================================================
+
+    @Test
+    void previewPdf_validDraft_returns200Pdf_inlineQuoteFilename() throws Exception {
+        long orderId = leadOrderInSession();
+        seedSimpleDraft(orderId, "100.00", "110.00");
+        entityManager.clear();
+
+        byte[] pdf = mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.APPLICATION_PDF))
+                .andExpect(header().string("Content-Disposition", containsString("inline")))
+                .andExpect(header().string("Content-Disposition", containsString("quote-preview-")))
+                .andExpect(header().string("Content-Disposition", containsString(orderNumber(orderId))))
+                .andExpect(header().string("Content-Disposition", containsString(".pdf")))
+                .andReturn().getResponse().getContentAsByteArray();
+
+        Assertions.assertTrue(pdf.length > 500, "expected a real PDF body, was " + pdf.length + " bytes");
+        Assertions.assertEquals("%PDF-", new String(pdf, 0, 5, java.nio.charset.StandardCharsets.US_ASCII),
+                "preview body must begin with the PDF magic header");
+    }
+
+    @Test
+    void previewPdf_noDraft_returns404QuoteNotFound() throws Exception {
+        long orderId = leadOrderInSession(); // no quote draft seeded
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("QUOTE_NOT_FOUND"));
+    }
+
+    @Test
+    void previewPdf_laidOrderWithDraft_returns200() throws Exception {
+        long orderId = laidOrderInSession();
+        seedSimpleDraft(orderId, "100.00", "110.00");
+        entityManager.clear();
+
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.APPLICATION_PDF));
+    }
+
+    @Test
+    void previewPdf_belowCostDraft_returns200() throws Exception {
+        long orderId = leadOrderInSession();
+        seedChargeLine(orderId, STORE_SYD_CBD, "10.00", "5000.00"); // high cost basis
+        seedSimpleDraft(orderId, "100.00", "110.00");               // quote far below cost
+        entityManager.clear();
+
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.APPLICATION_PDF));
+    }
+
+    @Test
+    void previewPdf_nonItemisedDraft_returns200() throws Exception {
+        long orderId = leadOrderInSession();
+        // A non-itemised draft is stored as one synthetic ITEM line; preview renders the single-amount form.
+        long draftId = jdbcTemplate.queryForObject(
+                "INSERT INTO quote_draft (order_id, itemised, quote_total_ex_gst, quote_total_inc_gst) "
+                        + "VALUES (?, FALSE, 500.00, 550.00) RETURNING quote_draft_id",
+                Long.class, orderId);
+        jdbcTemplate.update(
+                "INSERT INTO quote_draft_line "
+                        + "(quote_draft_id, line_type, description, quantity, unit_price_ex_gst, line_total_ex_gst, sort_order) "
+                        + "VALUES (?, 'ITEM', 'Quoted works', 1, 500.00, 500.00, 0)",
+                draftId);
+        entityManager.clear();
+
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.APPLICATION_PDF));
+    }
+
+    @Test
+    void previewPdf_crossStore_returns404() throws Exception {
+        int otherStore = storeInBusiness(BUSINESS_AUSSIE, STORE_SYD_CBD);
+        long orderId = insertOrder(BUSINESS_AUSSIE, otherStore, USER_LIAM, "LEAD");
+        seedSimpleDraft(orderId, "100.00", "110.00");
+
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void previewPdf_crossBusiness_returns404() throws Exception {
+        long otherBusiness = 2L;
+        int otherStore = storeInBusiness(otherBusiness, null);
+        long otherUser = userInBusiness(otherBusiness);
+        long orderId = insertOrder(otherBusiness, otherStore, otherUser, "LEAD");
+        seedSimpleDraft(orderId, "100.00", "110.00");
+
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void previewPdf_missingOrder_returns404() throws Exception {
+        mockMvc.perform(post(previewUrl(9_999_999L)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void previewPdf_noSession_returns401() throws Exception {
+        long orderId = leadOrderInSession();
+        mockMvc.perform(post(previewUrl(orderId)))
+                .andExpect(status().isUnauthorized())
+                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+    }
+
+    @Test
+    void previewPdf_noStoreSelected_returns403() throws Exception {
+        long orderId = leadOrderInSession();
+        mockMvc.perform(post(previewUrl(orderId)).session(liamSessionNoStore()))
+                .andExpect(status().isForbidden())
+                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+    }
+
+    @Test
+    void previewPdf_invalidOrderId_returns400() throws Exception {
+        mockMvc.perform(post(previewUrl("abc")).session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+    }
+
+    @Test
+    void previewPdf_emptyObjectBody_allowed_returns200() throws Exception {
+        long orderId = leadOrderInSession();
+        seedSimpleDraft(orderId, "100.00", "110.00");
+        entityManager.clear();
+
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.APPLICATION_PDF));
+    }
+
+    @Test
+    void previewPdf_blankBody_allowed_returns200() throws Exception {
+        long orderId = leadOrderInSession();
+        seedSimpleDraft(orderId, "100.00", "110.00");
+        entityManager.clear();
+
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("   "))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.APPLICATION_PDF));
+    }
+
+    @Test
+    void previewPdf_malformedBody_afterScopedLookup_returns400MalformedJson() throws Exception {
+        long orderId = leadOrderInSession(); // in scope, no draft: body validated BEFORE the no-draft 404
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{not json"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("MALFORMED_JSON"));
+    }
+
+    @Test
+    void previewPdf_malformedBody_crossStore_stillReturns404() throws Exception {
+        // Scoped lookup runs BEFORE body validation: a cross-store order with a malformed body is 404,
+        // never 400 — the body is never parsed for an order the caller cannot see.
+        int otherStore = storeInBusiness(BUSINESS_AUSSIE, STORE_SYD_CBD);
+        long orderId = insertOrder(BUSINESS_AUSSIE, otherStore, USER_LIAM, "LEAD");
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{not json"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+    }
+
+    @Test
+    void previewPdf_bodyWithFields_returns400Validation() throws Exception {
+        long orderId = leadOrderInSession();
+        seedSimpleDraft(orderId, "100.00", "110.00");
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{\"foo\":1}"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("foo"));
+    }
+
+    @Test
+    void previewPdf_jsonNullBody_returns400Validation() throws Exception {
+        long orderId = leadOrderInSession();
+        seedSimpleDraft(orderId, "100.00", "110.00");
+        // A JSON literal `null` is a non-object body and must be rejected (not treated as "no body").
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("null"))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+    }
+
+    @Test
+    void previewPdf_isReadOnly_writesNothing() throws Exception {
+        long orderId = leadOrderInSession();
+        seedSimpleDraft(orderId, "100.00", "110.00");
+        jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = 77.70 WHERE order_id = ?", orderId);
+        entityManager.clear();
+
+        int versionsBefore = quoteVersionCountForOrder(orderId);
+        int tokensBefore = countRows("quote_token");
+        int storedBefore = countRows("stored_file");
+        int draftRowsBefore = draftRowCount(orderId);
+        int lineRowsBefore = lineCount(orderId);
+        BigDecimal exBefore = draftDecimal(orderId, "quote_total_ex_gst");
+        java.sql.Timestamp updatedBefore = draftUpdatedAt(orderId);
+
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk());
+
+        Assertions.assertEquals(0, quoteVersionCountForOrder(orderId), "preview must not create a quote_version");
+        Assertions.assertEquals(versionsBefore, quoteVersionCountForOrder(orderId), "quote_version count unchanged");
+        Assertions.assertEquals(tokensBefore, countRows("quote_token"), "quote_token count unchanged");
+        Assertions.assertEquals(storedBefore, countRows("stored_file"), "stored_file count unchanged");
+        Assertions.assertEquals(draftRowsBefore, draftRowCount(orderId), "quote_draft row count unchanged");
+        Assertions.assertEquals(lineRowsBefore, lineCount(orderId), "quote_draft_line count unchanged");
+        assertMoney(exBefore.toPlainString(), draftDecimal(orderId, "quote_total_ex_gst"));
+        Assertions.assertEquals(updatedBefore, draftUpdatedAt(orderId), "quote_draft updated_at unchanged");
+        assertMoney("77.70", orderDecimal(orderId, "price_adjustment_inc_gst")); // sale-price override NOT touched
     }
 }
