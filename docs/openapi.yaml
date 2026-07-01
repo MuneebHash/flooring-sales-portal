@@ -1610,8 +1610,9 @@ paths:
         adjustments) for the order (Phase 16B). The server recomputes totals, enforces
         total == sum of lines (auto-inserting a negative adjustment line on a direct reduction via
         final_total_inc_gst), rejects a total above the line sum (QUOTE_TOTAL_EXCEEDS_LINES, 422),
-        blocks below-cost saves (QUOTE_BELOW_COST, 422), and updates the cosmetic order
-        sale-price override. Quote lines never mutate the order's product/charge lines. Blocked
+        blocks below-cost saves (QUOTE_BELOW_COST, 422). The quote draft is independent of order
+        pricing: a save does NOT update the order sale-price override or any sales_order header
+        financials, and quote lines never mutate the order's product/charge lines. Blocked
         when order_status is LAID (ORDER_LOCKED, 422).
       parameters:
         - $ref: '#/components/parameters/OrderId'

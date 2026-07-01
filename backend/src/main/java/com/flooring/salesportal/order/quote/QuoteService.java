@@ -14,11 +14,8 @@ import com.flooring.salesportal.common.session.RequestContextGuard;
 import com.flooring.salesportal.order.OrderChargeLineReadRepository;
 import com.flooring.salesportal.order.OrderProductLineRepository;
 import com.flooring.salesportal.order.SalesOrder;
-import com.flooring.salesportal.order.SalesOrderFinancialWriteRepository;
 import com.flooring.salesportal.order.SalesOrderRepository;
-import com.flooring.salesportal.order.dto.OrderFinancialSummaryDto;
 import com.flooring.salesportal.order.financial.LineFinancials;
-import com.flooring.salesportal.order.financial.OrderFinancialCalculator;
 import com.flooring.salesportal.order.quote.dto.QuoteDraftDto;
 import com.flooring.salesportal.order.quote.dto.QuoteDraftLineDto;
 import com.flooring.salesportal.order.quote.dto.QuoteWorkspaceDto;
@@ -48,17 +45,15 @@ import java.util.Set;
  * standard-protected guard → manual {@code orderId} parse (400 {@code VALIDATION_FAILED}) → scoped
  * {@code FOR UPDATE} order lookup (404 {@code ORDER_NOT_FOUND}; never 403/leak) → LAID gate (422
  * {@code ORDER_LOCKED}) → raw-body parse (400 {@code MALFORMED_JSON}) → validate → compute → persist
- * → update the order sale-price override — all inside one transaction holding the order lock.
+ * — all inside one transaction holding the order lock.
  *
  * <p>Money rules ({@link QuoteDraftCalculator}): quote total = sum of lines; a direct reduction
  * inserts a negative ADJUSTMENT line; a direct increase above the line sum is rejected with
  * {@code QUOTE_TOTAL_EXCEEDS_LINES}; a below-cost quote is rejected with {@code QUOTE_BELOW_COST}.
- * Saving pushes {@code quote_total_inc_gst} into the order's cosmetic sale-price override by reusing
- * the existing D.10 derivation ({@link OrderFinancialCalculator} +
- * {@link SalesOrderFinancialWriteRepository#updateHeaderFinancialsWithAdjustment}) — never a new
- * adjustment-SQL path, never a below-cost block on the manual override path. A zero-total quote
- * skips the override push (leaves the existing override untouched). Quote lines never carry or
- * expose cost; the order's product/charge lines are never mutated by a quote save.
+ * A quote save is INDEPENDENT of order pricing (Phase 16D-A): it persists only the quote draft and
+ * its lines and never writes the order sale-price override or any {@code sales_order} header
+ * financial. Quote lines never carry or expose cost; the order's product/charge lines are never
+ * mutated by a quote save.
  */
 @Service
 public class QuoteService {
@@ -67,11 +62,8 @@ public class QuoteService {
 
     private static final int MONEY_SCALE = 2;
     private static final RoundingMode ROUNDING = RoundingMode.HALF_UP;
-    private static final BigDecimal ZERO = BigDecimal.ZERO;
     private static final int MONEY_MAX_INTEGER_DIGITS = 10 - MONEY_SCALE; // DECIMAL(10,2)
     private static final String MONEY_MAX_LABEL = "99999999.99";
-    // sales_order.gp_percent is DECIMAL(5,2): persist NULL when the true value would overflow (R4).
-    private static final BigDecimal MAX_DB_GP_PERCENT = new BigDecimal("999.99");
     // Upper bound on a line's sort_order. Caps client input so the auto-inserted ADJUSTMENT line's
     // sort_order can never overflow Integer (Codex finding). SINGLE SOURCE OF TRUTH lives on
     // QuoteDraftCalculator so the validation cap (here) and the generation cap (the adjustment
@@ -94,8 +86,6 @@ public class QuoteService {
     private final SalesOrderRepository salesOrderRepository;
     private final OrderProductLineRepository orderProductLineRepository;
     private final OrderChargeLineReadRepository orderChargeLineReadRepository;
-    private final OrderFinancialCalculator financialCalculator;
-    private final SalesOrderFinancialWriteRepository salesOrderFinancialWriteRepository;
     private final QuoteDraftRepository quoteDraftRepository;
     private final QuoteDraftLineRepository quoteDraftLineRepository;
     private final QuoteDraftWriteRepository quoteDraftWriteRepository;
@@ -108,8 +98,6 @@ public class QuoteService {
                         SalesOrderRepository salesOrderRepository,
                         OrderProductLineRepository orderProductLineRepository,
                         OrderChargeLineReadRepository orderChargeLineReadRepository,
-                        OrderFinancialCalculator financialCalculator,
-                        SalesOrderFinancialWriteRepository salesOrderFinancialWriteRepository,
                         QuoteDraftRepository quoteDraftRepository,
                         QuoteDraftLineRepository quoteDraftLineRepository,
                         QuoteDraftWriteRepository quoteDraftWriteRepository,
@@ -121,8 +109,6 @@ public class QuoteService {
         this.salesOrderRepository = salesOrderRepository;
         this.orderProductLineRepository = orderProductLineRepository;
         this.orderChargeLineReadRepository = orderChargeLineReadRepository;
-        this.financialCalculator = financialCalculator;
-        this.salesOrderFinancialWriteRepository = salesOrderFinancialWriteRepository;
         this.quoteDraftRepository = quoteDraftRepository;
         this.quoteDraftLineRepository = quoteDraftLineRepository;
         this.quoteDraftWriteRepository = quoteDraftWriteRepository;
@@ -275,8 +261,8 @@ public class QuoteService {
         JsonNode root = parseBodyAfterGates(body);
         ParsedDraft parsed = validateAndParse(root);
 
-        // Order cost basis (product/charge lines): fetched ONCE and reused for below-cost + the
-        // sale-price override derivation. Quote lines are never mutated; these are read-only sums.
+        // Order cost basis (product/charge lines): fetched ONCE for the below-cost check
+        // (QuoteDraftCalculator.compute). Quote lines are never mutated; these are read-only sums.
         LineFinancials products = orderProductLineRepository.sumFinancials(orderId);
         LineFinancials charges = orderChargeLineReadRepository.sumFinancials(orderId);
         BigDecimal totalCostExGst = money(products.cost()).add(money(charges.cost())).setScale(MONEY_SCALE, ROUNDING);
@@ -290,11 +276,10 @@ public class QuoteService {
         quoteDraftWriteRepository.deleteLines(quoteDraftId);
         quoteDraftWriteRepository.insertLines(quoteDraftId, computation.lines());
 
-        // Update the order's cosmetic sale-price override from the quote inc-GST total (reuse D.10).
-        // Q4: a zero-total quote does NOT push into the override — leave the existing override as-is.
-        if (computation.quoteTotalIncGst().signum() != 0) {
-            applySalePriceOverride(orderId, computation.quoteTotalIncGst(), products, charges, now);
-        }
+        // Phase 16D-A: the quote save is INDEPENDENT of order pricing. It never writes the order
+        // sale-price override or any sales_order header financial — only quote_draft / quote_draft_line
+        // are persisted. The order's working price is driven solely by Products & Charges + the manual
+        // sale-price override; the quote total may differ from it by design.
 
         // Re-read the persisted lines so the save response carries real quote_draft_line_id values
         // (same shape as the workspace read). The native insert is in this transaction, so the JPA
@@ -310,40 +295,6 @@ public class QuoteService {
                 computation.gpPercent(),
                 false,
                 toLineDtos(persistedLines),
-                now);
-    }
-
-    /**
-     * Derive the GST-inclusive {@code price_adjustment_inc_gst} from the quote total and persist the
-     * recomputed header scalars — identical derivation to the manual sale-price override (D.10,
-     * {@link com.flooring.salesportal.order.OrderSalePriceService}). Never blocks below-cost here
-     * (that is the quote-save concern, already enforced); never touches a quote table or a line.
-     */
-    private void applySalePriceOverride(long orderId,
-                                        BigDecimal quoteTotalIncGst,
-                                        LineFinancials products,
-                                        LineFinancials charges,
-                                        LocalDateTime now) {
-        BigDecimal calculatedTotalIncGst =
-                financialCalculator.compute(products, charges, null).calculatedTotalIncGst();
-        BigDecimal priceAdjustmentIncGst =
-                quoteTotalIncGst.subtract(calculatedTotalIncGst).setScale(MONEY_SCALE, ROUNDING);
-        // A far-below/above adjustment could overflow DECIMAL(10,2): clean 400, not a persist-time 500.
-        if (!fitsMoney(priceAdjustmentIncGst)) {
-            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(),
-                    List.of(new ErrorDetail(null, FIELD_FINAL_TOTAL,
-                            "Resulting price adjustment exceeds the maximum supported value ("
-                                    + MONEY_MAX_LABEL + ").")));
-        }
-        OrderFinancialSummaryDto summary = financialCalculator.compute(products, charges, priceAdjustmentIncGst);
-        requirePersistableHeader(summary);
-        salesOrderFinancialWriteRepository.updateHeaderFinancialsWithAdjustment(
-                orderId,
-                priceAdjustmentIncGst,
-                summary.salePriceExGst(),
-                summary.totalCost(),
-                summary.gp(),
-                persistableGpPercent(summary.gpPercent()),
                 now);
     }
 
@@ -661,33 +612,6 @@ public class QuoteService {
         } catch (JsonProcessingException ex) {
             throw new MalformedJsonException();
         }
-    }
-
-    private static void requirePersistableHeader(OrderFinancialSummaryDto summary) {
-        List<ErrorDetail> errors = new ArrayList<>();
-        if (!fitsMoney(summary.salePriceExGst())) {
-            errors.add(new ErrorDetail(null, "sale_price_ex_gst",
-                    "Order sale price exceeds the maximum supported value (" + MONEY_MAX_LABEL + ")."));
-        }
-        BigDecimal totalCost = summary.totalCost();
-        if (totalCost.compareTo(ZERO) < 0) {
-            errors.add(new ErrorDetail(null, "total_cost", "Order total cost would be negative."));
-        } else if (!fitsMoney(totalCost)) {
-            errors.add(new ErrorDetail(null, "total_cost",
-                    "Order total cost exceeds the maximum supported value (" + MONEY_MAX_LABEL + ")."));
-        }
-        if (!fitsMoney(summary.gp())) {
-            errors.add(new ErrorDetail(null, null,
-                    "Order gross profit exceeds the maximum supported value (" + MONEY_MAX_LABEL + ")."));
-        }
-        throwIfErrors(errors);
-    }
-
-    private static BigDecimal persistableGpPercent(BigDecimal gpPercent) {
-        if (gpPercent == null) {
-            return null;
-        }
-        return gpPercent.abs().compareTo(MAX_DB_GP_PERCENT) <= 0 ? gpPercent : null;
     }
 
     private static BigDecimal money(BigDecimal value) {

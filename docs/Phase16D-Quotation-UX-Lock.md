@@ -19,14 +19,14 @@ These three points exist because earlier drafts described behavior that does not
 Current backend reality on `main` (Phase 16C):
 
 - Quote lines do **not** mutate the order's product/charge lines. That separation is real and must be preserved.
-- **But** `PUT /api/v1/{slug}/orders/{orderId}/quote/draft` **currently updates the order sale-price override** (`applySalePriceOverride`). A non-zero quote inc-GST total is pushed into `sales_order.price_adjustment_inc_gst` and the derived header financials.
-- Therefore, with autosave, **each quote save currently updates the working order/header price.** This is expected 16C behavior, not a bug.
+- `PUT /api/v1/{slug}/orders/{orderId}/quote/draft` saves the quote draft **only**. It does **not** change the order sale-price override or any `sales_order` header financials (decoupled in Phase 16D-A).
+- Therefore quote autosave never changes the order/header price or the next invoice — the quote draft is fully independent of order pricing.
 
-What 16D must state:
+What 16D states:
 
-- 16D **respects the current backend behavior**. Quote lines are customer-facing and separate from operational product/charge lines; editing quote lines never edits Products & Charges.
-- Quote draft save **does** currently push the order sale-price override, so the header "Sale total" reflects the latest quote total after a save.
-- A **fully modular** quote (one that stops pushing the override, so the quote can diverge from the order price with zero effect on the order) is a **separate backend decision / future slice** — it is **not** something a frontend-only 16D can claim or implement.
+- The quote draft is **price-independent**. Quote lines are customer-facing and separate from operational product/charge lines; editing/saving a quote never edits Products & Charges and never changes the order sale price.
+- The header "Sale total" is driven only by Products & Charges plus the manual sale-price override — a quote save does **not** move it.
+- The quote total **may differ** from the order's working price by design; they reconcile later only via the 16F accepted-snapshot invoice path (Path A).
 
 ### 1.2 Quote PDF wording — desired future, not a current bug
 
@@ -57,7 +57,7 @@ A quote is a **customer-facing commercial document**. Products & Charges / Detai
 
 - Quote Draft is a customer-facing, editable presentation, initially seeded from the order, that then becomes its own working quote canvas.
 - Quote lines **never** mutate order product/charge lines.
-- A quote **may** differ from the internal/current order working price if the salesperson chooses (subject to the current override-push behavior in §1.1).
+- A quote **may** differ from the internal/current order working price by design; saving a quote does not change the order price (see §1.1).
 - The accepted quote snapshot becomes the source for quote-led invoice creation later (16F).
 
 Illustrative:
@@ -205,16 +205,11 @@ After seeding:
 - editing quote lines does **not** mutate operational product/charge rows
 - if a saved quote draft already has lines, **the saved quote draft lines are the source of truth** — do not silently overwrite them from Products & Charges just because the order changed. Re-seeding only happens on an explicit user rebuild.
 
-### 8.2 Existing sale-price override reconciliation (locked — prevents silent data loss)
+### 8.2 Quote pricing is independent of the order (locked)
 
-If the order already has a manual sale-price override active (`price_adjustment_inc_gst` is non-null), the sum of the seeded per-line sale totals will **not** equal the current order Sale total. Because the first quote save pushes the quote total back into that same override, a naive seed-from-lines-only would **overwrite / wipe the salesperson's existing override** on the first autosave.
+The quote draft save is decoupled from order pricing (Phase 16D-A, see §1.1): saving a quote never writes `sales_order.price_adjustment_inc_gst` or any header financial. There is therefore **no** override to reconcile or preserve on carry-over — turning itemised ON and saving the seeded lines does not change the order price in any way.
 
-Locked rule: **carry-over must preserve the existing override.** When seeding lines while an override is active, also seed a visible customer-facing **adjustment line equal to the override delta**, so that:
-
-- the seeded quote total equals the current order Sale total, and
-- the first autosave round-trips the same override rather than silently resetting the order price to the raw line sum.
-
-Do **not** reset the order price to the raw line sum on carry-over. Nothing about pricing should change silently as a side effect of turning itemised ON.
+Seed the quote from the order's current sale-side line data as a **starting point only**. The salesperson then edits the quote freely; the quote total may differ from the order Sale total with no effect on the order or the next invoice.
 
 ### 8.3 Itemised math / adjustment helper
 
@@ -261,7 +256,7 @@ Requirements:
 - visible autosave status: `Unsaved changes` / `Saving…` / `Saved` / `Could not save`
 - never expose or send cost
 
-**Important documented behavior/risk:** because the current backend quote save updates the order sale-price override (§1.1), **autosave will update the order/header price** on each successful save. This is current backend behavior. Debounce should be generous (e.g. ~800ms–1s) so the header does not thrash and the override is not rewritten on every keystroke. After a successful save, refresh the header financial summary via the existing read path (begin-read → fetch order lines → apply-read), never via a direct financial-summary setter and never via the mutation path.
+**Important documented behavior:** the quote draft save is decoupled from order pricing (§1.1), so autosave does **not** change the order/header "Sale total" and does **not** require refreshing the order financial summary. Debounce should still be generous (e.g. ~800ms–1s) to avoid excessive PUTs. The frontend must not assume a quote save updates order financials.
 
 ---
 
@@ -373,8 +368,8 @@ A quote is not mandatory for invoicing — an invoice can still be created direc
 - Details of Sale action modal entry
 - hidden Quote tab until `Create Quote`
 - Quote Draft canvas (invoice-style)
-- itemised ON/OFF behavior (incl. carry-over + override reconciliation + adjustment helper)
-- autosave (respecting the current override-push behavior)
+- itemised ON/OFF behavior (incl. carry-over + adjustment helper)
+- autosave (quote-only; does not change order pricing)
 - Preview PDF that flushes autosave first, opens in a new tab
 - visible Send Quote button with a **disabled** confirmation modal (no real send)
 - Customer Quote / Accepted Quote clean empty states
@@ -407,4 +402,4 @@ Allowed in the protected salesperson portal only: `gp_percent`, the below-cost w
 
 ## 19. Purpose of this document
 
-This is the visual/workflow source of truth for Phase 16D onward. It exists so implementation agents do not guess: where the Quote tab appears and when it persists, what `Create Quote` means, how Quote Draft looks, how itemised carry-over and adjustment math work, how autosave behaves (and that it currently pushes the order override), what Customer Quote and Accepted Quote mean, how the quote PDF should eventually look, and what belongs to 16D vs 16E vs 16F.
+This is the visual/workflow source of truth for Phase 16D onward. It exists so implementation agents do not guess: where the Quote tab appears and when it persists, what `Create Quote` means, how Quote Draft looks, how itemised carry-over and adjustment math work, how autosave behaves (quote-only; it does not change order pricing), what Customer Quote and Accepted Quote mean, how the quote PDF should eventually look, and what belongs to 16D vs 16E vs 16F.
