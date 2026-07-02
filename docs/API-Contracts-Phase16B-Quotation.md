@@ -40,7 +40,7 @@ Phase 16B is the **planning + contract lock**. 16C builds the backend, 16D the s
 - **One quote per order**, versioned and append-only at the issued layer (mirrors the invoice append-only model).
 - **Editable draft** (`quote_draft`, one row per order) with customer-facing **quote lines** (`quote_draft_line`). Itemised mode copies product/charge lines into editable quote lines; the salesperson may edit quote-line description / quantity / unit price / line total and add **adjustment** lines (±). Non-itemised mode shows a single quoted amount + details-of-sale text, no line breakdown.
 - **Quote lines never mutate the order's product/charge lines.** The product/charge lines remain the operational/costing record; quote lines are customer-facing presentation only.
-- **Money model (locked):** the quote total = the sum of quote lines. The draft/issued quote total updates the order **sale-price override** (cosmetic layer). The **accepted quote snapshot is the legal billing number** — not the live override (see §6).
+- **Money model (locked):** the quote total = the sum of quote lines. The quote draft is **independent of the order sale price** — saving a draft does **not** change the order's sale-price override or header financials (see §6). The **accepted quote snapshot is the legal billing number** (see §6).
 - **Total rules:** reducing the final total directly auto-inserts a negative **adjustment** line to balance; the final total may not be set **above** the line sum (must raise a line or add a positive line, else 422); adjustments are customer-facing.
 - **GP / below cost:** the draft shows GP warnings while editing (like Details of Sale). **Below cost is blocked at save, send, and accept** (cannot even save a below-cost draft).
 - **Issued version on send:** sending generates and **stores an immutable issued quote PDF**, snapshots the lines + per-flooring-type terms, mints a secret token, and delivers. Draft **unchanged** since the last issue → **resend** the same issued version with a **new token** (old token marked `REPLACED`, kept for messaging). Draft **changed** → new issued version that **supersedes** the previous one (its token marked `SUPERSEDED`).
@@ -82,7 +82,7 @@ Money stays `DECIMAL(10,2)`, scale 2, `HALF_UP`. GST handling **reuses the exist
 | `order_id` | `BIGINT` | no | FK → `sales_order(order_id)`; **UNIQUE(order_id)** (one draft per order). No ON DELETE CASCADE. |
 | `itemised` | `BOOLEAN` | no | default `true`. `false` = single quoted amount, no customer line breakdown. |
 | `quote_total_ex_gst` | `DECIMAL(10,2)` | no | server-computed = sum of `quote_draft_line.line_total`. |
-| `quote_total_inc_gst` | `DECIMAL(10,2)` | no | server-derived (existing GST model); this is what updates the order sale-price override. |
+| `quote_total_inc_gst` | `DECIMAL(10,2)` | no | server-derived (existing GST model); customer-facing quote total only — does **not** update the order sale-price override. |
 | `created_at` / `updated_at` | `TIMESTAMP` | no | mutable working copy. |
 
 The draft is **mutable in place** (PUT upsert). It is **not** a legal record.
@@ -200,7 +200,7 @@ A draft may coexist with an accepted version. Signing the active issued version 
 - **Quote total = sum of quote lines** (ex-GST lines; inc-GST total derived via the existing invoice GST model). The system enforces `quote_total_ex_gst == Σ line_total_ex_gst` on every save and issue.
 - **Direct total reduction:** if the salesperson lowers the final total below the line sum, the backend inserts a negative `ADJUSTMENT` line equal to the difference so the invariant holds. The adjustment is customer-facing.
 - **Direct total increase above line sum:** rejected — 422 `QUOTE_TOTAL_EXCEEDS_LINES`. The salesperson must raise an existing line or add a positive line/adjustment.
-- **Override coupling (cosmetic):** saving/issuing a quote updates the order's **sale-price override** (`quote_total_inc_gst`). This is the **cosmetic** layer — it drives the on-screen/working price, exactly as a manual override does today.
+- **Quote/order price separation (locked):** saving/issuing a quote does **not** change the order's sale-price override or header financials. The quote draft total is a customer-facing figure that may differ from the order's working price; the order price is driven only by Products & Charges plus the manual sale-price override. (Decoupled in Phase 16D-A; supersedes the earlier "cosmetic override coupling.")
 - **Legal billing number (snapshot):** the **accepted `quote_version` snapshot** (`quote_total_inc_gst` at `ACCEPTED`) is the legal billing number. It is **not** the live override.
 - **Invoice conversion uses the snapshot, not the live override:**
   - **Path A** — `create-invoice` from the accepted quote: the invoice's sale price = the **accepted quote snapshot total**, terms = the quote's **frozen `terms_snapshot`**, and the signature/acceptance is **inherited** (no re-sign).
@@ -231,7 +231,7 @@ Upsert the editable draft (itemised flag, lines, adjustments). Full-body replace
 - Server recomputes totals, enforces the line/total invariant (§6), and applies auto-adjustment on direct reduction.
 - **Below-cost → 422 `QUOTE_BELOW_COST`** (blocked at save).
 - **Total > line sum → 422 `QUOTE_TOTAL_EXCEEDS_LINES`.**
-- Updates the order **sale-price override** (cosmetic).
+- Does **not** update the order sale-price override or any `sales_order` header financials (quote draft is price-independent; decoupled in Phase 16D-A).
 - **LAID → 422 `ORDER_LOCKED`** (write blocked).
 - **200** updated `draft`.
 
@@ -412,7 +412,7 @@ Clarifications:
 - **`invoice_template_key`** exists (V12) but is **dormant** (not read by the invoice PDF assembler/generator today). The quote PDF reuses the Aire Compact template directly; do **not** wire `invoice_template_key` in 16B/16C unless explicitly scoped.
 - **Cost discipline.** Quote lines carry no cost; the public surface is cost-free and ID-free; GP/below-cost is computed server-side from the order's product/charge cost lines and surfaced only on the **protected** Quote tab.
 - **Token security.** Generate with a CSPRNG; store only the hash; constant-time compare on lookup; per-token + per-IP throttle on public endpoints; lazy-expire on access.
-- **Risks:** (a) SMS deliverability + AU number formatting (Twilio config); (b) ensuring a carried-forward/inherited signature `stored_file` is not deleted while referenced (non-unique FK — same caution as Phase 13); (c) the cosmetic-override vs accepted-snapshot split must be coded explicitly so Path A bills the snapshot, never the live override; (d) public-surface isolation — a token must resolve to exactly one quote and leak nothing else.
+- **Risks:** (a) SMS deliverability + AU number formatting (Twilio config); (b) ensuring a carried-forward/inherited signature `stored_file` is not deleted while referenced (non-unique FK — same caution as Phase 13); (c) the quote draft is price-independent (a save never writes the order override) and Path A bills the **accepted snapshot**, never the live order price — both must be coded explicitly; (d) public-surface isolation — a token must resolve to exactly one quote and leak nothing else.
 
 ---
 

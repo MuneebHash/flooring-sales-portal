@@ -182,6 +182,35 @@ class QuoteControllerTest {
                 "expected " + expected + " but was " + actual);
     }
 
+    /** The five sales_order header financials a quote save must never touch (Phase 16D-A decouple). */
+    private static final String[] HEADER_FINANCIAL_COLS = {
+            "price_adjustment_inc_gst", "sale_price_ex_gst", "total_cost", "gp", "gp_percent"};
+
+    private BigDecimal[] headerFinancials(long orderId) {
+        BigDecimal[] values = new BigDecimal[HEADER_FINANCIAL_COLS.length];
+        for (int i = 0; i < HEADER_FINANCIAL_COLS.length; i++) {
+            values[i] = orderDecimal(orderId, HEADER_FINANCIAL_COLS[i]);
+        }
+        return values;
+    }
+
+    private void assertHeaderFinancialsUnchanged(BigDecimal[] before, long orderId) {
+        BigDecimal[] after = headerFinancials(orderId);
+        for (int i = 0; i < HEADER_FINANCIAL_COLS.length; i++) {
+            Assertions.assertTrue(sameMoney(before[i], after[i]),
+                    HEADER_FINANCIAL_COLS[i] + " must be unchanged by a quote save, but was "
+                            + before[i] + " -> " + after[i]);
+        }
+    }
+
+    /** Null-safe money equality: two nulls are equal; a null vs a non-null is not. */
+    private static boolean sameMoney(BigDecimal a, BigDecimal b) {
+        if (a == null || b == null) {
+            return a == b;
+        }
+        return a.compareTo(b) == 0;
+    }
+
     private static String previewUrl(Object orderId) {
         return "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/quote/preview-pdf";
     }
@@ -360,8 +389,13 @@ class QuoteControllerTest {
     }
 
     @Test
-    void putDraft_updatesOrderSalePriceOverride() throws Exception {
-        long orderId = leadOrderInSession(); // no product/charge lines: calculated total = 0
+    void putDraft_nonZeroSave_doesNotMutateOrderHeaderFinancials() throws Exception {
+        // Phase 16D-A decouple: a non-zero quote save must NOT touch the order sale-price override
+        // or any sales_order header financial. (Before 16D-A this pushed price_adjustment=1100.00
+        // and sale_price_ex_gst=1000.00; it now leaves the header exactly as it was.)
+        long orderId = leadOrderInSession();
+        seedChargeLine(orderId, STORE_SYD_CBD, "100.00", "80.00"); // give the order a real cost basis
+        BigDecimal[] before = headerFinancials(orderId);
 
         mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON)
@@ -371,9 +405,42 @@ class QuoteControllerTest {
                                 ]}"""))
                 .andExpect(status().isOk());
 
-        // override: price_adjustment = quote_inc (1100) - calculated (0); sale ex = 1100/1.10 = 1000.
-        assertMoney("1100.00", orderDecimal(orderId, "price_adjustment_inc_gst"));
-        assertMoney("1000.00", orderDecimal(orderId, "sale_price_ex_gst"));
+        // Quote draft persisted with its own totals ...
+        Assertions.assertEquals(1, draftRowCount(orderId), "quote draft persisted");
+        assertMoney("1000.00", draftDecimal(orderId, "quote_total_ex_gst"));
+        assertMoney("1100.00", draftDecimal(orderId, "quote_total_inc_gst"));
+        // ... but none of the five sales_order header financials changed.
+        assertHeaderFinancialsUnchanged(before, orderId);
+    }
+
+    @Test
+    void putDraft_nonZeroSave_preservesManualSalePriceOverride() throws Exception {
+        // A manual sale-price override already fixed the order price. A later quote save with a
+        // DIFFERENT total must leave that override (and its derived header financials) intact —
+        // quote total and order price are allowed to diverge (Phase 16D-A).
+        long orderId = leadOrderInSession();
+        seedChargeLine(orderId, STORE_SYD_CBD, "100.00", "80.00"); // cost basis ex 80
+        jdbcTemplate.update(
+                "UPDATE sales_order SET price_adjustment_inc_gst = 500.00, sale_price_ex_gst = 900.00, "
+                        + "total_cost = 80.00, gp = 820.00, gp_percent = 91.11 WHERE order_id = ?", orderId);
+        BigDecimal[] before = headerFinancials(orderId);
+
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":3,"unit_price_ex_gst":100,"line_total_ex_gst":300,"sort_order":0}
+                                ]}"""))
+                .andExpect(status().isOk());
+
+        // Quote saved with its own total (ex 300 / inc 330) ...
+        assertMoney("300.00", draftDecimal(orderId, "quote_total_ex_gst"));
+        assertMoney("330.00", draftDecimal(orderId, "quote_total_inc_gst"));
+        // ... the override the Details-of-Sale invoice path reads (price_adjustment_inc_gst) is
+        // preserved, NOT overwritten by the quote total, and every derived header financial is unchanged.
+        assertHeaderFinancialsUnchanged(before, orderId);
+        assertMoney("500.00", orderDecimal(orderId, "price_adjustment_inc_gst"));
+        assertMoney("900.00", orderDecimal(orderId, "sale_price_ex_gst"));
     }
 
     @Test
@@ -521,9 +588,10 @@ class QuoteControllerTest {
     }
 
     @Test
-    void putDraft_zeroTotal_savesDraft_skipsOverridePush() throws Exception {
+    void putDraft_zeroTotal_savesDraft_leavesOrderPriceUnchanged() throws Exception {
         long orderId = leadOrderInSession(); // no cost lines => zero quote is at-cost (allowed)
         jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = 77.70 WHERE order_id = ?", orderId);
+        BigDecimal[] before = headerFinancials(orderId);
 
         mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON)
@@ -533,7 +601,8 @@ class QuoteControllerTest {
 
         Assertions.assertEquals(1, draftRowCount(orderId));
         assertMoney("0.00", draftDecimal(orderId, "quote_total_inc_gst"));
-        // Zero-total quote must NOT push into the override — existing override untouched.
+        // Phase 16D-A: a quote save never writes the order price — the existing override is untouched.
+        assertHeaderFinancialsUnchanged(before, orderId);
         assertMoney("77.70", orderDecimal(orderId, "price_adjustment_inc_gst"));
     }
 
