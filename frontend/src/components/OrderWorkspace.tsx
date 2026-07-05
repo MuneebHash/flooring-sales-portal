@@ -15,6 +15,8 @@ import { InvoiceTab } from './workspace/InvoiceTab'
 import { NotesPhotosTab } from './workspace/NotesPhotosTab'
 import { PaymentsTab } from './workspace/PaymentsTab'
 import { ProductsChargesTab } from './workspace/ProductsChargesTab'
+import { QuoteTab } from './workspace/QuoteTab'
+import type { CreateQuoteAvailability } from './workspace/DetailsOfSaleTab'
 import {
   FLOORING_LABELS,
   FLOORING_TONES,
@@ -38,6 +40,8 @@ import type {
 } from '../lib/api/orderWorkspaceApi'
 import { fetchOrderLines } from '../lib/api/orderLinesApi'
 import type { OrderFinancialSummary } from '../lib/api/orderLinesApi'
+import { fetchQuoteWorkspace } from '../lib/api/orderQuoteApi'
+import type { QuoteDraftRead } from '../lib/api/orderQuoteApi'
 
 // Friendly message for a failed details autosave. The autosave single-flight
 // lock/loop lives in the always-mounted WorkspaceShell (below) so it survives the
@@ -47,12 +51,15 @@ function detailsAutosaveErrorMessage(err: unknown): string {
   return 'Could not save details. Please try again.'
 }
 
+// Phase 16D-B: 'quote' sits between Payments and Invoice but is HIDDEN by
+// default — the rendered tab list is filtered per order (see WorkspaceShell).
 const TAB_IDS = [
   'customer',
   'products',
   'details',
   'notes',
   'payments',
+  'quote',
   'invoice',
 ] as const
 
@@ -64,6 +71,7 @@ const TAB_LABELS: Record<TabId, string> = {
   details: 'Details of Sale',
   notes: 'Notes & Photos',
   payments: 'Payments',
+  quote: 'Quote',
   invoice: 'Invoice',
 }
 
@@ -169,6 +177,75 @@ function WorkspaceShell({
   const finishSalePriceMutation = useCallback(() => {
     setSalePriceMutationInFlight(false)
   }, [])
+
+  // --- Phase 16D-B: Quote tab visibility + quote-workspace probe. ---
+  // LOCKED visibility rules (docs/Phase16D-Quotation-UX-Lock.md §4): the Quote
+  // tab is hidden by default; on order load it is shown IFF the backend quote
+  // workspace returns a non-null draft (the durable signal); within a session,
+  // Create Quote shows it before the first save persists a draft. All of this
+  // state lives HERE in the per-order shell (keyed by orderId), so visibility is
+  // order-scoped and resets naturally on an order switch — no localStorage, no
+  // global flag.
+  //
+  // STRICT PROBE FAILURE RULE: a failed probe is NEVER treated as "no quote
+  // exists" — Create Quote stays unavailable (with a retry) and the Quote tab
+  // stays hidden until a probe succeeds, so a fresh full-replace save can never
+  // wipe a draft the frontend has not seen. QuoteTab therefore only ever mounts
+  // AFTER a successful probe.
+  const [quoteTabVisible, setQuoteTabVisible] = useState(false)
+  const [quoteProbeStatus, setQuoteProbeStatus] = useState<
+    'loading' | 'loaded' | 'error'
+  >('loading')
+  const [quoteInitialDraft, setQuoteInitialDraft] =
+    useState<QuoteDraftRead | null>(null)
+  const [quoteProbeToken, setQuoteProbeToken] = useState(0)
+
+  useEffect(() => {
+    let cancelled = false
+    setQuoteProbeStatus('loading')
+    fetchQuoteWorkspace(orderId)
+      .then((res) => {
+        if (cancelled) return
+        setQuoteInitialDraft(res.data.draft)
+        setQuoteProbeStatus('loaded')
+        // A saved draft is the durable visibility source of truth.
+        if (res.data.draft !== null) setQuoteTabVisible(true)
+      })
+      .catch(() => {
+        if (cancelled) return
+        setQuoteProbeStatus('error')
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [orderId, quoteProbeToken])
+
+  // What the Details of Sale action modal may offer for Create Quote:
+  // hidden once the Quote tab exists for this order; checking/error while the
+  // probe is unresolved/failed (never "safely available" on failure). A LAID
+  // order can never persist a NEW draft (every draft PUT is a 422 ORDER_LOCKED),
+  // so a confirmed no-draft state on a locked order is also 'hidden' — offering
+  // Create Quote there would only reveal a permanently dead read-only tab. The
+  // 'error' state is deliberately kept on locked orders: the retry still matters
+  // for REVEALING an existing saved draft (read/preview are LAID-allowed).
+  const createQuoteAvailability: CreateQuoteAvailability = quoteTabVisible
+    ? 'hidden'
+    : quoteProbeStatus === 'loading'
+      ? 'checking'
+      : quoteProbeStatus === 'error'
+        ? 'error'
+        : locked
+          ? 'hidden'
+          : 'enabled'
+
+  // Create Quote action (locked): reveal the Quote tab, switch to it. QuoteTab
+  // opens on its Quote Draft sub-tab by default (it mounts fresh here). No
+  // invoice call, no order mutation, no quote data wiped — the tab initialises
+  // from the probe-confirmed draft (null = fresh local draft).
+  function handleCreateQuote() {
+    setQuoteTabVisible(true)
+    setActiveTab('quote')
+  }
 
   // --- Details-of-sale autosave single-flight (Codex P1). ---
   // The lock + queue + last-persisted key live HERE in the always-mounted shell
@@ -413,7 +490,15 @@ function WorkspaceShell({
         </Panel>
 
         <Panel className="overflow-hidden">
-          <Tabs tabs={TABS} active={activeTab} onChange={setActiveTab} />
+          {/* The Quote tab entry renders only once revealed for THIS order
+              (saved draft found on load, or Create Quote clicked this session). */}
+          <Tabs
+            tabs={
+              quoteTabVisible ? TABS : TABS.filter((tab) => tab.id !== 'quote')
+            }
+            active={activeTab}
+            onChange={setActiveTab}
+          />
           <div className="p-6">
             {/* Customer is ALWAYS mounted (hidden when not active), unlike the other
                 tabs which stay conditionally rendered. This keeps the Lead Enquiry
@@ -460,6 +545,11 @@ function WorkspaceShell({
                 detailsAutosaveSaved={detailsAutosaveSaved}
                 detailsAutosaveError={detailsAutosaveError}
                 onInvoiceReady={() => setActiveTab('invoice')}
+                createQuoteAvailability={createQuoteAvailability}
+                onCreateQuote={handleCreateQuote}
+                onRetryQuoteProbe={() =>
+                  setQuoteProbeToken((token) => token + 1)
+                }
               />
             )}
             {/* `locked` (LAID) is passed for PHOTO-DELETE gating ONLY. Notes are
@@ -470,6 +560,29 @@ function WorkspaceShell({
               <NotesPhotosTab orderId={orderId} locked={locked} />
             )}
             {activeTab === 'payments' && <PaymentsTab orderId={orderId} />}
+            {/* Phase 16D-B: once revealed, QuoteTab stays MOUNTED (hidden with
+                CSS, like CustomerTab above) so in-progress quote work — the
+                draft total, autosave queue and statuses — survives top-level
+                tab switches. It mounts only after the quote probe SUCCEEDED
+                (visibility implies a loaded probe), so initialDraft is always
+                the confirmed server state and autosave can never fire against
+                an unknown draft. locked gates edits/autosave inside the tab;
+                reads + preview of a persisted draft stay available when LAID. */}
+            {quoteTabVisible && (
+              <div className={activeTab === 'quote' ? '' : 'hidden'}>
+                <QuoteTab
+                  key={orderId}
+                  orderId={orderId}
+                  locked={locked}
+                  flooringType={flooringType}
+                  orderNumber={orderNumber}
+                  customer={customer}
+                  billingAddress={billingAddress}
+                  saleDetails={saleDetails}
+                  initialDraft={quoteInitialDraft}
+                />
+              </div>
+            )}
             {activeTab === 'invoice' && (
               <InvoiceTab
                 orderId={orderId}

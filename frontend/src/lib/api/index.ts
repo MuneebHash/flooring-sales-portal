@@ -100,3 +100,20 @@ export type {
   RecordPaymentResponse,
   VoidPaymentResponse,
 } from './orderPaymentsApi'
+export {
+  fetchQuoteWorkspace,
+  saveQuoteDraft,
+  fetchQuotePreviewPdf,
+  QUOTE_TOTAL_MAX,
+} from './orderQuoteApi'
+export type {
+  QuoteLineType,
+  QuoteDraftLineRead,
+  QuoteDraftItemLineInput,
+  QuoteDraftAdjustmentLineInput,
+  QuoteDraftLineInput,
+  QuoteDraftRead,
+  QuoteWorkspace,
+  QuoteDraftSaveRequest,
+  QuotePreviewPdfDownload,
+} from './orderQuoteApi'
