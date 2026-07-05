@@ -648,6 +648,11 @@ export function QuoteTab({
   // is per instance and OrderWorkspace remounts this tab per order
   // (key={orderId}); a workspace reload remounts it too.
   const lastValidItemisedIncRef = useRef<number | null>(null)
+  // Re-entrancy guard for the async toggle-OFF row flush: while the pre-flip
+  // itemised flush is being awaited, further switch clicks are ignored (the
+  // status chip already shows "Saving…"). Prevents double flips / duplicate
+  // saves from rapid taps mid-flush.
+  const toggleBusyRef = useRef(false)
   const debounceRef = useRef<number | null>(null)
   // Awaitable single-flight chain (mirrors the shell's details chain) so Preview
   // PDF can flush pending saves and only proceed once the WHOLE queue drained.
@@ -957,8 +962,14 @@ export function QuoteTab({
     }
   }
 
-  function handleToggleItemised() {
-    if (lockedRef.current || seedState === 'loading') return
+  async function handleToggleItemised() {
+    if (
+      lockedRef.current ||
+      seedState === 'loading' ||
+      toggleBusyRef.current
+    ) {
+      return
+    }
     clearDebounce()
     markDraftEdited()
     if (itemisedRef.current) {
@@ -968,6 +979,37 @@ export function QuoteTab({
       // rows are deliberately kept, so toggling ON again restores them without
       // any re-seed.
       //
+      // ROW-FLUSH GUARD (Codex P2 round 2): a row edit made inside the 800ms
+      // debounce window would otherwise NEVER persist — the non-itemised save
+      // is header-only (PR2A), so the server would keep the PREVIOUS itemised
+      // rows and a reload (or 16E send) would silently lose the latest edits.
+      // When the rows are all valid, flush the itemised body through the
+      // normal single-flight machinery FIRST and only flip the mode once that
+      // body IS the persisted state (an already-clean draft short-circuits
+      // inside the flush — no extra PUT, so a no-pending-edit toggle still
+      // issues exactly one non-itemised PUT). The flush also refreshes
+      // lastValidItemisedIncRef via buildBodyForSave (round-1 consistency).
+      // On any other outcome, stay itemised with the local edits intact — no
+      // modal, no warning: 'save-failed' already surfaced the normal "Could
+      // not save" status/error; 'changed-during-flush' / 'invalid-input' mean
+      // the user kept editing mid-flush, and flipping then would re-open the
+      // exact row-loss hole (their edits keep autosaving normally instead).
+      const preBroken = rowsRef.current.some(
+        (row) => parseEditorRow(row, 0) === null,
+      )
+      if (!preBroken) {
+        toggleBusyRef.current = true
+        const flushOutcome = await flushQuoteAutosave().finally(() => {
+          toggleBusyRef.current = false
+        })
+        if (flushOutcome !== 'saved') return
+        // Re-validate the world after the await: bail if the tab unmounted or
+        // the mode was already flipped (defensive — the busy guard blocks the
+        // switch itself while the flush runs).
+        if (!mountedRef.current || lockedRef.current || !itemisedRef.current) {
+          return
+        }
+      }
       // BROKEN-ROW GUARD: a mid-edit invalid row contributes nothing to the
       // visible sum, and while itemised that partial sum can never persist
       // (the invalid-row save block). A mode flip would convert it into a
