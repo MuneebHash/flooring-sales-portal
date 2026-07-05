@@ -17,8 +17,11 @@ import java.util.List;
  * <p>{@link #upsertDraft} is a single {@code INSERT ... ON CONFLICT (order_id) DO UPDATE} that
  * respects {@code uq_quote_draft_order} (one draft per order can never be duplicated), preserves
  * {@code created_at} on replace, refreshes {@code updated_at}, and {@code RETURNING}s the draft id.
- * Lines are wholesale-replaced ({@link #deleteLines} then {@link #insertLines}) so the persisted set
- * always equals the server-computed set. Must run inside the caller's {@code @Transactional} method.
+ * On an ITEMISED save, lines are wholesale-replaced ({@link #deleteLines} then {@link #insertLines})
+ * so the persisted set always equals the server-computed set. A NON-itemised save is header-only
+ * (Phase 16D-B PR2A retention): the caller never invokes the line methods, so rows persisted by the
+ * last itemised save survive as dormant lines. Must run inside the caller's {@code @Transactional}
+ * method.
  */
 @Repository
 public class QuoteDraftWriteRepository {

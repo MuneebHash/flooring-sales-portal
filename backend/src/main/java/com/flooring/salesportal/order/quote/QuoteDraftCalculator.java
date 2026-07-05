@@ -29,12 +29,17 @@ import java.util.Set;
  *       {@code delta = target_ex − line_sum_ex}: {@code > 0.01} → 422 QUOTE_TOTAL_EXCEEDS_LINES;
  *       within ±0.01 → treat as equal (no adjustment, total = line sum, so a no-op resave never
  *       trips EXCEEDS); {@code < −0.01} → append a negative ADJUSTMENT line for the difference.</li>
- *   <li><b>Q2 — non-itemised synthetic line.</b> {@code itemised=false} with a
- *       {@code final_total_inc_gst} is stored as ONE synthetic ITEM line ("Quoted works") so the
- *       invariant {@code quote_total_ex_gst == Σ lines} always holds (no hidden total).</li>
+ *   <li><b>Q2 (amended Phase 16D-B PR2A) — non-itemised carries the total on the draft header.</b>
+ *       {@code itemised=false} with a {@code final_total_inc_gst} computes
+ *       {@code target_ex = round(final/1.10)} and returns NO lines — the synthetic "Quoted works"
+ *       line is gone. Any supplied lines are ignored (never summed, never EXCEEDS-checked); the
+ *       service retains previously persisted itemised rows untouched (contract §6.1). The
+ *       {@code total == Σ lines} invariant is therefore MODE-SCOPED: it holds for itemised
+ *       computations only.</li>
  * </ul>
- * The quote total never exceeds the sum of its lines; below cost (quote ex &lt; order total cost ex)
- * is blocked with 422 QUOTE_BELOW_COST (this calculator throws before returning).
+ * An itemised quote total never exceeds the sum of its lines; below cost (quote ex &lt; order total
+ * cost ex) is blocked with 422 QUOTE_BELOW_COST in BOTH modes (this calculator throws before
+ * returning — non-itemised uses the final-total-derived ex).
  */
 @Component
 public class QuoteDraftCalculator {
@@ -45,8 +50,6 @@ public class QuoteDraftCalculator {
     private static final BigDecimal HUNDRED = new BigDecimal("100");
     private static final BigDecimal ZERO = BigDecimal.ZERO.setScale(MONEY_SCALE);
     private static final BigDecimal ONE_CENT = new BigDecimal("0.01");
-    private static final BigDecimal SYNTHETIC_QTY = BigDecimal.ONE.setScale(MONEY_SCALE);
-    private static final String SYNTHETIC_DESCRIPTION = "Quoted works";
     private static final String ADJUSTMENT_DESCRIPTION = "Adjustment";
 
     // quote_total_*/line_total_ex_gst are DECIMAL(10,2): a 2dp value fits iff |value| <= 99999999.99.
@@ -63,14 +66,17 @@ public class QuoteDraftCalculator {
     public static final int MAX_SORT_ORDER = 1_000_000;
 
     /**
-     * Recompute and validate the draft money. Returns the final line set (including any auto-inserted
-     * ADJUSTMENT line / non-itemised synthetic line) plus the derived ex/inc totals and GP percent.
+     * Recompute and validate the draft money. For an itemised draft, returns the final line set
+     * (including any auto-inserted ADJUSTMENT line) plus the derived ex/inc totals and GP percent.
+     * For a non-itemised draft, returns NO lines — the totals are derived from
+     * {@code final_total_inc_gst} alone (Phase 16D-B PR2A; the service retains previously
+     * persisted itemised rows untouched).
      *
      * @param itemised          the draft itemised flag
      * @param inputs            validated request lines (ITEM totals are recomputed here)
      * @param finalTotalIncGst  optional GST-inclusive direct total (null = use the line sum)
      * @param totalCostExGst    the order's product+charge total cost ex-GST (for below-cost)
-     * @throws BusinessRuleException QUOTE_TOTAL_EXCEEDS_LINES (422) / QUOTE_BELOW_COST (422)
+     * @throws BusinessRuleException QUOTE_TOTAL_EXCEEDS_LINES (422, itemised only) / QUOTE_BELOW_COST (422)
      * @throws ValidationException   400 when a computed money value overflows DECIMAL(10,2)
      */
     public QuoteDraftComputation compute(boolean itemised,
@@ -81,12 +87,12 @@ public class QuoteDraftCalculator {
         BigDecimal quoteTotalExGst;
 
         if (!itemised && finalTotalIncGst != null) {
-            // Q2: a non-itemised quote with a quoted amount is stored as one synthetic ITEM line so
-            // the line-sum invariant holds (no hidden total). Any supplied lines are replaced.
-            BigDecimal targetEx = finalTotalIncGst.divide(GST_MULTIPLIER, MONEY_SCALE, ROUNDING);
-            lines = new ArrayList<>(List.of(new QuoteComputedLine(
-                    "ITEM", SYNTHETIC_DESCRIPTION, SYNTHETIC_QTY, targetEx, targetEx, 0)));
-            quoteTotalExGst = targetEx;
+            // Phase 16D-B PR2A: a non-itemised quote carries its total on the draft header only —
+            // NO synthetic line is generated and any supplied lines are ignored (never summed,
+            // never EXCEEDS-checked). The service leaves previously persisted itemised rows
+            // untouched (retention, contract §6.1); this computation contributes no lines.
+            lines = new ArrayList<>();
+            quoteTotalExGst = finalTotalIncGst.divide(GST_MULTIPLIER, MONEY_SCALE, ROUNDING);
         } else {
             lines = recomputeLineTotals(inputs);
             BigDecimal lineSumExGst = sumLineTotals(lines);

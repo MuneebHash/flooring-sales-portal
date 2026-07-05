@@ -17,8 +17,10 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 /**
  * Pure unit tests for {@link QuoteDraftCalculator} — the Phase 16C PR1 quote money core. No Spring.
  * Verifies the locked decisions: ex-primary {@code final_total_inc_gst} conversion + 1¢ tolerance
- * (Q1), the non-itemised synthetic line (Q2), the line-sum invariant, the EXCEEDS rejection, and the
- * below-cost block. Money is BigDecimal scale 2 HALF_UP, GST ×1.10.
+ * (Q1), the header-only non-itemised mode (Q2 as amended by Phase 16D-B PR2A — no synthetic line;
+ * empty computed line set; totals from the final), the mode-scoped line-sum invariant, the
+ * itemised-only EXCEEDS rejection, and the both-modes below-cost block. Money is BigDecimal scale 2
+ * HALF_UP, GST ×1.10.
  */
 class QuoteDraftCalculatorTest {
 
@@ -154,19 +156,42 @@ class QuoteDraftCalculatorTest {
     }
 
     @Test
-    void nonItemisedWithFinal_replacesWithSingleSyntheticLine() {
-        // itemised=false + final 550 inc => single ITEM "Quoted works" qty 1 unit 500 total 500.
+    void nonItemisedWithFinal_returnsNoLines_totalsDerivedFromFinal() {
+        // Phase 16D-B PR2A: no synthetic line. itemised=false + final 550 inc => EMPTY line set,
+        // ex 500 (= 550 / 1.10), inc 550. Supplied lines are ignored (the service retains any
+        // previously persisted itemised rows separately — never through this computation).
         QuoteDraftComputation c = calc.compute(false,
                 List.of(item("ignored", "9.00", "9.00", 0)), bd("550.00"), NO_COST);
-        assertEquals(1, c.lines().size());
-        QuoteComputedLine line = c.lines().get(0);
-        assertEquals("ITEM", line.lineType());
-        assertEquals("Quoted works", line.description());
-        assertMoney("1.00", line.quantity());
-        assertMoney("500.00", line.unitPriceExGst());
-        assertMoney("500.00", line.lineTotalExGst());
+        assertTrue(c.lines().isEmpty(), "non-itemised computation must produce no lines");
         assertMoney("500.00", c.quoteTotalExGst());
         assertMoney("550.00", c.quoteTotalIncGst());
+    }
+
+    @Test
+    void nonItemised_finalFarAboveIgnoredLines_neverThrowsExceeds() {
+        // QUOTE_TOTAL_EXCEEDS_LINES is itemised-only: a non-itemised final is never validated
+        // against lines (supplied or retained). 990 inc over a 10-ex line is accepted.
+        QuoteDraftComputation c = calc.compute(false,
+                List.of(item("ignored", "1.00", "10.00", 0)), bd("990.00"), NO_COST);
+        assertTrue(c.lines().isEmpty());
+        assertMoney("900.00", c.quoteTotalExGst());
+        assertMoney("990.00", c.quoteTotalIncGst());
+    }
+
+    @Test
+    void nonItemised_belowCost_throwsBelowCost() {
+        // Below-cost applies to non-itemised saves via the final-derived ex: 55 / 1.10 = 50 < cost 80.
+        BusinessRuleException ex = assertThrows(BusinessRuleException.class,
+                () -> calc.compute(false, List.of(), bd("55.00"), bd("80.00")));
+        assertSame(ErrorCode.QUOTE_BELOW_COST, ex.getErrorCode());
+    }
+
+    @Test
+    void nonItemised_gpPercent_fromFinalDerivedExTotal() {
+        // gp_percent on a non-itemised draft comes from final_total_inc_gst: ex 100, cost 80 => 20%.
+        QuoteDraftComputation c = calc.compute(false, List.of(), bd("110.00"), bd("80.00"));
+        assertMoney("100.00", c.quoteTotalExGst());
+        assertMoney("20.00", c.gpPercent());
     }
 
     @Test

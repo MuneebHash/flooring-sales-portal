@@ -172,7 +172,7 @@ Default / non-itemised quote is clean and invoice-like:
 
 Non-itemised is a clean customer-facing quotation without a line breakdown.
 
-**Backend mapping:** non-itemised saves send `itemised: false`, `final_total_inc_gst`, and `lines: []`. The backend stores this as a single synthetic line internally, but that synthetic line is **not** shown on the screen or the non-itemised PDF, and must not be rendered as an editable row.
+**Backend mapping (amended Phase 16D-B PR2A):** non-itemised saves still send exactly `itemised: false`, `final_total_inc_gst`, and `lines: []`. The backend **no longer stores a synthetic line** — it updates the draft mode/totals only and **retains** previously saved itemised rows as dormant `quote_draft_line` rows (see §9). A read of a non-itemised draft returns those retained rows in `lines[]`; they must **not** be shown on the screen or the non-itemised PDF, and must not be rendered as editable rows while itemised is OFF.
 
 ---
 
@@ -203,7 +203,7 @@ After seeding:
 - quote lines are independent, quote-only, customer-facing lines
 - editing quote lines does **not** edit Products & Charges
 - editing quote lines does **not** mutate operational product/charge rows
-- if a saved quote draft already has lines, **the saved quote draft lines are the source of truth** — do not silently overwrite them from Products & Charges just because the order changed. Re-seeding only happens on an explicit user rebuild.
+- if a saved quote draft already has lines, **the saved quote draft lines are the source of truth** — do not silently overwrite them from Products & Charges just because the order changed. Re-seeding only happens on an explicit user rebuild. This includes retained dormant rows on a non-itemised draft: toggling itemised back ON restores them and must not re-seed (§9).
 
 ### 8.2 Quote pricing is independent of the order (locked)
 
@@ -238,7 +238,19 @@ Rules:
 
 ---
 
-## 9. (reserved)
+## 9. Itemised line retention (locked — Phase 16D-B PR2A)
+
+Edited itemised quote rows are permanent working data. They must survive switching the quote to non-itemised mode, page reloads, and returning days later.
+
+1. **First itemised ON with no persisted itemised rows:** the frontend seeds the quote lines from Products & Charges (§8.1). This is the only seeding trigger.
+2. **Edited itemised rows persist permanently:** they survive toggle-OFF, page reload, and coming back days later. The backend keeps them as dormant `quote_draft_line` rows while the draft is non-itemised — a non-itemised save never writes and never deletes lines.
+3. **Toggle OFF:** the frontend saves non-itemised mode with the current itemised total as `final_total_inc_gst` (request shape unchanged: `itemised: false`, `final_total_inc_gst`, `lines: []`).
+4. **Toggle ON later:** the frontend restores the persisted `quote_draft_line` rows returned by the backend. It must **not** re-seed from Products & Charges when persisted itemised rows exist.
+5. **No warnings. No confirmation modals.** Toggling between modes is silent and non-destructive.
+
+While non-itemised, the quote total is `final_total_inc_gst` and is fully independent of the retained rows (never validated against them; below-cost/GP use the final-total-derived ex total). In itemised mode the total must equal the sum of the visible lines as before (§8.3).
+
+**Legacy note (dev data only):** drafts saved non-itemised before PR2A carry an old stored `Quoted works` row that is indistinguishable from retained rows (no schema flag; description matching is forbidden). It may appear in `lines[]` on read (never rendered in non-itemised mode) and, if the draft is toggled to itemised, in the editor; it heals on the next itemised save (full replace) or manual dev-data cleanup.
 
 ---
 

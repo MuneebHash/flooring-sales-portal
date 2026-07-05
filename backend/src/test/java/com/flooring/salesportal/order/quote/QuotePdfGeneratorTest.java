@@ -216,6 +216,30 @@ class QuotePdfGeneratorTest {
     }
 
     @Test
+    void render_nonItemised_withRetainedLines_ignoresLines_totalsFromModel() throws IOException {
+        // Phase 16D-B PR2A: retained dormant draft lines legitimately accompany a non-itemised
+        // draft (post toggle-OFF). The non-itemised render must ignore them entirely — no line
+        // table, no line descriptions/amounts — and take the totals from the draft header only.
+        M m = new M();
+        m.itemised = false;
+        m.lines = new ArrayList<>(List.of(
+                item("Retained carpet line", "2.00", "100.00", "200.00"),
+                adjustment("Retained discount", "-30.00")));
+        m.quoteTotalExGst = bd("900.00");
+        m.quoteTotalIncGst = bd("990.00");
+        byte[] pdf = GENERATOR.render(m.build());
+        assertPdfHeader(pdf);
+
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        Assertions.assertFalse(text.contains("Qty"), () -> "retained lines must not render a line table: " + text);
+        Assertions.assertFalse(text.contains("Retained carpet line"), () -> "retained ITEM row leaked into the PDF: " + text);
+        Assertions.assertFalse(text.contains("Retained discount"), () -> "retained ADJUSTMENT row leaked into the PDF: " + text);
+        Assertions.assertFalse(noSpace(text).contains("200.00"), () -> "retained line amount leaked into the PDF: " + text);
+        Assertions.assertTrue(noSpace(text).contains("990.00"), () -> "missing header-derived inc-GST total in: " + text);
+        Assertions.assertTrue(noSpace(text).contains("900.00"), () -> "missing header-derived ex-GST subtotal in: " + text);
+    }
+
+    @Test
     void render_softTerms_onDedicatedSecondPage_page1HasNoTerms() throws IOException {
         M m = new M();
         m.flooringTypeLabel = "Soft Flooring";
