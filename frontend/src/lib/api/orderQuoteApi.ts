@@ -98,13 +98,16 @@ export type QuoteWorkspace = {
 
 // PUT /quote/draft body — FULL-REPLACE upsert (a valid body with fewer lines
 // replaces the stored lines, so callers must always send the COMPLETE draft).
-//   Non-itemised (the only mode 16D-B PR1 edits): itemised MUST be false,
-//   final_total_inc_gst (GST-INCLUSIVE, >= 0, <= QUOTE_TOTAL_MAX) is REQUIRED and
-//   lines MUST be []. The backend stores a single synthetic internal line that is
-//   never rendered.
-//   Itemised: lines carry the draft; final_total_inc_gst below the line sum makes
-//   the server insert a negative ADJUSTMENT, above it is a 422
-//   QUOTE_TOTAL_EXCEEDS_LINES — itemised editing is Phase 16D-B PR2.
+//   Non-itemised: itemised MUST be false, final_total_inc_gst (GST-INCLUSIVE,
+//   >= 0, <= QUOTE_TOTAL_MAX) is REQUIRED and lines MUST be []. The save is
+//   header-only (Phase 16D-B PR2A): no synthetic line is stored and previously
+//   persisted itemised rows are RETAINED untouched (returned on reads as
+//   dormant lines — never rendered in non-itemised mode).
+//   Itemised (Phase 16D-B PR2B): lines carry the draft and final_total_inc_gst
+//   MUST BE OMITTED (locked wire rule) — the client keeps total = sum of the
+//   visible rows and manages ADJUSTMENT rows itself. (If it WERE sent: below
+//   the line sum the server inserts a hidden negative ADJUSTMENT, above it is
+//   a 422 QUOTE_TOTAL_EXCEEDS_LINES — behaviour the frontend must not lean on.)
 export type QuoteDraftSaveRequest = {
   itemised: boolean
   final_total_inc_gst?: number
