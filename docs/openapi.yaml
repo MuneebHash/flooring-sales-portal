@@ -1607,13 +1607,20 @@ paths:
       operationId: upsertQuoteDraft
       description: >
         Creates or replaces the editable quote draft (itemised flag, customer-facing lines and
-        adjustments) for the order (Phase 16B). The server recomputes totals, enforces
-        total == sum of lines (auto-inserting a negative adjustment line on a direct reduction via
-        final_total_inc_gst), rejects a total above the line sum (QUOTE_TOTAL_EXCEEDS_LINES, 422),
-        blocks below-cost saves (QUOTE_BELOW_COST, 422). The quote draft is independent of order
-        pricing: a save does NOT update the order sale-price override or any sales_order header
-        financials, and quote lines never mutate the order's product/charge lines. Blocked
-        when order_status is LAID (ORDER_LOCKED, 422).
+        adjustments) for the order (Phase 16B). An itemised save full-replaces the draft lines:
+        the server recomputes totals, enforces total == sum of lines (auto-inserting a negative
+        adjustment line on a direct reduction via final_total_inc_gst) and rejects a total above
+        the line sum (QUOTE_TOTAL_EXCEEDS_LINES, 422; itemised saves only). A non-itemised save
+        (itemised false, final_total_inc_gst required, lines must be empty) is header-only
+        (Phase 16D-B PR2A): it updates mode/totals (inc = final_total_inc_gst; ex = final / 1.10
+        HALF_UP 2dp), creates NO synthetic line, and never writes or deletes quote_draft_line
+        rows — lines persisted by the last itemised save are retained as dormant rows and are
+        returned in the response lines[]. The non-itemised total is never validated against
+        retained lines. Below-cost saves are blocked in both modes (QUOTE_BELOW_COST, 422):
+        itemised uses the visible line sum, non-itemised the final-total-derived ex total. The
+        quote draft is independent of order pricing: a save does NOT update the order sale-price
+        override or any sales_order header financials, and quote lines never mutate the order's
+        product/charge lines. Blocked when order_status is LAID (ORDER_LOCKED, 422).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -4364,6 +4371,10 @@ components:
           description: True when the quote is below cost (save/send/accept are blocked).
         lines:
           type: array
+          description: >
+            Ordered draft lines. On a non-itemised draft this contains the RETAINED dormant
+            itemised rows (empty when none exist; Phase 16D-B PR2A) — they are not part of the
+            non-itemised totals and must not be rendered while itemised is false.
           items:
             $ref: '#/components/schemas/QuoteDraftLine'
         updated_at:
@@ -4502,9 +4513,11 @@ components:
             - $ref: '#/components/schemas/Money'
           nullable: true
           description: >
-            Optional desired GST-inclusive final total. If below the line sum the server inserts a
-            negative adjustment line to balance; above the line sum returns 422
-            (QUOTE_TOTAL_EXCEEDS_LINES).
+            Desired GST-inclusive final total. Itemised save (optional): if below the line sum the
+            server inserts a negative adjustment line to balance; above the line sum returns 422
+            (QUOTE_TOTAL_EXCEEDS_LINES). Non-itemised save (required): becomes the quote total
+            (ex derived as final / 1.10, HALF_UP 2dp); never validated against retained dormant
+            lines (Phase 16D-B PR2A).
         lines:
           type: array
           items:

@@ -15,9 +15,12 @@ import java.time.LocalDateTime;
  * loaded on the GET {@code /quote/workspace} read. Read-only like {@link com.flooring.salesportal.order.OrderEnquiry}:
  * no setters — the write path is the focused native upsert in {@link QuoteDraftWriteRepository}, not JPA.
  *
- * <p>{@code quote_total_ex_gst} is the server-computed sum of the draft lines; {@code quote_total_inc_gst}
- * is the GST-grossed total (the value pushed into the order's cosmetic sale-price override). The
- * draft carries NO cost column — costs live on the order's product/charge lines (contract §4.2).
+ * <p>{@code quote_total_ex_gst} is server-computed: for an ITEMISED draft it is the sum of the draft
+ * lines; for a NON-itemised draft it is derived from {@code final_total_inc_gst} alone and is
+ * independent of any retained dormant lines (Phase 16D-B PR2A, contract §6.1).
+ * {@code quote_total_inc_gst} is the GST-grossed total — customer-facing only; a quote save never
+ * writes the order sale-price override (Phase 16D-A). The draft carries NO cost column — costs live
+ * on the order's product/charge lines (contract §4.2).
  */
 @Entity
 @Table(name = "quote_draft")

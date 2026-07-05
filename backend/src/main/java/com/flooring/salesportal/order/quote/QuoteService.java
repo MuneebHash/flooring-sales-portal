@@ -47,13 +47,17 @@ import java.util.Set;
  * {@code ORDER_LOCKED}) → raw-body parse (400 {@code MALFORMED_JSON}) → validate → compute → persist
  * — all inside one transaction holding the order lock.
  *
- * <p>Money rules ({@link QuoteDraftCalculator}): quote total = sum of lines; a direct reduction
- * inserts a negative ADJUSTMENT line; a direct increase above the line sum is rejected with
- * {@code QUOTE_TOTAL_EXCEEDS_LINES}; a below-cost quote is rejected with {@code QUOTE_BELOW_COST}.
- * A quote save is INDEPENDENT of order pricing (Phase 16D-A): it persists only the quote draft and
- * its lines and never writes the order sale-price override or any {@code sales_order} header
- * financial. Quote lines never carry or expose cost; the order's product/charge lines are never
- * mutated by a quote save.
+ * <p>Money rules ({@link QuoteDraftCalculator}): an ITEMISED quote total = sum of lines; a direct
+ * reduction inserts a negative ADJUSTMENT line; a direct increase above the line sum is rejected
+ * with {@code QUOTE_TOTAL_EXCEEDS_LINES} (itemised saves only); a below-cost quote is rejected with
+ * {@code QUOTE_BELOW_COST} in both modes. A NON-itemised save is header-only (Phase 16D-B PR2A,
+ * contract §6.1): totals come from {@code final_total_inc_gst} (no synthetic line) and
+ * {@code quote_draft_line} rows are never written or deleted — lines persisted by the last itemised
+ * save are RETAINED as dormant rows (they survive toggle-OFF/reload and are returned on reads) and
+ * are never validated against the non-itemised total. A quote save is INDEPENDENT of order pricing
+ * (Phase 16D-A): it persists only the quote draft and its lines and never writes the order
+ * sale-price override or any {@code sales_order} header financial. Quote lines never carry or
+ * expose cost; the order's product/charge lines are never mutated by a quote save.
  */
 @Service
 public class QuoteService {
@@ -273,8 +277,19 @@ public class QuoteService {
         LocalDateTime now = LocalDateTime.now();
         long quoteDraftId = quoteDraftWriteRepository.upsertDraft(
                 orderId, parsed.itemised(), computation.quoteTotalExGst(), computation.quoteTotalIncGst(), now);
-        quoteDraftWriteRepository.deleteLines(quoteDraftId);
-        quoteDraftWriteRepository.insertLines(quoteDraftId, computation.lines());
+        if (parsed.itemised()) {
+            // Itemised save: wholesale-replace the lines with the server-computed set.
+            quoteDraftWriteRepository.deleteLines(quoteDraftId);
+            quoteDraftWriteRepository.insertLines(quoteDraftId, computation.lines());
+        }
+        // Non-itemised save (Phase 16D-B PR2A retention, contract §6.1): header-only — quote_draft_line
+        // is NEVER touched. Rows persisted by the last itemised save stay as dormant rows so switching
+        // back to itemised restores the salesperson's edited lines (they must survive toggle-OFF, page
+        // reload, and returning days later). Deliberately NO delete on any non-itemised save: a
+        // false-mode draft with lines is indistinguishable from the retained state (no schema flag;
+        // description matching is forbidden), and repeated non-itemised autosaves after a toggle-OFF
+        // would otherwise destroy the retained rows. A legacy pre-PR2A synthetic "Quoted works" row
+        // (dev data only) therefore persists until the next itemised save full-replaces it.
 
         // Phase 16D-A: the quote save is INDEPENDENT of order pricing. It never writes the order
         // sale-price override or any sales_order header financial — only quote_draft / quote_draft_line
@@ -283,7 +298,8 @@ public class QuoteService {
 
         // Re-read the persisted lines so the save response carries real quote_draft_line_id values
         // (same shape as the workspace read). The native insert is in this transaction, so the JPA
-        // query sees the rows just written.
+        // query sees the rows just written. For a non-itemised save this returns the RETAINED dormant
+        // rows (empty when none exist) — the read contract for a non-itemised draft.
         List<QuoteDraftLine> persistedLines =
                 quoteDraftLineRepository.findByQuoteDraftIdOrderBySortOrderAsc(quoteDraftId);
 
@@ -354,9 +370,10 @@ public class QuoteService {
             }
         }
 
-        // Non-itemised strictness (Q2): a single quoted amount, no client line breakdown. A genuine
-        // itemised=false REQUIRES final_total_inc_gst and an EMPTY lines array — the backend then
-        // generates the one synthetic line. Only enforced when itemised is explicitly the boolean
+        // Non-itemised strictness: a single quoted amount, no client line breakdown. A genuine
+        // itemised=false REQUIRES final_total_inc_gst and an EMPTY lines array — the backend stores
+        // the total on the draft header and retains any previously persisted itemised rows untouched
+        // (Phase 16D-B PR2A; no synthetic line). Only enforced when itemised is explicitly the boolean
         // false; a missing/malformed itemised is already reported by readRequiredBoolean above.
         JsonNode itemisedNode = root.get(FIELD_ITEMISED);
         boolean explicitlyNonItemised =

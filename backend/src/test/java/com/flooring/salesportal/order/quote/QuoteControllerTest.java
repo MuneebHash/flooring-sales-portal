@@ -172,6 +172,30 @@ class QuoteControllerTest {
                 BigDecimal.class, orderId);
     }
 
+    private java.util.List<Long> lineIds(long orderId) {
+        return jdbcTemplate.queryForList(
+                "SELECT quote_draft_line_id FROM quote_draft_line l "
+                        + "JOIN quote_draft d ON l.quote_draft_id = d.quote_draft_id "
+                        + "WHERE d.order_id = ? ORDER BY l.sort_order", Long.class, orderId);
+    }
+
+    private Boolean draftItemised(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT itemised FROM quote_draft WHERE order_id = ?", Boolean.class, orderId);
+    }
+
+    /** Save a two-ITEM itemised draft (Carpet 2×100 + Underlay 1×50 = 250 ex / 275 inc) via the API. */
+    private void saveItemisedTwoLineDraft(long orderId) throws Exception {
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":2,"unit_price_ex_gst":100,"line_total_ex_gst":200,"sort_order":0},
+                                  {"line_type":"ITEM","description":"Underlay","quantity":1,"unit_price_ex_gst":50,"line_total_ex_gst":50,"sort_order":1}
+                                ]}"""))
+                .andExpect(status().isOk());
+    }
+
     private BigDecimal orderDecimal(long orderId, String col) {
         return jdbcTemplate.queryForObject(
                 "SELECT " + col + " FROM sales_order WHERE order_id = ?", BigDecimal.class, orderId);
@@ -607,22 +631,282 @@ class QuoteControllerTest {
     }
 
     @Test
-    void putDraft_nonItemisedWithFinal_createsSingleSyntheticLine() throws Exception {
+    void putDraft_nonItemisedFresh_savesTotalsOnly_noSyntheticLine() throws Exception {
         long orderId = leadOrderInSession();
 
-        // itemised=false + final 550 inc => single synthetic ITEM "Quoted works" ex 500.
+        // Phase 16D-B PR2A: itemised=false + final 550 inc => header-only save. NO synthetic
+        // "Quoted works" line — no line row of ANY kind is written (count assert; no description
+        // matching). Read returns lines: [].
         mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
                                 {"itemised": false, "final_total_inc_gst": 550, "lines": []}"""))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.itemised").value(false))
-                .andExpect(jsonPath("$.data.lines", hasSize(1)))
-                .andExpect(jsonPath("$.data.lines[0].description").value("Quoted works"));
+                .andExpect(jsonPath("$.data.lines", hasSize(0)));
 
-        Assertions.assertEquals(1, lineCount(orderId));
+        Assertions.assertEquals(1, draftRowCount(orderId));
+        Assertions.assertEquals(0, lineCount(orderId), "non-itemised save must not insert any line");
         assertMoney("500.00", draftDecimal(orderId, "quote_total_ex_gst"));
         assertMoney("550.00", draftDecimal(orderId, "quote_total_inc_gst"));
+
+        entityManager.clear();
+        mockMvc.perform(get(workspaceUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.draft.itemised").value(false))
+                .andExpect(jsonPath("$.data.draft.lines", hasSize(0)));
+    }
+
+    @Test
+    void putDraft_nonItemisedNonRoundTripFinal_persistsSuppliedIncVerbatim() throws Exception {
+        long orderId = leadOrderInSession();
+
+        // Codex fix round 1: 4900.00 does not round-trip (ex = 4454.55; re-grossing gives 4900.01).
+        // The persisted and returned inc total must be exactly the supplied final (contract §6.1);
+        // only the ex total is derived (HALF_UP 2dp).
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 4900.00, "lines": []}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.itemised").value(false))
+                .andExpect(jsonPath("$.data.quote_total_inc_gst").value(4900.00))
+                .andExpect(jsonPath("$.data.quote_total_ex_gst").value(4454.55));
+
+        assertMoney("4454.55", draftDecimal(orderId, "quote_total_ex_gst"));
+        assertMoney("4900.00", draftDecimal(orderId, "quote_total_inc_gst"));
+
+        // The workspace read serves the same verbatim inc total.
+        entityManager.clear();
+        mockMvc.perform(get(workspaceUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.draft.quote_total_inc_gst").value(4900.00))
+                .andExpect(jsonPath("$.data.draft.quote_total_ex_gst").value(4454.55));
+    }
+
+    // ================================================================
+    // PUT draft — itemised-line retention (Phase 16D-B PR2A, contract §6.1)
+    // ================================================================
+
+    @Test
+    void putDraft_itemisedThenNonItemised_retainsLines_headerBecomesNonItemised() throws Exception {
+        long orderId = leadOrderInSession();
+        saveItemisedTwoLineDraft(orderId); // 250 ex / 275 inc, 2 ITEM rows
+        java.util.List<Long> idsBefore = lineIds(orderId);
+        Assertions.assertEquals(2, idsBefore.size());
+
+        // Toggle OFF: header-only save. Retained rows are untouched (same ids — no delete/reinsert).
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 550, "lines": []}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.itemised").value(false))
+                .andExpect(jsonPath("$.data.lines", hasSize(2)))
+                .andExpect(jsonPath("$.data.lines[0].description").value("Carpet"))
+                .andExpect(jsonPath("$.data.lines[1].description").value("Underlay"));
+
+        Assertions.assertEquals(Boolean.FALSE, draftItemised(orderId));
+        Assertions.assertEquals(2, lineCount(orderId), "retained rows must survive the toggle-OFF save");
+        Assertions.assertEquals(idsBefore, lineIds(orderId), "retained rows keep their ids (never rewritten)");
+        // Totals reflect final_total_inc_gst, independent of the retained rows (sum 250 ex).
+        assertMoney("500.00", draftDecimal(orderId, "quote_total_ex_gst"));
+        assertMoney("550.00", draftDecimal(orderId, "quote_total_inc_gst"));
+
+        // Read contract: a non-itemised draft returns itemised=false plus the retained lines[].
+        entityManager.clear();
+        mockMvc.perform(get(workspaceUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.draft.itemised").value(false))
+                .andExpect(jsonPath("$.data.draft.lines", hasSize(2)))
+                .andExpect(jsonPath("$.data.draft.lines[0].description").value("Carpet"));
+    }
+
+    @Test
+    void putDraft_repeatedNonItemisedSaves_keepRetainedLines() throws Exception {
+        // The critical retention case: after a toggle-OFF the stored draft is itemised=false WITH
+        // retained rows. Every subsequent non-itemised autosave (total edits, reload + edit days
+        // later) must ALSO leave them untouched — a non-itemised save never deletes lines, even
+        // when the stored draft is already non-itemised.
+        long orderId = leadOrderInSession();
+        saveItemisedTwoLineDraft(orderId);
+
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 550, "lines": []}"""))
+                .andExpect(status().isOk());
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 660, "lines": []}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.lines", hasSize(2)));
+
+        Assertions.assertEquals(2, lineCount(orderId),
+                "a second non-itemised save must not delete the retained rows");
+        assertMoney("600.00", draftDecimal(orderId, "quote_total_ex_gst"));
+        assertMoney("660.00", draftDecimal(orderId, "quote_total_inc_gst"));
+    }
+
+    @Test
+    void putDraft_toggleBackItemised_updatesRetainedLines() throws Exception {
+        long orderId = leadOrderInSession();
+        saveItemisedTwoLineDraft(orderId);
+
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 550, "lines": []}"""))
+                .andExpect(status().isOk());
+
+        // Toggle ON later: the retained rows are still available (no forced re-seed) and an
+        // itemised save can update them — here the Carpet quantity changes 2 -> 3.
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":3,"unit_price_ex_gst":100,"line_total_ex_gst":300,"sort_order":0},
+                                  {"line_type":"ITEM","description":"Underlay","quantity":1,"unit_price_ex_gst":50,"line_total_ex_gst":50,"sort_order":1}
+                                ]}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.itemised").value(true))
+                .andExpect(jsonPath("$.data.lines", hasSize(2)));
+
+        Assertions.assertEquals(Boolean.TRUE, draftItemised(orderId));
+        Assertions.assertEquals(2, lineCount(orderId));
+        // Itemised mode restores the line-sum invariant on the updated rows.
+        assertMoney("350.00", draftDecimal(orderId, "quote_total_ex_gst"));
+        assertMoney("385.00", draftDecimal(orderId, "quote_total_inc_gst"));
+        Assertions.assertEquals(0, draftDecimal(orderId, "quote_total_ex_gst").compareTo(sumLineTotals(orderId)));
+    }
+
+    @Test
+    void putDraft_itemisedRetainedRoundTrip_persistsAdjustmentRows() throws Exception {
+        // ITEM + ADJUSTMENT rows both persist through an itemised save and survive a toggle-OFF.
+        long orderId = leadOrderInSession();
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":2,"unit_price_ex_gst":100,"line_total_ex_gst":200,"sort_order":0},
+                                  {"line_type":"ADJUSTMENT","description":"Discount","line_total_ex_gst":-30,"sort_order":1}
+                                ]}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.lines", hasSize(2)));
+
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 187, "lines": []}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.lines", hasSize(2)))
+                .andExpect(jsonPath("$.data.lines[1].line_type").value("ADJUSTMENT"))
+                .andExpect(jsonPath("$.data.lines[1].description").value("Discount"));
+
+        Assertions.assertEquals(2, lineCount(orderId), "ITEM and ADJUSTMENT rows both retained");
+    }
+
+    @Test
+    void putDraft_nonItemisedFinal_neverValidatedAgainstRetainedLines() throws Exception {
+        // QUOTE_TOTAL_EXCEEDS_LINES is itemised-only: a non-itemised final far ABOVE the retained
+        // line sum (250 ex) must save cleanly — retained dormant lines are independent by design.
+        long orderId = leadOrderInSession();
+        saveItemisedTwoLineDraft(orderId); // retained sum 250 ex
+
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 990, "lines": []}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.lines", hasSize(2)));
+
+        assertMoney("900.00", draftDecimal(orderId, "quote_total_ex_gst"));
+        Assertions.assertEquals(2, lineCount(orderId));
+    }
+
+    @Test
+    void putDraft_nonItemisedBelowCost_usesFinalTotal_notRetainedLines() throws Exception {
+        // Below-cost on a non-itemised save uses the final-derived ex total, never the retained
+        // line sum: cost 80, retained lines ex 100 (fine), final 55 => ex 50 < 80 => 422.
+        long orderId = leadOrderInSession();
+        seedChargeLine(orderId, STORE_SYD_CBD, "100.00", "80.00");
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":1,"unit_price_ex_gst":100,"line_total_ex_gst":100,"sort_order":0}
+                                ]}"""))
+                .andExpect(status().isOk());
+
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 55, "lines": []}"""))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("QUOTE_BELOW_COST"));
+
+        // The rejected save persisted nothing: the draft is still the itemised one, rows intact.
+        Assertions.assertEquals(Boolean.TRUE, draftItemised(orderId));
+        Assertions.assertEquals(1, lineCount(orderId));
+        assertMoney("100.00", draftDecimal(orderId, "quote_total_ex_gst"));
+    }
+
+    @Test
+    void putDraft_nonItemisedGpPercent_fromFinalTotal() throws Exception {
+        // gp_percent on a non-itemised save comes from final_total_inc_gst: ex 100, cost 80 => 20%.
+        long orderId = leadOrderInSession();
+        seedChargeLine(orderId, STORE_SYD_CBD, "100.00", "80.00");
+
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 110, "lines": []}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.gp_percent").value(20.0))
+                .andExpect(jsonPath("$.data.below_cost").value(false));
+    }
+
+    @Test
+    void putDraft_legacyNonItemisedStoredLine_survivesNonItemisedSave_replacedByItemisedSave() throws Exception {
+        // LEGACY TRANSITION (documented accepted edge — dev data only, contract §6.1): a pre-PR2A
+        // non-itemised draft carries a real stored "Quoted works" row. It is structurally
+        // indistinguishable from retained rows (no schema flag; description matching is forbidden),
+        // so a non-itemised save deliberately does NOT delete it — deleting lines on a non-itemised
+        // save would also destroy retained rows on the next autosave after a toggle-OFF. The legacy
+        // row heals on the next ITEMISED save (full line replace).
+        long orderId = leadOrderInSession();
+        long draftId = jdbcTemplate.queryForObject(
+                "INSERT INTO quote_draft (order_id, itemised, quote_total_ex_gst, quote_total_inc_gst) "
+                        + "VALUES (?, FALSE, 500.00, 550.00) RETURNING quote_draft_id",
+                Long.class, orderId);
+        jdbcTemplate.update(
+                "INSERT INTO quote_draft_line "
+                        + "(quote_draft_id, line_type, description, quantity, unit_price_ex_gst, line_total_ex_gst, sort_order) "
+                        + "VALUES (?, 'ITEM', 'Quoted works', 1, 500.00, 500.00, 0)",
+                draftId);
+
+        // A non-itemised save updates the header and leaves the legacy row in place (accepted edge).
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 660, "lines": []}"""))
+                .andExpect(status().isOk());
+        Assertions.assertEquals(1, lineCount(orderId), "legacy row is retained (accepted dev-only edge)");
+        assertMoney("600.00", draftDecimal(orderId, "quote_total_ex_gst"));
+
+        // The next ITEMISED save full-replaces the lines — the legacy row is healed.
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":2,"unit_price_ex_gst":100,"line_total_ex_gst":200,"sort_order":0}
+                                ]}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.lines", hasSize(1)))
+                .andExpect(jsonPath("$.data.lines[0].description").value("Carpet"));
+        Assertions.assertEquals(1, lineCount(orderId));
+        assertMoney("200.00", draftDecimal(orderId, "quote_total_ex_gst"));
     }
 
     // ================================================================
@@ -821,7 +1105,8 @@ class QuoteControllerTest {
     void putDraft_nonItemisedWithLines_returns400() throws Exception {
         long orderId = leadOrderInSession();
 
-        // itemised=false must have an EMPTY lines array — the backend generates the synthetic line.
+        // itemised=false must have an EMPTY lines array — the total is header-only and any
+        // previously persisted itemised rows are retained server-side (Phase 16D-B PR2A).
         mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""
@@ -974,16 +1259,31 @@ class QuoteControllerTest {
     @Test
     void previewPdf_nonItemisedDraft_returns200() throws Exception {
         long orderId = leadOrderInSession();
-        // A non-itemised draft is stored as one synthetic ITEM line; preview renders the single-amount form.
-        long draftId = jdbcTemplate.queryForObject(
-                "INSERT INTO quote_draft (order_id, itemised, quote_total_ex_gst, quote_total_inc_gst) "
-                        + "VALUES (?, FALSE, 500.00, 550.00) RETURNING quote_draft_id",
-                Long.class, orderId);
+        // A non-itemised draft carries its totals on the header (Phase 16D-B PR2A); no lines needed.
         jdbcTemplate.update(
-                "INSERT INTO quote_draft_line "
-                        + "(quote_draft_id, line_type, description, quantity, unit_price_ex_gst, line_total_ex_gst, sort_order) "
-                        + "VALUES (?, 'ITEM', 'Quoted works', 1, 500.00, 500.00, 0)",
-                draftId);
+                "INSERT INTO quote_draft (order_id, itemised, quote_total_ex_gst, quote_total_inc_gst) "
+                        + "VALUES (?, FALSE, 500.00, 550.00)",
+                orderId);
+        entityManager.clear();
+
+        mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(content().contentType(MediaType.APPLICATION_PDF));
+    }
+
+    @Test
+    void previewPdf_nonItemisedDraftWithRetainedLines_returns200() throws Exception {
+        // Retained dormant rows alongside a non-itemised draft (post toggle-OFF state) must not
+        // break the preview; the non-itemised PDF renders the single-amount form from the draft
+        // totals and ignores lines (rendering-level proof lives in QuotePdfGeneratorTest).
+        long orderId = leadOrderInSession();
+        saveItemisedTwoLineDraft(orderId);
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 990, "lines": []}"""))
+                .andExpect(status().isOk());
+        Assertions.assertEquals(2, lineCount(orderId), "retained rows present alongside the non-itemised draft");
         entityManager.clear();
 
         mockMvc.perform(post(previewUrl(orderId)).session(liamStore1Session()))
