@@ -580,6 +580,11 @@ function WorkspaceShell({
                   billingAddress={billingAddress}
                   saleDetails={saleDetails}
                   initialDraft={quoteInitialDraft}
+                  // Codex P2: the quote preview PDF renders the PERSISTED
+                  // sales_order.details_of_sale, so Preview must flush pending
+                  // Details of Sale autosaves first — the same shell-owned
+                  // awaitable flush that gates invoice create/rewrite.
+                  flushDetailsAutosave={flushDetailsAutosave}
                 />
               </div>
             )}

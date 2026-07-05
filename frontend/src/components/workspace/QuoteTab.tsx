@@ -77,6 +77,14 @@ type Props = {
   // (null = confirmed no saved draft). The tab seeds ONCE from this and then owns
   // the live draft state; it is never re-seeded after mount.
   initialDraft: QuoteDraftRead | null
+  // Awaitable flush of any pending/in-flight Details of Sale autosave (lives in
+  // the always-mounted shell — the SAME flush that gates invoice create/rewrite).
+  // Codex P2: the quote preview PDF renders sales_order.details_of_sale from the
+  // PERSISTED order, so Preview must flush pending details edits first or the
+  // screen could show fresh details while the generated PDF shows stale ones.
+  // Resolves true once the latest details draft is persisted; false blocks the
+  // preview.
+  flushDetailsAutosave: () => Promise<boolean>
 }
 
 const MONEY_FORMATTER = new Intl.NumberFormat('en-AU', {
@@ -214,6 +222,7 @@ export function QuoteTab({
   billingAddress,
   saleDetails,
   initialDraft,
+  flushDetailsAutosave,
 }: Props) {
   const [subTab, setSubTab] = useState<QuoteSubTabId>('draft')
 
@@ -558,20 +567,39 @@ export function QuoteTab({
     const tab = window.open('', '_blank')
     setPreviewing(true)
     try {
-      if (!locked && !itemisedReadOnly) {
-        const flush = await flushQuoteAutosave()
-        if (flush !== 'saved') {
+      if (!locked) {
+        // Codex P2: the preview PDF renders sales_order.details_of_sale from
+        // the PERSISTED order, so pending Details of Sale edits must be flushed
+        // BEFORE the quote flush/fetch — otherwise the screen could show fresh
+        // details while the generated PDF shows stale ones. Runs for every
+        // non-locked preview (an itemised read-only draft still renders the
+        // order's details on the PDF). LAID skips it: edits are impossible and
+        // the flush machinery is suppressed anyway.
+        const detailsSaved = await flushDetailsAutosave()
+        if (!detailsSaved) {
           tab?.close()
           if (mountedRef.current) {
             setPreviewError(
-              flush === 'invalid-input'
-                ? 'Enter a valid quote total before previewing the PDF.'
-                : flush === 'changed-during-flush'
-                  ? 'The quote total changed while preparing the preview. Try Preview PDF again.'
-                  : 'The quote could not be saved, so the preview was not opened. Fix the save error and try again.',
+              'Could not save the latest Details of Sale. Fix the details and try again.',
             )
           }
           return
+        }
+        if (!itemisedReadOnly) {
+          const flush = await flushQuoteAutosave()
+          if (flush !== 'saved') {
+            tab?.close()
+            if (mountedRef.current) {
+              setPreviewError(
+                flush === 'invalid-input'
+                  ? 'Enter a valid quote total before previewing the PDF.'
+                  : flush === 'changed-during-flush'
+                    ? 'The quote total changed while preparing the preview. Try Preview PDF again.'
+                    : 'The quote could not be saved, so the preview was not opened. Fix the save error and try again.',
+              )
+            }
+            return
+          }
         }
       }
       const { blob, fileName } = await fetchQuotePreviewPdf(orderIdRef.current)
