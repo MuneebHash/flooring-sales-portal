@@ -1018,6 +1018,22 @@ export function DetailsOfSaleTab({
   const targetGpCostMessage = targetGpCostUnavailableMessage(financialSummary)
   const targetGpControlsDisabled =
     locked || salePriceMutationInFlight || targetGpCostMessage !== null
+  // Codex round 2: the ONLY Create Quote entry normally lives in the action
+  // modal, but the overpaid-rewrite guard makes handleRewriteInvoiceClick
+  // return BEFORE opening that modal — so on an unlocked order with an existing
+  // invoice in the overpaid state, quotes would be unreachable even though
+  // quote creation is independent of rewriting. When (and only when) the modal
+  // is unreachable for exactly that reason, surface an inline Create Quote with
+  // the SAME availability semantics as the modal button. Never on locked orders
+  // (LAID UX unchanged — availability is 'hidden' there anyway when no draft),
+  // never while probing invoiceExists, and never while the modal is open (no
+  // duplicate Create Quote controls).
+  const overpaidInlineQuoteVisible =
+    !locked &&
+    invoiceExists === true &&
+    confirmAction === null &&
+    overpaidRewriteAmounts() !== null &&
+    createQuoteAvailability !== 'hidden'
 
   return (
     <div>
@@ -1329,8 +1345,10 @@ export function DetailsOfSaleTab({
             shows this, but the modal is not always reachable (Rewrite is
             LAID-disabled; the overpaid guard returns before opening), so a
             failed probe must be retryable from here too — otherwise a saved
-            quote could stay hidden for the whole session. */}
-        {createQuoteAvailability === 'error' && (
+            quote could stay hidden for the whole session. Suppressed while the
+            overpaid inline Create Quote block below is showing — that block
+            renders its own Retry for the error state (no duplicate controls). */}
+        {createQuoteAvailability === 'error' && !overpaidInlineQuoteVisible && (
           <div className="mt-2 flex items-center gap-2 sm:justify-end">
             <span className="text-xs font-medium text-amber-700">
               Could not check this order's quote status.
@@ -1343,6 +1361,50 @@ export function DetailsOfSaleTab({
             >
               Retry
             </Button>
+          </div>
+        )}
+
+        {/* Codex round 2: inline Create Quote, shown ONLY while the
+            overpaid-rewrite guard makes the action modal unreachable (see
+            overpaidInlineQuoteVisible). Same availability semantics and the
+            same handler as the modal's Create Quote button — it never opens
+            the modal, never calls create/rewrite invoice, never mutates order
+            pricing. */}
+        {overpaidInlineQuoteVisible && (
+          <div className="mt-2 flex flex-col items-start gap-1.5 sm:items-end">
+            <p className="text-xs text-slate-600">
+              You can still create a quote for this order.
+            </p>
+            <div className="flex items-center gap-2">
+              {createQuoteAvailability === 'error' && (
+                <>
+                  <span className="text-xs font-medium text-amber-700">
+                    Could not check this order's quote status.
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={onRetryQuoteProbe}
+                  >
+                    Retry
+                  </Button>
+                </>
+              )}
+              <Button
+                type="button"
+                variant="secondary"
+                size="md"
+                onClick={handleCreateQuoteClick}
+                disabled={
+                  invoiceActionBusy || createQuoteAvailability !== 'enabled'
+                }
+              >
+                {createQuoteAvailability === 'checking'
+                  ? 'Checking…'
+                  : 'Create Quote'}
+              </Button>
+            </div>
           </div>
         )}
       </div>
