@@ -168,6 +168,30 @@ class QuoteDraftCalculatorTest {
     }
 
     @Test
+    void nonItemised_nonRoundTripFinal_incCarriedVerbatim_notRegrossed() {
+        // Codex fix round 1: the supplied final IS the inc total (§6.1). 4900.00 / 1.10 rounds to
+        // ex 4454.55; re-grossing that would drift the inc to 4900.01. Inc must stay 4900.00.
+        QuoteDraftComputation c = calc.compute(false, List.of(), bd("4900.00"), NO_COST);
+        assertMoney("4454.55", c.quoteTotalExGst());
+        assertMoney("4900.00", c.quoteTotalIncGst());
+
+        // 0.05 / 1.10 rounds to ex 0.05; re-grossing would drift the inc to 0.06. Inc stays 0.05.
+        c = calc.compute(false, List.of(), bd("0.05"), NO_COST);
+        assertMoney("0.05", c.quoteTotalExGst());
+        assertMoney("0.05", c.quoteTotalIncGst());
+    }
+
+    @Test
+    void itemised_incStillRegrossedFromExTotal() {
+        // Itemised paths are untouched by the Codex round-1 fix: a final within the 1c tolerance is
+        // treated as equal to the line sum and inc is still derived ex * 1.10 (110.00, not 110.01).
+        QuoteDraftComputation c = calc.compute(true,
+                List.of(item("Carpet", "1.00", "100.00", 0)), bd("110.01"), NO_COST);
+        assertMoney("100.00", c.quoteTotalExGst());
+        assertMoney("110.00", c.quoteTotalIncGst());
+    }
+
+    @Test
     void nonItemised_finalFarAboveIgnoredLines_neverThrowsExceeds() {
         // QUOTE_TOTAL_EXCEEDS_LINES is itemised-only: a non-itemised final is never validated
         // against lines (supplied or retained). 990 inc over a 10-ex line is accepted.

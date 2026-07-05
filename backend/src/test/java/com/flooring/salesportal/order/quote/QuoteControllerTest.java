@@ -657,6 +657,33 @@ class QuoteControllerTest {
                 .andExpect(jsonPath("$.data.draft.lines", hasSize(0)));
     }
 
+    @Test
+    void putDraft_nonItemisedNonRoundTripFinal_persistsSuppliedIncVerbatim() throws Exception {
+        long orderId = leadOrderInSession();
+
+        // Codex fix round 1: 4900.00 does not round-trip (ex = 4454.55; re-grossing gives 4900.01).
+        // The persisted and returned inc total must be exactly the supplied final (contract §6.1);
+        // only the ex total is derived (HALF_UP 2dp).
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": false, "final_total_inc_gst": 4900.00, "lines": []}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.itemised").value(false))
+                .andExpect(jsonPath("$.data.quote_total_inc_gst").value(4900.00))
+                .andExpect(jsonPath("$.data.quote_total_ex_gst").value(4454.55));
+
+        assertMoney("4454.55", draftDecimal(orderId, "quote_total_ex_gst"));
+        assertMoney("4900.00", draftDecimal(orderId, "quote_total_inc_gst"));
+
+        // The workspace read serves the same verbatim inc total.
+        entityManager.clear();
+        mockMvc.perform(get(workspaceUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.draft.quote_total_inc_gst").value(4900.00))
+                .andExpect(jsonPath("$.data.draft.quote_total_ex_gst").value(4454.55));
+    }
+
     // ================================================================
     // PUT draft — itemised-line retention (Phase 16D-B PR2A, contract §6.1)
     // ================================================================
