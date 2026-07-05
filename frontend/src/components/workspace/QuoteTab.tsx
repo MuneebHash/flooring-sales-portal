@@ -636,6 +636,18 @@ export function QuoteTab({
   const lastSavedBodyRef = useRef<string | null>(initialBaseline(initialDraft))
   const savingRef = useRef(false)
   const pendingBodyRef = useRef<QuoteDraftSaveRequest | null>(null)
+  // Inc-GST total of the LATEST COMPLETE itemised body produced for a save —
+  // sent, queued mid-flight, or skipped-as-unchanged — recorded at the single
+  // build funnel (buildBodyForSave). The toggle-OFF broken-row fallback
+  // prefers this over the last persisted total: while a valid itemised PUT is
+  // still in flight, serverDraftRef is one save STALE, and copying it would
+  // let the queued non-itemised save overwrite the just-saved newer total
+  // (Codex P2: $100→$200 edit autosaves, add an incomplete row, toggle OFF →
+  // the old $110 inc would persist instead of $220). null = no complete
+  // itemised body was built this session. Cannot leak across drafts: the ref
+  // is per instance and OrderWorkspace remounts this tab per order
+  // (key={orderId}); a workspace reload remounts it too.
+  const lastValidItemisedIncRef = useRef<number | null>(null)
   const debounceRef = useRef<number | null>(null)
   // Awaitable single-flight chain (mirrors the shell's details chain) so Preview
   // PDF can flush pending saves and only proceed once the WHOLE queue drained.
@@ -751,13 +763,28 @@ export function QuoteTab({
   // drop a revert-to-baseline edit (type 100, then retype the original before
   // the PUT settles -> the wrong total would persist). The drain compares the
   // queued body against the POST-save baseline and skips unchanged bodies.
-  function requestSave() {
-    if (lockedRef.current) return
+  // The single funnel that builds the current mode-aware body for a SAVE
+  // (autosave/blur via requestSave, preview via flushQuoteAutosave). Records
+  // the inc total of every complete itemised body it produces — derived from
+  // the body's own lines so it is exactly the total that save would persist —
+  // for the toggle-OFF broken-row fallback (see lastValidItemisedIncRef).
+  function buildBodyForSave(): QuoteDraftSaveRequest | null {
     const body = buildDraftBody(
       itemisedRef.current,
       totalInputRef.current,
       rowsRef.current,
     )
+    if (body !== null && body.itemised) {
+      let ex = 0
+      for (const line of body.lines) ex += line.line_total_ex_gst
+      lastValidItemisedIncRef.current = incFromExGst(round2(ex))
+    }
+    return body
+  }
+
+  function requestSave() {
+    if (lockedRef.current) return
+    const body = buildBodyForSave()
     if (body === null) return
     if (savingRef.current) {
       // Collapse to the latest complete body while a PUT is in flight.
@@ -945,20 +972,27 @@ export function QuoteTab({
       // visible sum, and while itemised that partial sum can never persist
       // (the invalid-row save block). A mode flip would convert it into a
       // VALID non-itemised body and silently persist an understated total —
-      // so fall back to the last PERSISTED total instead (the freshest
-      // truthful customer-facing value). Either way the copied total lands in
-      // the editable field where it is fully visible. The partial sum is used
-      // only when nothing was ever persisted (fresh unsaved draft — there is
-      // no truthful persisted value to preserve).
+      // so fall back to a truthful total instead, in freshness order:
+      //   1. the latest COMPLETE itemised body built for save this session
+      //      (lastValidItemisedIncRef) — NOT the persisted draft, which is one
+      //      save STALE while that body's PUT is still in flight (Codex P2:
+      //      copying it would overwrite the just-saved newer total);
+      //   2. the last persisted total, when no complete itemised body was
+      //      built this session;
+      //   3. the partial visible sum, only when nothing was ever persisted
+      //      AND no complete body exists (fresh unsaved draft — there is no
+      //      truthful value to preserve).
+      // Either way the copied total lands in the editable field where it is
+      // fully visible.
       const currentRows = rowsRef.current
       const rowsBroken = currentRows.some(
         (row) => parseEditorRow(row, 0) === null,
       )
-      const draft = serverDraftRef.current
-      const incTotal =
-        rowsBroken && draft !== null
-          ? draft.quote_total_inc_gst
-          : computeItemisedTotals(currentRows).inc
+      const incTotal = rowsBroken
+        ? (lastValidItemisedIncRef.current ??
+          serverDraftRef.current?.quote_total_inc_gst ??
+          computeItemisedTotals(currentRows).inc)
+        : computeItemisedTotals(currentRows).inc
       const totalStr = toFixed2(incTotal)
       totalInputRef.current = totalStr
       setTotalInput(totalStr)
@@ -1020,11 +1054,7 @@ export function QuoteTab({
     'saved' | 'invalid-input' | 'changed-during-flush' | 'save-failed'
   > {
     clearDebounce()
-    const startBody = buildDraftBody(
-      itemisedRef.current,
-      totalInputRef.current,
-      rowsRef.current,
-    )
+    const startBody = buildBodyForSave()
     if (startBody === null) return 'invalid-input'
     const startJson = JSON.stringify(startBody)
     if (savingRef.current) {
