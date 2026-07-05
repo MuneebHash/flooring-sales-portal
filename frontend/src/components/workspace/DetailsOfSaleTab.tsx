@@ -68,7 +68,23 @@ type Props = {
   // always-mounted shell) can switch to the Invoice tab, where the new/rewritten
   // invoice mounts + refetches and is shown immediately. Not invoked on failure.
   onInvoiceReady: () => void
+  // Phase 16D-B: whether the action modal may offer Create Quote. Owned by the
+  // shell (it runs the quote-workspace probe): 'hidden' once the Quote tab
+  // exists for this order; 'checking' while the probe is unresolved; 'error'
+  // when it failed (STRICT rule: never treat a failed probe as "no quote
+  // exists" — the option stays disabled with a retry); 'enabled' only after the
+  // probe confirmed no saved draft.
+  createQuoteAvailability: CreateQuoteAvailability
+  // Reveals the Quote tab + switches to it (shell-owned). Never creates or
+  // rewrites an invoice and never mutates order pricing.
+  onCreateQuote: () => void
+  // Re-runs the shell's quote-workspace probe after a failure.
+  onRetryQuoteProbe: () => void
 }
+
+// Phase 16D-B: Create Quote availability in the invoice action modal (see the
+// prop docs above). Exported so OrderWorkspace shares the exact union.
+export type CreateQuoteAvailability = 'hidden' | 'checking' | 'error' | 'enabled'
 
 // Local form mirror of the five details-of-sale fields. lay_date_status keeps the
 // empty-string "no selection" state of the <select>; it normalises to null at
@@ -442,6 +458,9 @@ export function DetailsOfSaleTab({
   detailsAutosaveSaved,
   detailsAutosaveError,
   onInvoiceReady,
+  createQuoteAvailability,
+  onCreateQuote,
+  onRetryQuoteProbe,
 }: Props) {
   const [errors, setErrors] = useState<Record<string, string>>({})
 
@@ -886,14 +905,25 @@ export function DetailsOfSaleTab({
     }
   }
 
-  // Create: confirm only when the GP warning is active; otherwise create directly.
+  // Create: ALWAYS opens the action modal (Phase 16D-B, doc-locked — the button
+  // no longer creates directly). The modal carries the GP warning when active
+  // and offers Create Quote while no quote exists for this order; confirming
+  // runs the unchanged runCreateInvoice. Deliberately does NOT clear
+  // invoiceActionError/invoicePreconditions here (unlike the rewrite click): a
+  // visible precondition checklist must survive an open-then-cancel so the user
+  // can still fix the listed items; runCreateInvoice clears both on confirm.
   function handleCreateInvoiceClick() {
     if (invoiceActionBusy || invoiceExists === null) return
-    if (gpWarning) {
-      setConfirmAction('create')
-      return
-    }
-    void runCreateInvoice()
+    setConfirmAction('create')
+  }
+
+  // Phase 16D-B: Create Quote from the action modal. Closes the modal and hands
+  // off to the shell (reveal Quote tab + switch). No invoice call, no order
+  // mutation. Only actionable once the quote probe confirmed no saved draft.
+  function handleCreateQuoteClick() {
+    if (invoiceActionBusy || createQuoteAvailability !== 'enabled') return
+    setConfirmAction(null)
+    onCreateQuote()
   }
 
   // Rewrite: ALWAYS confirm (it regenerates the invoice and makes the changes
@@ -988,6 +1018,22 @@ export function DetailsOfSaleTab({
   const targetGpCostMessage = targetGpCostUnavailableMessage(financialSummary)
   const targetGpControlsDisabled =
     locked || salePriceMutationInFlight || targetGpCostMessage !== null
+  // Codex round 2: the ONLY Create Quote entry normally lives in the action
+  // modal, but the overpaid-rewrite guard makes handleRewriteInvoiceClick
+  // return BEFORE opening that modal — so on an unlocked order with an existing
+  // invoice in the overpaid state, quotes would be unreachable even though
+  // quote creation is independent of rewriting. When (and only when) the modal
+  // is unreachable for exactly that reason, surface an inline Create Quote with
+  // the SAME availability semantics as the modal button. Never on locked orders
+  // (LAID UX unchanged — availability is 'hidden' there anyway when no draft),
+  // never while probing invoiceExists, and never while the modal is open (no
+  // duplicate Create Quote controls).
+  const overpaidInlineQuoteVisible =
+    !locked &&
+    invoiceExists === true &&
+    confirmAction === null &&
+    overpaidRewriteAmounts() !== null &&
+    createQuoteAvailability !== 'hidden'
 
   return (
     <div>
@@ -1294,11 +1340,81 @@ export function DetailsOfSaleTab({
             )}
           </div>
         )}
+
+        {/* Phase 16D-B: inline quote-probe failure notice. The action modal also
+            shows this, but the modal is not always reachable (Rewrite is
+            LAID-disabled; the overpaid guard returns before opening), so a
+            failed probe must be retryable from here too — otherwise a saved
+            quote could stay hidden for the whole session. Suppressed while the
+            overpaid inline Create Quote block below is showing — that block
+            renders its own Retry for the error state (no duplicate controls). */}
+        {createQuoteAvailability === 'error' && !overpaidInlineQuoteVisible && (
+          <div className="mt-2 flex items-center gap-2 sm:justify-end">
+            <span className="text-xs font-medium text-amber-700">
+              Could not check this order's quote status.
+            </span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={onRetryQuoteProbe}
+            >
+              Retry
+            </Button>
+          </div>
+        )}
+
+        {/* Codex round 2: inline Create Quote, shown ONLY while the
+            overpaid-rewrite guard makes the action modal unreachable (see
+            overpaidInlineQuoteVisible). Same availability semantics and the
+            same handler as the modal's Create Quote button — it never opens
+            the modal, never calls create/rewrite invoice, never mutates order
+            pricing. */}
+        {overpaidInlineQuoteVisible && (
+          <div className="mt-2 flex flex-col items-start gap-1.5 sm:items-end">
+            <p className="text-xs text-slate-600">
+              You can still create a quote for this order.
+            </p>
+            <div className="flex items-center gap-2">
+              {createQuoteAvailability === 'error' && (
+                <>
+                  <span className="text-xs font-medium text-amber-700">
+                    Could not check this order's quote status.
+                  </span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={onRetryQuoteProbe}
+                  >
+                    Retry
+                  </Button>
+                </>
+              )}
+              <Button
+                type="button"
+                variant="secondary"
+                size="md"
+                onClick={handleCreateQuoteClick}
+                disabled={
+                  invoiceActionBusy || createQuoteAvailability !== 'enabled'
+                }
+              >
+                {createQuoteAvailability === 'checking'
+                  ? 'Checking…'
+                  : 'Create Quote'}
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
 
-      {/* Create / Rewrite confirmation. Rewrite ALWAYS confirms; Create confirms
-          only when the GP warning is active. The GP warning, when active, is shown
-          here so the user explicitly accepts the below-threshold price. FRONTEND
+      {/* Invoice ACTION modal (Phase 16D-B): both Create and Rewrite now ALWAYS
+          confirm here. The GP warning, when active, is shown so the user
+          explicitly accepts the below-threshold price — it never removes or
+          blocks Create Quote. While no quote exists for this order the modal
+          also offers Create Quote (a separate sibling action — the
+          create/rewrite confirm flow itself is unchanged). FRONTEND
           confirmation only — it does not change backend behaviour. */}
       <Modal
         open={confirmAction !== null}
@@ -1330,6 +1446,50 @@ export function DetailsOfSaleTab({
             <p className="mt-3 text-sm font-semibold text-red-600">
               Manager approval required before proceeding with this invoice.
             </p>
+          )}
+
+          {/* Phase 16D-B: Create Quote — offered only while the Quote tab does
+              not exist for this order ('hidden' otherwise). Disabled while the
+              quote probe is unresolved or failed (never "safely available" on a
+              failed probe), and NOT gated on the GP warning. */}
+          {createQuoteAvailability !== 'hidden' && (
+            <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50/60 px-4 py-3">
+              <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
+                <p className="text-xs text-slate-600 leading-relaxed">
+                  Want to quote the customer first? A quote is separate from the
+                  invoice and does not change the order.
+                </p>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="md"
+                  onClick={handleCreateQuoteClick}
+                  disabled={
+                    invoiceActionBusy || createQuoteAvailability !== 'enabled'
+                  }
+                  className="shrink-0"
+                >
+                  {createQuoteAvailability === 'checking'
+                    ? 'Checking…'
+                    : 'Create Quote'}
+                </Button>
+              </div>
+              {createQuoteAvailability === 'error' && (
+                <div className="mt-2 flex items-center gap-2">
+                  <p className="text-xs font-medium text-amber-700">
+                    Could not check this order's quote status.
+                  </p>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={onRetryQuoteProbe}
+                  >
+                    Retry
+                  </Button>
+                </div>
+              )}
+            </div>
           )}
 
           <div className="mt-6 flex justify-end gap-2">
