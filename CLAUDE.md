@@ -54,12 +54,9 @@ Phase 16A (invoice presentation foundation) is COMPLETE on main:
     page 2 (SOFT and HARD); footer renders exactly once with or without terms. Template-only.
   Phase 16A added NO migration (still V1–V15) and NO production Java in PR3.
 
-Current focus: Phase 16B — Quotation PDF / quote sending. See docs/Phases.md §7/§9.
+Current focus: Phase 16E — Quote delivery planning / send quote by email/SMS. See docs/Phases.md §7/§9.
 
-Phase 16B scope is NOT locked. Before any branch: decide the quote model
-  (separate versioned entity vs draft-invoice view vs new model), then lock the API contract
-  (openapi.yaml + contract docs) FIRST. The quote PDF may reuse the Aire Compact document style
-  but must NOT reuse invoice acceptance/signature/payment rules blindly. Scope and contract first.
+Phase 16B–16D-C quotation foundation is complete on main: quote contract, backend quote draft/workspace/preview PDF, frontend Quote tab, itemised quote editor, retained itemised rows, and acceptance-ready quotation PDF. Next scope must not mix delivery with remote acceptance: 16E is send/email/SMS + issued customer quote; 16F is public signing/accepted quote/create invoice from accepted quote.
 
 Roadmap: 16 Quotation PDF · 17 Deploy & Hardening · 18 Revamp/app chrome · 19 Final audit gate
   (full roadmap in docs/Phases.md §7).

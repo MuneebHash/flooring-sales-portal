@@ -22,7 +22,7 @@
 
 Phase 16A finished the invoice presentation (Aire Compact PDF). Phase 16B specifies the **quotation feature**: a salesperson builds a customer-facing quote on an order, sends it by email/SMS as a secure link, the customer opens it on their phone, signs it remotely, the store is notified, and the salesperson converts the accepted quote into an invoice without the customer re-signing.
 
-A quote is **not** an invoice and must not be hacked into the invoice flow. It has its own tables, its own statuses, its own versioning, and its own public signing surface. It **reuses** the Aire Compact document style (title `QUOTE`, not `TAX INVOICE`) and the existing `stored_file` / `FileStorageService` / email mechanisms.
+A quote is **not** an invoice and must not be hacked into the invoice flow. It has its own tables, its own statuses, its own versioning, and its own public signing surface. It **reuses** the Aire Compact document style (title `QUOTATION`, not `TAX INVOICE`) and the existing `stored_file` / `FileStorageService` / email mechanisms.
 
 Concretely, Phase 16B adds:
 - An **editable quote draft** per order (itemised or non-itemised customer-facing lines, distinct from the order's product/charge lines).
@@ -38,7 +38,7 @@ Phase 16B is the **planning + contract lock**. 16C builds the backend, 16D the s
 ## 2. MVP scope (included)
 
 - **One quote per order**, versioned and append-only at the issued layer (mirrors the invoice append-only model).
-- **Editable draft** (`quote_draft`, one row per order) with customer-facing **quote lines** (`quote_draft_line`). Itemised mode copies product/charge lines into editable quote lines; the salesperson may edit quote-line description / quantity / unit price / line total and add **adjustment** lines (±). Non-itemised mode shows a single quoted amount + details-of-sale text, no line breakdown. Itemised draft lines are **retained (dormant)** while the draft is non-itemised — see §6.1 (amended Phase 16D-B PR2A).
+- **Editable draft** (`quote_draft`, one row per order) with customer-facing **quote lines** (`quote_draft_line`). Itemised mode copies product/charge lines into editable quote lines; the salesperson may edit quote-line description / quantity / unit price / line total and add **adjustment** lines (±). Non-itemised mode shows the quote total + details-of-sale text, no line breakdown and no filler "Quoted Works" section. Itemised draft lines are **retained (dormant)** while the draft is non-itemised — see §6.1 (amended Phase 16D-B PR2A).
 - **Quote lines never mutate the order's product/charge lines.** The product/charge lines remain the operational/costing record; quote lines are customer-facing presentation only.
 - **Money model (locked):** in **itemised** mode the quote total = the sum of quote lines; in **non-itemised** mode the quote total = `final_total_inc_gst` carried on the draft header, with **no synthetic line** (amended Phase 16D-B PR2A — see §6.1). The quote draft is **independent of the order sale price** — saving a draft does **not** change the order's sale-price override or header financials (see §6). The **accepted quote snapshot is the legal billing number** (see §6).
 - **Total rules (itemised mode only):** reducing the final total directly auto-inserts a negative **adjustment** line to balance; the final total may not be set **above** the line sum (must raise a line or add a positive line, else 422); adjustments are customer-facing. A non-itemised `final_total_inc_gst` is **never** validated against lines (§6.1).
@@ -253,7 +253,7 @@ Upsert the editable draft (itemised flag, lines, adjustments). An **itemised** s
 #### POST `/api/v1/{slug}/orders/{orderId}/quote/preview-pdf`
 On-demand **draft** preview PDF. **Not stored.**
 - **200** `application/pdf`, `Content-Disposition: inline; filename="quote-preview-{order_number}.pdf"`.
-- Aire Compact style, title `QUOTE`, shows draft lines/total + selected per-type terms.
+- Aire Compact style, title `QUOTATION`, shows draft lines/total, selected per-type terms, the display-only 40% deposit line, and the printable declaration/customer acceptance area.
 - **LAID:** allowed (read-only render). Below-cost does **not** block a draft *preview* (only save/send/accept block).
 
 #### POST `/api/v1/{slug}/orders/{orderId}/quote/send-email`
@@ -369,7 +369,7 @@ Stream the **issued** PDF to the customer **only while the link is `ACTIVE`**. C
 - **Draft preview** (`preview-pdf`) is generated **on-demand and not stored**.
 - **Issued PDF** is generated and **stored immutably** when a quote is sent (`issued_pdf_file_id`).
 - **Signed PDF** is generated and **stored immutably** on acceptance (`signed_pdf_file_id`); it is served **only** in the protected portal (Accepted Quote tab / `GET …/quote/pdf?type=accepted`). It is **never** served on the public surface — the public link is dead once signed.
-- All quote PDFs reuse the **Aire Compact** document style with title **`QUOTE`** (not `TAX INVOICE`), itemised columns (description / quantity / unit price / amount) in itemised mode, or a single quoted amount + details-of-sale text in non-itemised mode (dormant retained draft lines are never rendered on a non-itemised quote PDF — §6.1), plus the frozen per-type terms (page 2, single column — same openhtmltopdf constraints as the invoice; tables/conservative CSS only; numeric entities, not named ones).
+- All quote PDFs reuse the **Aire Compact** document style with title **`QUOTATION`** (not `TAX INVOICE`), itemised columns (description / quantity / unit price / amount) in itemised mode, or a totals-only non-itemised presentation with details-of-sale text and no filler line section (dormant retained draft lines are never rendered on a non-itemised quote PDF — §6.1), plus a display-only 40% deposit line, printable declaration/customer acceptance area, and the frozen per-type terms (page 2, single column — same openhtmltopdf constraints as the invoice; tables/conservative CSS only; numeric entities, not named ones).
 - The signed PDF embeds the signature image + accepted customer name + accepted timestamp (mirrors the invoice signed PDF).
 
 ---

@@ -317,7 +317,7 @@ Footguns — must not break:
          token model, expiry, rate limiting, NO logged-in session, public read-only surface.
          Must NOT reuse or weaken the HttpSession auth model. DESIGNED in 16B, built in 16E/16F.
       6. PDF / EMAIL / SMS / SIGNATURE / INVOICE-CONVERSION rules:
-         - quote PDF reuses the Aire Compact document style, title "QUOTE" (DISTINCT from invoice).
+         - quote PDF reuses the Aire Compact document style, title "QUOTATION" (DISTINCT from invoice; retitled in 16D-C).
          - delivery channels (email and/or SMS via Twilio) — lock exact channel rules here.
          - signature/acceptance rules — do NOT reuse invoice acceptance/signature/payment rules blindly.
          - invoice-conversion + signature-inheritance rules: does the accepted quote signature carry
