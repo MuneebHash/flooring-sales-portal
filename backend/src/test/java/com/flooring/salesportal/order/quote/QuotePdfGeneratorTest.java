@@ -12,14 +12,19 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
+import java.util.regex.Pattern;
 
 /**
- * DB-free unit test for {@link QuotePdfGenerator} (Phase 16C PR2). Exercises the real Thymeleaf
- * template ({@code templates/quote.html}) + openhtmltopdf-pdfbox pipeline end-to-end. Asserts the
- * output is a valid PDF (the {@code %PDF-} magic header) AND — via PDFBox text extraction — that the
- * quote model values render and that NO invoice semantics (TAX INVOICE / Payment Made / Balance Due /
- * Customer Acceptance / signature) appear. Guards against a malformed (non-XML-well-formed) template,
- * a missing PDF dependency, or a broken variable binding.
+ * DB-free unit test for {@link QuotePdfGenerator} (Phase 16C PR2, extended Phase 16D-C). Exercises
+ * the real Thymeleaf template ({@code templates/quote.html}) + openhtmltopdf-pdfbox pipeline
+ * end-to-end. Asserts the output is a valid PDF (the {@code %PDF-} magic header) AND — via PDFBox
+ * text extraction — that the quote model values render, that the document reads as a QUOTATION
+ * (16D-C: title/recipient wording, deposit line, blank invoice-style "Customer Acceptance" area
+ * adapted invoice-to-quotation), and that NO invoice-only semantics (TAX INVOICE / Invoice To /
+ * Payment Made / Balance Due / Accepted by / "of this invoice" / "value shown on this invoice")
+ * appear. The Customer Acceptance heading and the "Customer signature" caption are deliberately
+ * SHARED with the invoice document (16D-C fix round 2). Guards against a malformed
+ * (non-XML-well-formed) template, a missing PDF dependency, or a broken variable binding.
  */
 class QuotePdfGeneratorTest {
 
@@ -143,16 +148,37 @@ class QuotePdfGeneratorTest {
                 "output must begin with the PDF magic header");
     }
 
-    /** Every quote render must read as a QUOTE and carry NONE of the invoice-only semantics. */
+    // Word-boundary regexes (Phase 16D-C): "QUOTATION".contains("QUOTE") is true, so plain contains()
+    // could pass silently against a stale QUOTE title. \bQUOTE\b matches a standalone QUOTE word only
+    // (not QUOTATION / QUOTED), and \bQUOTATION\b requires the real retitled document.
+    private static final Pattern STANDALONE_QUOTATION = Pattern.compile("\\bQUOTATION\\b");
+    private static final Pattern STANDALONE_QUOTE = Pattern.compile("\\bQUOTE\\b");
+
+    /**
+     * Every quote render must read as a QUOTATION and carry NONE of the invoice-only semantics.
+     * 16D-C fix round 2: the "Customer Acceptance" heading and the "Customer signature" caption are
+     * legitimately SHARED with the invoice document (the quote mirrors the invoice acceptance idiom),
+     * so they are NOT banned here. What stays banned is everything invoice-only: TAX INVOICE,
+     * Invoice To, Payment Made, Balance Due, "Accepted by" (accepted-state caption), and the
+     * invoice-specific declaration fragments "of this invoice" / "value shown on this invoice".
+     * The recipient label is CSS-uppercased, so PDFBox extracts it as "QUOTATION TO".
+     */
     private static void assertQuoteNotInvoice(String text) {
-        Assertions.assertTrue(text.contains("QUOTE"), () -> "missing QUOTE title in: " + text);
+        Assertions.assertTrue(STANDALONE_QUOTATION.matcher(text).find(),
+                () -> "missing standalone QUOTATION title in: " + text);
+        Assertions.assertFalse(STANDALONE_QUOTE.matcher(text).find(),
+                () -> "standalone QUOTE word must no longer appear: " + text);
+        Assertions.assertTrue(text.contains("QUOTATION TO"), () -> "missing Quotation To block in: " + text);
+        Assertions.assertFalse(text.contains("QUOTE TO"), () -> "stale Quote To block in: " + text);
         Assertions.assertFalse(text.contains("TAX INVOICE"), () -> "quote must not say TAX INVOICE: " + text);
+        Assertions.assertFalse(text.toUpperCase().contains("INVOICE TO"), () -> "quote must not say Invoice To: " + text);
         Assertions.assertFalse(text.contains("Payment Made"), () -> "quote must not show Payment Made: " + text);
         Assertions.assertFalse(text.contains("Balance Due"), () -> "quote must not show Balance Due: " + text);
-        Assertions.assertFalse(text.toUpperCase().contains("CUSTOMER ACCEPTANCE"),
-                () -> "quote must not show acceptance: " + text);
-        Assertions.assertFalse(text.contains("Customer signature"), () -> "quote must not show signature line: " + text);
-        Assertions.assertFalse(text.contains("Accepted by"), () -> "quote must not show acceptance text: " + text);
+        Assertions.assertFalse(text.contains("Accepted by"), () -> "quote must not show invoice acceptance text: " + text);
+        Assertions.assertFalse(text.contains("of this invoice"),
+                () -> "invoice declaration wording leaked into the quote: " + text);
+        Assertions.assertFalse(text.contains("value shown on this invoice"),
+                () -> "invoice agreement wording leaked into the quote: " + text);
     }
 
     @Test
@@ -198,7 +224,9 @@ class QuotePdfGeneratorTest {
     }
 
     @Test
-    void render_nonItemised_rendersSingleAmount_noLineTableHeader() throws IOException {
+    void render_nonItemised_noLineTable_showsTotalsDepositAndAcceptance() throws IOException {
+        // Phase 16D-C removed the filler "Quoted Works" block: a non-itemised quotation is
+        // customer/details/totals/deposit/acceptance/terms — no line table and no fake section.
         M m = new M();
         m.itemised = false;
         m.lines = new ArrayList<>();
@@ -209,10 +237,16 @@ class QuotePdfGeneratorTest {
 
         String text = extractText(pdf).replaceAll("\\s+", " ");
         assertQuoteNotInvoice(text);
-        // The .sec-h heading is uppercased by CSS text-transform (PDFBox extracts it uppercased).
-        Assertions.assertTrue(text.toUpperCase().contains("QUOTED WORKS"), () -> "missing non-itemised heading in: " + text);
+        Assertions.assertFalse(text.toUpperCase().contains("QUOTED WORKS"),
+                () -> "stale Quoted Works heading must be gone: " + text);
+        Assertions.assertFalse(text.contains("A single quoted amount"),
+                () -> "stale single-amount filler sentence must be gone: " + text);
         Assertions.assertFalse(text.contains("Qty"), () -> "non-itemised quote must not render the line-table header: " + text);
         Assertions.assertTrue(noSpace(text).contains("550.00"), () -> "missing inc-GST total in: " + text);
+        Assertions.assertTrue(noSpace(text).contains("$220.00"),
+                () -> "missing 40% deposit (550.00 x 0.40) in: " + text);
+        Assertions.assertTrue(text.contains("CUSTOMER ACCEPTANCE"),
+                () -> "missing acceptance section in: " + text);
     }
 
     @Test
@@ -237,6 +271,114 @@ class QuotePdfGeneratorTest {
         Assertions.assertFalse(noSpace(text).contains("200.00"), () -> "retained line amount leaked into the PDF: " + text);
         Assertions.assertTrue(noSpace(text).contains("990.00"), () -> "missing header-derived inc-GST total in: " + text);
         Assertions.assertTrue(noSpace(text).contains("900.00"), () -> "missing header-derived ex-GST subtotal in: " + text);
+        // Phase 16D-C: the deposit must come from the header total too (990.00 x 0.40), never from lines.
+        Assertions.assertTrue(noSpace(text).contains("$396.00"),
+                () -> "missing header-derived 40% deposit in: " + text);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 16D-C — QUOTATION wording, 40% deposit, acceptance/signing area
+    // ------------------------------------------------------------------
+
+    @Test
+    void render_titleAndRecipient_useQuotationWording() throws IOException {
+        byte[] pdf = GENERATOR.render(new M().build());
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        Assertions.assertTrue(STANDALONE_QUOTATION.matcher(text).find(),
+                () -> "missing standalone QUOTATION in: " + text);
+        Assertions.assertFalse(STANDALONE_QUOTE.matcher(text).find(),
+                () -> "standalone QUOTE word must no longer appear: " + text);
+        // The recipient eyebrow is CSS-uppercased, so PDFBox extracts "QUOTATION TO".
+        Assertions.assertTrue(text.contains("QUOTATION TO"), () -> "missing Quotation To label in: " + text);
+        Assertions.assertFalse(text.contains("QUOTE TO"), () -> "stale Quote To label in: " + text);
+        Assertions.assertFalse(text.toUpperCase().contains("QUOTED WORKS"),
+                () -> "stale Quoted Works heading in: " + text);
+        Assertions.assertFalse(text.contains("A single quoted amount"),
+                () -> "stale single-amount filler sentence in: " + text);
+    }
+
+    @Test
+    void render_itemised_showsDeposit40PercentOfIncTotal() throws IOException {
+        // Default itemised model: inc total 244.20 -> deposit 244.20 x 0.40 = 97.68. The sentence
+        // wraps the amount: "A deposit of $97.68 is required to proceed with this quotation."
+        byte[] pdf = GENERATOR.render(new M().build());
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        Assertions.assertTrue(text.contains("A deposit of"),
+                () -> "missing deposit sentence lead in: " + text);
+        Assertions.assertTrue(text.contains("is required to proceed with this quotation."),
+                () -> "missing deposit sentence tail in: " + text);
+        Assertions.assertTrue(noSpace(text).contains("$97.68"),
+                () -> "missing 40% deposit amount (244.20 x 0.40) in: " + text);
+    }
+
+    @Test
+    void render_deposit_roundsHalfUpTo2dp() throws IOException {
+        // 100.99 x 0.40 = 40.396 -> HALF_UP 2dp -> $40.40 (a truncating implementation shows $40.39).
+        M m = new M();
+        m.itemised = false;
+        m.lines = new ArrayList<>();
+        m.quoteTotalExGst = bd("91.81");
+        m.quoteTotalIncGst = bd("100.99");
+        byte[] pdf = GENERATOR.render(m.build());
+        String text = noSpace(extractText(pdf));
+        Assertions.assertTrue(text.contains("$40.40"), () -> "missing HALF_UP-rounded deposit in: " + text);
+        Assertions.assertFalse(text.contains("40.39"), () -> "deposit was truncated, not rounded HALF_UP: " + text);
+    }
+
+    @Test
+    void render_acceptanceSection_rendersAcceptanceWordingAndBlankSignatureLine() throws IOException {
+        // 16D-C fix round 2: the acceptance section mirrors the invoice's two-column idiom — the
+        // invoice-tab wording adapted invoice-to-quotation on the left, one blank signature line with
+        // the shared "Customer signature" caption on the right. No name/date fields, no accepted state.
+        byte[] pdf = GENERATOR.render(new M().build());
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        assertQuoteNotInvoice(text);
+
+        // Section heading (.sec-h is CSS-uppercased on extraction) — deliberately the invoice heading.
+        Assertions.assertTrue(text.contains("CUSTOMER ACCEPTANCE"),
+                () -> "missing Customer Acceptance heading in: " + text);
+        // The five acceptance lines, verbatim (sentence-case, never CSS-uppercased; ’ = curly
+        // apostrophe, template entity &#8217;). The intro is compared whitespace-stripped because
+        // PDFBox injects a stray space after the ’ glyph ("customer’ s") on extraction.
+        Assertions.assertTrue(
+                noSpace(text).contains(noSpace(
+                        "Furniture removal and replacement, take up of old floor coverings, floor preparation "
+                        + "and adjustment of door heights are the customer’s responsibility unless otherwise stated above.")),
+                () -> "missing responsibility intro sentence in: " + text);
+        Assertions.assertTrue(text.contains("I agree to pay the balance before the installation date."),
+                () -> "missing balance checkbox line in: " + text);
+        Assertions.assertTrue(
+                text.contains("I agree that no floor preparation costs are included unless otherwise stated above."),
+                () -> "missing floor-preparation checkbox line in: " + text);
+        Assertions.assertTrue(
+                text.contains("This agreement is for the sale and installation of the goods described above at the "
+                        + "value shown on this quotation and upon the terms and conditions stated herein."),
+                () -> "missing agreement sentence in: " + text);
+        Assertions.assertTrue(text.contains("I accept the terms and conditions of this quotation."),
+                () -> "missing acceptance sentence in: " + text);
+        // Blank signing line caption (shared with the invoice); no accepted-state text ever.
+        Assertions.assertTrue(text.contains("Customer signature"),
+                () -> "missing Customer signature caption in: " + text);
+        Assertions.assertFalse(text.contains("Accepted by"),
+                () -> "blank quote acceptance must not show Accepted by: " + text);
+    }
+
+    @Test
+    void render_footer_saysQuotation_withBusinessName() throws IOException {
+        byte[] pdf = GENERATOR.render(new M().build());
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        // 16D-C fix round 5: the footer carries the business name ("Generated by <business name> ·
+        // Quotation · GST included where applicable"). The name is an inline span, which PDFBox may
+        // emit out of visual order, so the footer is asserted by its stable fragments; the
+        // name-in-footer itself is proven by the logo test (where the header name is suppressed and
+        // the footer is the only occurrence). · = the footer's middle dot (template entity &#183;).
+        Assertions.assertTrue(text.contains("Generated by"), () -> "missing footer lead in: " + text);
+        Assertions.assertTrue(text.contains("Quotation · GST included where applicable"),
+                () -> "footer must carry the Quotation document word: " + text);
+        Assertions.assertFalse(text.contains("the Flooring Sales Portal"),
+                () -> "footer must use the business name, not the generic fallback: " + text);
+        Assertions.assertEquals(1, countOccurrences(text, "GST included where applicable"),
+                () -> "footer must render exactly once: " + text);
     }
 
     @Test
@@ -278,7 +420,8 @@ class QuotePdfGeneratorTest {
         String text = extractText(pdf).replaceAll("\\s+", " ");
         Assertions.assertEquals(1, pageCount(pdf), "no terms -> single page (no terms page created)");
         Assertions.assertFalse(text.contains("TERMS"), "no terms -> no terms heading");
-        Assertions.assertEquals(1, countOccurrences(text, "Generated by the Flooring Sales Portal"),
+        // Count anchor is the stable footer tail (the lead now carries the tenant business name).
+        Assertions.assertEquals(1, countOccurrences(text, "GST included where applicable"),
                 () -> "footer must render exactly once when there are no terms: " + text);
     }
 
@@ -288,11 +431,12 @@ class QuotePdfGeneratorTest {
         m.termsHtml = "<p>Some quote terms apply.</p>";
         byte[] pdf = GENERATOR.render(m.build());
         String text = extractText(pdf).replaceAll("\\s+", " ");
-        Assertions.assertEquals(1, countOccurrences(text, "Generated by the Flooring Sales Portal"),
+        // Count anchor is the stable footer tail (the lead now carries the tenant business name).
+        Assertions.assertEquals(1, countOccurrences(text, "GST included where applicable"),
                 () -> "footer must render exactly once when terms exist (no duplicate): " + text);
         Assertions.assertEquals(2, pageCount(pdf), "terms exist -> terms on a dedicated second page");
         String page2 = extractPageText(pdf, 2).replaceAll("\\s+", " ");
-        Assertions.assertTrue(page2.contains("Generated by the Flooring Sales Portal"),
+        Assertions.assertTrue(page2.contains("GST included where applicable"),
                 () -> "footer must appear on the terms page: " + page2);
     }
 
@@ -325,14 +469,22 @@ class QuotePdfGeneratorTest {
     }
 
     @Test
-    void render_withLogoDataUri_embedsLogoImage_andSuppressesBusinessNameText() throws IOException {
+    void render_withLogoDataUri_embedsLogoImage_suppressesHeaderName_keepsAbnAndFooterName() throws IOException {
+        // The user-facing demo scenario: tenant logo + ABN. The logo replaces the header business-name
+        // text, but the ABN line under the logo and the business name in the footer must still render.
         M m = new M();
         m.logoDataUri = ONE_PIXEL_PNG_DATA_URI;
+        m.abn = "11 222 333 444";
         byte[] pdf = GENERATOR.render(m.build());
         assertPdfHeader(pdf);
         Assertions.assertTrue(countImages(pdf) >= 1, "logo data URI must embed an image");
-        Assertions.assertFalse(extractText(pdf).contains("Aussie Floors Group"),
-                "plain business name should be suppressed when a logo is present");
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        // Header mark suppressed -> the footer is the ONLY occurrence of the business name.
+        Assertions.assertEquals(1, countOccurrences(text, "Aussie Floors Group"),
+                () -> "with a logo the business name must appear exactly once (the footer): " + text);
+        // ABN regression guard (16D-C fix round 5): label + value, whitespace-insensitive.
+        Assertions.assertTrue(noSpace(text).contains("ABN11222333444"),
+                () -> "missing ABN line under the logo: " + text);
     }
 
     @Test
@@ -362,7 +514,9 @@ class QuotePdfGeneratorTest {
         assertPdfHeader(pdf);
 
         String text = extractText(pdf).replaceAll("\\s+", " ");
-        Assertions.assertTrue(text.contains("11 222 333 444"), () -> "missing ABN: " + text);
+        // ABN regression guard (16D-C fix round 5): assert the label AND the value render together.
+        Assertions.assertTrue(noSpace(text).contains("ABN11222333444"),
+                () -> "missing ABN label/value: " + text);
         Assertions.assertTrue(text.contains("Sydney CBD"), () -> "missing store name: " + text);
         Assertions.assertTrue(text.contains("Liam Carter"), () -> "missing salesperson: " + text);
         Assertions.assertTrue(text.contains("Example Bank"), () -> "missing bank name: " + text);

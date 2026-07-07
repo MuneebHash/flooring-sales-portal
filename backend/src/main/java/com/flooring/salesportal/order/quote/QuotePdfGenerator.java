@@ -40,6 +40,11 @@ public class QuotePdfGenerator {
     private static final Locale DISPLAY_LOCALE = Locale.ENGLISH;
     private static final int MONEY_SCALE = 2;
 
+    // Phase 16D-C: hardcoded, display-only deposit — 40% of the inc-GST total for every tenant/store
+    // (no tenant config). Render-time math only: never persisted, never in any API body; rounded
+    // HALF_UP to 2dp by money(). A future per-tenant percentage is explicitly out of scope.
+    private static final BigDecimal DEPOSIT_RATE = new BigDecimal("0.40");
+
     private final TemplateEngine templateEngine;
 
     public QuotePdfGenerator() {
@@ -85,12 +90,14 @@ public class QuotePdfGenerator {
         context.setVariable("itemised", model.itemised());
         context.setVariable("lines", toDisplayLines(model.lines()));
 
-        // Totals: subtotal (ex GST), GST (inc - ex), total (inc GST) — server-formatted verbatim.
+        // Totals: subtotal (ex GST), GST (inc - ex), total (inc GST) — server-formatted verbatim —
+        // plus the display-only 40% deposit derived from the inc-GST total (Phase 16D-C).
         BigDecimal ex = scale(model.quoteTotalExGst());
         BigDecimal inc = scale(model.quoteTotalIncGst());
         context.setVariable("subtotalExGst", money(ex));
         context.setVariable("gstAmount", money(inc.subtract(ex)));
         context.setVariable("totalIncGst", money(inc));
+        context.setVariable("depositAmount", money(inc.multiply(DEPOSIT_RATE)));
 
         // Payment methods / bank details (nullable -> hidden when absent).
         context.setVariable("bankName", model.bankName());

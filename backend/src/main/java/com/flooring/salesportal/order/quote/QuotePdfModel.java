@@ -10,11 +10,15 @@ import java.util.List;
  *
  * <p>This is the quote analogue of {@code InvoicePdfGenerator.InvoicePdfModel}, but DELIBERATELY
  * carries NONE of the invoice-only fields — there is no invoice version number, invoice/due date,
- * payment made, balance due, acceptance, signature, accepted timestamp, emailed timestamp, quote
- * version, or quote token. A preview is an on-demand, read-only render of the editable draft; it is
- * never stored and never advances any lifecycle. The header layout fields (business / store /
- * salesperson / logo / terms) and the per-flooring-type terms mirror the invoice document's
- * "Aire Compact" style (title {@code QUOTE}, not {@code TAX INVOICE}).
+ * payment made, balance due, accepted state, signature image, accepted timestamp, emailed timestamp,
+ * quote version, or quote token. The rendered document does include a BLANK printable "Customer
+ * Acceptance" area (two CSS-border declaration squares + one blank Customer signature line) and a
+ * display-only deposit line (Phase 16D-C), but those are template/generator concerns — no model field
+ * feeds the acceptance area and no accepted state exists on a preview. A preview is an on-demand,
+ * read-only render of the editable draft; it is never stored and never advances any lifecycle. The
+ * header layout fields (business / store / salesperson / logo / terms) and the per-flooring-type
+ * terms mirror the invoice document's "Aire Compact" style (title {@code QUOTATION}, not
+ * {@code TAX INVOICE}).
  *
  * <p>Every optional field is nullable and the template hides it when absent (logo fails soft to the
  * business-name text; blank terms render no terms page). {@code lines} is the ordered draft line set
