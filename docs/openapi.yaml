@@ -1656,7 +1656,7 @@ paths:
       summary: Preview quote draft PDF
       operationId: previewQuotePdf
       description: >
-        Generates an on-demand draft quote PDF (Aire Compact style, title QUOTE) for preview.
+        Generates an on-demand draft quote PDF (Aire Compact style, title QUOTATION, including a display-only 40% deposit line and printable declaration/customer acceptance area) for preview.
         Not stored. Empty JSON object body. Below-cost does not block a preview (only
         save/send/accept block). Allowed when order_status is LAID (read-only render).
       parameters:

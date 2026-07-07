@@ -28,19 +28,14 @@ What 16D states:
 - The header "Sale total" is driven only by Products & Charges plus the manual sale-price override — a quote save does **not** move it.
 - The quote total **may differ** from the order's working price by design; they reconcile later only via the 16F accepted-snapshot invoice path (Path A).
 
-### 1.2 Quote PDF wording — desired future, not a current bug
+### 1.2 Quote PDF wording — implemented in Phase 16D-C
 
-Current known state of the quote PDF template (`quote.html`):
+Current known state of the quote PDF template (`quote.html`) after Phase 16D-C:
 
-- It already uses quote-specific wording: title `QUOTE`, recipient label `Quote To`. It does **not** say `TAX INVOICE` or `Invoice To`.
+- It uses quote-specific wording: title `QUOTATION`, recipient label `Quotation To`. It does **not** say `TAX INVOICE` or `Invoice To`.
+- It renders an acceptance-ready quotation PDF with a display-only 40% deposit line, printable declaration/customer acceptance area, and terms applicable to the quotation.
 
-Desired future wording preference (product direction only):
-
-- `QUOTE` → `QUOTATION`
-- `Quote To` → `Quotation To`
-- terms wording should clearly read as **terms applicable to this quote**
-
-These are **backend template wording changes** and are **out of 16D frontend scope**. Document them as desired direction only. Do **not** reopen the backend PDF in 16D unless it is explicitly scoped later as its own small backend task (own verify gate + Codex review).
+These were backend template/PDF wording changes completed under the separately scoped Phase 16D-C backend task with its own verify gate and Codex review.
 
 ### 1.3 Send Quote — visible in 16D, real sending is 16E
 
@@ -343,22 +338,27 @@ Accepted Quote shows the **latest** accepted quote only for MVP; older accepted-
 
 ---
 
-## 15. Quote PDF — desired visual direction (not 16D scope)
+## 15. Quote PDF — Phase 16D-C implemented visual direction
 
-Documented as desired final direction. The quote PDF is backend (`quote.html`) and is **out of 16D frontend scope**; change it only under a separately scoped small backend task.
+The quote PDF is backend (`quote.html`). Phase 16D-C completed the separately scoped backend quote PDF update.
 
-Desired:
+Implemented:
 
-- title `QUOTE` → `QUOTATION`
-- `Quote To` → `Quotation To`
-- terms wording should read as terms applicable to this quote, not invoice
-- signed quote PDF includes the customer signature, accepted name, and accepted timestamp
+- title `QUOTATION`
+- `Quotation To`
+- terms wording reads as terms applicable to this quotation
+- printable customer acceptance/signature area is present on the quotation PDF
+- display-only 40% deposit line is present on both itemised and non-itemised quote PDFs
 - non-itemised PDF: no fake `Quoted works` / "single quoted amount for works described above" line — clean Details of Sale + total + quote terms
 - itemised PDF: show the line table **only when itemised is ON**, with clean columns: description / quantity / unit price / amount
 - adjustment/discount lines shown visibly if present; total matches the visible lines
 - never show raw cost
 
-Note: the current template already suppresses the itemised line table for non-itemised quotes and already uses `QUOTE` / `Quote To` — so the desired wording change is a preference, not a fix, and must not be treated as reopening merged 16C work in 16D.
+Still future 16F scope:
+
+- remote customer quote signing
+- accepted quote lifecycle
+- signed quote PDF with accepted timestamp and stored signature
 
 ---
 
