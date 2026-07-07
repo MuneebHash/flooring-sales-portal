@@ -1,14 +1,19 @@
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
 <head>
-    <title>Quote</title>
-    <!-- Phase 16C PR2: quote PREVIEW document. Reuses the invoice "Aire Compact" style but is a
-         SEPARATE template (title QUOTE, never TAX INVOICE; no payment made / balance due; no customer
-         acceptance / signature). Rendered by Thymeleaf + openhtmltopdf (XML parser, no JS, no external
+    <title>Quotation</title>
+    <!-- Phase 16D-C: quote PREVIEW document, an acceptance-ready printable QUOTATION. Reuses the
+         invoice "Aire Compact" style but is a SEPARATE template (title QUOTATION, never TAX INVOICE;
+         no payment made / balance due). Carries a display-only deposit line (40% of the inc-GST
+         total) and a BLANK print-and-sign "Customer Acceptance" area mirroring the invoice's
+         two-column acceptance idiom, adapted invoice-to-quotation (two CSS-border declaration
+         squares + one blank signature line; never interactive form fields, no accepted state, no
+         signature image). Rendered by Thymeleaf + openhtmltopdf (XML parser, no JS, no external
          fonts/images). Tables + conservative CSS only (no flexbox/grid/CSS-multi-column). All ${...}
-         values are server-supplied; user text is escaped via th:text; sanitized terms HTML is injected
-         via th:utext. The logo is a real data-URI image (logoDataUri); there is no placeholder box.
-         Only XML-built-in (&amp; &lt; &gt;) or numeric (&#183; &#8212;) entities are used. -->
+         values are server-supplied; user text is escaped via th:text; sanitized terms HTML is
+         injected via th:utext. The logo is a real data-URI image (logoDataUri); there is no
+         placeholder box. Only XML-built-in (&amp; &lt; &gt;) or numeric (&#183; &#8212; &#8217;)
+         entities are used. -->
     <style type="text/css">
         @page { size: A4; margin: 12mm; }
         body { font-family: Helvetica, Arial, sans-serif; font-size: 9pt; color: #34423d; line-height: 1.45; }
@@ -35,7 +40,7 @@
         .accent { border-top: 1.5pt solid #0e7a70; margin: 11pt 0 13pt 0; }
         .hair { border-top: 1pt solid #e7ebe8; margin: 13pt 0; }
 
-        /* two-column meta row: Quote To | Sales Person/Store (anchored right) */
+        /* two-column meta row: Quotation To | Sales Person/Store (anchored right) */
         .grid { width: 100%; border-collapse: collapse; }
         .grid td { vertical-align: top; }
         .grid .c-to { width: 60%; padding-right: 16pt; }
@@ -69,6 +74,45 @@
         .tline .v { text-align: right; font-weight: bold; color: #0f3d36; }
         .tline .tot td { border-bottom: none; border-top: 2pt solid #0f3d36; font-size: 14pt; padding-top: 9pt; }
         .tline .tot .k { color: #0f3d36; font-weight: bold; }
+
+        /* deposit line — display-only 40% of the inc-GST total, right-anchored under the totals */
+        .deposit { font-size: 9.5pt; font-weight: bold; color: #0f3d36; text-align: right; margin-top: 8pt; }
+
+        /* customer acceptance — invoice-idiom section: hair rules above and below close the block
+           (like invoice.html; a full-width rule, not a boxed card). Layout: full-width intro, then a
+           full-width bold agreement sentence, then the two checkbox lines in the left column, then a
+           final two-column row where the accept sentence sits LEVEL with the blank signature line
+           (the .a-slot mirrors invoice.html's .sig-area: fixed 44pt bottom-aligned one-cell table).
+           Sentences stay sentence-case and are never CSS-uppercased; bold is the only emphasis (an
+           uppercased "terms" would leak TERMS onto page 1 and break the terms-page split). The whole
+           block, heading to closing rule, never splits across pages. The two empty squares are
+           CSS-border boxes (print-and-tick; never interactive form fields, no unicode glyphs). */
+        .accept-block { page-break-inside: avoid; }
+        /* Final row: ONE table row whose bottom edge is shared by both cells — the accept sentence
+           (vertical-align: bottom, line-height 1, no bottom padding) and the signature rule (the
+           right cell's border-bottom). Sharing the row bottom is what keeps the text baseline level
+           with the rule; the 20pt cell height is the pen space above the line. The caption sits in a
+           second row under the rule, right column only. */
+        .accept { width: 100%; border-collapse: collapse; margin-top: 9pt; }
+        .accept td { vertical-align: bottom; }
+        .accept .agree { width: 54%; padding-right: 22pt; }
+        .accept .sign { width: 46%; }
+        .accept .sig-line { height: 20pt; }
+        /* The rule is an inner div (border inside the cell rather than a collapsed cell border, which
+           would draw centered on the row grid line and sit visibly below the text). Verified by
+           rasterising at 300dpi and measuring: with this geometry the accept sentence's BASELINE lands
+           within half a point of the line. */
+        .accept .sig-rule { border-bottom: 1pt solid #aebab3; }
+        .accept .cap-row td { vertical-align: top; }
+        .agree-intro { font-size: 8.5pt; line-height: 1.5; color: #3c4a44; margin-bottom: 7pt; }
+        .agree-lead { font-size: 8.5pt; line-height: 1.5; color: #0f3d36; font-weight: bold; margin-bottom: 7pt; }
+        .agree-chk { width: 54%; border-collapse: collapse; }
+        .agree-chk td { vertical-align: top; padding: 2pt 0; }
+        .agree-chk .chk-cell { width: 14pt; }
+        .agree-chk .chk { width: 7pt; height: 7pt; border: 1pt solid #5d716d; margin-top: 1pt; }
+        .agree-chk .chk-text { font-size: 8.5pt; line-height: 1.5; font-weight: bold; color: #0f3d36; }
+        .agree-accept { font-size: 8.5pt; line-height: 1; color: #0f3d36; font-weight: bold; }
+        .sig-cap { font-size: 7.5pt; color: #5d716d; margin-top: 4pt; }
 
         /* footer */
         .footer { text-align: center; font-size: 7.5pt; color: #5d716d; margin-top: 16pt; letter-spacing: 0.3pt; }
@@ -104,7 +148,7 @@
             </td>
             <td class="doc">
                 <div class="kicker" th:if="${flooringTypeLabel != null}" th:text="${flooringTypeLabel}">Flooring</div>
-                <div class="title">QUOTE</div>
+                <div class="title">QUOTATION</div>
                 <div class="no" th:text="${orderNumber}">ORDER-NUMBER</div>
             </td>
         </tr>
@@ -116,7 +160,7 @@
     <table class="grid">
         <tr>
             <td class="c-to">
-                <div class="eyebrow eyebrow-hi">Quote To</div>
+                <div class="eyebrow eyebrow-hi">Quotation To</div>
                 <div class="name" th:if="${customerName != null}" th:text="${customerName}">Customer Name</div>
                 <div class="line" th:if="${billingLine1 != null}" th:text="${billingLine1}">Address line 1</div>
                 <div class="line" th:if="${billingLine2 != null}" th:text="${billingLine2}">Address line 2</div>
@@ -143,7 +187,9 @@
     </div>
 
     <!-- ITEMISED: line table. Each row is a server-formatted map (description / qty / unit / amount).
-         ADJUSTMENT rows carry empty qty/unit and a signed amount. -->
+         ADJUSTMENT rows carry empty qty/unit and a signed amount. The th:if gate is the retained-line
+         leak guard: a non-itemised draft may still carry dormant retained rows in ${lines}, and this
+         table is the ONLY place lines are iterated — nothing may render ${lines} outside this gate. -->
     <table class="items" th:if="${itemised}">
         <tr>
             <th class="desc">Description</th>
@@ -159,11 +205,8 @@
         </tr>
     </table>
 
-    <!-- NON-ITEMISED: a single quoted amount; the work itself is described in Details of Sale above. -->
-    <div th:unless="${itemised}">
-        <div class="sec-h">Quoted Works</div>
-        <div class="details-body">A single quoted amount for the works described above.</div>
-    </div>
+    <!-- NON-ITEMISED: no line table and no filler section — the work is described in Details of Sale
+         above and the document flows straight into the totals. -->
 
     <!-- PAYMENT METHODS (borderless) + QUOTE TOTALS (clean rules, no box). Totals use server-formatted
          model values verbatim (never recomputed in the template). -->
@@ -189,6 +232,53 @@
         </tr>
     </table>
 
+    <!-- DEPOSIT: display-only, hardcoded 40% of the inc-GST total (computed by the generator, HALF_UP
+         2dp — never persisted, never in an API body). Sits directly under the totals, before the
+         acceptance section. Plain body text, never CSS-uppercased. -->
+    <div class="deposit">A deposit of <span th:text="${depositAmount}">$0.00</span> is required to proceed with this quotation.</div>
+
+    <div class="hair"></div>
+
+    <!-- CUSTOMER ACCEPTANCE: mirrors the invoice document's acceptance idiom, adapted
+         invoice-to-quotation ("of this quotation" / "on this quotation") — hair rules above and below
+         close the section like invoice.html. Rows: full-width intro, full-width agreement sentence,
+         the two checkbox lines (left column), then a final two-column row where the accept sentence
+         sits level with the blank signature line. Blank print-and-sign area only: no accepted state,
+         no signature image, no timestamps — remote signing is a later phase. The two empty squares are
+         CSS-border boxes; this PDF is NOT interactive (no form fields, no unicode checkbox glyphs).
+         All sentences stay sentence-case and are never CSS-uppercased, so "terms and conditions"
+         cannot surface as "TERMS" on page 1 (the terms heading belongs to the dedicated terms page). -->
+    <div class="accept-block">
+        <div class="sec-h">Customer Acceptance</div>
+        <div class="agree-intro">Furniture removal and replacement, take up of old floor coverings, floor preparation and adjustment of door heights are the customer&#8217;s responsibility unless otherwise stated above.</div>
+        <div class="agree-lead">This agreement is for the sale and installation of the goods described above at the value shown on this quotation and upon the terms and conditions stated herein.</div>
+        <table class="agree-chk">
+            <tr>
+                <td class="chk-cell"><div class="chk"></div></td>
+                <td class="chk-text">I agree to pay the balance before the installation date.</td>
+            </tr>
+            <tr>
+                <td class="chk-cell"><div class="chk"></div></td>
+                <td class="chk-text">I agree that no floor preparation costs are included unless otherwise stated above.</td>
+            </tr>
+        </table>
+        <table class="accept">
+            <tr>
+                <td class="agree"><div class="agree-accept">I accept the terms and conditions of this quotation.</div></td>
+                <!-- The inner div's bottom border IS the blank signature line. -->
+                <td class="sign sig-line"><div class="sig-rule"></div></td>
+            </tr>
+            <tr class="cap-row">
+                <td class="agree"></td>
+                <td class="sign"><div class="sig-cap">Customer signature</div></td>
+            </tr>
+        </table>
+        <!-- Subtle separator below the entire Customer Acceptance block (matches the rule above it),
+             spanning the full width — mirrors invoice.html. Kept inside the block so the closing rule
+             always travels with the section when a full page pushes it over. -->
+        <div class="hair"></div>
+    </div>
+
     <!-- TERMS — when present, on a dedicated page after the quote content (SOFT and HARD alike); page 1
          never carries a terms section. Near-full-height table so the terms sit at the top and the footer
          is pinned to the bottom of the page. th:utext — value is pre-sanitized, XML-well-formed HTML
@@ -196,13 +286,13 @@
     <table class="tpage" th:if="${termsHtml != null}">
         <tr>
             <td class="tp-body">
-                <div class="terms-h">Terms &amp; Conditions</div>
+                <div class="terms-h">Terms &amp; Conditions of this Quotation</div>
                 <div class="terms-body" th:utext="${termsHtml}">Terms</div>
             </td>
         </tr>
         <tr>
             <td class="tp-foot">
-                <div class="footer">Generated by the Flooring Sales Portal &#183; Quote &#183; GST included where applicable</div>
+                <div class="footer">Generated by <span th:text="${businessName} ?: 'the Flooring Sales Portal'">Business Name</span> &#183; Quotation &#183; GST included where applicable</div>
             </td>
         </tr>
     </table>
@@ -210,6 +300,6 @@
     <!-- No-terms fallback: when there are no terms there is no terms page (and no terms-page footer), so
          the footer renders ONCE here at the very end. This and the terms-page footer are mutually
          exclusive (termsHtml != null vs == null), so exactly one footer ever renders. -->
-    <div class="footer" th:if="${termsHtml == null}">Generated by the Flooring Sales Portal &#183; Quote &#183; GST included where applicable</div>
+    <div class="footer" th:if="${termsHtml == null}">Generated by <span th:text="${businessName} ?: 'the Flooring Sales Portal'">Business Name</span> &#183; Quotation &#183; GST included where applicable</div>
 </body>
 </html>
