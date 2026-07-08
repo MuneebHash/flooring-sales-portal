@@ -11,6 +11,7 @@ import {
   cancelQuote,
   fetchQuotePreviewPdf,
   fetchQuoteStoredPdf,
+  fetchQuoteWorkspace,
   saveQuoteDraft,
   sendQuoteEmail,
   type QuoteChannel,
@@ -1498,6 +1499,24 @@ export function QuoteTab({
       )
     } catch (err) {
       if (mountedRef.current) applySendError(err)
+      // Codex P2 round 2: a 502 EMAIL_SEND_FAILED means the backend ALREADY
+      // persisted the issued version/PDF/link (locked §7.1 keep rule) — only
+      // the delivery failed. The local issued state is therefore stale (still
+      // null on a first send), and the Customer Quote sub-tab would misreport
+      // until a reload. Resync it from the workspace; the refetched summary
+      // carries no last_emailed_at, so the Not-delivered badge renders
+      // naturally. The modal stays open with the error either way, and the
+      // in-flight guard (reset in finally, after this await) keeps a retry
+      // from racing the resync.
+      if (err instanceof ApiError && err.code === 'EMAIL_SEND_FAILED') {
+        try {
+          const ws = await fetchQuoteWorkspace(orderIdRef.current)
+          if (mountedRef.current) setIssued(ws.data.current_issued)
+        } catch {
+          // Best-effort resync: the in-modal error already covers the user;
+          // leave the local state as-is until the next action or reload.
+        }
+      }
     } finally {
       sendingRef.current = false
       if (mountedRef.current) setSending(false)
@@ -1538,6 +1557,15 @@ export function QuoteTab({
           ? err.message
           : 'Could not cancel the quote. Please try again.',
       )
+      // Drift resync: 422 QUOTE_NOT_ISSUED means the backend has NO active
+      // issued quote (it was cancelled/superseded elsewhere) — the local
+      // summary is stale. Null it so the Customer Quote sub-tab returns to
+      // its empty state, matching what a reload shows. QUOTE_ALREADY_ACCEPTED
+      // (409) and all other errors deliberately leave the state untouched
+      // (acceptance is 16F state this surface cannot represent yet).
+      if (err instanceof ApiError && err.code === 'QUOTE_NOT_ISSUED') {
+        setIssued(null)
+      }
     } finally {
       cancellingRef.current = false
       if (mountedRef.current) setCancelling(false)
