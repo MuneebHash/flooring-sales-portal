@@ -217,8 +217,12 @@ function WorkspaceShell({
         setQuoteInitialDraft(res.data.draft)
         setQuoteInitialIssued(res.data.current_issued)
         setQuoteProbeStatus('loaded')
-        // A saved draft is the durable visibility source of truth.
-        if (res.data.draft !== null) setQuoteTabVisible(true)
+        // A saved draft OR an active issued quote is the durable visibility
+        // source of truth (issued-only is unreachable via the API today —
+        // sending requires a persisted draft and drafts are never deleted —
+        // but the backend workspace deliberately supports the shape).
+        if (res.data.draft !== null || res.data.current_issued !== null)
+          setQuoteTabVisible(true)
       })
       .catch(() => {
         // STRICT: a failed probe is never "no quote" — status stays 'error',
