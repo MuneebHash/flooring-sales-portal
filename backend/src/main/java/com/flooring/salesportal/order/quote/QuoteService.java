@@ -144,10 +144,14 @@ public class QuoteService {
 
         // Phase 16E-A: the active ISSUED version summary (or null). Surfaced independently of the
         // draft — a sent quote is never hidden by draft state (contract §11). The summary carries
-        // the ACTIVE token's expiry only — never the token value or hash.
+        // the ACTIVE token's expiry only — never the token value or hash. 16E-B: it also carries
+        // the frozen issued body snapshot (quote_total_ex_gst / details_of_sale / lines) so the
+        // Customer Quote tab renders from current_issued alone; the snapshot lines are read in
+        // (sort_order, PK) order and are structurally EMPTY for a non-itemised issue.
         QuoteIssuedSummaryDto currentIssued = quoteVersionRepository.findIssuedByOrderId(orderId)
                 .map(row -> QuoteIssuedSummaryDto.from(row,
-                        quoteVersionRepository.findActiveTokenExpiry(row.quoteVersionId()).orElse(null)))
+                        quoteVersionRepository.findActiveTokenExpiry(row.quoteVersionId()).orElse(null),
+                        quoteVersionRepository.findVersionLines(row.quoteVersionId())))
                 .orElse(null);
 
         Optional<QuoteDraft> draftOpt = quoteDraftRepository.findByOrderId(orderId);

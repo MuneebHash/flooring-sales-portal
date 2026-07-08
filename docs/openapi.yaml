@@ -4398,6 +4398,9 @@ components:
         - last_emailed_at
         - viewed_at
         - token_expires_at
+        - quote_total_ex_gst
+        - details_of_sale
+        - lines
       properties:
         quote_version_id:
           type: integer
@@ -4437,6 +4440,43 @@ components:
             - $ref: '#/components/schemas/Timestamp'
           nullable: true
           description: Active-token expiry; no token value is ever returned.
+        quote_total_ex_gst:
+          $ref: '#/components/schemas/Money'
+        details_of_sale:
+          type: string
+          nullable: true
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuoteIssuedLine'
+          description: Issued snapshot lines; always empty when the issued quote is non-itemised.
+
+    QuoteIssuedLine:
+      type: object
+      additionalProperties: false
+      required:
+        - line_type
+        - description
+        - line_total_ex_gst
+        - sort_order
+      properties:
+        line_type:
+          $ref: '#/components/schemas/QuoteLineType'
+        description:
+          type: string
+        quantity:
+          type: number
+          format: double
+          nullable: true
+        unit_price_ex_gst:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          nullable: true
+        line_total_ex_gst:
+          $ref: '#/components/schemas/Money'
+        sort_order:
+          type: integer
+          minimum: 0
 
     QuoteAcceptedSummary:
       type: object

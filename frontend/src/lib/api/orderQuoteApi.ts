@@ -1,18 +1,22 @@
 import { API_BASE_URL } from './config'
 import { ApiError } from './ApiError'
 import { getActiveSlug } from '../tenant'
-import { get, put } from './client'
+import { get, post, put } from './client'
 import { apiPath } from './paths'
 import type { ApiSuccess } from './types'
 
 // Phase 16D-B PR1 — quote draft wiring (workspace read, draft save, preview PDF).
-// Field names are snake_case to mirror the backend JSON verbatim (the backend
-// serializes with SNAKE_CASE), matching orderInvoicesApi.ts / orderWorkspaceApi.ts.
+// Phase 16E-B adds the delivery wrappers: send-email, cancel and the stored
+// issued-PDF download. Field names are snake_case to mirror the backend JSON
+// verbatim (the backend serializes with SNAKE_CASE), matching
+// orderInvoicesApi.ts / orderWorkspaceApi.ts.
 //
-// Only THREE quote endpoints exist on the backend (Phase 16C): the workspace GET,
-// the draft PUT and the on-demand preview-pdf POST. Send (email/SMS), cancel,
-// create-invoice, stored-PDF download and the public token surface are Phase
-// 16E/16F — they must NOT be called or stubbed here.
+// Wired quote endpoints (Phase 16C/16E-A backends): the workspace GET, the
+// draft PUT, the on-demand preview-pdf POST, the send-email POST, the cancel
+// POST and the stored-PDF GET (type=issued). The backend send-sms endpoint
+// exists (16E-A) but is deliberately NOT wrapped here — frontend SMS enablement
+// is Phase 16E-C. Create-invoice, signing/acceptance and the public token
+// surface are Phase 16E-C/16F — they must NOT be called or stubbed here.
 //
 // Phase 16D-A decoupling (locked): PUT /quote/draft saves the quote draft ONLY.
 // It never updates the order sale-price override or any sales_order header
@@ -86,13 +90,59 @@ export type QuoteDraftRead = {
   updated_at: string | null
 }
 
+// Delivery channel of the latest send attempt (backend QuoteChannel).
+export type QuoteChannel = 'EMAIL' | 'SMS'
+
+// One FROZEN issued snapshot line (backend QuoteIssuedSummaryDto.Line / openapi
+// QuoteIssuedLine): the customer-facing quote_version_line fields only.
+// quantity / unit_price_ex_gst are null for ADJUSTMENT lines. Read-only issued
+// history — never sent back in any payload. No cost fields, no token fields, no
+// storage fields, no ids.
+export type QuoteIssuedLine = {
+  line_type: QuoteLineType
+  description: string
+  quantity: number | null
+  unit_price_ex_gst: number | null
+  line_total_ex_gst: number
+  sort_order: number
+}
+
+// The active issued quote version summary (backend QuoteIssuedSummaryDto /
+// openapi QuoteIssuedSummary): workspace `current_issued` plus the `data` of
+// the send-email / cancel responses. Every field is always present (nullable
+// ones arrive as JSON null). token_expires_at is the ACTIVE link's expiry ONLY
+// — the token value/hash, stored_file ids, storage paths and any cost/GP field
+// are NEVER returned by the backend and must never be typed here.
+// details_of_sale + lines are the FROZEN issue snapshot (lines is ALWAYS []
+// for a non-itemised issued quote) — the Customer Quote tab renders from this
+// object alone, never from live draft/order state.
+export type QuoteIssuedSummary = {
+  quote_version_id: number
+  version_number: number
+  status: string
+  itemised: boolean
+  quote_total_ex_gst: number
+  quote_total_inc_gst: number
+  flooring_type: string
+  sent_channel: QuoteChannel | null
+  first_sent_at: string | null
+  last_sent_at: string | null
+  last_emailed_at: string | null
+  viewed_at: string | null
+  token_expires_at: string | null
+  details_of_sale: string | null
+  lines: QuoteIssuedLine[]
+}
+
 // GET /quote/workspace payload. All three keys are always present. draft is null
 // until the first successful draft save — that nullability is the LOCKED source
-// of truth for revealing the Quote tab on order load. current_issued / accepted
-// are ALWAYS null until Phase 16E/16F populate the issued/accepted layers.
+// of truth for revealing the Quote tab on order load. current_issued is the
+// active ISSUED version summary (null when nothing is issued — never sent yet,
+// or the latest issued version was cancelled/superseded/accepted away).
+// accepted is ALWAYS null until Phase 16F populates the acceptance layer.
 export type QuoteWorkspace = {
   draft: QuoteDraftRead | null
-  current_issued: null
+  current_issued: QuoteIssuedSummary | null
   accepted: null
 }
 
@@ -234,6 +284,119 @@ export async function fetchQuotePreviewPdf(
   if (!response.ok) {
     let code: string | null = null
     let message = 'Could not generate the quote preview PDF.'
+    try {
+      const body: unknown = await response.json()
+      const errorObj =
+        body && typeof body === 'object' && 'error' in body
+          ? (body as { error?: { code?: unknown; message?: unknown } }).error
+          : null
+      if (errorObj && typeof errorObj === 'object') {
+        if (typeof errorObj.code === 'string' && errorObj.code.length > 0) {
+          code = errorObj.code
+        }
+        if (
+          typeof errorObj.message === 'string' &&
+          errorObj.message.length > 0
+        ) {
+          message = errorObj.message
+        }
+      }
+    } catch {
+      // Non-JSON / empty error body — keep the friendly fallback message.
+    }
+    throw new ApiError({ status: response.status, code, message })
+  }
+
+  const fileName = parseContentDispositionFilename(
+    response.headers.get('Content-Disposition'),
+  )
+  const blob = await response.blob()
+  return { blob, fileName }
+}
+
+// POST /api/v1/{slug}/orders/{orderId}/quote/send-email — issue (or resend) the
+// quote and email it (stored issued PDF + public link). The body MUST be an
+// empty JSON object {}. 201; `data` is the updated QuoteIssuedSummary (never
+// the token). The backend issues from the PERSISTED draft, so callers must
+// flush the quote autosave AND the details autosave first (same double-flush
+// discipline as the preview).
+// Errors: 400 VALIDATION_FAILED / MALFORMED_JSON; 404 ORDER_NOT_FOUND /
+// QUOTE_NOT_FOUND (no saved draft); 422 ORDER_LOCKED (LAID) / QUOTE_BELOW_COST
+// (live re-check) / CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID; 502
+// EMAIL_SEND_FAILED (delivery failed — the issued version/PDF/link are KEPT
+// server-side, so retrying is safe and never duplicates a version).
+export function sendQuoteEmail(
+  orderId: number,
+): Promise<ApiSuccess<QuoteIssuedSummary>> {
+  return post<ApiSuccess<QuoteIssuedSummary>>(
+    apiPath(getActiveSlug(), `/orders/${orderId}/quote/send-email`),
+    {},
+  )
+}
+
+// NOTE: there is deliberately NO sendQuoteSms wrapper. The backend send-sms
+// endpoint exists (16E-A) but frontend SMS enablement is Phase 16E-C — the
+// Send Quote modal keeps its SMS button disabled until then.
+
+// POST /api/v1/{slug}/orders/{orderId}/quote/cancel — cancel the active issued
+// quote (version + public link → CANCELLED; rows kept server-side). The body
+// MUST be an empty JSON object {}. 200; `data` is the CANCELLED summary
+// (status 'CANCELLED', token_expires_at null). After success the workspace no
+// longer returns a current_issued, so callers should clear their local issued
+// state to null. ALLOWED when LAID (kills a public link only).
+// Errors: 404 ORDER_NOT_FOUND; 422 QUOTE_NOT_ISSUED (nothing active to
+// cancel); 409 QUOTE_ALREADY_ACCEPTED (16F data — defensive).
+export function cancelQuote(
+  orderId: number,
+): Promise<ApiSuccess<QuoteIssuedSummary>> {
+  return post<ApiSuccess<QuoteIssuedSummary>>(
+    apiPath(getActiveSlug(), `/orders/${orderId}/quote/cancel`),
+    {},
+  )
+}
+
+// Result of a stored quote-PDF fetch: raw bytes plus the server file name from
+// Content-Disposition (inline; filename="quote-{order_number}-v{n}.pdf").
+export type QuoteStoredPdfDownload = {
+  blob: Blob
+  fileName: string | null
+}
+
+// GET /api/v1/{slug}/orders/{orderId}/quote/pdf?type=issued — fetch the STORED
+// issued quote PDF (the exact frozen artifact that was emailed) as raw bytes.
+// Same credentialed-fetch-to-Blob pattern as fetchQuotePreviewPdf /
+// fetchCurrentInvoicePdf: the endpoint returns RAW BINARY and is
+// session-protected, so a bare href/window.open(url) would not reliably carry
+// context. Read-only; allowed on LAID orders. Only type=issued is callable
+// from the frontend in 16E-B — type=accepted is the 16F signed artifact.
+// Errors (standard JSON envelope): 404 ORDER_NOT_FOUND / QUOTE_PDF_NOT_FOUND
+// (no active issued version).
+export async function fetchQuoteStoredPdf(
+  orderId: number,
+  type: 'issued',
+): Promise<QuoteStoredPdfDownload> {
+  const base = API_BASE_URL.replace(/\/+$/, '')
+  const path = apiPath(
+    getActiveSlug(),
+    `/orders/${orderId}/quote/pdf?type=${type}`,
+  )
+  let response: Response
+  try {
+    response = await fetch(`${base}${path}`, {
+      credentials: 'include',
+    })
+  } catch (err) {
+    throw new ApiError({
+      status: 0,
+      code: null,
+      message: 'Network request failed.',
+      details: err,
+    })
+  }
+
+  if (!response.ok) {
+    let code: string | null = null
+    let message = 'Could not download the quote PDF.'
     try {
       const body: unknown = await response.json()
       const errorObj =
