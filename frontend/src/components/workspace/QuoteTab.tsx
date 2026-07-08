@@ -226,6 +226,29 @@ function channelLabel(channel: QuoteChannel | null): string {
   return '—'
 }
 
+// True when the LATEST email send attempt was not delivered (Codex P2 rounds
+// 1+3). last_emailed_at is the SUCCESS-ONLY stamp and on a successful send it
+// always lands strictly AFTER the attempt marker (last_sent_at: stamped in the
+// pre-delivery transaction; the success stamp in a follow-up transaction), so:
+//   - no success stamp at all            -> the only/first attempt failed;
+//   - success stamp OLDER than the latest -> a later resend failed: the stamp
+//     attempt marker                        belongs to a PRIOR attempt whose
+//                                           link the failed resend already
+//                                           replaced (token REPLACED), so the
+//                                           customer holds nothing usable;
+//   - success stamp equal-or-later       -> the latest attempt was delivered.
+// Both timestamps are backend LocalDateTime strings in the same clock, so the
+// Date comparison is sound. SMS has no success marker — never "not delivered".
+function emailNotDelivered(issued: QuoteIssuedSummary): boolean {
+  if (issued.sent_channel !== 'EMAIL') return false
+  if (issued.last_emailed_at === null) return true
+  if (issued.last_sent_at === null) return false
+  return (
+    new Date(issued.last_emailed_at).getTime() <
+    new Date(issued.last_sent_at).getTime()
+  )
+}
+
 function composeFullName(customer: OrderCustomer | null | undefined): string {
   if (!customer) return ''
   return [customer.first_name, customer.middle_name, customer.last_name]
@@ -2517,14 +2540,11 @@ export function QuoteTab({
                         <span className="inline-flex items-center rounded-md border border-teal-200 bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700">
                           Opened
                         </span>
-                      ) : issued.sent_channel === 'EMAIL' &&
-                        issued.last_emailed_at === null ? (
-                        // Email delivery failed (Codex P2): the 502 path keeps
-                        // the attempt markers but never stamps the success-only
-                        // last_emailed_at, so an EMAIL-channel summary without
-                        // it means the customer never received the email —
-                        // "Sent" would misreport it. SMS has no success marker
-                        // and keeps the plain Sent badge (not user-enabled yet).
+                      ) : emailNotDelivered(issued) ? (
+                        // The latest EMAIL attempt failed (see the
+                        // emailNotDelivered helper for the timestamp
+                        // reasoning) — "Sent" would misreport it. SMS keeps
+                        // the plain Sent badge (no success marker exists).
                         <>
                           <span className="inline-flex items-center rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
                             Not delivered
