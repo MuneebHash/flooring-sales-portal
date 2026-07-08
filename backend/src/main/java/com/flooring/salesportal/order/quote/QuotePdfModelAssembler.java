@@ -26,10 +26,12 @@ import java.util.Locale;
 import javax.imageio.ImageIO;
 
 /**
- * Phase 16C PR2 — single assembly point for the quote PREVIEW PDF model. The quote analogue of
- * {@code InvoicePdfModelAssembler}: it enriches the order + quote draft with the tenant invoice layout
- * data (private config — ABN, bank details, per-flooring-type terms, logo), the store contact/address,
- * the order-bound salesperson, and the customer + billing address.
+ * Phase 16C PR2 — single assembly point for the quote PDF model: the on-demand DRAFT preview
+ * ({@link #assemble}) and, since Phase 16E-A, the ISSUED snapshot render
+ * ({@link #assembleIssued}). The quote analogue of {@code InvoicePdfModelAssembler}: it enriches
+ * the quote body with the tenant invoice layout data (private config — ABN, bank details,
+ * per-flooring-type terms, logo), the store contact/address, the order-bound salesperson, and the
+ * customer + billing address.
  *
  * <p><b>Read-only.</b> Every lookup here is a SELECT; this assembler NEVER writes a row, never calls
  * {@link FileStorageService#store} (only the bounded read for the logo), and never advances any
@@ -82,18 +84,67 @@ public class QuotePdfModelAssembler {
     }
 
     /**
-     * Build the {@link QuotePdfModel} from the scoped order + persisted draft + ordered draft lines.
-     * The caller has already resolved {@code business}/{@code order} scoped to the session; this method
-     * only ADDS read-only layout context. {@code lines} is the draft line set ordered by sort_order.
+     * Build the {@link QuotePdfModel} from the scoped order + persisted draft + ordered draft lines
+     * (the on-demand PREVIEW path — unchanged behaviour). The caller has already resolved
+     * {@code business}/{@code order} scoped to the session; this method only ADDS read-only layout
+     * context. {@code lines} is the draft line set ordered by sort_order.
      */
     public QuotePdfModel assemble(Business business, SalesOrder order, long orderId,
                                   QuoteDraft draft, List<QuoteDraftLine> lines) {
-        Long businessId = business.getBusinessId();
-        String flooringType = order.getFlooringType();
-
         BusinessInvoiceConfigView config = businessRepository
-                .findInvoiceConfigByBusinessId(businessId)
+                .findInvoiceConfigByBusinessId(business.getBusinessId())
                 .orElse(null);
+
+        // Per-flooring-type terms: SOFT -> terms_soft, HARD -> terms_hard. NO fallback to legacy terms.
+        // Sanitize to safe, XML-well-formed HTML (null when blank/unsafe/fails). The DRAFT preview uses
+        // the LIVE current terms (the frozen terms_snapshot only exists on an ISSUED quote_version).
+        String flooringType = order.getFlooringType();
+        String rawTerms = config == null
+                ? null
+                : (FLOORING_SOFT.equals(flooringType) ? config.getTermsSoft() : config.getTermsHard());
+        String termsHtml = termsSanitizer.sanitize(rawTerms);
+
+        return buildModel(business, order, orderId, config,
+                draft.isItemised(), toPdfLines(lines),
+                draft.getQuoteTotalExGst(), draft.getQuoteTotalIncGst(),
+                flooringType, blankToNull(order.getDetailsOfSale()), termsHtml);
+    }
+
+    /**
+     * Phase 16E-A — build the {@link QuotePdfModel} for the ISSUED quote PDF from the frozen
+     * {@link QuoteIssueSnapshot}. The quote BODY (itemised flag, lines — already MODE-SCOPED, so a
+     * non-itemised issue renders the single-amount presentation with no dormant rows — totals,
+     * flooring-type label, details-of-sale text, and the once-sanitized {@code terms_snapshot}
+     * HTML) comes EXCLUSIVELY from the snapshot: this method never reads the live draft, the live
+     * draft lines, or the live tenant terms, so later edits can never leak into the stored issued
+     * document. Presentation context (store / salesperson / customer / billing / logo / bank /
+     * ABN) is read live AT ISSUE TIME — the stored PDF bytes are the frozen artifact for that data
+     * (resends re-deliver the stored bytes verbatim; they never re-render).
+     */
+    public QuotePdfModel assembleIssued(Business business, SalesOrder order, long orderId,
+                                        QuoteIssueSnapshot snapshot) {
+        BusinessInvoiceConfigView config = businessRepository
+                .findInvoiceConfigByBusinessId(business.getBusinessId())
+                .orElse(null);
+
+        return buildModel(business, order, orderId, config,
+                snapshot.itemised(), snapshotToPdfLines(snapshot.lines()),
+                snapshot.quoteTotalExGst(), snapshot.quoteTotalIncGst(),
+                snapshot.flooringType(), blankToNull(snapshot.detailsOfSale()), snapshot.termsHtml());
+    }
+
+    /**
+     * Shared model construction: live presentation context (config bank/ABN, store, salesperson,
+     * logo, customer, billing address) around a caller-supplied quote body. The preview path feeds
+     * the live draft + live sanitized terms; the issued path feeds the frozen snapshot.
+     */
+    private QuotePdfModel buildModel(Business business, SalesOrder order, long orderId,
+                                     BusinessInvoiceConfigView config,
+                                     boolean itemised, List<QuotePdfLine> pdfLines,
+                                     java.math.BigDecimal quoteTotalExGst,
+                                     java.math.BigDecimal quoteTotalIncGst,
+                                     String flooringType, String detailsOfSale, String termsHtml) {
+        Long businessId = business.getBusinessId();
 
         Store store = storeRepository
                 .findByStoreIdAndBusinessId(order.getStoreId(), businessId)
@@ -104,14 +155,6 @@ public class QuotePdfModelAssembler {
 
         OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
         List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
-
-        // Per-flooring-type terms: SOFT -> terms_soft, HARD -> terms_hard. NO fallback to legacy terms.
-        // Sanitize to safe, XML-well-formed HTML (null when blank/unsafe/fails). The DRAFT preview uses
-        // the LIVE current terms (the frozen terms_snapshot only exists on an ISSUED quote_version).
-        String rawTerms = config == null
-                ? null
-                : (FLOORING_SOFT.equals(flooringType) ? config.getTermsSoft() : config.getTermsHard());
-        String termsHtml = termsSanitizer.sanitize(rawTerms);
 
         return new QuotePdfModel(
                 business.getName(),
@@ -128,16 +171,32 @@ public class QuotePdfModelAssembler {
                 customer == null ? null : blankToNull(customerName(customer)),
                 blankToNull(billingLine1(addresses)),
                 blankToNull(billingLine2(addresses)),
-                blankToNull(order.getDetailsOfSale()),
-                draft.isItemised(),
-                toPdfLines(lines),
-                draft.getQuoteTotalExGst(),
-                draft.getQuoteTotalIncGst(),
+                detailsOfSale,
+                itemised,
+                pdfLines,
+                quoteTotalExGst,
+                quoteTotalIncGst,
                 blankToNull(config == null ? null : config.getBankName()),
                 blankToNull(config == null ? null : config.getBsb()),
                 blankToNull(config == null ? null : config.getAccountName()),
                 blankToNull(config == null ? null : config.getAccountNumber()),
                 termsHtml);
+    }
+
+    private static List<QuotePdfLine> snapshotToPdfLines(List<QuoteIssueSnapshot.Line> lines) {
+        List<QuotePdfLine> out = new ArrayList<>(lines == null ? 0 : lines.size());
+        if (lines == null) {
+            return out;
+        }
+        for (QuoteIssueSnapshot.Line line : lines) {
+            out.add(new QuotePdfLine(
+                    line.lineType(),
+                    line.description(),
+                    line.quantity(),
+                    line.unitPriceExGst(),
+                    line.lineTotalExGst()));
+        }
+        return out;
     }
 
     private static List<QuotePdfLine> toPdfLines(List<QuoteDraftLine> lines) {
