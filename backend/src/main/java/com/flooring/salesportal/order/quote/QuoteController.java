@@ -1,12 +1,15 @@
 package com.flooring.salesportal.order.quote;
 
 import com.flooring.salesportal.common.api.ApiResponse;
+import com.flooring.salesportal.order.quote.QuoteSendService.QuoteStoredPdf;
 import com.flooring.salesportal.order.quote.QuoteService.QuotePreviewResult;
 import com.flooring.salesportal.order.quote.dto.QuoteDraftDto;
+import com.flooring.salesportal.order.quote.dto.QuoteIssuedSummaryDto;
 import com.flooring.salesportal.order.quote.dto.QuoteWorkspaceDto;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ContentDisposition;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -15,6 +18,8 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.nio.charset.StandardCharsets;
@@ -30,9 +35,10 @@ import java.nio.charset.StandardCharsets;
  * so JSON parsing happens INSIDE the service, strictly after the guard / orderId / scoped-lookup /
  * 404 / LAID gates — so malformed JSON can never 400 ahead of them.
  *
- * <p>PR1 added the workspace GET and the draft PUT; PR2 adds the on-demand preview PDF
- * ({@code POST .../quote/preview-pdf}). Send (email/SMS), cancel, create-invoice, the stored-PDF
- * download, and the public token surface are Phase 16E / 16F.
+ * <p>PR1 added the workspace GET and the draft PUT; PR2 added the on-demand preview PDF
+ * ({@code POST .../quote/preview-pdf}); Phase 16E-A adds send-email / send-sms / cancel / the
+ * stored issued-PDF download (all delivery/lifecycle logic lives in {@link QuoteSendService}).
+ * Create-invoice and the public token surface are Phase 16F / 16E-C.
  *
  * <p>The preview returns a raw {@code ResponseEntity<byte[]>} (the file-binary exception, mirroring the
  * invoice file download D.4) rather than the {@code ApiResponse} envelope; its error paths still flow
@@ -45,12 +51,14 @@ import java.nio.charset.StandardCharsets;
 public class QuoteController {
 
     private final QuoteService quoteService;
+    private final QuoteSendService quoteSendService;
 
-    public QuoteController(QuoteService quoteService) {
+    public QuoteController(QuoteService quoteService, QuoteSendService quoteSendService) {
         this.quoteService = quoteService;
+        this.quoteSendService = quoteSendService;
     }
 
-    /** GET .../quote/workspace — draft (issued/accepted are null in PR1). LAID read allowed. */
+    /** GET .../quote/workspace — draft + current_issued (accepted is null until 16F). LAID read allowed. */
     @GetMapping("/workspace")
     public ApiResponse<QuoteWorkspaceDto> getWorkspace(
             @PathVariable String slug,
@@ -94,5 +102,73 @@ public class QuoteController {
                 .contentLength(preview.bytes().length)
                 .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition)
                 .body(preview.bytes());
+    }
+
+    /**
+     * POST .../quote/send-email — issue (or resend) the quote and email it (issued PDF + link +
+     * body). Empty body only. LAID write blocked (422); provider failure → 502 EMAIL_SEND_FAILED
+     * with the issued version/PDF/token kept. 201 issued summary (never the token).
+     */
+    @PostMapping("/send-email")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ApiResponse<QuoteIssuedSummaryDto> sendEmail(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestBody(required = false) String body,
+            HttpServletRequest httpRequest) {
+        return quoteSendService.sendEmail(slug, orderId, body, httpRequest);
+    }
+
+    /**
+     * POST .../quote/send-sms — issue (or resend) the quote and SMS the public link only (no PDF).
+     * Empty body only. LAID write blocked (422); provider failure → 502 SMS_SEND_FAILED with the
+     * issued version/PDF/token kept. 201 issued summary (never the token).
+     */
+    @PostMapping("/send-sms")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ApiResponse<QuoteIssuedSummaryDto> sendSms(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestBody(required = false) String body,
+            HttpServletRequest httpRequest) {
+        return quoteSendService.sendSms(slug, orderId, body, httpRequest);
+    }
+
+    /**
+     * POST .../quote/cancel — cancel the active issued quote (version + token → CANCELLED; rows
+     * kept). Empty body only. ALLOWED when LAID (narrow exception — kills a public link only).
+     * 422 QUOTE_NOT_ISSUED / 409 QUOTE_ALREADY_ACCEPTED. 200 cancelled summary.
+     */
+    @PostMapping("/cancel")
+    public ApiResponse<QuoteIssuedSummaryDto> cancel(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestBody(required = false) String body,
+            HttpServletRequest httpRequest) {
+        return quoteSendService.cancel(slug, orderId, body, httpRequest);
+    }
+
+    /**
+     * GET .../quote/pdf?type=issued|accepted — stream a STORED quote PDF (salesperson download;
+     * LAID read allowed). type=issued → the active issued version's stored PDF; type=accepted →
+     * the 16F signed PDF (always 404 QUOTE_PDF_NOT_FOUND in 16E-A). Raw binary like the preview.
+     */
+    @GetMapping("/pdf")
+    public ResponseEntity<byte[]> downloadStoredPdf(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestParam(value = "type", required = false) String type,
+            HttpServletRequest httpRequest) {
+        QuoteStoredPdf pdf = quoteSendService.downloadStoredPdf(slug, orderId, type, httpRequest);
+
+        String contentDisposition = ContentDisposition.inline()
+                .filename(pdf.fileName(), StandardCharsets.UTF_8)
+                .build()
+                .toString();
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_PDF)
+                .contentLength(pdf.bytes().length)
+                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition)
+                .body(pdf.bytes());
     }
 }

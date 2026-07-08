@@ -18,6 +18,7 @@ import com.flooring.salesportal.order.SalesOrderRepository;
 import com.flooring.salesportal.order.financial.LineFinancials;
 import com.flooring.salesportal.order.quote.dto.QuoteDraftDto;
 import com.flooring.salesportal.order.quote.dto.QuoteDraftLineDto;
+import com.flooring.salesportal.order.quote.dto.QuoteIssuedSummaryDto;
 import com.flooring.salesportal.order.quote.dto.QuoteWorkspaceDto;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.stereotype.Service;
@@ -36,7 +37,8 @@ import java.util.Set;
 /**
  * Phase 16C PR1 — quote money/data core. Backs the two protected endpoints:
  * <ul>
- *   <li>GET {@code /orders/{orderId}/quote/workspace} — loads the draft (issued/accepted are null in PR1).</li>
+ *   <li>GET {@code /orders/{orderId}/quote/workspace} — loads the draft + the active issued summary
+ *       (16E-A; accepted stays null until 16F).</li>
  *   <li>PUT {@code /orders/{orderId}/quote/draft} — full-replace upsert of the editable draft.</li>
  * </ul>
  *
@@ -94,6 +96,7 @@ public class QuoteService {
     private final QuoteDraftLineRepository quoteDraftLineRepository;
     private final QuoteDraftWriteRepository quoteDraftWriteRepository;
     private final QuoteDraftCalculator quoteDraftCalculator;
+    private final QuoteVersionRepository quoteVersionRepository;
     private final QuotePdfModelAssembler quotePdfModelAssembler;
     private final QuotePdfGenerator quotePdfGenerator;
     private final ObjectMapper objectMapper;
@@ -106,6 +109,7 @@ public class QuoteService {
                         QuoteDraftLineRepository quoteDraftLineRepository,
                         QuoteDraftWriteRepository quoteDraftWriteRepository,
                         QuoteDraftCalculator quoteDraftCalculator,
+                        QuoteVersionRepository quoteVersionRepository,
                         QuotePdfModelAssembler quotePdfModelAssembler,
                         QuotePdfGenerator quotePdfGenerator,
                         ObjectMapper objectMapper) {
@@ -117,6 +121,7 @@ public class QuoteService {
         this.quoteDraftLineRepository = quoteDraftLineRepository;
         this.quoteDraftWriteRepository = quoteDraftWriteRepository;
         this.quoteDraftCalculator = quoteDraftCalculator;
+        this.quoteVersionRepository = quoteVersionRepository;
         this.quotePdfModelAssembler = quotePdfModelAssembler;
         this.quotePdfGenerator = quotePdfGenerator;
         this.objectMapper = objectMapper;
@@ -126,7 +131,7 @@ public class QuoteService {
     // GET /orders/{orderId}/quote/workspace
     // ------------------------------------------------------------------
 
-    /** Read the quote workspace. LAID read is allowed. current_issued / accepted are null in PR1. */
+    /** Read the quote workspace. LAID read is allowed. accepted is null until 16F. */
     @Transactional(readOnly = true)
     public QuoteWorkspaceDto getWorkspace(String slug, String orderIdRaw, HttpServletRequest httpRequest) {
         RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
@@ -137,14 +142,22 @@ public class QuoteService {
                 .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
 
+        // Phase 16E-A: the active ISSUED version summary (or null). Surfaced independently of the
+        // draft — a sent quote is never hidden by draft state (contract §11). The summary carries
+        // the ACTIVE token's expiry only — never the token value or hash.
+        QuoteIssuedSummaryDto currentIssued = quoteVersionRepository.findIssuedByOrderId(orderId)
+                .map(row -> QuoteIssuedSummaryDto.from(row,
+                        quoteVersionRepository.findActiveTokenExpiry(row.quoteVersionId()).orElse(null)))
+                .orElse(null);
+
         Optional<QuoteDraft> draftOpt = quoteDraftRepository.findByOrderId(orderId);
         if (draftOpt.isEmpty()) {
-            return QuoteWorkspaceDto.draftOnly(null);
+            return QuoteWorkspaceDto.of(null, currentIssued);
         }
 
         QuoteDraft draft = draftOpt.get();
         List<QuoteDraftLine> lineEntities =
-                quoteDraftLineRepository.findByQuoteDraftIdOrderBySortOrderAsc(draft.getQuoteDraftId());
+                quoteDraftLineRepository.findByQuoteDraftIdOrderBySortOrderAscQuoteDraftLineIdAsc(draft.getQuoteDraftId());
 
         // Live GP / below-cost against the order's CURRENT product/charge cost lines: a workspace read
         // can show below_cost = true even though the last save passed, if cost lines changed since.
@@ -160,7 +173,7 @@ public class QuoteService {
                 belowCost,
                 toLineDtos(lineEntities),
                 draft.getUpdatedAt());
-        return QuoteWorkspaceDto.draftOnly(draftDto);
+        return QuoteWorkspaceDto.of(draftDto, currentIssued);
     }
 
     // ------------------------------------------------------------------
@@ -202,7 +215,7 @@ public class QuoteService {
                 .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_NOT_FOUND,
                         ErrorCode.QUOTE_NOT_FOUND.defaultMessage()));
         List<QuoteDraftLine> lines =
-                quoteDraftLineRepository.findByQuoteDraftIdOrderBySortOrderAsc(draft.getQuoteDraftId());
+                quoteDraftLineRepository.findByQuoteDraftIdOrderBySortOrderAscQuoteDraftLineIdAsc(draft.getQuoteDraftId());
 
         QuotePdfModel model = quotePdfModelAssembler.assemble(ctx.business(), order, orderId, draft, lines);
         byte[] bytes = quotePdfGenerator.render(model);
@@ -301,7 +314,7 @@ public class QuoteService {
         // query sees the rows just written. For a non-itemised save this returns the RETAINED dormant
         // rows (empty when none exist) — the read contract for a non-itemised draft.
         List<QuoteDraftLine> persistedLines =
-                quoteDraftLineRepository.findByQuoteDraftIdOrderBySortOrderAsc(quoteDraftId);
+                quoteDraftLineRepository.findByQuoteDraftIdOrderBySortOrderAscQuoteDraftLineIdAsc(quoteDraftId);
 
         // We only reach here when the quote is NOT below cost, so below_cost is false on the response.
         return new QuoteDraftDto(
