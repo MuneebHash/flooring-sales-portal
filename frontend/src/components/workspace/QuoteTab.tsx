@@ -2485,13 +2485,30 @@ export function QuoteTab({
                       Status
                     </div>
                     <div className="mt-1">
-                      {issued.viewed_at === null ? (
-                        <span className="inline-flex items-center rounded-md border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
-                          Sent
-                        </span>
-                      ) : (
+                      {issued.viewed_at !== null ? (
                         <span className="inline-flex items-center rounded-md border border-teal-200 bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700">
                           Opened
+                        </span>
+                      ) : issued.sent_channel === 'EMAIL' &&
+                        issued.last_emailed_at === null ? (
+                        // Email delivery failed (Codex P2): the 502 path keeps
+                        // the attempt markers but never stamps the success-only
+                        // last_emailed_at, so an EMAIL-channel summary without
+                        // it means the customer never received the email —
+                        // "Sent" would misreport it. SMS has no success marker
+                        // and keeps the plain Sent badge (not user-enabled yet).
+                        <>
+                          <span className="inline-flex items-center rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
+                            Not delivered
+                          </span>
+                          <p className="mt-1 text-xs text-amber-800">
+                            The email could not be delivered. Resend to try
+                            again.
+                          </p>
+                        </>
+                      ) : (
+                        <span className="inline-flex items-center rounded-md border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
+                          Sent
                         </span>
                       )}
                     </div>
