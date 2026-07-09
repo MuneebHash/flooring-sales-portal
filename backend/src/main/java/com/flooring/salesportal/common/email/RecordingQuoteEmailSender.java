@@ -41,10 +41,11 @@ public class RecordingQuoteEmailSender implements QuoteEmailSender {
         // DEV-ONLY visibility (Phase 16E-C): recorded emails are otherwise invisible outside the
         // test API, so surface the message on the backend console — the body carries the public
         // /q/{token} link, making it copyable for manual QA. Logs ONLY what the request already
-        // contains (recipient / subject / bodyText). This recording sender is never active with a
-        // real provider (the Phase 17 branch introduces the selection mechanism), so no real
-        // customer email is ever logged from here.
-        log.info("Dev-recorded quote email (no real email sent) — to: {} | subject: {}\n{}",
+        // contains (recipient / subject / bodyText). DEBUG, not INFO (Codex round 3): the body is
+        // a BEARER link, so it must never reach default-level logs — dev visibility requires the
+        // DEBUG level, which the dev application.properties enables explicitly for this class;
+        // production configs must NOT.
+        log.debug("Dev-recorded quote email (no real email sent) — to: {} | subject: {}\n{}",
                 request.recipientEmail(), request.subject(), request.bodyText());
     }
 
