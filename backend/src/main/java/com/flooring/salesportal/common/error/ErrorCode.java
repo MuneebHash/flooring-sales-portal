@@ -66,14 +66,25 @@ public enum ErrorCode {
     // create an ACCEPTED version, but it is valid data once 16F lands), stored-PDF download
     // (QUOTE_PDF_NOT_FOUND 404), the send-sms recipient gate (422s, mirroring the Phase 13
     // CUSTOMER_EMAIL_* pair), and the send-sms provider failure (502, mirroring EMAIL_SEND_FAILED).
-    // The 16E-C/16F public-link/token codes (QUOTE_TOKEN_NOT_FOUND / QUOTE_LINK_* /
-    // QUOTE_NOT_ACCEPTED) are added by their owning endpoints, not here.
+    // The 16F create-invoice code (QUOTE_NOT_ACCEPTED) is added by its owning endpoint, not here.
     QUOTE_NOT_ISSUED(HttpStatus.UNPROCESSABLE_ENTITY, "There is no active quote to cancel."),
     QUOTE_ALREADY_ACCEPTED(HttpStatus.CONFLICT, "This quote has already been accepted."),
     QUOTE_PDF_NOT_FOUND(HttpStatus.NOT_FOUND, "The requested quote PDF is not available."),
     CUSTOMER_MOBILE_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "A valid customer mobile number is required to send by SMS."),
     CUSTOMER_MOBILE_INVALID(HttpStatus.UNPROCESSABLE_ENTITY, "Customer mobile number is not valid."),
     SMS_SEND_FAILED(HttpStatus.BAD_GATEWAY, "The quote could not be sent by SMS. Please try again."),
+    // Phase 16E-C public quote-link codes (contract §12): the token-only public surface.
+    // QUOTE_TOKEN_NOT_FOUND (404) covers BOTH an unknown and a malformed token — the public GET
+    // must never distinguish them (no existence leak). The four QUOTE_LINK_* codes are 410 Gone
+    // for a FOUND but dead link, raised only by the public viewed/pdf (and 16F accept) actions;
+    // the public GET instead returns 200 with a state so the customer page can show the message
+    // (contract §12 clarification). QUOTE_LINK_SUPERSEDED serves both REPLACED and SUPERSEDED
+    // tokens; QUOTE_LINK_INACTIVE is the CONSUMED (signed) token — dead like the others.
+    QUOTE_TOKEN_NOT_FOUND(HttpStatus.NOT_FOUND, "Quote not found."),
+    QUOTE_LINK_EXPIRED(HttpStatus.GONE, "This quote link has expired. Please contact the store."),
+    QUOTE_LINK_SUPERSEDED(HttpStatus.GONE, "This quote has been replaced. Please use the latest quote link."),
+    QUOTE_LINK_CANCELLED(HttpStatus.GONE, "This quote has been cancelled. Please contact the store."),
+    QUOTE_LINK_INACTIVE(HttpStatus.GONE, "This quote link is no longer active. Please contact the store."),
     INTERNAL_SERVER_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
 
     private final HttpStatus status;

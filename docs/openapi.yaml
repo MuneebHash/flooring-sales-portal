@@ -4611,6 +4611,15 @@ components:
       required:
         - state
         - business_name
+      description: >
+        Public, token-only quote view. Phase 16E-C extends the original 16B shape ADDITIVELY with
+        the document fields the public quote page renders (Quotation To, Details of Sale, totals
+        breakdown, deposit) — all nullable, populated only when state is ACTIVE, sourced from the
+        frozen issued snapshot plus the same live presentation context the issued PDF reads
+        (business branding, saved customer name/billing address). Still cost-free, GP-free and
+        internal-ID-free: order_number is the business-facing document number already printed on
+        the delivered PDF, not an internal id. A non-ACTIVE state returns the minimal payload
+        (state, business_name, message; every document field null).
       properties:
         state:
           $ref: '#/components/schemas/PublicQuoteState'
@@ -4622,6 +4631,55 @@ components:
         accent_color:
           type: string
           nullable: true
+        business_abn:
+          type: string
+          nullable: true
+          description: Business ABN as shown on the issued PDF; present when state is ACTIVE.
+        payment_account_name:
+          type: string
+          nullable: true
+          description: Direct-deposit account name as shown on the issued PDF; present when state is ACTIVE.
+        payment_bank_name:
+          type: string
+          nullable: true
+          description: Direct-deposit bank name as shown on the issued PDF; present when state is ACTIVE.
+        payment_bsb:
+          type: string
+          nullable: true
+          description: Direct-deposit BSB as shown on the issued PDF; present when state is ACTIVE.
+        payment_account_number:
+          type: string
+          nullable: true
+          description: Direct-deposit account number as shown on the issued PDF; present when state is ACTIVE.
+        payment_stripe_link_url:
+          type: string
+          nullable: true
+          description: Tenant Stripe payment-link URL as used by the Payments tab; present when state is ACTIVE.
+        order_number:
+          type: string
+          nullable: true
+          description: Document number under the QUOTATION title; present when state is ACTIVE.
+        flooring_type:
+          allOf:
+            - $ref: '#/components/schemas/FlooringType'
+          nullable: true
+          description: The frozen flooring_type_snapshot; present when state is ACTIVE.
+        customer_name:
+          type: string
+          nullable: true
+          description: Quotation To — the saved customer name; present when state is ACTIVE.
+        customer_address_line1:
+          type: string
+          nullable: true
+          description: Quotation To billing address line 1; present when state is ACTIVE.
+        customer_address_line2:
+          type: string
+          nullable: true
+          description: Quotation To billing address line 2; present when state is ACTIVE.
+        details_of_sale:
+          type: string
+          nullable: true
+          description: The frozen details_of_sale_snapshot; present when state is ACTIVE.
         itemised:
           type: boolean
           nullable: true
@@ -4629,14 +4687,34 @@ components:
         lines:
           type: array
           nullable: true
-          description: Present when state is ACTIVE and itemised.
+          description: >
+            Present when state is ACTIVE and itemised (frozen issued snapshot lines in display
+            order); always an empty array for an ACTIVE non-itemised quote (a non-itemised issue
+            snapshots zero lines).
           items:
             $ref: '#/components/schemas/PublicQuoteLine'
+        quote_total_ex_gst:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          nullable: true
+          description: Subtotal ex GST from the frozen snapshot; present when state is ACTIVE.
+        gst_amount:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          nullable: true
+          description: Server-computed inc − ex (issued-PDF math); present when state is ACTIVE.
         quote_total_inc_gst:
           allOf:
             - $ref: '#/components/schemas/Money'
           nullable: true
           description: Present when state is ACTIVE.
+        deposit_amount:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+          nullable: true
+          description: >
+            Display-only 40% of the inc-GST total, server-computed with the exact issued-PDF
+            rounding (HALF_UP 2dp); present when state is ACTIVE. Never persisted.
         terms_html:
           type: string
           nullable: true

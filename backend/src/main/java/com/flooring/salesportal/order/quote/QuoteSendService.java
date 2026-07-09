@@ -41,6 +41,7 @@ import com.flooring.salesportal.tenant.BusinessRepository;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -164,6 +165,9 @@ public class QuoteSendService {
     // email-success stamp in its own follow-up transaction — so the send methods cannot be
     // @Transactional (the OrderInvoiceService accept/resend precedent).
     private final TransactionTemplate transactionTemplate;
+    // Phase 16E-C: absolute app origin for the public /q/{token} link (app.public-base-url;
+    // normalized to no trailing slash). The public page/API are SLUGLESS — locked 16E-C decision.
+    private final String publicBaseUrl;
 
     public QuoteSendService(RequestContextGuard requestContextGuard,
                             SalesOrderRepository salesOrderRepository,
@@ -184,7 +188,8 @@ public class QuoteSendService {
                             QuoteEmailSender quoteEmailSender,
                             SmsSender smsSender,
                             ObjectMapper objectMapper,
-                            PlatformTransactionManager transactionManager) {
+                            PlatformTransactionManager transactionManager,
+                            @Value("${app.public-base-url}") String publicBaseUrl) {
         this.requestContextGuard = requestContextGuard;
         this.salesOrderRepository = salesOrderRepository;
         this.orderCustomerRepository = orderCustomerRepository;
@@ -205,6 +210,8 @@ public class QuoteSendService {
         this.smsSender = smsSender;
         this.objectMapper = objectMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        // Normalize once: no trailing slash, so publicBaseUrl + "/q/" + token is always clean.
+        this.publicBaseUrl = publicBaseUrl == null ? "" : publicBaseUrl.trim().replaceAll("/+$", "");
     }
 
     // ------------------------------------------------------------------
@@ -225,7 +232,7 @@ public class QuoteSendService {
         long orderId = parseOrderId(orderIdRaw);
 
         PreparedSend prepared = transactionTemplate.execute(status ->
-                prepareSend(ctx, slug, orderId, body, CHANNEL_EMAIL));
+                prepareSend(ctx, orderId, body, CHANNEL_EMAIL));
 
         try {
             quoteEmailSender.send(new QuoteEmailRequest(
@@ -268,7 +275,7 @@ public class QuoteSendService {
         long orderId = parseOrderId(orderIdRaw);
 
         PreparedSend prepared = transactionTemplate.execute(status ->
-                prepareSend(ctx, slug, orderId, body, CHANNEL_SMS));
+                prepareSend(ctx, orderId, body, CHANNEL_SMS));
 
         try {
             smsSender.send(new SmsRequest(
@@ -403,7 +410,7 @@ public class QuoteSendService {
      * live below-cost re-check (422 {@code QUOTE_BELOW_COST}, before ANY persistence) →
      * changed-detection → persist → token mint → attempt markers.
      */
-    private PreparedSend prepareSend(RequestContext ctx, String slug, long orderId, String body, String channel) {
+    private PreparedSend prepareSend(RequestContext ctx, long orderId, String body, String channel) {
         SalesOrder order = salesOrderRepository
                 .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
@@ -505,9 +512,10 @@ public class QuoteSendService {
                         "quote_version disappeared while preparing send: " + quoteVersionId));
         List<QuoteVersionLineRow> summaryLines = quoteVersionRepository.findVersionLines(quoteVersionId);
 
-        // Public page URL shape is /{slug}/q/{token} (contract §8); the absolute origin is a
-        // 16E-C/Phase 17 delivery concern — no real message leaves the system in 16E-A.
-        String publicLink = "/" + slug + "/q/" + plainToken;
+        // Phase 16E-C (locked): the public quote page is TOP-LEVEL and SLUGLESS — the real link is
+        // <app-base>/q/{token}. This is the ONLY place the plaintext token appears (exactly once,
+        // inside the delivered message body); it is never persisted and never in an API response.
+        String publicLink = publicBaseUrl + "/q/" + plainToken;
         return new PreparedSend(finalRow, expiresAt, recipient, pdfBytes, pdfFileName,
                 publicLink, order.getOrderNumber(), summaryLines);
     }

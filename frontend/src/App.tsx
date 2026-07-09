@@ -16,6 +16,7 @@ import {
 import { DashboardPage } from './components/DashboardPage'
 import { Login } from './components/Login'
 import { OrderWorkspace } from './components/OrderWorkspace'
+import { PublicQuotePage } from './components/PublicQuotePage'
 import { StoreSelection } from './components/StoreSelection'
 
 function RequireAuth({ children }: { children: ReactNode }) {
@@ -70,6 +71,13 @@ function App() {
     <BrowserRouter>
       <AuthProvider>
         <Routes>
+          {/* Phase 16E-C — PUBLIC customer quote page: top-level, SLUGLESS,
+              token-only, no login/store-selection/app shell. The static "q"
+              segment outranks the dynamic :slug route in React Router's
+              matching, so /q/{token} can never be routed as a tenant. The
+              page itself makes no authenticated call (publicQuoteApi fetches
+              WITHOUT credentials); AuthProvider around it is inert state. */}
+          <Route path="q/:token" element={<PublicQuotePage />} />
           <Route path=":slug" element={<TenantGuard />}>
             <Route path="login" element={<Login />} />
             <Route
