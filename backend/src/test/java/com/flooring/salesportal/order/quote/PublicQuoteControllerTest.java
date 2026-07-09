@@ -359,12 +359,25 @@ class PublicQuoteControllerTest {
         saveItemisedTwoLineDraft(orderId);
         String token = issueAndExtractToken(orderId);
 
-        // Mutate EVERY live source after the issue: tenant terms, order details-of-sale, and the
-        // draft itself (different line set + totals). None of it may leak into the public view.
+        // The issue must have FROZEN the "Quotation To" identity onto the version row (V17).
+        Map<String, Object> issuedRow = issuedVersionRow(orderId);
+        Assertions.assertEquals("Quote Tester", issuedRow.get("customer_name_snapshot"));
+        Assertions.assertEquals("12 Test Street", issuedRow.get("customer_address_line1_snapshot"));
+        Assertions.assertEquals("Sydney NSW 2000", issuedRow.get("customer_address_line2_snapshot"));
+
+        // Mutate EVERY live source after the issue: tenant terms, order details-of-sale, the
+        // CUSTOMER + BILLING ADDRESS (the Codex P1 leak — a pre-LAID customer edit must never
+        // reach the old token holder), and the draft itself (different line set + totals). None
+        // of it may leak into the public view.
         jdbcTemplate.update("UPDATE business SET terms_soft = '<p>Edited later</p>' "
                 + "WHERE business_id = ?", BUSINESS_AUSSIE);
         jdbcTemplate.update("UPDATE sales_order SET details_of_sale = 'Edited later' "
                 + "WHERE order_id = ?", orderId);
+        jdbcTemplate.update("UPDATE order_customer SET first_name = 'Changed', "
+                + "middle_name = NULL, last_name = 'Person' WHERE order_id = ?", orderId);
+        jdbcTemplate.update("UPDATE order_address SET unit_number = NULL, street_number = '99', "
+                + "street = 'Changed Street', suburb = 'Melbourne', state_code = 'VIC', "
+                + "postcode = '3000' WHERE order_id = ?", orderId);
         clearJpaCache();
         mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON)
@@ -380,12 +393,31 @@ class PublicQuoteControllerTest {
                 .andExpect(jsonPath("$.data.state").value("ACTIVE"))
                 .andExpect(jsonPath("$.data.details_of_sale").value("Frozen details"))
                 .andExpect(jsonPath("$.data.terms_html").value("<p>Frozen at issue</p>"))
+                // "Quotation To" comes from the V17 snapshot columns — the ORIGINAL identity,
+                // never the post-issue "Changed Person"/Melbourne edits.
+                .andExpect(jsonPath("$.data.customer_name").value("Quote Tester"))
+                .andExpect(jsonPath("$.data.customer_address_line1").value("12 Test Street"))
+                .andExpect(jsonPath("$.data.customer_address_line2").value("Sydney NSW 2000"))
                 .andExpect(jsonPath("$.data.lines", hasSize(2)))
                 .andExpect(jsonPath("$.data.lines[0].description").value("Carpet"))
                 .andReturn();
         com.jayway.jsonpath.DocumentContext json =
                 com.jayway.jsonpath.JsonPath.parse(result.getResponse().getContentAsString());
         assertMoneyJson("275.00", json.read("$.data.quote_total_inc_gst"));
+
+        // Freeze-at-issue, not freeze-forever: the draft changed above, so a re-send issues a
+        // NEW version whose snapshot must carry the EDITED identity ("every new version gets
+        // them"); the old link is now dead (SUPERSEDED).
+        String newToken = issueAndExtractToken(orderId);
+        mockMvc.perform(get(publicUrl(newToken)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.state").value("ACTIVE"))
+                .andExpect(jsonPath("$.data.customer_name").value("Changed Person"))
+                .andExpect(jsonPath("$.data.customer_address_line1").value("99 Changed Street"))
+                .andExpect(jsonPath("$.data.customer_address_line2").value("Melbourne VIC 3000"));
+        mockMvc.perform(get(publicUrl(token)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.state").value("SUPERSEDED"));
     }
 
     @Test

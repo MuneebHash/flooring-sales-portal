@@ -48,6 +48,9 @@ public class QuoteVersionRepository {
                 flooring_type_snapshot,
                 terms_snapshot,
                 details_of_sale_snapshot,
+                customer_name_snapshot,
+                customer_address_line1_snapshot,
+                customer_address_line2_snapshot,
                 sent_channel,
                 first_sent_at,
                 last_sent_at,
@@ -86,10 +89,12 @@ public class QuoteVersionRepository {
             INSERT INTO quote_version
                 (order_id, version_number, status, itemised, quote_total_ex_gst, quote_total_inc_gst,
                  flooring_type_snapshot, terms_snapshot, details_of_sale_snapshot,
+                 customer_name_snapshot, customer_address_line1_snapshot, customer_address_line2_snapshot,
                  issued_pdf_file_id, created_by_user_id)
             VALUES
                 (:orderId, :versionNumber, 'ISSUED', :itemised, :quoteTotalExGst, :quoteTotalIncGst,
                  :flooringTypeSnapshot, :termsSnapshot, :detailsOfSaleSnapshot,
+                 :customerNameSnapshot, :customerAddressLine1Snapshot, :customerAddressLine2Snapshot,
                  :issuedPdfFileId, :createdByUserId)
             RETURNING
             """ + VERSION_COLUMNS;
@@ -285,6 +290,9 @@ public class QuoteVersionRepository {
                 .addValue("flooringTypeSnapshot", snapshot.flooringType())
                 .addValue("termsSnapshot", snapshot.termsHtml())
                 .addValue("detailsOfSaleSnapshot", snapshot.detailsOfSale())
+                .addValue("customerNameSnapshot", snapshot.customerName())
+                .addValue("customerAddressLine1Snapshot", snapshot.customerAddressLine1())
+                .addValue("customerAddressLine2Snapshot", snapshot.customerAddressLine2())
                 .addValue("issuedPdfFileId", issuedPdfFileId)
                 .addValue("createdByUserId", createdByUserId);
         return jdbc.queryForObject(INSERT_VERSION_SQL, params, VERSION_ROW_MAPPER);
@@ -452,6 +460,9 @@ public class QuoteVersionRepository {
             rs.getString("flooring_type_snapshot"),
             rs.getString("terms_snapshot"),
             rs.getString("details_of_sale_snapshot"),
+            rs.getString("customer_name_snapshot"),
+            rs.getString("customer_address_line1_snapshot"),
+            rs.getString("customer_address_line2_snapshot"),
             rs.getString("sent_channel"),
             toLocalDateTime(rs.getTimestamp("first_sent_at")),
             toLocalDateTime(rs.getTimestamp("last_sent_at")),
@@ -500,6 +511,9 @@ public class QuoteVersionRepository {
             String flooringTypeSnapshot,
             String termsSnapshot,
             String detailsOfSaleSnapshot,
+            String customerNameSnapshot,
+            String customerAddressLine1Snapshot,
+            String customerAddressLine2Snapshot,
             String sentChannel,
             LocalDateTime firstSentAt,
             LocalDateTime lastSentAt,

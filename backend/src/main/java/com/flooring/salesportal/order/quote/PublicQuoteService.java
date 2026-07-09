@@ -11,10 +11,6 @@ import com.flooring.salesportal.common.error.MalformedJsonException;
 import com.flooring.salesportal.common.error.NotFoundException;
 import com.flooring.salesportal.common.error.ValidationException;
 import com.flooring.salesportal.common.storage.FileStorageService;
-import com.flooring.salesportal.order.OrderAddress;
-import com.flooring.salesportal.order.OrderAddressRepository;
-import com.flooring.salesportal.order.OrderCustomer;
-import com.flooring.salesportal.order.OrderCustomerRepository;
 import com.flooring.salesportal.order.SalesOrder;
 import com.flooring.salesportal.order.SalesOrderRepository;
 import com.flooring.salesportal.order.quote.QuoteVersionRepository.QuoteFile;
@@ -72,10 +68,12 @@ import java.util.regex.Pattern;
  *
  * <p><b>Snapshot-only body.</b> The ACTIVE payload's quote content comes exclusively from the
  * FROZEN issued snapshot ({@code quote_version} totals/flags, {@code quote_version_line} rows,
- * {@code terms_snapshot}, {@code details_of_sale_snapshot}, {@code flooring_type_snapshot}) —
- * never from the live draft, live draft lines, live tenant terms or live order details-of-sale.
- * Presentation context (business name/logo/accent, customer name + billing lines) is read live,
- * exactly as the issued-PDF assembler reads it. The PDF endpoint streams the STORED issued bytes
+ * {@code terms_snapshot}, {@code details_of_sale_snapshot}, {@code flooring_type_snapshot}, and —
+ * since V17 (Codex P1 fix) — the {@code customer_*_snapshot} "Quotation To" columns frozen at
+ * issue). This service reads NO live order_customer/order_address row: a pre-LAID customer edit
+ * after issue can never leak the new person's name/billing to the old token holder. The only live
+ * reads are the tenant's OWN self-data (business name/logo/accent/ABN + payment config), exactly
+ * as the issued-PDF assembler reads them. The PDF endpoint streams the STORED issued bytes
  * verbatim — nothing is ever regenerated here.
  */
 @Service
@@ -93,8 +91,6 @@ public class PublicQuoteService {
     private static final String STATE_SUPERSEDED = "SUPERSEDED";
     private static final String STATE_CANCELLED = "CANCELLED";
     private static final String STATE_INACTIVE = "INACTIVE";
-
-    private static final String ADDRESS_BILLING = "BILLING";
 
     // Minted tokens are 32 CSPRNG bytes -> 43 URL-safe Base64 chars (no padding). Anything
     // shorter, longer than a defensive cap, or off the URL-safe alphabet cannot be a real token
@@ -115,8 +111,6 @@ public class PublicQuoteService {
     private final QuoteVersionRepository quoteVersionRepository;
     private final SalesOrderRepository salesOrderRepository;
     private final BusinessRepository businessRepository;
-    private final OrderCustomerRepository orderCustomerRepository;
-    private final OrderAddressRepository orderAddressRepository;
     private final FileStorageService fileStorageService;
     private final ObjectMapper objectMapper;
     // Programmatic transactions (the QuoteSendService pattern): the lazy-expiry flip must COMMIT
@@ -126,16 +120,12 @@ public class PublicQuoteService {
     public PublicQuoteService(QuoteVersionRepository quoteVersionRepository,
                               SalesOrderRepository salesOrderRepository,
                               BusinessRepository businessRepository,
-                              OrderCustomerRepository orderCustomerRepository,
-                              OrderAddressRepository orderAddressRepository,
                               FileStorageService fileStorageService,
                               ObjectMapper objectMapper,
                               PlatformTransactionManager transactionManager) {
         this.quoteVersionRepository = quoteVersionRepository;
         this.salesOrderRepository = salesOrderRepository;
         this.businessRepository = businessRepository;
-        this.orderCustomerRepository = orderCustomerRepository;
-        this.orderAddressRepository = orderAddressRepository;
         this.fileStorageService = fileStorageService;
         this.objectMapper = objectMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
@@ -346,10 +336,11 @@ public class PublicQuoteService {
     // ------------------------------------------------------------------
 
     /**
-     * The full ACTIVE document payload. Quote BODY fields come from the frozen issued snapshot
-     * only; presentation context (business branding, customer name + billing lines) is read live —
-     * the same split {@code QuotePdfModelAssembler.assembleIssued} uses. The line set is re-gated
-     * on the snapshot's itemised flag (structurally empty for a non-itemised issue — §6.1).
+     * The full ACTIVE document payload. Quote BODY fields — including, since V17, the
+     * "Quotation To" customer name + billing lines — come from the frozen issued snapshot only;
+     * the ONLY live reads are the tenant's own branding/payment self-data (the sanctioned set).
+     * The line set is re-gated on the snapshot's itemised flag (structurally empty for a
+     * non-itemised issue — §6.1).
      */
     private PublicQuoteViewDto buildActiveView(ResolvedToken resolved) {
         long quoteVersionId = resolved.token().quoteVersionId();
@@ -379,9 +370,6 @@ public class PublicQuoteService {
         String paymentStripeLinkUrl =
                 safeStripeLinkUrl(config == null ? null : config.getStripePaymentLinkUrl());
 
-        OrderCustomer customer = orderCustomerRepository.findByOrderId(version.orderId()).orElse(null);
-        List<OrderAddress> addresses = orderAddressRepository.findByOrderId(version.orderId());
-
         List<PublicQuoteViewDto.Line> lines = version.itemised()
                 ? quoteVersionRepository.findVersionLines(quoteVersionId).stream()
                         .map(PublicQuoteService::toPublicLine)
@@ -404,9 +392,9 @@ public class PublicQuoteService {
                 paymentStripeLinkUrl,
                 order.getOrderNumber(),
                 version.flooringTypeSnapshot(),
-                customer == null ? null : blankToNull(customerName(customer)),
-                blankToNull(billingLine1(addresses)),
-                blankToNull(billingLine2(addresses)),
+                blankToNull(version.customerNameSnapshot()),
+                blankToNull(version.customerAddressLine1Snapshot()),
+                blankToNull(version.customerAddressLine2Snapshot()),
                 blankToNull(version.detailsOfSaleSnapshot()),
                 version.itemised(),
                 lines,
@@ -470,53 +458,9 @@ public class PublicQuoteService {
         return (value == null ? BigDecimal.ZERO : value).setScale(MONEY_SCALE, ROUNDING);
     }
 
-    private static String customerName(OrderCustomer customer) {
-        StringBuilder sb = new StringBuilder();
-        appendIfPresent(sb, customer.getFirstName());
-        appendIfPresent(sb, customer.getMiddleName());
-        appendIfPresent(sb, customer.getLastName());
-        return sb.toString();
-    }
-
-    private static String billingLine1(List<OrderAddress> addresses) {
-        OrderAddress billing = billing(addresses);
-        if (billing == null) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder();
-        if (billing.getUnitNumber() != null && !billing.getUnitNumber().isBlank()) {
-            sb.append(billing.getUnitNumber().trim()).append('/');
-        }
-        sb.append(billing.getStreetNumber()).append(' ').append(billing.getStreet());
-        return sb.toString();
-    }
-
-    private static String billingLine2(List<OrderAddress> addresses) {
-        OrderAddress billing = billing(addresses);
-        if (billing == null) {
-            return "";
-        }
-        return billing.getSuburb() + " " + billing.getStateCode() + " " + billing.getPostcode();
-    }
-
-    private static OrderAddress billing(List<OrderAddress> addresses) {
-        if (addresses == null) {
-            return null;
-        }
-        return addresses.stream()
-                .filter(a -> ADDRESS_BILLING.equals(a.getAddressType()))
-                .findFirst()
-                .orElse(null);
-    }
-
-    private static void appendIfPresent(StringBuilder sb, String value) {
-        if (value != null && !value.isBlank()) {
-            if (sb.length() > 0) {
-                sb.append(' ');
-            }
-            sb.append(value.trim());
-        }
-    }
+    // The customer-name/billing-line derivation helpers moved to QuoteSendService (V17): the
+    // "Quotation To" identity is now frozen into quote_version at ISSUE and this service renders
+    // the snapshot columns verbatim — no live order_customer/order_address read exists here.
 
     private static String blankToNull(String value) {
         return (value == null || value.isBlank()) ? null : value.trim();

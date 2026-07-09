@@ -25,6 +25,8 @@ import com.flooring.salesportal.common.storage.FileStorageService;
 import com.flooring.salesportal.order.CustomerEmailValidator;
 import com.flooring.salesportal.order.CustomerMobileValidator;
 import com.flooring.salesportal.order.InvoiceTermsSanitizer;
+import com.flooring.salesportal.order.OrderAddress;
+import com.flooring.salesportal.order.OrderAddressRepository;
 import com.flooring.salesportal.order.OrderChargeLineReadRepository;
 import com.flooring.salesportal.order.OrderCustomer;
 import com.flooring.salesportal.order.OrderCustomerRepository;
@@ -145,6 +147,7 @@ public class QuoteSendService {
     private final RequestContextGuard requestContextGuard;
     private final SalesOrderRepository salesOrderRepository;
     private final OrderCustomerRepository orderCustomerRepository;
+    private final OrderAddressRepository orderAddressRepository;
     private final CustomerEmailValidator customerEmailValidator;
     private final CustomerMobileValidator customerMobileValidator;
     private final OrderProductLineRepository orderProductLineRepository;
@@ -172,6 +175,7 @@ public class QuoteSendService {
     public QuoteSendService(RequestContextGuard requestContextGuard,
                             SalesOrderRepository salesOrderRepository,
                             OrderCustomerRepository orderCustomerRepository,
+                            OrderAddressRepository orderAddressRepository,
                             CustomerEmailValidator customerEmailValidator,
                             CustomerMobileValidator customerMobileValidator,
                             OrderProductLineRepository orderProductLineRepository,
@@ -193,6 +197,7 @@ public class QuoteSendService {
         this.requestContextGuard = requestContextGuard;
         this.salesOrderRepository = salesOrderRepository;
         this.orderCustomerRepository = orderCustomerRepository;
+        this.orderAddressRepository = orderAddressRepository;
         this.customerEmailValidator = customerEmailValidator;
         this.customerMobileValidator = customerMobileValidator;
         this.orderProductLineRepository = orderProductLineRepository;
@@ -467,7 +472,7 @@ public class QuoteSendService {
             // Changed draft (or no active issued version) → NEW issued version from a fresh
             // snapshot. The snapshot object feeds BOTH the DB rows and the PDF (they can't drift),
             // and its line set is mode-scoped (the §6.1 dormant-row guard).
-            QuoteIssueSnapshot snapshot = buildIssueSnapshot(ctx.businessId(), order, draft, draftLines);
+            QuoteIssueSnapshot snapshot = buildIssueSnapshot(ctx.businessId(), orderId, order, draft, draftLines);
             int versionNumber = quoteVersionRepository.maxVersionNumber(orderId) + 1;
             pdfFileName = "quote-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
             pdfBytes = quotePdfGenerator.render(
@@ -523,10 +528,13 @@ public class QuoteSendService {
     /**
      * Freeze the issue snapshot: per-flooring-type tenant terms are read LIVE, sanitized ONCE
      * ({@code InvoiceTermsSanitizer}) and frozen into {@code terms_snapshot}; flooring type and
-     * details-of-sale are frozen from the order; the line set is mode-scoped by
+     * details-of-sale are frozen from the order; the customer name + billing lines are frozen
+     * from the saved customer/address records (V17 — the "Quotation To" identity the PUBLIC
+     * payload renders; derivation identical to the issued-PDF assembler's, so the stored PDF and
+     * the snapshot columns can never disagree); the line set is mode-scoped by
      * {@link QuoteIssueSnapshot#of} (dormant retained rows are never snapshotted).
      */
-    private QuoteIssueSnapshot buildIssueSnapshot(long businessId, SalesOrder order,
+    private QuoteIssueSnapshot buildIssueSnapshot(long businessId, long orderId, SalesOrder order,
                                                   QuoteDraft draft, List<QuoteDraftLine> draftLines) {
         BusinessInvoiceConfigView config = businessRepository
                 .findInvoiceConfigByBusinessId(businessId)
@@ -536,8 +544,19 @@ public class QuoteSendService {
                 ? null
                 : (FLOORING_SOFT.equals(order.getFlooringType()) ? config.getTermsSoft() : config.getTermsHard());
         String termsHtml = termsSanitizer.sanitize(rawTerms);
+
+        // Customer identity frozen AT ISSUE (V17, Codex P1): a later pre-LAID customer edit must
+        // never reach the already-issued public quote. Nullable — the send gate only requires the
+        // channel recipient, not a name or billing address.
+        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
+        List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
+        String customerNameSnapshot = customer == null ? null : blankToNull(customerName(customer));
+        String customerAddressLine1Snapshot = blankToNull(billingLine1(addresses));
+        String customerAddressLine2Snapshot = blankToNull(billingLine2(addresses));
+
         return QuoteIssueSnapshot.of(draft, draftLines, order.getFlooringType(), termsHtml,
-                order.getDetailsOfSale());
+                order.getDetailsOfSale(),
+                customerNameSnapshot, customerAddressLine1Snapshot, customerAddressLine2Snapshot);
     }
 
     // ------------------------------------------------------------------
@@ -685,6 +704,66 @@ public class QuoteSendService {
         if (STATUS_LAID.equals(order.getOrderStatus())) {
             throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // "Quotation To" derivation for the V17 issue snapshot — the exact
+    // QuotePdfModelAssembler customer-name/billing-line helpers (duplicated per the locked
+    // duplicate-don't-extract decision), so snapshot columns == issued-PDF content.
+    // ------------------------------------------------------------------
+
+    private static final String ADDRESS_BILLING = "BILLING";
+
+    private static String customerName(OrderCustomer customer) {
+        StringBuilder sb = new StringBuilder();
+        appendIfPresent(sb, customer.getFirstName());
+        appendIfPresent(sb, customer.getMiddleName());
+        appendIfPresent(sb, customer.getLastName());
+        return sb.toString();
+    }
+
+    private static String billingLine1(List<OrderAddress> addresses) {
+        OrderAddress billing = billing(addresses);
+        if (billing == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        if (billing.getUnitNumber() != null && !billing.getUnitNumber().isBlank()) {
+            sb.append(billing.getUnitNumber().trim()).append('/');
+        }
+        sb.append(billing.getStreetNumber()).append(' ').append(billing.getStreet());
+        return sb.toString();
+    }
+
+    private static String billingLine2(List<OrderAddress> addresses) {
+        OrderAddress billing = billing(addresses);
+        if (billing == null) {
+            return "";
+        }
+        return billing.getSuburb() + " " + billing.getStateCode() + " " + billing.getPostcode();
+    }
+
+    private static OrderAddress billing(List<OrderAddress> addresses) {
+        if (addresses == null) {
+            return null;
+        }
+        return addresses.stream()
+                .filter(a -> ADDRESS_BILLING.equals(a.getAddressType()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static void appendIfPresent(StringBuilder sb, String value) {
+        if (value != null && !value.isBlank()) {
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            sb.append(value.trim());
+        }
+    }
+
+    private static String blankToNull(String value) {
+        return (value == null || value.isBlank()) ? null : value.trim();
     }
 
     private BigDecimal orderTotalCostExGst(long orderId) {
