@@ -548,15 +548,30 @@ public class QuoteSendService {
         // Customer identity frozen AT ISSUE (V17, Codex P1): a later pre-LAID customer edit must
         // never reach the already-issued public quote. Nullable — the send gate only requires the
         // channel recipient, not a name or billing address.
-        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
-        List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
-        String customerNameSnapshot = customer == null ? null : blankToNull(customerName(customer));
-        String customerAddressLine1Snapshot = blankToNull(billingLine1(addresses));
-        String customerAddressLine2Snapshot = blankToNull(billingLine2(addresses));
+        CustomerIdentity identity = currentCustomerIdentity(orderId);
 
         return QuoteIssueSnapshot.of(draft, draftLines, order.getFlooringType(), termsHtml,
                 order.getDetailsOfSale(),
-                customerNameSnapshot, customerAddressLine1Snapshot, customerAddressLine2Snapshot);
+                identity.name(), identity.line1(), identity.line2());
+    }
+
+    /**
+     * The order's CURRENT "Quotation To" identity — the single V17 derivation (name, billing
+     * line 1, billing line 2, each blank→null) used both to FREEZE the snapshot at issue and to
+     * COMPARE against the active version's snapshot in changed-detection, so the two can never
+     * use different rules.
+     */
+    private CustomerIdentity currentCustomerIdentity(long orderId) {
+        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
+        List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
+        return new CustomerIdentity(
+                customer == null ? null : blankToNull(customerName(customer)),
+                blankToNull(billingLine1(addresses)),
+                blankToNull(billingLine2(addresses)));
+    }
+
+    /** The derived customer-facing identity triple (V17). Server-internal, never serialized. */
+    private record CustomerIdentity(String name, String line1, String line2) {
     }
 
     // ------------------------------------------------------------------
@@ -578,6 +593,12 @@ public class QuoteSendService {
      * positional compare DETERMINISTIC when duplicate sort_order values exist (contract-legal via
      * direct API clients; without it, Postgres's unspecified tie order could flag an unchanged
      * draft as changed and spuriously supersede the issued version — 16E-A review finding).
+     *
+     * <p>(6) V17 / Codex round-2 P1: the CURRENT customer identity (the exact
+     * {@link #currentCustomerIdentity} snapshot derivation) vs the active version's frozen
+     * {@code customer_*_snapshot} columns, null-safe. A changed name/billing address must issue a
+     * NEW version that freezes the NEW identity — a resend re-delivers the OLD stored artifact,
+     * which would show the previous person's details to the new recipient.
      */
     private boolean draftChangedSinceIssue(QuoteDraft draft, List<QuoteDraftLine> draftLines,
                                            SalesOrder order, QuoteVersionRow issued) {
@@ -612,6 +633,15 @@ public class QuoteSendService {
                     return true;
                 }
             }
+        }
+        // (6) Customer identity vs the frozen V17 snapshot (Codex round-2 P1): an edited name or
+        // billing address is a CONTENT change — the resend path would re-deliver the stored PDF
+        // and snapshot carrying the OLD identity.
+        CustomerIdentity identity = currentCustomerIdentity(issued.orderId());
+        if (!Objects.equals(identity.name(), issued.customerNameSnapshot())
+                || !Objects.equals(identity.line1(), issued.customerAddressLine1Snapshot())
+                || !Objects.equals(identity.line2(), issued.customerAddressLine2Snapshot())) {
+            return true;
         }
         return false;
     }

@@ -10,13 +10,14 @@
 -- Append-only: V1-V16 stay locked (this is a NEW migration; the CI "Locked migration protection"
 -- guard covers V1-V13 and the Phase 17 squash/baseline will fold V14-V17 into one).
 --
--- Sizes: name = first(100)+middle(100)+last(100) space-joined but capped at 200 like the sibling
--- accepted_customer_name-style display fields (derived value, trimmed); address lines mirror the
--- order_address street(255) scale.
+-- TEXT, not VARCHAR (Codex round-2 P2): these are derived server-composed values (name =
+-- first+middle+last can exceed a fixed cap; line1 composes unit/street_number/street), and the
+-- sibling snapshot columns (terms_snapshot, details_of_sale_snapshot) are already unbounded TEXT
+-- — a cap here could make an issue INSERT fail for a legitimately long identity.
 
-ALTER TABLE quote_version ADD COLUMN customer_name_snapshot          VARCHAR(200);
-ALTER TABLE quote_version ADD COLUMN customer_address_line1_snapshot VARCHAR(255);
-ALTER TABLE quote_version ADD COLUMN customer_address_line2_snapshot VARCHAR(255);
+ALTER TABLE quote_version ADD COLUMN customer_name_snapshot          TEXT;
+ALTER TABLE quote_version ADD COLUMN customer_address_line1_snapshot TEXT;
+ALTER TABLE quote_version ADD COLUMN customer_address_line2_snapshot TEXT;
 
 -- Backfill existing (pre-V17) versions from the CURRENT order_customer/order_address rows — the
 -- same values the public payload was serving live until this migration, and the best available
