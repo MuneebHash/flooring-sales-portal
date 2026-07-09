@@ -2536,15 +2536,15 @@ export function QuoteTab({
                       Status
                     </div>
                     <div className="mt-1">
-                      {issued.viewed_at !== null ? (
-                        <span className="inline-flex items-center rounded-md border border-teal-200 bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700">
-                          Opened
-                        </span>
-                      ) : emailNotDelivered(issued) ? (
+                      {emailNotDelivered(issued) ? (
                         // The latest EMAIL attempt failed (see the
                         // emailNotDelivered helper for the timestamp
-                        // reasoning) — "Sent" would misreport it. SMS keeps
-                        // the plain Sent badge (no success marker exists).
+                        // reasoning) — "Sent" OR "Opened" would misreport it:
+                        // an unchanged resend replaced the token, so a
+                        // previously-opened link is dead and the failure is
+                        // the actionable state; viewed_at is only settable
+                        // from 16E-C onward. SMS keeps the plain Sent badge
+                        // (no success marker exists).
                         <>
                           <span className="inline-flex items-center rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
                             Not delivered
@@ -2554,6 +2554,10 @@ export function QuoteTab({
                             again.
                           </p>
                         </>
+                      ) : issued.viewed_at !== null ? (
+                        <span className="inline-flex items-center rounded-md border border-teal-200 bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700">
+                          Opened
+                        </span>
                       ) : (
                         <span className="inline-flex items-center rounded-md border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
                           Sent
