@@ -34,6 +34,7 @@ import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -333,6 +334,7 @@ class QuoteSendControllerTest {
                 .andExpect(jsonPath("$.data.version_number").value(1))
                 .andExpect(jsonPath("$.data.status").value("ISSUED"))
                 .andExpect(jsonPath("$.data.itemised").value(true))
+                .andExpect(jsonPath("$.data.quote_total_ex_gst").value(250.00))
                 .andExpect(jsonPath("$.data.quote_total_inc_gst").value(275.00))
                 .andExpect(jsonPath("$.data.flooring_type").value("SOFT"))
                 .andExpect(jsonPath("$.data.sent_channel").value("EMAIL"))
@@ -341,6 +343,23 @@ class QuoteSendControllerTest {
                 .andExpect(jsonPath("$.data.last_emailed_at").isNotEmpty())
                 .andExpect(jsonPath("$.data.viewed_at").value(nullValue()))
                 .andExpect(jsonPath("$.data.token_expires_at").isNotEmpty())
+                // 16E-B frozen body snapshot: no details were saved on this order (null), and the
+                // itemised issue snapshots BOTH lines in (sort_order, PK) order with the full
+                // customer-facing field set — never a cost, id or snapshot-internal field.
+                .andExpect(jsonPath("$.data.details_of_sale").value(nullValue()))
+                .andExpect(jsonPath("$.data.lines", hasSize(2)))
+                .andExpect(jsonPath("$.data.lines[0].line_type").value("ITEM"))
+                .andExpect(jsonPath("$.data.lines[0].description").value("Carpet"))
+                .andExpect(jsonPath("$.data.lines[0].quantity").value(2.00))
+                .andExpect(jsonPath("$.data.lines[0].unit_price_ex_gst").value(100.00))
+                .andExpect(jsonPath("$.data.lines[0].line_total_ex_gst").value(200.00))
+                .andExpect(jsonPath("$.data.lines[0].sort_order").value(0))
+                .andExpect(jsonPath("$.data.lines[1].line_type").value("ITEM"))
+                .andExpect(jsonPath("$.data.lines[1].description").value("Underlay"))
+                .andExpect(jsonPath("$.data.lines[1].quantity").value(1.00))
+                .andExpect(jsonPath("$.data.lines[1].unit_price_ex_gst").value(50.00))
+                .andExpect(jsonPath("$.data.lines[1].line_total_ex_gst").value(50.00))
+                .andExpect(jsonPath("$.data.lines[1].sort_order").value(1))
                 .andReturn();
 
         // Version snapshot persisted.
@@ -407,8 +426,30 @@ class QuoteSendControllerTest {
         // dormant line is the bug being guarded).
         jdbcTemplate.update("UPDATE business SET terms_soft = NULL, terms_hard = NULL "
                 + "WHERE business_id = ?", BUSINESS_AUSSIE);
+        jdbcTemplate.update("UPDATE sales_order SET details_of_sale = 'Supply only, non-itemised' "
+                + "WHERE order_id = ?", orderId);
+        clearJpaCache();
 
-        sendEmailOk(orderId);
+        // 16E-B summary body on a NON-itemised issue: lines is ALWAYS an empty list (the dormant
+        // retained rows are never snapshotted or serialized) while quote_total_ex_gst and
+        // details_of_sale still ride on the summary.
+        mockMvc.perform(post(sendEmailUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.itemised").value(false))
+                .andExpect(jsonPath("$.data.quote_total_ex_gst").value(300.00))
+                .andExpect(jsonPath("$.data.quote_total_inc_gst").value(330.00))
+                .andExpect(jsonPath("$.data.details_of_sale").value("Supply only, non-itemised"))
+                .andExpect(jsonPath("$.data.lines").isArray())
+                .andExpect(jsonPath("$.data.lines", hasSize(0)));
+
+        // The workspace current_issued mirrors the same empty-lines / details snapshot shape.
+        mockMvc.perform(get(workspaceUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.current_issued.quote_total_ex_gst").value(300.00))
+                .andExpect(jsonPath("$.data.current_issued.details_of_sale")
+                        .value("Supply only, non-itemised"))
+                .andExpect(jsonPath("$.data.current_issued.lines", hasSize(0)));
 
         Map<String, Object> version = issuedVersionRow(orderId);
         Assertions.assertEquals(Boolean.FALSE, version.get("itemised"));
@@ -732,7 +773,11 @@ class QuoteSendControllerTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.message").value("Quote sent by SMS."))
                 .andExpect(jsonPath("$.data.sent_channel").value("SMS"))
-                .andExpect(jsonPath("$.data.last_emailed_at").value(nullValue()));
+                .andExpect(jsonPath("$.data.last_emailed_at").value(nullValue()))
+                // 16E-B: the SMS 201 summary carries the frozen body snapshot too (its own
+                // plumbing — PreparedSend.summaryLines — distinct from the email path's).
+                .andExpect(jsonPath("$.data.quote_total_ex_gst").value(250.00))
+                .andExpect(jsonPath("$.data.lines", hasSize(2)));
 
         Map<String, Object> version = issuedVersionRow(orderId);
         Assertions.assertEquals("SMS", version.get("sent_channel"));
@@ -904,7 +949,10 @@ class QuoteSendControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.message").value("Quote cancelled."))
                 .andExpect(jsonPath("$.data.status").value("CANCELLED"))
-                .andExpect(jsonPath("$.data.token_expires_at").value(nullValue()));
+                .andExpect(jsonPath("$.data.token_expires_at").value(nullValue()))
+                // 16E-B: the cancel response carries the frozen body snapshot too.
+                .andExpect(jsonPath("$.data.quote_total_ex_gst").value(250.00))
+                .andExpect(jsonPath("$.data.lines", hasSize(2)));
 
         Assertions.assertEquals(1, versionCountByStatus(orderId, "CANCELLED"));
         Assertions.assertEquals(0, versionCountByStatus(orderId, "ISSUED"));
@@ -1086,6 +1134,7 @@ class QuoteSendControllerTest {
                 .andExpect(jsonPath("$.data.current_issued.version_number").value(1))
                 .andExpect(jsonPath("$.data.current_issued.status").value("ISSUED"))
                 .andExpect(jsonPath("$.data.current_issued.itemised").value(true))
+                .andExpect(jsonPath("$.data.current_issued.quote_total_ex_gst").value(250.00))
                 .andExpect(jsonPath("$.data.current_issued.quote_total_inc_gst").value(275.00))
                 .andExpect(jsonPath("$.data.current_issued.flooring_type").value("SOFT"))
                 .andExpect(jsonPath("$.data.current_issued.sent_channel").value("EMAIL"))
@@ -1094,6 +1143,14 @@ class QuoteSendControllerTest {
                 .andExpect(jsonPath("$.data.current_issued.last_emailed_at").isNotEmpty())
                 .andExpect(jsonPath("$.data.current_issued.viewed_at").value(nullValue()))
                 .andExpect(jsonPath("$.data.current_issued.token_expires_at").isNotEmpty())
+                // 16E-B: the workspace summary carries the frozen body snapshot — details (null
+                // here; never saved) and the ordered issued lines.
+                .andExpect(jsonPath("$.data.current_issued.details_of_sale").value(nullValue()))
+                .andExpect(jsonPath("$.data.current_issued.lines", hasSize(2)))
+                .andExpect(jsonPath("$.data.current_issued.lines[0].description").value("Carpet"))
+                .andExpect(jsonPath("$.data.current_issued.lines[0].sort_order").value(0))
+                .andExpect(jsonPath("$.data.current_issued.lines[1].description").value("Underlay"))
+                .andExpect(jsonPath("$.data.current_issued.lines[1].sort_order").value(1))
                 .andExpect(jsonPath("$.data.accepted").value(nullValue()))
                 .andReturn();
 
@@ -1116,6 +1173,26 @@ class QuoteSendControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.current_issued").value(nullValue()))
                 .andExpect(jsonPath("$.data.accepted").value(nullValue()));
+    }
+
+    @Test
+    void workspace_currentIssuedDetails_areFrozenSnapshot_notLiveOrder() throws Exception {
+        long orderId = sendReadyOrder();
+        jdbcTemplate.update("UPDATE sales_order SET details_of_sale = 'Frozen at issue' "
+                + "WHERE order_id = ?", orderId);
+        sendEmailOk(orderId);
+
+        // Live details change AFTER the issue: the summary must keep the FROZEN
+        // details_of_sale_snapshot — the Customer Quote surface renders from current_issued
+        // only, never from live order/draft state (16E-B locked rule).
+        jdbcTemplate.update("UPDATE sales_order SET details_of_sale = 'Changed after issue' "
+                + "WHERE order_id = ?", orderId);
+        clearJpaCache();
+
+        mockMvc.perform(get(workspaceUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.current_issued.details_of_sale")
+                        .value("Frozen at issue"));
     }
 
     // ================================================================

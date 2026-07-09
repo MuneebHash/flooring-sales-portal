@@ -8,12 +8,18 @@ import { CheckCircleIcon, ChevronDownIcon, PlusIcon, TrashIcon } from '../icons'
 import { ApiError } from '../../lib/api/ApiError'
 import {
   QUOTE_TOTAL_MAX,
+  cancelQuote,
   fetchQuotePreviewPdf,
+  fetchQuoteStoredPdf,
+  fetchQuoteWorkspace,
   saveQuoteDraft,
+  sendQuoteEmail,
+  type QuoteChannel,
   type QuoteDraftLineInput,
   type QuoteDraftLineRead,
   type QuoteDraftRead,
   type QuoteDraftSaveRequest,
+  type QuoteIssuedSummary,
   type QuoteLineType,
 } from '../../lib/api/orderQuoteApi'
 import {
@@ -33,12 +39,28 @@ import { fetchPublicBusiness } from '../../lib/api/tenantApi'
 import { getActiveSlug } from '../../lib/tenant'
 import type { FlooringType } from '../../lib/flooring'
 
-// Phase 16D-B PR1 + PR2B — the salesperson Quote tab (docs/Phase16D-Quotation-UX-Lock.md).
+// Phase 16D-B PR1 + PR2B + 16E-B — the salesperson Quote tab
+// (docs/Phase16D-Quotation-UX-Lock.md).
 //
-// Three internal sub-tabs: Quote Draft (functional), Customer Quote and Accepted
-// Quote (real lifecycle tabs whose data arrives in 16E/16F — clean empty states
-// until then). The Quote Draft is an invoice-style QUOTATION canvas mirroring
-// InvoiceTab's document layout, NOT a generic form.
+// Three internal sub-tabs: Quote Draft (functional), Customer Quote (functional
+// since 16E-B — the ISSUED quote surface) and Accepted Quote (16F — clean empty
+// state until then). The Quote Draft is an invoice-style QUOTATION canvas
+// mirroring InvoiceTab's document layout, NOT a generic form.
+//
+// 16E-B delivery rules (locked):
+//   - Send by Email goes through the confirmation modal ONLY (no one-click
+//     send), runs the SAME double-flush as Preview PDF (details autosave, then
+//     quote autosave — the backend issues from PERSISTED state), and is blocked
+//     when either flush fails. An in-flight guard prevents duplicate sends.
+//   - SMS stays DISABLED ("Available soon") — no sendQuoteSms wrapper exists;
+//     frontend SMS enablement is 16E-C.
+//   - The Customer Quote sub-tab renders from the `issued` summary state
+//     (seeded from the probe's current_issued, replaced by send responses,
+//     nulled by a successful cancel) and from it ONLY — never from the live
+//     draft rows / totals / details / terms, which may have drifted since the
+//     issue was frozen.
+//   - LAID: Send/Resend disabled; Cancel quote and issued Preview PDF stay
+//     enabled (cancel only kills a public link; the stored PDF is a read).
 //
 // PR2B adds ITEMISED editing on top of PR1's non-itemised total:
 //   - a toggle switches the draft between the two modes (no warnings/modals);
@@ -110,6 +132,14 @@ type Props = {
   // (null = confirmed no saved draft). The tab seeds ONCE from this and then owns
   // the live draft state; it is never re-seeded after mount.
   initialDraft: QuoteDraftRead | null
+  // The active issued quote summary from the same probe (null = nothing issued).
+  // Seeds the Customer Quote sub-tab ONCE; after mount the tab owns the issued
+  // state (send responses replace it; a successful cancel nulls it).
+  initialIssued: QuoteIssuedSummary | null
+  // Switches the workspace to the Customer tab when a send fails with
+  // CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID so the salesperson can fix
+  // the email where it lives (the InvoiceTab accept/resend precedent).
+  onGoToCustomer?: () => void
   // Awaitable flush of any pending/in-flight Details of Sale autosave (lives in
   // the always-mounted shell — the SAME flush that gates invoice create/rewrite).
   // Codex P2: the quote preview PDF renders sales_order.details_of_sale from the
@@ -161,6 +191,62 @@ function formatMoney(value: number): string {
 function formatPercent(value: number | null): string {
   if (value === null) return '—'
   return `${value.toFixed(2)}%`
+}
+
+// Compact timestamp for the issued summary panel (copy of the InvoiceTab /
+// PaymentsTab helper): "08 Jul 2026, 14:05". Returns '' for an unparsable value.
+const MONTH_NAMES = [
+  'Jan',
+  'Feb',
+  'Mar',
+  'Apr',
+  'May',
+  'Jun',
+  'Jul',
+  'Aug',
+  'Sep',
+  'Oct',
+  'Nov',
+  'Dec',
+]
+
+function formatTimestamp(iso: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso)
+  if (!match) return ''
+  const [, year, month, day, hours, minutes] = match
+  const name = MONTH_NAMES[Number(month) - 1]
+  if (!name) return ''
+  return `${day} ${name} ${year}, ${hours}:${minutes}`
+}
+
+// Human label for the issued summary's delivery channel.
+function channelLabel(channel: QuoteChannel | null): string {
+  if (channel === 'EMAIL') return 'Email'
+  if (channel === 'SMS') return 'SMS'
+  return '—'
+}
+
+// True when the LATEST email send attempt was not delivered (Codex P2 rounds
+// 1+3). last_emailed_at is the SUCCESS-ONLY stamp and on a successful send it
+// always lands strictly AFTER the attempt marker (last_sent_at: stamped in the
+// pre-delivery transaction; the success stamp in a follow-up transaction), so:
+//   - no success stamp at all            -> the only/first attempt failed;
+//   - success stamp OLDER than the latest -> a later resend failed: the stamp
+//     attempt marker                        belongs to a PRIOR attempt whose
+//                                           link the failed resend already
+//                                           replaced (token REPLACED), so the
+//                                           customer holds nothing usable;
+//   - success stamp equal-or-later       -> the latest attempt was delivered.
+// Both timestamps are backend LocalDateTime strings in the same clock, so the
+// Date comparison is sound. SMS has no success marker — never "not delivered".
+function emailNotDelivered(issued: QuoteIssuedSummary): boolean {
+  if (issued.sent_channel !== 'EMAIL') return false
+  if (issued.last_emailed_at === null) return true
+  if (issued.last_sent_at === null) return false
+  return (
+    new Date(issued.last_emailed_at).getTime() <
+    new Date(issued.last_sent_at).getTime()
+  )
 }
 
 function composeFullName(customer: OrderCustomer | null | undefined): string {
@@ -537,7 +623,9 @@ export function QuoteTab({
   billingAddress,
   saleDetails,
   initialDraft,
+  initialIssued,
   flushDetailsAutosave,
+  onGoToCustomer,
 }: Props) {
   const [subTab, setSubTab] = useState<QuoteSubTabId>('draft')
 
@@ -594,6 +682,33 @@ export function QuoteTab({
   const [previewing, setPreviewing] = useState(false)
   const [previewError, setPreviewError] = useState<string | null>(null)
   const [sendModalOpen, setSendModalOpen] = useState(false)
+
+  // --- Phase 16E-B issued-quote state. ---
+  // The active issued quote summary driving the Customer Quote sub-tab. Seeded
+  // ONCE from the shell probe's current_issued; replaced by each successful
+  // send-email response; set to NULL by a successful cancel — matching what a
+  // page reload shows, because the workspace only returns current_issued for an
+  // active ISSUED version. All Customer Quote rendering reads THIS object only,
+  // never the live draft/details state (the issue snapshot is frozen).
+  const [issued, setIssued] = useState<QuoteIssuedSummary | null>(initialIssued)
+  // Send by Email lifecycle: in-flight flag (duplicate-send guard via ref),
+  // in-modal error + the Customer-tab pointer flag for the CUSTOMER_EMAIL_*
+  // codes (the InvoiceTab accept/resend precedent).
+  const [sending, setSending] = useState(false)
+  const [sendError, setSendError] = useState<string | null>(null)
+  const [sendEmailFixNeeded, setSendEmailFixNeeded] = useState(false)
+  // Cancel-quote confirmation lifecycle (its own modal, per the locked UX).
+  const [cancelModalOpen, setCancelModalOpen] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
+  const [cancelError, setCancelError] = useState<string | null>(null)
+  // One-line success notice ("Quote sent by email." / "Quote cancelled.") shown
+  // above the sub-tab content so it is visible from any sub-tab.
+  const [actionNotice, setActionNotice] = useState<string | null>(null)
+  // Stored issued-PDF preview lifecycle (Customer Quote action row).
+  const [issuedPreviewing, setIssuedPreviewing] = useState(false)
+  const [issuedPreviewError, setIssuedPreviewError] = useState<string | null>(
+    null,
+  )
 
   // Branding + per-type quote terms — same two INDEPENDENT fail-soft fetch
   // chains as InvoiceTab (business name/logo is optional branding; the tenant
@@ -654,6 +769,10 @@ export function QuoteTab({
   // saves from rapid taps mid-flush.
   const toggleBusyRef = useRef(false)
   const debounceRef = useRef<number | null>(null)
+  // In-flight guards for Send by Email and Cancel quote (16E-B): refs, not the
+  // render state, so a double-click in the same tick can never fire twice.
+  const sendingRef = useRef(false)
+  const cancellingRef = useRef(false)
   // Awaitable single-flight chain (mirrors the shell's details chain) so Preview
   // PDF can flush pending saves and only proceed once the WHOLE queue drained.
   const saveChainRef = useRef<Promise<void> | null>(null)
@@ -1299,6 +1418,244 @@ export function QuoteTab({
     }
   }
 
+  // --- Phase 16E-B: Send by Email / Cancel quote / stored issued-PDF preview. ---
+
+  // Open the Send Quote confirmation modal with a clean slate (used by the
+  // draft action bar's Send Quote and the Customer Quote Resend — both go
+  // through the SAME confirmation; there is no one-click send).
+  function handleOpenSendModal() {
+    setSendError(null)
+    setSendEmailFixNeeded(false)
+    setActionNotice(null)
+    setSendModalOpen(true)
+  }
+
+  // Map a failed send to its in-modal message. Backend messages surface
+  // VERBATIM whenever present; the per-code branches only add the right
+  // recovery pointer (Customer tab for the email gates; safe-retry for the
+  // provider 502, where the backend KEPT the issued version/PDF/link).
+  function applySendError(err: unknown) {
+    const fallback = 'Could not send the quote. Please try again.'
+    if (err instanceof ApiError) {
+      const message = err.message.length > 0 ? err.message : fallback
+      if (
+        err.code === 'CUSTOMER_EMAIL_REQUIRED' ||
+        err.code === 'CUSTOMER_EMAIL_INVALID'
+      ) {
+        // The fix lives on the Customer tab — the modal adds the pointer/button.
+        setSendError(message)
+        setSendEmailFixNeeded(true)
+        return
+      }
+      if (err.code === 'EMAIL_SEND_FAILED') {
+        // 502: delivery failed AFTER the issue was persisted. Nothing reached
+        // the customer; retrying resends the same quote (no duplicate version).
+        setSendError(
+          `${message} Nothing was sent to the customer — it is safe to try again.`,
+        )
+        return
+      }
+      // Everything else verbatim: 422 QUOTE_BELOW_COST / ORDER_LOCKED, 404
+      // ORDER_NOT_FOUND / QUOTE_NOT_FOUND, 400s.
+      setSendError(message)
+      return
+    }
+    setSendError(fallback)
+  }
+
+  // Send (or resend) the quote by email. Runs the SAME double-flush as Preview
+  // PDF — the backend issues from the PERSISTED draft + PERSISTED order details
+  // — and blocks the send when either flush fails. The ref guard makes the send
+  // single-flight (no duplicate issue from a double-tap). Disabled when LAID.
+  async function handleSendEmail() {
+    // Cross in-flight guard: never send while a cancel is running (and vice
+    // versa) — the two mutations race server-side and the loser's response
+    // could reinstall dead state.
+    if (sendingRef.current || cancellingRef.current || lockedRef.current) return
+    sendingRef.current = true
+    setSending(true)
+    setSendError(null)
+    setSendEmailFixNeeded(false)
+    try {
+      const detailsSaved = await flushDetailsAutosave()
+      if (!detailsSaved) {
+        if (mountedRef.current) {
+          setSendError(
+            'Could not save the latest Details of Sale. Fix the details and try again.',
+          )
+        }
+        return
+      }
+      const flush = await flushQuoteAutosave()
+      if (flush !== 'saved') {
+        if (mountedRef.current) {
+          setSendError(
+            flush === 'invalid-input'
+              ? itemisedRef.current
+                ? 'Fix the quote line errors before sending the quote.'
+                : 'Enter a valid quote total before sending the quote.'
+              : flush === 'changed-during-flush'
+                ? 'The quote changed while preparing the send. Try again.'
+                : 'The quote could not be saved, so it was not sent. Fix the save error and try again.',
+          )
+        }
+        return
+      }
+      const res = await sendQuoteEmail(orderIdRef.current)
+      if (!mountedRef.current) return
+      // The 201 summary is the new issued state — the Customer Quote sub-tab
+      // renders from it immediately (no workspace refetch, no financial
+      // refresh: a quote send never changes order pricing). Defensive: only an
+      // ISSUED summary is installed as the ACTIVE quote — if another session
+      // cancelled between the send's issue and its success stamp, the re-read
+      // summary can be CANCELLED, and rendering that as active would show a
+      // live-looking quote whose link is dead (a reload would show null).
+      setIssued(res.data.status === 'ISSUED' ? res.data : null)
+      // A preview failure recorded against the PREVIOUS issued artifact must
+      // not resurface against this fresh one.
+      setIssuedPreviewError(null)
+      setSendModalOpen(false)
+      setActionNotice(
+        res.message && res.message.length > 0
+          ? res.message
+          : 'Quote sent by email.',
+      )
+    } catch (err) {
+      if (mountedRef.current) applySendError(err)
+      // Codex P2 round 2: a 502 EMAIL_SEND_FAILED means the backend ALREADY
+      // persisted the issued version/PDF/link (locked §7.1 keep rule) — only
+      // the delivery failed. The local issued state is therefore stale (still
+      // null on a first send), and the Customer Quote sub-tab would misreport
+      // until a reload. Resync it from the workspace; the refetched summary
+      // carries no last_emailed_at, so the Not-delivered badge renders
+      // naturally. The modal stays open with the error either way, and the
+      // in-flight guard (reset in finally, after this await) keeps a retry
+      // from racing the resync.
+      if (err instanceof ApiError && err.code === 'EMAIL_SEND_FAILED') {
+        try {
+          const ws = await fetchQuoteWorkspace(orderIdRef.current)
+          if (mountedRef.current) setIssued(ws.data.current_issued)
+        } catch {
+          // Best-effort resync: the in-modal error already covers the user;
+          // leave the local state as-is until the next action or reload.
+        }
+      }
+    } finally {
+      sendingRef.current = false
+      if (mountedRef.current) setSending(false)
+    }
+  }
+
+  // Cancel the active issued quote (its own confirmation modal). ALLOWED when
+  // LAID — cancelling only kills the public link. On success the local issued
+  // state becomes NULL so the Customer Quote sub-tab returns to its empty
+  // state, exactly matching a reload (the workspace only returns current_issued
+  // for an active ISSUED version). Errors (422 QUOTE_NOT_ISSUED / 409
+  // QUOTE_ALREADY_ACCEPTED / 404) surface verbatim inside the modal.
+  async function handleCancelQuote() {
+    // Cross in-flight guard (mirrors handleSendEmail): a cancel racing an
+    // in-flight send could let the later send response reinstall a summary the
+    // backend built AFTER the cancel committed.
+    if (cancellingRef.current || sendingRef.current) return
+    cancellingRef.current = true
+    setCancelling(true)
+    setCancelError(null)
+    try {
+      const res = await cancelQuote(orderIdRef.current)
+      if (!mountedRef.current) return
+      setIssued(null)
+      // The stale-status rule: an old preview failure must not render against
+      // whatever is issued next.
+      setIssuedPreviewError(null)
+      setCancelModalOpen(false)
+      setActionNotice(
+        res.message && res.message.length > 0
+          ? res.message
+          : 'Quote cancelled.',
+      )
+    } catch (err) {
+      if (!mountedRef.current) return
+      setCancelError(
+        err instanceof ApiError && err.message.length > 0
+          ? err.message
+          : 'Could not cancel the quote. Please try again.',
+      )
+      // Drift resync: 422 QUOTE_NOT_ISSUED means the backend has NO active
+      // issued quote (it was cancelled/superseded elsewhere) — the local
+      // summary is stale. Null it so the Customer Quote sub-tab returns to
+      // its empty state, matching what a reload shows. QUOTE_ALREADY_ACCEPTED
+      // (409) and all other errors deliberately leave the state untouched
+      // (acceptance is 16F state this surface cannot represent yet).
+      if (err instanceof ApiError && err.code === 'QUOTE_NOT_ISSUED') {
+        setIssued(null)
+      }
+    } finally {
+      cancellingRef.current = false
+      if (mountedRef.current) setCancelling(false)
+    }
+  }
+
+  // Preview the STORED issued PDF in a new tab — the exact frozen artifact that
+  // was emailed, so there is NO flush and NO regeneration (unlike the draft
+  // preview). Same popup-safe order as the draft preview: open a blank tab
+  // synchronously in the click handler, fetch the credentialed blob, then point
+  // the tab at the object URL; fall back to a download only when the popup was
+  // blocked. Allowed when LAID (read-only).
+  async function handleIssuedPreviewPdf() {
+    if (issuedPreviewing) return
+    setIssuedPreviewError(null)
+    const tab = window.open('', '_blank')
+    setIssuedPreviewing(true)
+    try {
+      const { blob, fileName } = await fetchQuoteStoredPdf(
+        orderIdRef.current,
+        'issued',
+      )
+      if (!mountedRef.current) {
+        tab?.close()
+        return
+      }
+      const url = URL.createObjectURL(blob)
+      if (tab && !tab.closed) {
+        // Revoked on unmount only — revoking now could blank the loading tab.
+        previewUrlsRef.current.push(url)
+        tab.location.href = url
+      } else if (tab === null) {
+        // Popup blocked — fall back to a normal download so the stored PDF is
+        // still reachable. One-shot URL: consumed by the click, revoke now.
+        const issuedVersion = issued?.version_number
+        const anchor = document.createElement('a')
+        anchor.href = url
+        anchor.download =
+          fileName ??
+          `quote-${orderNumber && orderNumber.length > 0 ? orderNumber : 'order'}${
+            issuedVersion !== undefined ? `-v${issuedVersion}` : ''
+          }.pdf`
+        document.body.appendChild(anchor)
+        anchor.click()
+        anchor.remove()
+        URL.revokeObjectURL(url)
+        setIssuedPreviewError(
+          'The preview tab was blocked by the browser, so the PDF was downloaded instead.',
+        )
+      } else {
+        // The user closed the blank tab while the PDF was being fetched —
+        // treat it as a cancel: no forced download, no error banner.
+        URL.revokeObjectURL(url)
+      }
+    } catch (err) {
+      tab?.close()
+      if (!mountedRef.current) return
+      setIssuedPreviewError(
+        err instanceof ApiError && err.message.length > 0
+          ? err.message
+          : 'Could not open the issued quote PDF. Please try again.',
+      )
+    } finally {
+      if (mountedRef.current) setIssuedPreviewing(false)
+    }
+  }
+
   const customerName = composeFullName(customer)
   const billingAddressLines = composeAddressLines(billingAddress)
   const detailsOfSaleText = saleDetails?.details_of_sale || ''
@@ -1476,6 +1833,14 @@ export function QuoteTab({
       <div className="mb-5 -mx-3">
         <Tabs tabs={SUB_TABS} active={subTab} onChange={setSubTab} />
       </div>
+
+      {/* 16E-B success notice ("Quote sent by email." / "Quote cancelled.") —
+          above the sub-tab content so it is visible from any sub-tab. */}
+      {actionNotice && (
+        <div className="mb-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3">
+          <p className="text-sm font-medium text-teal-700">{actionNotice}</p>
+        </div>
+      )}
 
       {subTab === 'draft' && (
         <div>
@@ -2124,8 +2489,14 @@ export function QuoteTab({
               </button>
               <button
                 type="button"
-                onClick={() => setSendModalOpen(true)}
-                className="flex w-full items-center justify-center rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40"
+                onClick={handleOpenSendModal}
+                disabled={locked}
+                title={
+                  locked
+                    ? 'This order is laid and locked, so the quote cannot be sent.'
+                    : undefined
+                }
+                className="flex w-full items-center justify-center rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 Send Quote
               </button>
@@ -2134,13 +2505,240 @@ export function QuoteTab({
         </div>
       )}
 
-      {subTab === 'customer' && (
-        <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-10 text-center">
-          <p className="text-base font-medium text-slate-700">
-            No quote has been sent yet.
-          </p>
-        </div>
-      )}
+      {/* Customer Quote — the ISSUED quote surface (16E-B). Everything below
+          renders from the `issued` summary ONLY (the frozen issue snapshot):
+          never the live draft rows/totals, live details, live terms or any
+          autosave state, all of which may have drifted since the issue. No
+          cost, GP, token, hash, storage path or file id is ever rendered. */}
+      {subTab === 'customer' &&
+        (issued === null ? (
+          <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-10 text-center">
+            <p className="text-base font-medium text-slate-700">
+              No quote has been sent yet.
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-5">
+            {issuedPreviewError && (
+              <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
+                <p className="text-sm font-medium text-rose-700">
+                  {issuedPreviewError}
+                </p>
+              </div>
+            )}
+
+            {/* Summary panel: status/channel left, sent time/link expiry right. */}
+            <div className="rounded-lg border border-slate-200 bg-white px-5 py-4">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-3">
+                <div className="space-y-3">
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
+                      Status
+                    </div>
+                    <div className="mt-1">
+                      {emailNotDelivered(issued) ? (
+                        // The latest EMAIL attempt failed (see the
+                        // emailNotDelivered helper for the timestamp
+                        // reasoning) — "Sent" OR "Opened" would misreport it:
+                        // an unchanged resend replaced the token, so a
+                        // previously-opened link is dead and the failure is
+                        // the actionable state; viewed_at is only settable
+                        // from 16E-C onward. SMS keeps the plain Sent badge
+                        // (no success marker exists).
+                        <>
+                          <span className="inline-flex items-center rounded-md border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800">
+                            Not delivered
+                          </span>
+                          <p className="mt-1 text-xs text-amber-800">
+                            The email could not be delivered. Resend to try
+                            again.
+                          </p>
+                        </>
+                      ) : issued.viewed_at !== null ? (
+                        <span className="inline-flex items-center rounded-md border border-teal-200 bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700">
+                          Opened
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center rounded-md border border-slate-300 bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-700">
+                          Sent
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
+                      Channel
+                    </div>
+                    <div className="mt-1 text-sm text-slate-800">
+                      {channelLabel(issued.sent_channel)}
+                    </div>
+                  </div>
+                </div>
+                <div className="space-y-3 sm:text-right">
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
+                      Sent
+                    </div>
+                    <div className="mt-1 text-sm text-slate-800">
+                      {issued.last_sent_at
+                        ? formatTimestamp(issued.last_sent_at)
+                        : '—'}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
+                      Link expires
+                    </div>
+                    {/* Display-only: expiry enforcement is the public page's
+                        concern (16E-C). */}
+                    <div className="mt-1 text-sm text-slate-800">
+                      {issued.token_expires_at
+                        ? formatTimestamp(issued.token_expires_at)
+                        : '—'}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Action row. LAID: Resend disabled (a send is an order-state
+                  write); Preview PDF and Cancel quote stay ENABLED (stored-PDF
+                  read / link kill only). */}
+              <div className="mt-4 flex flex-wrap gap-2 border-t border-slate-100 pt-4">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="md"
+                  onClick={handleIssuedPreviewPdf}
+                  disabled={issuedPreviewing}
+                >
+                  {issuedPreviewing ? 'Preparing…' : 'Preview PDF'}
+                </Button>
+                <Button
+                  type="button"
+                  variant="success"
+                  size="md"
+                  onClick={handleOpenSendModal}
+                  disabled={locked}
+                  title={
+                    locked
+                      ? 'This order is laid and locked, so the quote cannot be resent.'
+                      : undefined
+                  }
+                >
+                  Resend
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="md"
+                  onClick={() => {
+                    setCancelError(null)
+                    setActionNotice(null)
+                    setCancelModalOpen(true)
+                  }}
+                >
+                  Cancel quote
+                </Button>
+              </div>
+            </div>
+
+            {/* Read-only issued snapshot — a draft-style document view built
+                from the FROZEN current_issued body only. No inputs, no
+                editing, no autosave, no draft mutation. */}
+            <article className="rounded-lg border border-slate-200 bg-white shadow-sm px-6 py-6 sm:px-8 sm:py-8 lg:px-10 lg:py-8">
+              <header className="flex items-start justify-between gap-4">
+                <div className="text-xl font-bold text-slate-900 tracking-tight">
+                  Issued quote
+                </div>
+                <div className="text-sm text-slate-500">
+                  Version {issued.version_number}
+                </div>
+              </header>
+
+              <div className="my-6 border-t border-slate-200" />
+
+              <div>
+                <div className="text-base font-semibold text-slate-900">
+                  Details Of Sale
+                </div>
+                <p className="mt-2 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
+                  {issued.details_of_sale || '—'}
+                </p>
+              </div>
+
+              {/* Itemised issue: the frozen snapshot lines (always [] for a
+                  non-itemised issue — the itemised flag drives this branch, so
+                  a non-itemised quote never renders a line table). */}
+              {issued.itemised && (
+                <div className="mt-8 overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-slate-200 text-[11px] uppercase tracking-wider text-slate-500">
+                        <th className="py-2 pr-3 text-left font-semibold">
+                          Description
+                        </th>
+                        <th className="py-2 px-3 text-right font-semibold">
+                          Quantity
+                        </th>
+                        <th className="py-2 px-3 text-right font-semibold">
+                          Unit price
+                        </th>
+                        <th className="py-2 pl-3 text-right font-semibold">
+                          Amount
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {issued.lines.map((line, idx) => (
+                        <tr
+                          key={`issued-line-${idx}`}
+                          className="border-b border-slate-100"
+                        >
+                          <td className="py-2 pr-3 text-slate-800">
+                            {line.description}
+                          </td>
+                          <td className="py-2 px-3 text-right tabular-nums text-slate-700">
+                            {line.quantity !== null
+                              ? toFixed2(line.quantity)
+                              : '—'}
+                          </td>
+                          <td className="py-2 px-3 text-right tabular-nums text-slate-700">
+                            {line.unit_price_ex_gst !== null
+                              ? formatMoney(line.unit_price_ex_gst)
+                              : '—'}
+                          </td>
+                          <td className="py-2 pl-3 text-right tabular-nums text-slate-900">
+                            {formatMoney(line.line_total_ex_gst)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Totals from the frozen summary. For a non-itemised issue this
+                  single quoted amount IS the whole presentation — no line
+                  table. */}
+              <div className="mt-8 sm:ml-auto sm:w-[360px] rounded-md border border-slate-200">
+                <div className="flex items-center justify-between px-4 py-2.5">
+                  <span className="text-sm text-slate-700">Total Ex. GST</span>
+                  <span className="text-sm font-medium tabular-nums text-slate-900">
+                    {formatMoney(issued.quote_total_ex_gst)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between px-4 py-2.5 border-t border-slate-200">
+                  <span className="text-sm text-slate-700">
+                    Quote Total Inc. GST
+                  </span>
+                  <span className="text-sm font-semibold tabular-nums text-slate-900">
+                    {formatMoney(issued.quote_total_inc_gst)}
+                  </span>
+                </div>
+              </div>
+            </article>
+          </div>
+        ))}
 
       {subTab === 'accepted' && (
         <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-10 text-center">
@@ -2150,12 +2748,18 @@ export function QuoteTab({
         </div>
       )}
 
-      {/* Send Quote confirmation — 16D-B shows the modal ONLY. No send endpoint
-          exists on main; Email/SMS arrive in 16E, always through this modal
-          (hard rule: no accidental one-click sending). */}
+      {/* Send Quote confirmation (16E-B) — the ONLY send path (first send and
+          Resend alike; hard rule: no accidental one-click sending). Send by
+          Email flushes details + quote autosaves first, is single-flight, and
+          is disabled when LAID. SMS stays disabled until 16E-C ("Available
+          soon") — no backend SMS call is ever made from here. */}
       <Modal
         open={sendModalOpen}
-        onClose={() => setSendModalOpen(false)}
+        onClose={() => {
+          // Keep the modal up while a send is in flight so its outcome
+          // (success close / in-modal error) is never lost behind a dismiss.
+          if (!sending) setSendModalOpen(false)
+        }}
         labelledBy="send-quote-title"
       >
         <div className="p-6">
@@ -2168,27 +2772,60 @@ export function QuoteTab({
           <p className="mt-2 text-sm text-slate-600 leading-relaxed">
             Please double-check all quote details before sending.
           </p>
+          {sendError && (
+            <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
+              <p className="text-sm font-medium text-rose-700">{sendError}</p>
+              {sendEmailFixNeeded && (
+                <div className="mt-2 flex flex-col sm:flex-row sm:items-center gap-2">
+                  <p className="text-xs text-rose-700">
+                    Add or fix the customer's email on the Customer tab, then
+                    try again.
+                  </p>
+                  {onGoToCustomer && (
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => {
+                        setSendModalOpen(false)
+                        onGoToCustomer()
+                      }}
+                    >
+                      Go to Customer tab
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
           <div className="mt-5 space-y-2">
             <Button
               type="button"
               variant="success"
               size="md"
-              disabled
+              disabled={locked || sending || cancelling}
+              title={
+                locked
+                  ? 'This order is laid and locked, so the quote cannot be sent.'
+                  : undefined
+              }
+              onClick={handleSendEmail}
               className="w-full"
             >
-              Send by Email
+              {sending ? 'Sending…' : 'Send by Email'}
             </Button>
             <Button
               type="button"
               variant="success"
               size="md"
               disabled
+              title="Available soon"
               className="w-full"
             >
               Send by Phone/SMS
             </Button>
             <p className="text-center text-[11px] text-slate-500">
-              Sending by Email and Phone/SMS is coming in 16E.
+              Sending by Phone/SMS — Available soon.
             </p>
           </div>
           <div className="mt-4 flex justify-end">
@@ -2196,9 +2833,60 @@ export function QuoteTab({
               type="button"
               variant="secondary"
               size="md"
+              disabled={sending}
               onClick={() => setSendModalOpen(false)}
             >
               Cancel
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Cancel quote confirmation (16E-B) — its own confirmation, separate
+          from the send modal. Allowed when LAID (kills the public link only). */}
+      <Modal
+        open={cancelModalOpen}
+        onClose={() => {
+          if (!cancelling) setCancelModalOpen(false)
+        }}
+        labelledBy="cancel-quote-title"
+      >
+        <div className="p-6">
+          <h3
+            id="cancel-quote-title"
+            className="text-lg font-semibold text-slate-900 tracking-tight"
+          >
+            Cancel this quote?
+          </h3>
+          <p className="mt-2 text-sm text-slate-600 leading-relaxed">
+            The customer's quote link will stop working. You can send a new
+            quote at any time.
+          </p>
+          {cancelError && (
+            <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
+              <p className="text-sm font-medium text-rose-700">
+                {cancelError}
+              </p>
+            </div>
+          )}
+          <div className="mt-5 flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              size="md"
+              disabled={cancelling}
+              onClick={() => setCancelModalOpen(false)}
+            >
+              Keep quote
+            </Button>
+            <Button
+              type="button"
+              variant="primary"
+              size="md"
+              disabled={cancelling || sending}
+              onClick={handleCancelQuote}
+            >
+              {cancelling ? 'Cancelling…' : 'Cancel quote'}
             </Button>
           </div>
         </div>

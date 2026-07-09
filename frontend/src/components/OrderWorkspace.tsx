@@ -41,7 +41,10 @@ import type {
 import { fetchOrderLines } from '../lib/api/orderLinesApi'
 import type { OrderFinancialSummary } from '../lib/api/orderLinesApi'
 import { fetchQuoteWorkspace } from '../lib/api/orderQuoteApi'
-import type { QuoteDraftRead } from '../lib/api/orderQuoteApi'
+import type {
+  QuoteDraftRead,
+  QuoteIssuedSummary,
+} from '../lib/api/orderQuoteApi'
 
 // Friendly message for a failed details autosave. The autosave single-flight
 // lock/loop lives in the always-mounted WorkspaceShell (below) so it survives the
@@ -198,6 +201,11 @@ function WorkspaceShell({
   >('loading')
   const [quoteInitialDraft, setQuoteInitialDraft] =
     useState<QuoteDraftRead | null>(null)
+  // Phase 16E-B: the probe's current_issued (the active ISSUED quote summary,
+  // or null) seeds QuoteTab's Customer Quote sub-tab. After that seed the tab
+  // owns the issued state (send/cancel responses update it locally).
+  const [quoteInitialIssued, setQuoteInitialIssued] =
+    useState<QuoteIssuedSummary | null>(null)
   const [quoteProbeToken, setQuoteProbeToken] = useState(0)
 
   useEffect(() => {
@@ -207,11 +215,18 @@ function WorkspaceShell({
       .then((res) => {
         if (cancelled) return
         setQuoteInitialDraft(res.data.draft)
+        setQuoteInitialIssued(res.data.current_issued)
         setQuoteProbeStatus('loaded')
-        // A saved draft is the durable visibility source of truth.
-        if (res.data.draft !== null) setQuoteTabVisible(true)
+        // A saved draft OR an active issued quote is the durable visibility
+        // source of truth (issued-only is unreachable via the API today —
+        // sending requires a persisted draft and drafts are never deleted —
+        // but the backend workspace deliberately supports the shape).
+        if (res.data.draft !== null || res.data.current_issued !== null)
+          setQuoteTabVisible(true)
       })
       .catch(() => {
+        // STRICT: a failed probe is never "no quote" — status stays 'error',
+        // the tab stays hidden and no issued/draft state is cleared or faked.
         if (cancelled) return
         setQuoteProbeStatus('error')
       })
@@ -580,11 +595,15 @@ function WorkspaceShell({
                   billingAddress={billingAddress}
                   saleDetails={saleDetails}
                   initialDraft={quoteInitialDraft}
+                  initialIssued={quoteInitialIssued}
                   // Codex P2: the quote preview PDF renders the PERSISTED
                   // sales_order.details_of_sale, so Preview must flush pending
                   // Details of Sale autosaves first — the same shell-owned
                   // awaitable flush that gates invoice create/rewrite.
                   flushDetailsAutosave={flushDetailsAutosave}
+                  // Lets a send-quote customer-email error send the user
+                  // straight to where the email is fixed (InvoiceTab parity).
+                  onGoToCustomer={() => setActiveTab('customer')}
                 />
               </div>
             )}

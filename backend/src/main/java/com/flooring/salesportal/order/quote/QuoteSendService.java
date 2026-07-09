@@ -286,7 +286,8 @@ public class QuoteSendService {
         // transaction 1 and last_emailed_at is email-only. The summary basis was re-read after
         // those stamps, so it is the accurate final state.
         return ApiResponse.ok(
-                QuoteIssuedSummaryDto.from(prepared.row(), prepared.tokenExpiresAt()), SENT_SMS_MESSAGE);
+                QuoteIssuedSummaryDto.from(prepared.row(), prepared.tokenExpiresAt(), prepared.summaryLines()),
+                SENT_SMS_MESSAGE);
     }
 
     // ------------------------------------------------------------------
@@ -334,8 +335,12 @@ public class QuoteSendService {
         QuoteVersionRow cancelled = quoteVersionRepository.findById(quoteVersionId)
                 .orElseThrow(() -> new IllegalStateException(
                         "quote_version disappeared while cancelling: " + quoteVersionId));
-        // token_expires_at is null on a cancelled summary — the link is dead by definition.
-        return ApiResponse.ok(QuoteIssuedSummaryDto.from(cancelled, null), CANCELLED_MESSAGE);
+        // token_expires_at is null on a cancelled summary — the link is dead by definition. The
+        // frozen body snapshot (16E-B) still rides on the response like every issued summary.
+        return ApiResponse.ok(
+                QuoteIssuedSummaryDto.from(cancelled, null,
+                        quoteVersionRepository.findVersionLines(quoteVersionId)),
+                CANCELLED_MESSAGE);
     }
 
     // ------------------------------------------------------------------
@@ -492,16 +497,19 @@ public class QuoteSendService {
         quoteVersionRepository.insertActiveToken(quoteVersionId, hashToken(plainToken), expiresAt);
         quoteVersionRepository.stampAttemptMarkers(quoteVersionId, channel, now);
 
-        // Re-read the stamped row so the summary basis reflects the persisted final state.
+        // Re-read the stamped row so the summary basis reflects the persisted final state. The
+        // snapshot lines are read here too (16E-B summary body): immutable once inserted, in
+        // (sort_order, PK) order, structurally empty for a non-itemised issue.
         QuoteVersionRow finalRow = quoteVersionRepository.findById(quoteVersionId)
                 .orElseThrow(() -> new IllegalStateException(
                         "quote_version disappeared while preparing send: " + quoteVersionId));
+        List<QuoteVersionLineRow> summaryLines = quoteVersionRepository.findVersionLines(quoteVersionId);
 
         // Public page URL shape is /{slug}/q/{token} (contract §8); the absolute origin is a
         // 16E-C/Phase 17 delivery concern — no real message leaves the system in 16E-A.
         String publicLink = "/" + slug + "/q/" + plainToken;
         return new PreparedSend(finalRow, expiresAt, recipient, pdfBytes, pdfFileName,
-                publicLink, order.getOrderNumber());
+                publicLink, order.getOrderNumber(), summaryLines);
     }
 
     /**
@@ -616,7 +624,8 @@ public class QuoteSendService {
         LocalDateTime tokenExpiresAt = quoteVersionRepository
                 .findActiveTokenExpiry(quoteVersionId)
                 .orElse(null);
-        return QuoteIssuedSummaryDto.from(row, tokenExpiresAt);
+        return QuoteIssuedSummaryDto.from(row, tokenExpiresAt,
+                quoteVersionRepository.findVersionLines(quoteVersionId));
     }
 
     // ------------------------------------------------------------------
@@ -752,8 +761,9 @@ public class QuoteSendService {
      * Everything transaction 1 hands to the post-commit delivery + response building: the re-read
      * version row (summary basis), the fresh token's expiry, the resolved recipient, the PDF bytes
      * + file name (stored bytes reused verbatim on a resend), the public link carrying the
-     * plaintext token (never serialized in any response), and the order number for the message
-     * wording. Never serialized itself.
+     * plaintext token (never serialized in any response), the order number for the message
+     * wording, and the version's snapshot lines for the 16E-B summary body (read inside
+     * transaction 1; immutable, empty for a non-itemised issue). Never serialized itself.
      */
     private record PreparedSend(QuoteVersionRow row,
                                 LocalDateTime tokenExpiresAt,
@@ -761,6 +771,7 @@ public class QuoteSendService {
                                 byte[] pdfBytes,
                                 String pdfFileName,
                                 String publicLink,
-                                String orderNumber) {
+                                String orderNumber,
+                                List<QuoteVersionLineRow> summaryLines) {
     }
 }
