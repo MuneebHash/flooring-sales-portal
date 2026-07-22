@@ -306,6 +306,7 @@ export function PublicQuotePage() {
                 <img
                   src={quote.business_logo_url ?? undefined}
                   alt={quote.business_name ?? 'Business logo'}
+                  referrerPolicy="no-referrer"
                   className="h-auto w-auto max-h-14 max-w-[200px] object-contain"
                   onError={() => setLogoFailed(true)}
                 />
