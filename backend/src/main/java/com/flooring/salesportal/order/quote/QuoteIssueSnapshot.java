@@ -22,6 +22,14 @@ import java.util.List;
  * {@code quote_version.terms_snapshot} and rendered verbatim on the issued PDF, so later tenant
  * term edits can never alter an already-issued quote. {@code detailsOfSale} / {@code flooringType}
  * are the order values frozen at the same moment.
+ *
+ * <p><b>Customer identity snapshot (V17 — Codex P1 fix).</b> {@code customerName} /
+ * {@code customerAddressLine1} / {@code customerAddressLine2} freeze the customer-facing
+ * "Quotation To" block at issue (nullable — an order may be issued with no saved customer name or
+ * billing address). Derived by the caller with the exact customer-name/billing-line helpers the
+ * issued PDF uses, so the stored PDF bytes and the snapshot columns can never disagree. The
+ * PUBLIC payload renders ONLY these columns — a pre-LAID customer edit after issue can no longer
+ * leak the new person's identity to the old token holder.
  */
 public record QuoteIssueSnapshot(
         boolean itemised,
@@ -30,6 +38,9 @@ public record QuoteIssueSnapshot(
         String flooringType,
         String termsHtml,
         String detailsOfSale,
+        String customerName,
+        String customerAddressLine1,
+        String customerAddressLine2,
         List<Line> lines) {
 
     /** One issued line (immutable copy of a persisted draft line at issue; contract §4.4). */
@@ -50,7 +61,10 @@ public record QuoteIssueSnapshot(
                                         List<QuoteDraftLine> draftLines,
                                         String flooringType,
                                         String sanitizedTermsHtml,
-                                        String detailsOfSale) {
+                                        String detailsOfSale,
+                                        String customerName,
+                                        String customerAddressLine1,
+                                        String customerAddressLine2) {
         List<Line> snapshotLines = draft.isItemised()
                 ? draftLines.stream()
                         .map(l -> new Line(l.getLineType(), l.getDescription(), l.getQuantity(),
@@ -64,6 +78,9 @@ public record QuoteIssueSnapshot(
                 flooringType,
                 sanitizedTermsHtml,
                 detailsOfSale,
+                customerName,
+                customerAddressLine1,
+                customerAddressLine2,
                 snapshotLines);
     }
 }

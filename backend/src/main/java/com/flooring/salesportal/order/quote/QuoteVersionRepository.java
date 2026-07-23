@@ -21,11 +21,16 @@ import java.util.Optional;
  *
  * <p>{@code issued_pdf_file_id} / {@code signed_pdf_file_id} are written but NEVER selected back
  * onto {@link QuoteVersionRow} (streaming goes through the {@code stored_file} join in
- * {@link #findIssuedFileByOrderId}), and {@code token_hash} is written but never selected — so
- * neither internal file ids nor token material can leak into a response. All callers run inside a
- * transaction that holds the order row {@code FOR UPDATE}, which serialises version allocation and
- * token transitions per order (the "one ACTIVE token per order" application invariant; the DB
- * backstops are per-version/per-order partial unique indexes in V16).
+ * {@link #findIssuedFileByOrderId}), and {@code token_hash} is selected ONLY onto the
+ * server-internal {@link QuoteTokenRow} for the public path's constant-time re-verification
+ * (Phase 16E-C) — so neither internal file ids nor token material can leak into a response. The
+ * PROTECTED write callers all run inside a transaction that holds the order row {@code FOR
+ * UPDATE}, which serialises version allocation and token transitions per order (the "one ACTIVE
+ * token per order" application invariant; the DB backstops are per-version/per-order partial
+ * unique indexes in V16). The PUBLIC 16E-C writes are status/NULL-guarded single statements; the
+ * lazy-expiry pair additionally takes the SAME order row lock first
+ * ({@link #lockOrderRowForPublicTransition}) so it serialises with the protected transitions,
+ * while the first-view stamp stays lock-free (write-once by its {@code IS NULL} guard).
  */
 @Repository
 public class QuoteVersionRepository {
@@ -43,6 +48,9 @@ public class QuoteVersionRepository {
                 flooring_type_snapshot,
                 terms_snapshot,
                 details_of_sale_snapshot,
+                customer_name_snapshot,
+                customer_address_line1_snapshot,
+                customer_address_line2_snapshot,
                 sent_channel,
                 first_sent_at,
                 last_sent_at,
@@ -81,10 +89,12 @@ public class QuoteVersionRepository {
             INSERT INTO quote_version
                 (order_id, version_number, status, itemised, quote_total_ex_gst, quote_total_inc_gst,
                  flooring_type_snapshot, terms_snapshot, details_of_sale_snapshot,
+                 customer_name_snapshot, customer_address_line1_snapshot, customer_address_line2_snapshot,
                  issued_pdf_file_id, created_by_user_id)
             VALUES
                 (:orderId, :versionNumber, 'ISSUED', :itemised, :quoteTotalExGst, :quoteTotalIncGst,
                  :flooringTypeSnapshot, :termsSnapshot, :detailsOfSaleSnapshot,
+                 :customerNameSnapshot, :customerAddressLine1Snapshot, :customerAddressLine2Snapshot,
                  :issuedPdfFileId, :createdByUserId)
             RETURNING
             """ + VERSION_COLUMNS;
@@ -163,6 +173,63 @@ public class QuoteVersionRepository {
             WHERE v.order_id = :orderId AND v.status = 'ISSUED'
             """;
 
+    // ------------------------------------------------------------------
+    // Phase 16E-C — public token surface (token-only resolution; no session, no order scope)
+    // ------------------------------------------------------------------
+
+    // Hash-keyed token lookup (uq_quote_token_hash). token_hash IS selected here — the service
+    // re-verifies it with MessageDigest.isEqual (constant-time) after the indexed lookup — but the
+    // row record is server-internal and is NEVER serialized into any response (same posture as
+    // QuoteFile.storagePath).
+    private static final String FIND_TOKEN_BY_HASH_SQL = """
+            SELECT quote_token_id, quote_version_id, token_hash, status, expires_at
+            FROM quote_token
+            WHERE token_hash = :tokenHash
+            """;
+
+    // Lazy expiry (contract §8): ONLY an ACTIVE token may expire — the status guard makes the flip
+    // race-safe (a concurrent public hit that lost the race updates 0 rows and just re-reads) and
+    // structurally incapable of touching an already-dead (REPLACED/SUPERSEDED/CANCELLED/CONSUMED)
+    // row. dead_at is stamped in the same statement; rows are never deleted.
+    private static final String EXPIRE_ACTIVE_TOKEN_SQL = """
+            UPDATE quote_token SET status = 'EXPIRED', dead_at = :deadAt
+            WHERE quote_token_id = :quoteTokenId AND status = 'ACTIVE'
+            """;
+
+    // The version half of lazy expiry: ISSUED -> EXPIRED, guarded on the FROM status. Unlike
+    // moveIssuedVersionTo this is TOLERANT (0 rows is fine) — defensive belt on top of the order
+    // lock the lazy-expiry path now takes (see LOCK_ORDER_ROW_SQL).
+    private static final String EXPIRE_ISSUED_VERSION_SQL = """
+            UPDATE quote_version SET status = 'EXPIRED'
+            WHERE quote_version_id = :quoteVersionId AND status = 'ISSUED'
+            """;
+
+    // Lazy expiry serialisation (16E-C review P2 fix): the protected send/cancel transitions all
+    // serialise on the ORDER row (SELECT ... FOR UPDATE); taking the SAME lock before the expiry
+    // flips means a public lazy expiry can never interleave with a resend/cancel mid-transaction
+    // (which could otherwise mint an ACTIVE token on an EXPIRED version, 500 a cancel's strict
+    // moveIssuedVersionTo, or deadlock on inverted token/version lock order). Unscoped on purpose:
+    // the public surface has no session tenant scope — the token is the credential — and this
+    // statement reveals nothing; it only blocks until the protected transaction commits.
+    private static final String LOCK_ORDER_ROW_SQL =
+            "SELECT order_id FROM sales_order WHERE order_id = :orderId FOR UPDATE";
+
+    // First-view stamp (contract §7.2 viewed): write-once via the IS NULL guard — a second view
+    // updates 0 rows, so viewed_at is NEVER overwritten and there is no view count.
+    private static final String STAMP_VIEWED_AT_ONCE_SQL = """
+            UPDATE quote_version SET viewed_at = :viewedAt
+            WHERE quote_version_id = :quoteVersionId AND viewed_at IS NULL
+            """;
+
+    // The stored issued PDF by VERSION id (the public path resolves token -> version, never by
+    // order). Serves the stored bytes verbatim — the public surface never regenerates a PDF.
+    private static final String FIND_ISSUED_FILE_BY_VERSION_SQL = """
+            SELECT sf.file_name, sf.storage_path, sf.mime_type, sf.file_size
+            FROM quote_version v
+            JOIN stored_file sf ON sf.stored_file_id = v.issued_pdf_file_id
+            WHERE v.quote_version_id = :quoteVersionId
+            """;
+
     private final NamedParameterJdbcTemplate jdbc;
 
     public QuoteVersionRepository(NamedParameterJdbcTemplate jdbc) {
@@ -223,6 +290,9 @@ public class QuoteVersionRepository {
                 .addValue("flooringTypeSnapshot", snapshot.flooringType())
                 .addValue("termsSnapshot", snapshot.termsHtml())
                 .addValue("detailsOfSaleSnapshot", snapshot.detailsOfSale())
+                .addValue("customerNameSnapshot", snapshot.customerName())
+                .addValue("customerAddressLine1Snapshot", snapshot.customerAddressLine1())
+                .addValue("customerAddressLine2Snapshot", snapshot.customerAddressLine2())
                 .addValue("issuedPdfFileId", issuedPdfFileId)
                 .addValue("createdByUserId", createdByUserId);
         return jdbc.queryForObject(INSERT_VERSION_SQL, params, VERSION_ROW_MAPPER);
@@ -312,6 +382,73 @@ public class QuoteVersionRepository {
                 .stream().findFirst();
     }
 
+    // ------------------------------------------------------------------
+    // Phase 16E-C — public token surface
+    // ------------------------------------------------------------------
+
+    /** The token row for a presented token's hash, or empty (unknown token → 404, no leak). */
+    public Optional<QuoteTokenRow> findTokenByHash(String tokenHash) {
+        return jdbc.query(FIND_TOKEN_BY_HASH_SQL, new MapSqlParameterSource("tokenHash", tokenHash),
+                TOKEN_ROW_MAPPER).stream().findFirst();
+    }
+
+    /**
+     * Take the protected transitions' ORDER row lock ({@code SELECT ... FOR UPDATE}) so a public
+     * lazy expiry serialises behind any in-flight send/cancel and vice versa. Called ONLY from
+     * the lazy-expiry branch (at most once per token lifetime — after the flip the token is never
+     * ACTIVE again, so an unauthenticated caller cannot use this to hold locks repeatedly). Held
+     * until the surrounding resolution transaction commits.
+     */
+    public void lockOrderRowForPublicTransition(long orderId) {
+        Long locked = jdbc.queryForObject(LOCK_ORDER_ROW_SQL,
+                new MapSqlParameterSource("orderId", orderId), Long.class);
+        if (locked == null) {
+            // FK-impossible; defensive so a miss can never be silently treated as "locked".
+            throw new IllegalStateException("sales_order disappeared while locking: " + orderId);
+        }
+    }
+
+    /**
+     * Lazy-expire an ACTIVE token past its expiry (status → {@code EXPIRED}, {@code dead_at}
+     * stamped). Returns true when THIS call performed the flip. The caller holds the order row
+     * lock and has re-read the token under it, so under normal operation the guard always
+     * matches; the status guard remains as a structural backstop — a non-ACTIVE row can never be
+     * mutated by this call.
+     */
+    public boolean expireActiveToken(long quoteTokenId, LocalDateTime deadAt) {
+        return jdbc.update(EXPIRE_ACTIVE_TOKEN_SQL, new MapSqlParameterSource()
+                .addValue("quoteTokenId", quoteTokenId)
+                .addValue("deadAt", Timestamp.valueOf(deadAt))) == 1;
+    }
+
+    /**
+     * Flip an ISSUED version to {@code EXPIRED} (the version half of lazy expiry). Tolerant —
+     * 0 updated rows is not an error here (defensive belt on top of the order lock), unlike
+     * {@link #moveIssuedVersionTo}'s strict protected callers.
+     */
+    public void expireIssuedVersion(long quoteVersionId) {
+        jdbc.update(EXPIRE_ISSUED_VERSION_SQL,
+                new MapSqlParameterSource("quoteVersionId", quoteVersionId));
+    }
+
+    /**
+     * Stamp {@code viewed_at} on the version's FIRST successful public view. Write-once: the
+     * {@code IS NULL} guard makes every later call a no-op, so the first-view timestamp is never
+     * overwritten and no view count exists (contract §7.2 — idempotent).
+     */
+    public void stampViewedAtOnce(long quoteVersionId, LocalDateTime viewedAt) {
+        jdbc.update(STAMP_VIEWED_AT_ONCE_SQL, new MapSqlParameterSource()
+                .addValue("quoteVersionId", quoteVersionId)
+                .addValue("viewedAt", Timestamp.valueOf(viewedAt)));
+    }
+
+    /** The version's stored issued-PDF metadata (public streaming path), or empty. */
+    public Optional<QuoteFile> findIssuedFileByVersionId(long quoteVersionId) {
+        return jdbc.query(FIND_ISSUED_FILE_BY_VERSION_SQL,
+                        new MapSqlParameterSource("quoteVersionId", quoteVersionId), FILE_ROW_MAPPER)
+                .stream().findFirst();
+    }
+
     private static final RowMapper<QuoteVersionRow> VERSION_ROW_MAPPER = (rs, n) -> new QuoteVersionRow(
             rs.getLong("quote_version_id"),
             rs.getLong("order_id"),
@@ -323,6 +460,9 @@ public class QuoteVersionRepository {
             rs.getString("flooring_type_snapshot"),
             rs.getString("terms_snapshot"),
             rs.getString("details_of_sale_snapshot"),
+            rs.getString("customer_name_snapshot"),
+            rs.getString("customer_address_line1_snapshot"),
+            rs.getString("customer_address_line2_snapshot"),
             rs.getString("sent_channel"),
             toLocalDateTime(rs.getTimestamp("first_sent_at")),
             toLocalDateTime(rs.getTimestamp("last_sent_at")),
@@ -344,6 +484,13 @@ public class QuoteVersionRepository {
             rs.getString("mime_type"),
             rs.getLong("file_size"));
 
+    private static final RowMapper<QuoteTokenRow> TOKEN_ROW_MAPPER = (rs, n) -> new QuoteTokenRow(
+            rs.getLong("quote_token_id"),
+            rs.getLong("quote_version_id"),
+            rs.getString("token_hash"),
+            rs.getString("status"),
+            rs.getTimestamp("expires_at").toLocalDateTime());
+
     private static LocalDateTime toLocalDateTime(Timestamp ts) {
         return ts == null ? null : ts.toLocalDateTime();
     }
@@ -364,6 +511,9 @@ public class QuoteVersionRepository {
             String flooringTypeSnapshot,
             String termsSnapshot,
             String detailsOfSaleSnapshot,
+            String customerNameSnapshot,
+            String customerAddressLine1Snapshot,
+            String customerAddressLine2Snapshot,
             String sentChannel,
             LocalDateTime firstSentAt,
             LocalDateTime lastSentAt,
@@ -384,5 +534,19 @@ public class QuoteVersionRepository {
 
     /** Stored-PDF metadata for binary streaming; {@code storagePath} is never returned to a client. */
     public record QuoteFile(String fileName, String storagePath, String mimeType, long fileSize) {
+    }
+
+    /**
+     * One {@code quote_token} row for public resolution (Phase 16E-C). SERVER-INTERNAL: it carries
+     * {@code tokenHash} solely for the service's constant-time {@code MessageDigest.isEqual}
+     * re-verification after the indexed lookup — this record must never be serialized into any
+     * response (the public DTO exposes only the derived state and {@code expiresAt}).
+     */
+    public record QuoteTokenRow(
+            long quoteTokenId,
+            long quoteVersionId,
+            String tokenHash,
+            String status,
+            LocalDateTime expiresAt) {
     }
 }

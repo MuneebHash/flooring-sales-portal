@@ -1,5 +1,7 @@
 package com.flooring.salesportal.common.email;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -23,6 +25,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 @Component
 public class RecordingQuoteEmailSender implements QuoteEmailSender {
 
+    private static final Logger log = LoggerFactory.getLogger(RecordingQuoteEmailSender.class);
+
     private final List<QuoteEmailRequest> sent = Collections.synchronizedList(new ArrayList<>());
     private final List<QuoteEmailRequest> failed = Collections.synchronizedList(new ArrayList<>());
     private final AtomicBoolean failNextSend = new AtomicBoolean(false);
@@ -34,6 +38,15 @@ public class RecordingQuoteEmailSender implements QuoteEmailSender {
             throw new QuoteEmailException("Quote email send failed (forced by RecordingQuoteEmailSender).");
         }
         sent.add(request);
+        // DEV-ONLY visibility (Phase 16E-C): recorded emails are otherwise invisible outside the
+        // test API, so surface the message on the backend console — the body carries the public
+        // /q/{token} link, making it copyable for manual QA. Logs ONLY what the request already
+        // contains (recipient / subject / bodyText). DEBUG, not INFO (Codex round 3): the body is
+        // a BEARER link, so it must never reach default-level logs — dev visibility requires the
+        // DEBUG level, which the dev application.properties enables explicitly for this class;
+        // production configs must NOT.
+        log.debug("Dev-recorded quote email (no real email sent) — to: {} | subject: {}\n{}",
+                request.recipientEmail(), request.subject(), request.bodyText());
     }
 
     /** Arm a one-shot failure: the NEXT send throws (and is recorded under {@link #failedEmails()}). */

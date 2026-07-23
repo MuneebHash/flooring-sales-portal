@@ -25,6 +25,8 @@ import com.flooring.salesportal.common.storage.FileStorageService;
 import com.flooring.salesportal.order.CustomerEmailValidator;
 import com.flooring.salesportal.order.CustomerMobileValidator;
 import com.flooring.salesportal.order.InvoiceTermsSanitizer;
+import com.flooring.salesportal.order.OrderAddress;
+import com.flooring.salesportal.order.OrderAddressRepository;
 import com.flooring.salesportal.order.OrderChargeLineReadRepository;
 import com.flooring.salesportal.order.OrderCustomer;
 import com.flooring.salesportal.order.OrderCustomerRepository;
@@ -41,6 +43,7 @@ import com.flooring.salesportal.tenant.BusinessRepository;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -144,6 +147,7 @@ public class QuoteSendService {
     private final RequestContextGuard requestContextGuard;
     private final SalesOrderRepository salesOrderRepository;
     private final OrderCustomerRepository orderCustomerRepository;
+    private final OrderAddressRepository orderAddressRepository;
     private final CustomerEmailValidator customerEmailValidator;
     private final CustomerMobileValidator customerMobileValidator;
     private final OrderProductLineRepository orderProductLineRepository;
@@ -164,10 +168,14 @@ public class QuoteSendService {
     // email-success stamp in its own follow-up transaction — so the send methods cannot be
     // @Transactional (the OrderInvoiceService accept/resend precedent).
     private final TransactionTemplate transactionTemplate;
+    // Phase 16E-C: absolute app origin for the public /q/{token} link (app.public-base-url;
+    // normalized to no trailing slash). The public page/API are SLUGLESS — locked 16E-C decision.
+    private final String publicBaseUrl;
 
     public QuoteSendService(RequestContextGuard requestContextGuard,
                             SalesOrderRepository salesOrderRepository,
                             OrderCustomerRepository orderCustomerRepository,
+                            OrderAddressRepository orderAddressRepository,
                             CustomerEmailValidator customerEmailValidator,
                             CustomerMobileValidator customerMobileValidator,
                             OrderProductLineRepository orderProductLineRepository,
@@ -184,10 +192,12 @@ public class QuoteSendService {
                             QuoteEmailSender quoteEmailSender,
                             SmsSender smsSender,
                             ObjectMapper objectMapper,
-                            PlatformTransactionManager transactionManager) {
+                            PlatformTransactionManager transactionManager,
+                            @Value("${app.public-base-url}") String publicBaseUrl) {
         this.requestContextGuard = requestContextGuard;
         this.salesOrderRepository = salesOrderRepository;
         this.orderCustomerRepository = orderCustomerRepository;
+        this.orderAddressRepository = orderAddressRepository;
         this.customerEmailValidator = customerEmailValidator;
         this.customerMobileValidator = customerMobileValidator;
         this.orderProductLineRepository = orderProductLineRepository;
@@ -205,6 +215,8 @@ public class QuoteSendService {
         this.smsSender = smsSender;
         this.objectMapper = objectMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        // Normalize once: no trailing slash, so publicBaseUrl + "/q/" + token is always clean.
+        this.publicBaseUrl = publicBaseUrl == null ? "" : publicBaseUrl.trim().replaceAll("/+$", "");
     }
 
     // ------------------------------------------------------------------
@@ -225,7 +237,7 @@ public class QuoteSendService {
         long orderId = parseOrderId(orderIdRaw);
 
         PreparedSend prepared = transactionTemplate.execute(status ->
-                prepareSend(ctx, slug, orderId, body, CHANNEL_EMAIL));
+                prepareSend(ctx, orderId, body, CHANNEL_EMAIL));
 
         try {
             quoteEmailSender.send(new QuoteEmailRequest(
@@ -268,7 +280,7 @@ public class QuoteSendService {
         long orderId = parseOrderId(orderIdRaw);
 
         PreparedSend prepared = transactionTemplate.execute(status ->
-                prepareSend(ctx, slug, orderId, body, CHANNEL_SMS));
+                prepareSend(ctx, orderId, body, CHANNEL_SMS));
 
         try {
             smsSender.send(new SmsRequest(
@@ -403,7 +415,7 @@ public class QuoteSendService {
      * live below-cost re-check (422 {@code QUOTE_BELOW_COST}, before ANY persistence) →
      * changed-detection → persist → token mint → attempt markers.
      */
-    private PreparedSend prepareSend(RequestContext ctx, String slug, long orderId, String body, String channel) {
+    private PreparedSend prepareSend(RequestContext ctx, long orderId, String body, String channel) {
         SalesOrder order = salesOrderRepository
                 .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
@@ -460,7 +472,7 @@ public class QuoteSendService {
             // Changed draft (or no active issued version) → NEW issued version from a fresh
             // snapshot. The snapshot object feeds BOTH the DB rows and the PDF (they can't drift),
             // and its line set is mode-scoped (the §6.1 dormant-row guard).
-            QuoteIssueSnapshot snapshot = buildIssueSnapshot(ctx.businessId(), order, draft, draftLines);
+            QuoteIssueSnapshot snapshot = buildIssueSnapshot(ctx.businessId(), orderId, order, draft, draftLines);
             int versionNumber = quoteVersionRepository.maxVersionNumber(orderId) + 1;
             pdfFileName = "quote-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
             pdfBytes = quotePdfGenerator.render(
@@ -505,9 +517,10 @@ public class QuoteSendService {
                         "quote_version disappeared while preparing send: " + quoteVersionId));
         List<QuoteVersionLineRow> summaryLines = quoteVersionRepository.findVersionLines(quoteVersionId);
 
-        // Public page URL shape is /{slug}/q/{token} (contract §8); the absolute origin is a
-        // 16E-C/Phase 17 delivery concern — no real message leaves the system in 16E-A.
-        String publicLink = "/" + slug + "/q/" + plainToken;
+        // Phase 16E-C (locked): the public quote page is TOP-LEVEL and SLUGLESS — the real link is
+        // <app-base>/q/{token}. This is the ONLY place the plaintext token appears (exactly once,
+        // inside the delivered message body); it is never persisted and never in an API response.
+        String publicLink = publicBaseUrl + "/q/" + plainToken;
         return new PreparedSend(finalRow, expiresAt, recipient, pdfBytes, pdfFileName,
                 publicLink, order.getOrderNumber(), summaryLines);
     }
@@ -515,10 +528,13 @@ public class QuoteSendService {
     /**
      * Freeze the issue snapshot: per-flooring-type tenant terms are read LIVE, sanitized ONCE
      * ({@code InvoiceTermsSanitizer}) and frozen into {@code terms_snapshot}; flooring type and
-     * details-of-sale are frozen from the order; the line set is mode-scoped by
+     * details-of-sale are frozen from the order; the customer name + billing lines are frozen
+     * from the saved customer/address records (V17 — the "Quotation To" identity the PUBLIC
+     * payload renders; derivation identical to the issued-PDF assembler's, so the stored PDF and
+     * the snapshot columns can never disagree); the line set is mode-scoped by
      * {@link QuoteIssueSnapshot#of} (dormant retained rows are never snapshotted).
      */
-    private QuoteIssueSnapshot buildIssueSnapshot(long businessId, SalesOrder order,
+    private QuoteIssueSnapshot buildIssueSnapshot(long businessId, long orderId, SalesOrder order,
                                                   QuoteDraft draft, List<QuoteDraftLine> draftLines) {
         BusinessInvoiceConfigView config = businessRepository
                 .findInvoiceConfigByBusinessId(businessId)
@@ -528,8 +544,34 @@ public class QuoteSendService {
                 ? null
                 : (FLOORING_SOFT.equals(order.getFlooringType()) ? config.getTermsSoft() : config.getTermsHard());
         String termsHtml = termsSanitizer.sanitize(rawTerms);
+
+        // Customer identity frozen AT ISSUE (V17, Codex P1): a later pre-LAID customer edit must
+        // never reach the already-issued public quote. Nullable — the send gate only requires the
+        // channel recipient, not a name or billing address.
+        CustomerIdentity identity = currentCustomerIdentity(orderId);
+
         return QuoteIssueSnapshot.of(draft, draftLines, order.getFlooringType(), termsHtml,
-                order.getDetailsOfSale());
+                order.getDetailsOfSale(),
+                identity.name(), identity.line1(), identity.line2());
+    }
+
+    /**
+     * The order's CURRENT "Quotation To" identity — the single V17 derivation (name, billing
+     * line 1, billing line 2, each blank→null) used both to FREEZE the snapshot at issue and to
+     * COMPARE against the active version's snapshot in changed-detection, so the two can never
+     * use different rules.
+     */
+    private CustomerIdentity currentCustomerIdentity(long orderId) {
+        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
+        List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
+        return new CustomerIdentity(
+                customer == null ? null : blankToNull(customerName(customer)),
+                blankToNull(billingLine1(addresses)),
+                blankToNull(billingLine2(addresses)));
+    }
+
+    /** The derived customer-facing identity triple (V17). Server-internal, never serialized. */
+    private record CustomerIdentity(String name, String line1, String line2) {
     }
 
     // ------------------------------------------------------------------
@@ -551,6 +593,12 @@ public class QuoteSendService {
      * positional compare DETERMINISTIC when duplicate sort_order values exist (contract-legal via
      * direct API clients; without it, Postgres's unspecified tie order could flag an unchanged
      * draft as changed and spuriously supersede the issued version — 16E-A review finding).
+     *
+     * <p>(6) V17 / Codex round-2 P1: the CURRENT customer identity (the exact
+     * {@link #currentCustomerIdentity} snapshot derivation) vs the active version's frozen
+     * {@code customer_*_snapshot} columns, null-safe. A changed name/billing address must issue a
+     * NEW version that freezes the NEW identity — a resend re-delivers the OLD stored artifact,
+     * which would show the previous person's details to the new recipient.
      */
     private boolean draftChangedSinceIssue(QuoteDraft draft, List<QuoteDraftLine> draftLines,
                                            SalesOrder order, QuoteVersionRow issued) {
@@ -585,6 +633,15 @@ public class QuoteSendService {
                     return true;
                 }
             }
+        }
+        // (6) Customer identity vs the frozen V17 snapshot (Codex round-2 P1): an edited name or
+        // billing address is a CONTENT change — the resend path would re-deliver the stored PDF
+        // and snapshot carrying the OLD identity.
+        CustomerIdentity identity = currentCustomerIdentity(issued.orderId());
+        if (!Objects.equals(identity.name(), issued.customerNameSnapshot())
+                || !Objects.equals(identity.line1(), issued.customerAddressLine1Snapshot())
+                || !Objects.equals(identity.line2(), issued.customerAddressLine2Snapshot())) {
+            return true;
         }
         return false;
     }
@@ -677,6 +734,66 @@ public class QuoteSendService {
         if (STATUS_LAID.equals(order.getOrderStatus())) {
             throw new BusinessRuleException(ErrorCode.ORDER_LOCKED, ErrorCode.ORDER_LOCKED.defaultMessage());
         }
+    }
+
+    // ------------------------------------------------------------------
+    // "Quotation To" derivation for the V17 issue snapshot — the exact
+    // QuotePdfModelAssembler customer-name/billing-line helpers (duplicated per the locked
+    // duplicate-don't-extract decision), so snapshot columns == issued-PDF content.
+    // ------------------------------------------------------------------
+
+    private static final String ADDRESS_BILLING = "BILLING";
+
+    private static String customerName(OrderCustomer customer) {
+        StringBuilder sb = new StringBuilder();
+        appendIfPresent(sb, customer.getFirstName());
+        appendIfPresent(sb, customer.getMiddleName());
+        appendIfPresent(sb, customer.getLastName());
+        return sb.toString();
+    }
+
+    private static String billingLine1(List<OrderAddress> addresses) {
+        OrderAddress billing = billing(addresses);
+        if (billing == null) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        if (billing.getUnitNumber() != null && !billing.getUnitNumber().isBlank()) {
+            sb.append(billing.getUnitNumber().trim()).append('/');
+        }
+        sb.append(billing.getStreetNumber()).append(' ').append(billing.getStreet());
+        return sb.toString();
+    }
+
+    private static String billingLine2(List<OrderAddress> addresses) {
+        OrderAddress billing = billing(addresses);
+        if (billing == null) {
+            return "";
+        }
+        return billing.getSuburb() + " " + billing.getStateCode() + " " + billing.getPostcode();
+    }
+
+    private static OrderAddress billing(List<OrderAddress> addresses) {
+        if (addresses == null) {
+            return null;
+        }
+        return addresses.stream()
+                .filter(a -> ADDRESS_BILLING.equals(a.getAddressType()))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private static void appendIfPresent(StringBuilder sb, String value) {
+        if (value != null && !value.isBlank()) {
+            if (sb.length() > 0) {
+                sb.append(' ');
+            }
+            sb.append(value.trim());
+        }
+    }
+
+    private static String blankToNull(String value) {
+        return (value == null || value.isBlank()) ? null : value.trim();
     }
 
     private BigDecimal orderTotalCostExGst(long orderId) {

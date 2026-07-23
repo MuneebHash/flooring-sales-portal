@@ -29,14 +29,15 @@ export function getActiveSlug(): string {
 // (/login, /orders, /account, …), so the router redirects them to the marketing
 // site instead of routing them as a tenant.
 //
-// THIS LIST MUST MIRROR the backend V11 `chk_business_slug_reserved` constraint
-// (db/migration/V11__reserve_app_route_words_in_business_slug.sql) EXACTLY — it
-// is the single frontend source of truth. If a word is added/removed/changed in
-// that constraint, change it here too, or the two will silently drift.
+// THIS LIST MUST MIRROR the backend `chk_business_slug_reserved` constraint
+// (last replaced by db/migration/V18__reserve_slug_q.sql, which added 'q' for
+// the public quote page route /q/{token} — closes #105) EXACTLY — it is the
+// single frontend source of truth. If a word is added/removed/changed in that
+// constraint, change it here too, or the two will silently drift.
 export const RESERVED_BUSINESS_SLUGS = [
   'admin', 'api', 'login', 'static', 'auth', 'health',
   'dashboard', 'orders', 'select-store', 'assets', 'new',
-  'logout', 'account', 'settings', 'public',
+  'logout', 'account', 'settings', 'public', 'q',
 ] as const
 
 const RESERVED_BUSINESS_SLUG_SET: ReadonlySet<string> = new Set(

@@ -1248,4 +1248,67 @@ class QuoteSendControllerTest {
         Assertions.assertNull(order.get("last_emailed_at"),
                 "sales_order.last_emailed_at is the INVOICE mirror — quote sends must never touch it");
     }
+
+    // ================================================================
+    // Customer-identity changed-detection (V17 — Codex round-2 P1)
+    // ================================================================
+
+    /** Seed a BILLING address (12 Test Street, Sydney NSW 2000) — the V17 identity source. */
+    private void seedBillingAddress(long orderId) {
+        jdbcTemplate.update(
+                "INSERT INTO order_address "
+                        + "(order_id, address_type, unit_number, street_number, street, suburb, state_code, postcode) "
+                        + "VALUES (?, 'BILLING'::address_type, NULL, '12', 'Test Street', 'Sydney', 'NSW', '2000')",
+                orderId);
+    }
+
+    @Test
+    void sendEmail_customerNameEditedAfterIssue_issuesNewVersionWithNewIdentity() throws Exception {
+        long orderId = sendReadyOrder();
+        sendEmailOk(orderId);
+        Assertions.assertEquals(1, versionCount(orderId));
+        Assertions.assertEquals("Quote Tester",
+                issuedVersionRow(orderId).get("customer_name_snapshot"));
+
+        // Edit ONLY the customer name (a legal pre-LAID edit). The draft/lines/details are all
+        // unchanged, so without the identity comparison this would take the RESEND path and
+        // re-deliver the old person's frozen artifact to the new recipient.
+        jdbcTemplate.update("UPDATE order_customer SET first_name = 'Edited' WHERE order_id = ?",
+                orderId);
+        clearJpaCache();
+        sendEmailOk(orderId);
+
+        Assertions.assertEquals(2, versionCount(orderId));
+        Map<String, Object> issued = issuedVersionRow(orderId);
+        Assertions.assertEquals(2, ((Number) issued.get("version_number")).intValue());
+        Assertions.assertEquals("Edited Tester", issued.get("customer_name_snapshot"));
+        Assertions.assertEquals("SUPERSEDED", versionRowByNumber(orderId, 1).get("status"));
+        Assertions.assertEquals(1, tokenCountByStatus(orderId, "SUPERSEDED"));
+        Assertions.assertEquals(1, tokenCountByStatus(orderId, "ACTIVE"));
+        assertOrderInvariants(orderId);
+    }
+
+    @Test
+    void sendEmail_billingAddressEditedAfterIssue_issuesNewVersionWithNewIdentity() throws Exception {
+        long orderId = sendReadyOrder();
+        seedBillingAddress(orderId);
+        sendEmailOk(orderId);
+        Assertions.assertEquals(1, versionCount(orderId));
+        Assertions.assertEquals("12 Test Street",
+                issuedVersionRow(orderId).get("customer_address_line1_snapshot"));
+
+        // Edit ONLY the billing address — same identity rule as the name.
+        jdbcTemplate.update("UPDATE order_address SET street_number = '99', street = 'New Street' "
+                + "WHERE order_id = ?", orderId);
+        clearJpaCache();
+        sendEmailOk(orderId);
+
+        Assertions.assertEquals(2, versionCount(orderId));
+        Map<String, Object> issued = issuedVersionRow(orderId);
+        Assertions.assertEquals(2, ((Number) issued.get("version_number")).intValue());
+        Assertions.assertEquals("99 New Street", issued.get("customer_address_line1_snapshot"));
+        Assertions.assertEquals("Sydney NSW 2000", issued.get("customer_address_line2_snapshot"));
+        Assertions.assertEquals("SUPERSEDED", versionRowByNumber(orderId, 1).get("status"));
+        assertOrderInvariants(orderId);
+    }
 }
