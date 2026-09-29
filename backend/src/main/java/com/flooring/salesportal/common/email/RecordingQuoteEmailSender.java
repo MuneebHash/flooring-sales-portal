@@ -42,9 +42,12 @@ public class RecordingQuoteEmailSender implements QuoteEmailSender {
         // test API, so surface the message on the backend console — the body carries the public
         // /q/{token} link, making it copyable for manual QA. Logs ONLY what the request already
         // contains (recipient / subject / bodyText). DEBUG, not INFO (Codex round 3): the body is
-        // a BEARER link, so it must never reach default-level logs — dev visibility requires the
-        // DEBUG level, which the dev application.properties enables explicitly for this class;
-        // production configs must NOT.
+        // a BEARER link, so it must never reach default-level logs. Nothing enables DEBUG for this
+        // class by default — application.properties does NOT — so seeing recorded messages needs
+        // an explicit local switch, e.g. run the backend with
+        // --logging.level.com.flooring.salesportal.common.email.RecordingQuoteEmailSender=DEBUG
+        // (for example via -Dspring-boot.run.arguments on ./mvnw spring-boot:run). Production
+        // configs must NOT enable it.
         log.debug("Dev-recorded quote email (no real email sent) — to: {} | subject: {}\n{}",
                 request.recipientEmail(), request.subject(), request.bodyText());
     }

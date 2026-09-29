@@ -2,7 +2,9 @@
 
 Status: **locked product + UX contract for Phase 16D onward.** Docs-only. No code is implemented by this document.
 
-This document **extends and clarifies** `docs/API-Contracts-Phase16B-Quotation.md`. It does **not** replace it. Phase 16B remains the authoritative contract for the broader quotation lifecycle (quote draft, issued/customer quote, accepted quote, send email/SMS, public token link, viewed/opened state, customer acceptance/signature, signed quote PDF, create-invoice-from-accepted-quote).
+Implementation status (post-16E reconciliation, `main` @ `33c4e22`): the 16D and 16E behaviour described here is **built** — Quote Draft (16D), Send by Email + Customer Quote (16E-B), and the public read-only quote page with viewed tracking (16E-C). Remote acceptance, the Accepted Quote view, the signed quote PDF and Create Invoice from an accepted quote are **planned 16F** and not built. Delivery is **email only**; SMS is dormant (§12).
+
+This document **extends and clarifies** `docs/API-Contracts-Phase16B-Quotation.md`. It does **not** replace it. Phase 16B remains the authoritative contract for the broader quotation lifecycle (quote draft, issued/customer quote, accepted quote, send by email (SMS dormant), public token link, viewed/opened state, customer acceptance/signature, signed quote PDF, create-invoice-from-accepted-quote).
 
 Where this document and Phase 16B differ on a **frontend workflow / visual / product** decision, **this document wins for 16D**. Where they differ on **backend contract/behavior**, the **live code on `main` and Phase 16B win** — see the corrections in §1.
 
@@ -16,10 +18,11 @@ These three points exist because earlier drafts described behavior that does not
 
 ### 1.1 Quote modularity — described accurately
 
-Current backend reality on `main` (Phase 16C):
+Current backend reality on `main` (Phase 16C–16E):
 
 - Quote lines do **not** mutate the order's product/charge lines. That separation is real and must be preserved.
 - `PUT /api/v1/{slug}/orders/{orderId}/quote/draft` saves the quote draft **only**. It does **not** change the order sale-price override or any `sales_order` header financials (decoupled in Phase 16D-A).
+- Issuing/sending a quote (16E) does not change the order price or header financials either.
 - Therefore quote autosave never changes the order/header price or the next invoice — the quote draft is fully independent of order pricing.
 
 What 16D states:
@@ -37,12 +40,15 @@ Current known state of the quote PDF template (`quote.html`) after Phase 16D-C:
 
 These were backend template/PDF wording changes completed under the separately scoped Phase 16D-C backend task with its own verify gate and Codex review.
 
-### 1.3 Send Quote — visible in 16D, real sending is 16E
+### 1.3 Send Quote — email sending is built (16E)
 
-16D may show the Send Quote button and its confirmation modal, but must **not** wire real delivery.
+History: 16D shipped the Send Quote button and its confirmation modal with delivery disabled (no backend send endpoint called). 16E wired email delivery.
 
-- 16D: button visible → click opens a confirmation modal → modal shows `Send by Email` / `Send by Phone/SMS` / `Cancel`, with Email/SMS **disabled or clearly marked "Coming in 16E"** → **no backend send endpoint is called**.
-- 16E: wire real `send-email` / `send-sms`, issue a quote version, store the issued PDF, mint token/link, and make the Customer Quote tab functional.
+Current behaviour (16E-A backend, 16E-B UI):
+
+- `Send by Email` calls `send-email`, which issues a new quote version (or resends the unchanged one), stores the immutable issued PDF, mints the public link, and makes the Customer Quote sub-tab functional (§12, §13).
+- `Send by Phone/SMS` is shown **disabled** and no SMS call is ever made. SMS is dormant backend support only, outside the approved delivery scope (email only) — see §12.
+- In the current build email delivery is **recording-only** (in-memory sender): no real email reaches the customer until the Phase 17 email provider.
 
 ---
 
@@ -93,16 +99,18 @@ Reason: once the Quote tab exists, quote work continues inside it. Showing `Crea
 
 ## 4. Quote tab visibility
 
-- The Quote tab is **hidden by default**.
-- It appears only after the user chooses `Create Quote` from the Details of Sale action modal.
+- The Quote tab is **hidden by default**. When shown it sits between Payments and Invoice.
+- It appears when the user chooses `Create Quote` from the Details of Sale action modal, or on order load when the backend already has quote state for the order (below).
 - Once visible for an order, it **stays visible for that order** for the rest of the workspace session.
 - Switching away and back must **not** lose in-progress quote work (keep the tab mounted / preserve its local state across tab switches).
 
 **Visibility source of truth (locked — prevents guessing):**
 
-- **On order load:** the Quote tab is shown **iff a backend quote draft already exists** for that order (i.e. `GET /quote/workspace` returns a non-null `draft`). This is the durable signal — visibility survives reload because it is derived from real backend state, not a transient flag.
+- **On order load:** the Quote tab is shown **iff the quote-workspace probe (`GET /quote/workspace`) succeeds and returns a non-null `draft` or a non-null `current_issued`** (an active issued quote). This is the durable signal — visibility survives reload because it is derived from real backend state, not a transient flag.
 - **Within a session:** once the user clicks `Create Quote`, the tab is shown for the rest of that session even before the first save has persisted a draft.
-- Do **not** invent a separate "quote started" flag or persist visibility in the frontend only. Draft-existence is the durable source of truth; the session flag only bridges the gap between clicking `Create Quote` and the first successful autosave.
+- **Probe failure is never "no quote":** while the probe is loading or after it fails, the tab stays hidden and `Create Quote` shows as checking / unavailable with a Retry; nothing is cleared or faked, and the Quote tab only mounts after a successful probe (so a fresh full-replace save can never overwrite a draft the frontend has not seen).
+- On a LAID order with no saved quote state, `Create Quote` is hidden (a LAID order cannot save a new draft).
+- Do **not** invent a separate "quote started" flag or persist visibility in the frontend only. Backend quote state (draft or active issued quote) is the durable source of truth; the session flag only bridges the gap between clicking `Create Quote` and the first successful autosave.
 
 ---
 
@@ -114,13 +122,13 @@ The Quote tab has three internal sub-tabs:
 2. **Customer Quote** — latest sent/issued quote snapshot, read-only.
 3. **Accepted Quote** — latest accepted/signed quote snapshot, read-only.
 
-For 16D:
+Current state (post-16E):
 
-- **Quote Draft** is functional.
-- **Customer Quote** shows a clean empty state: `No quote has been sent yet.`
-- **Accepted Quote** shows a clean empty state: `No quote has been accepted yet.`
+- **Quote Draft** is functional (16D).
+- **Customer Quote** is functional (16E-B) — it renders the active issued quote from `current_issued` (§13), and shows the clean empty state `No quote has been sent yet.` when there is no active issued quote (never sent, cancelled, or already lazily expired by a public visit after its link lapsed).
+- **Accepted Quote** shows the clean empty state `No quote has been accepted yet.` — `accepted` is always null until 16F.
 
-These are real lifecycle tabs, not throwaway placeholders. (`current_issued` and `accepted` are always null in 16C, so no real data drives Customer/Accepted quote yet — that is 16E/16F.)
+These are real lifecycle tabs, not throwaway placeholders.
 
 ---
 
@@ -198,7 +206,7 @@ After seeding:
 - quote lines are independent, quote-only, customer-facing lines
 - editing quote lines does **not** edit Products & Charges
 - editing quote lines does **not** mutate operational product/charge rows
-- if a saved quote draft already has lines, **the saved quote draft lines are the source of truth** — do not silently overwrite them from Products & Charges just because the order changed. Re-seeding only happens on an explicit user rebuild. This includes retained dormant rows on a non-itemised draft: toggling itemised back ON restores them and must not re-seed (§9).
+- if a saved quote draft already has lines, **the saved quote draft lines are the source of truth** — do not silently overwrite them from Products & Charges just because the order changed. Re-seeding only happens on an explicit user rebuild. This includes retained dormant rows on a non-itemised draft: toggling itemised back ON restores them and must not re-seed (§9 — active until Batch A #108 changes it).
 
 ### 8.2 Quote pricing is independent of the order (locked)
 
@@ -247,6 +255,8 @@ While non-itemised, the quote total is `final_total_inc_gst` and is fully indepe
 
 **Legacy note (dev data only):** drafts saved non-itemised before PR2A carry an old stored `Quoted works` row that is indistinguishable from retained rows (no schema flag; description matching is forbidden). It may appear in `lines[]` on read (never rendered in non-itemised mode) and, if the draft is toggled to itemised, in the editor; it heals on the next itemised save (full replace) or manual dev-data cleanup.
 
+> **Planned change — Batch A, [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108) (approved, NOT implemented).** The explicit switch of a **draft** from non-itemised to itemised will refill the lines from the current Products & Charges and discard manual quote rows/adjustments (draft only; not continuous auto-sync; issued/accepted snapshots and converted invoices untouched). Whether a confirmation is shown first is still an open decision. Until the #108 PR merges, the retention rules above are the **active** behaviour; that PR amends this section, contract §6.1 and `openapi.yaml` together with its code.
+
 ---
 
 ## 10. Autosave
@@ -293,37 +303,38 @@ Popup-safe behavior:
 
 Bottom button `Send Quote`, visible because it is core to the quote workflow.
 
-16D behavior:
+Current behavior (built in 16E-B; 16D shipped the same modal with delivery disabled):
 
-- clicking it opens a **confirmation modal only** — it never sends immediately
-- modal meaning: `Are you sure you want to send this quote?`
+- clicking it opens a **confirmation modal only** — it never sends immediately. The Customer Quote `Resend` button opens the same modal.
+- modal title: `Are you sure you want to send this quote?`
 - modal body: `Please double-check all quote details before sending.`
-- delivery options: `Send by Email`, `Send by Phone/SMS`, `Cancel`
-- Email/SMS actions are **disabled or clearly marked "Coming in 16E"**
-- no backend send endpoint is called
+- actions: `Send by Email`, `Send by Phone/SMS` (disabled), `Cancel`
+- `Send by Email` first flushes the Details of Sale autosave and then the quote autosave (the backend issues from **persisted** state); if either flush fails the send is blocked with an inline error. It is single-flight (no duplicate send on a double tap), mutually exclusive with Cancel quote, and disabled when the order is LAID.
+- on success the modal closes, the confirmation `Quote sent by email.` shows, and Customer Quote renders the returned issued summary.
+- errors show inside the modal: a missing/invalid customer email adds a pointer and a `Go to Customer tab` button; a delivery failure (502) says nothing was sent and it is safe to try again (the issued version/PDF/link were kept); other backend messages show verbatim.
+- delivery is **recording-only** in the current build — the send is recorded in memory and no real email reaches the customer (Phase 17 adds the provider).
+- `Send by Phone/SMS` is disabled and never calls the backend. SMS is dormant backend support, **not** approved customer delivery (email only), and no activation is planned. The button's current "Available soon" wording overstates this — a known follow-up listed in `docs/Phases.md` §8 (no issue filed yet); this document does not change the UI.
 
-16E behavior: the Email/SMS actions wire to the real `send-email` / `send-sms` endpoints.
-
-Hard rule: **no accidental one-click sending**, now or in 16E — sending always passes through this confirmation modal.
-
----
-
-## 13. Customer Quote — future visual
-
-Same quotation canvas style, read-only. Shows the latest issued/sent quote snapshot. Never shows raw cost.
-
-Simple lifecycle states (MVP direction):
-
-- first state: `Sent`
-- after the customer opens the public quote link: `Opened / Viewed`
-
-Future fields (16E and later): sent channel (Email/SMS), sent time, opened/viewed time, link expiry, download issued PDF, cancel/resend controls if scoped. Keep the status model simple — do not add many states beyond Sent and Opened/Viewed for MVP.
+Hard rule: **no accidental one-click sending** — sending always passes through this confirmation modal.
 
 ---
 
-## 14. Accepted Quote — future visual
+## 13. Customer Quote — built (16E-B)
 
-Same quotation canvas style, read-only and signed. Shows:
+Read-only. Shows the active issued quote from the workspace `current_issued` summary (seeded by the probe, replaced by send responses, cleared by a successful cancel) — **never** from the live draft rows, totals, details or terms, which may have drifted since the issue was frozen. Never shows raw cost, GP, token or internal file data.
+
+- **Status badge:** `Sent`; `Opened` once the customer has opened the public link (`viewed_at` set — 16E-C, shown from the next workspace load); `Not delivered` when the latest email attempt failed (with "The email could not be delivered. Resend to try again."). Keep the status model simple — no further states for MVP.
+- **Details:** channel, sent time, link expiry.
+- **Actions:** `Preview PDF` (opens the **stored** issued PDF, never regenerated), `Resend` (through the §12 confirmation modal; disabled when LAID), `Cancel quote` (its own confirmation — "Cancel this quote?" / "The customer's quote link will stop working. You can send a new quote at any time."; allowed when LAID because it only kills the public link).
+- **Document:** a read-only "Issued quote" view of the frozen version (version number, details of sale, the snapshot lines for an itemised issue, and the ex-GST / inc-GST totals). The full document, including terms, is the stored issued PDF.
+
+The customer-facing side is the public read-only quote page `/q/{token}` (16E-C): it renders the issued snapshot (customer identity from the `V17` snapshot; business presentation fields read live), records the first view, offers the stored issued PDF, and shows a per-state message for expired/replaced/cancelled/inactive links. Its customer-acceptance area is static document content — signing is 16F.
+
+---
+
+## 14. Accepted Quote — future visual (planned 16F)
+
+Not built: today the sub-tab shows only its empty state (§5). Planned for 16F — same quotation canvas style, read-only and signed. Shows:
 
 - the same customer-facing quote content
 - signature section
@@ -367,7 +378,7 @@ Still future 16F scope:
 Quote and invoice are separate lifecycle objects.
 
 - Direct invoice path: Details of Sale → `Create Invoice` / `Rewrite Invoice`.
-- Quote path: Details of Sale → `Create Quote` → Quote Draft → Send Quote → Customer Quote → Accepted Quote → Create Invoice from Accepted Quote.
+- Quote path: Details of Sale → `Create Quote` → Quote Draft → Send Quote → Customer Quote → Accepted Quote → Create Invoice from Accepted Quote (the last two steps are planned 16F).
 
 A quote is not mandatory for invoicing — an invoice can still be created directly from Details of Sale. A quote can be created before or after an invoice, as long as the Quote tab has not already been opened for that order. Once a quote is accepted and an invoice is created from it, the Details of Sale button reads `Rewrite Invoice`.
 
@@ -375,7 +386,7 @@ A quote is not mandatory for invoicing — an invoice can still be created direc
 
 ## 17. Phase split (16D / 16E / 16F)
 
-**16D — frontend quote UX foundation:**
+**16D — frontend quote UX foundation (COMPLETE):**
 
 - Details of Sale action modal entry
 - hidden Quote tab until `Create Quote`
@@ -383,22 +394,20 @@ A quote is not mandatory for invoicing — an invoice can still be created direc
 - itemised ON/OFF behavior (incl. carry-over + adjustment helper)
 - autosave (quote-only; does not change order pricing)
 - Preview PDF that flushes autosave first, opens in a new tab
-- visible Send Quote button with a **disabled** confirmation modal (no real send)
+- visible Send Quote button with a **disabled** confirmation modal (no real send) — superseded by 16E-B
 - Customer Quote / Accepted Quote clean empty states
 
-**16E — quote delivery:**
+**16E — quote delivery (COMPLETE — email only):**
 
-- `send-email` / `send-sms` endpoints
-- issue a quote version; store the issued PDF; mint token/link
-- sent / opened(viewed) state
-- Customer Quote tab becomes functional
+- 16E-A: `send-email` endpoint (plus dormant `send-sms` — not used, outside the approved scope); issue a quote version; store the issued PDF; mint token/link; cancel
+- 16E-B: Send by Email wired through the confirmation modal; Customer Quote tab functional (Sent / Opened / Not delivered, stored issued PDF preview, Resend, Cancel quote)
+- 16E-C: public read-only quote page `/q/{token}`; public viewed tracking (drives `Opened`); issue-time customer snapshots (`V17`); reserved slug `q` (`V18`)
 
-**16F — remote acceptance + invoice conversion:**
+**16F — remote acceptance + invoice conversion (PLANNED, not built):**
 
-- public quote page; public viewed tracking
-- customer signature; accepted quote; signed PDF
+- customer signature on the public link; accepted quote; signed PDF; store notification email
 - Accepted Quote tab functional
-- Create Invoice from Accepted Quote
+- Create Invoice from Accepted Quote (inherits the signature; no re-sign)
 
 ---
 
@@ -414,4 +423,4 @@ Allowed in the protected salesperson portal only: `gp_percent`, the below-cost w
 
 ## 19. Purpose of this document
 
-This is the visual/workflow source of truth for Phase 16D onward. It exists so implementation agents do not guess: where the Quote tab appears and when it persists, what `Create Quote` means, how Quote Draft looks, how itemised carry-over and adjustment math work, how autosave behaves (quote-only; it does not change order pricing), what Customer Quote and Accepted Quote mean, how the quote PDF should eventually look, and what belongs to 16D vs 16E vs 16F.
+This is the visual/workflow source of truth for Phase 16D onward. It exists so implementation agents do not guess: where the Quote tab appears and when it persists, what `Create Quote` means, how Quote Draft looks, how itemised carry-over and adjustment math work, how autosave behaves (quote-only; it does not change order pricing), what Customer Quote and Accepted Quote mean, how the quote PDF looks, and what belongs to 16D vs 16E vs 16F.

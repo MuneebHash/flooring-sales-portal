@@ -39,6 +39,8 @@ Not a generic CRM — a specialised flooring sales workflow product. Multi-tenan
 
 The user controls all approvals, commits, pushes, merges, and all product/UI decisions. Claude Code may run build/test/terminal commands during implementation, but never commits, pushes, or creates audit files inside the repo.
 
+Review workflow: GPT drafts task prompts and Fable independently reviews them; both then review the actual implementation diff, and neither reviewer automatically outranks the other. Claude Code implements, validates and self-reviews, then stops with the branch uncommitted. After both approvals and the user's explicit go-ahead, the user commits/pushes and opens the PR from an HTTPS compare link; the PR review trigger is exactly `@codex review`. There is no docs-only review exemption, and changes made after approval need the affected changes reviewed again.
+
 ---
 
 ## Status
@@ -54,15 +56,26 @@ Phase 16A (invoice presentation foundation) is COMPLETE on main:
     page 2 (SOFT and HARD); footer renders exactly once with or without terms. Template-only.
   Phase 16A added NO migration (still V1–V15) and NO production Java in PR3.
 
-Current focus: Phase 16E — Quote delivery planning / send quote by email/SMS. See docs/Phases.md §7/§9.
+Phase 16B–16E (quotation foundation + email delivery + public read-only link) is COMPLETE on main:
+  - 16B contract + OpenAPI lock · 16C (#92/#93) V16 quote tables, draft money core, preview PDF
+  - 16D-A (#94) quote/order price decoupling · 16D-B (#95/#97/#98) Quote tab, autosave,
+    itemised editor, retained itemised rows · 16D-C (#99/#100) acceptance-ready QUOTATION PDF
+  - 16E-A (#102) issue/resend/cancel + stored issued PDFs · 16E-B (#103) Send by Email + Customer Quote
+  - 16E-C (#106) public read-only /q/{token} page + viewed tracking, V17 issue-time customer
+    snapshots (identity-aware resend), V18 reserved slug 'q'
+  NOT built: remote quote acceptance/signing, signed quote PDF, Accepted Quote, Create Invoice
+  from an accepted quote — all planned 16F.
 
-Phase 16B–16D-C quotation foundation is complete on main: quote contract, backend quote draft/workspace/preview PDF, frontend Quote tab, itemised quote editor, retained itemised rows, and acceptance-ready quotation PDF. Next scope must not mix delivery with remote acceptance: 16E is send/email/SMS + issued customer quote; 16F is public signing/accepted quote/create invoice from accepted quote.
+Next development step: the 16F READ-ONLY verify gate, after the post-16E docs reconciliation PR
+  merges. That gate must assess #101's impact on 16F and the accepted-customer-name source (live
+  saved customer vs the V17 issued snapshot) — neither outcome is pre-decided.
 
-Roadmap: 16 Quotation PDF · 17 Deploy & Hardening · 18 Revamp/app chrome · 19 Final audit gate
-  (full roadmap in docs/Phases.md §7).
+Approved sequence (details: docs/Phases.md §7/§9):
+  GitHub cleanup (done) -> post-16E docs reconciliation -> 16F read-only verify gate -> 16F
+  -> 16G -> Batch A -> Batch B -> 17 Deploy & Hardening -> 18 Revamp/app chrome -> 19 Final audit
 ```
 
-The app is wired to the Spring Boot backend across the full MVP sales workflow: auth/login/logout/store-selection; dashboard order list + status update; create order shell; order workspace; customer + address save; details-of-sale autosave; product search + product lines; charge/labour lines; financial summary, GP, sale-price override/reset, target-GP price control; notes; photo upload/list/preview/delete; invoice create/rewrite/view/download; payment list/record/**void**; invoice acceptance with customer signature; resend/email state; per-tenant invoice on screen + PDF; per-flooring-type terms; PaymentsTab Stripe-link + bank-transfer helpers; **Lead Enquiry form (one-per-order order_enquiry) in the Customer tab**; dynamic business-slug routing; reserved-slug blocking; slug validation + Business-Not-Found; per-tenant quick-adds; go-forward db/dev-seed workflow + MS1 multi-store demo user.
+The app is wired to the Spring Boot backend across the full MVP sales workflow: auth/login/logout/store-selection; dashboard order list + status update; create order shell; order workspace; customer + address save; details-of-sale autosave; product search + product lines; charge/labour lines; financial summary, GP, sale-price override/reset, target-GP price control; notes; photo upload/list/preview/delete; invoice create/rewrite/view/download; payment list/record/**void**; invoice acceptance with customer signature; resend/email state; per-tenant invoice on screen + PDF; per-flooring-type terms; PaymentsTab Stripe-link + bank-transfer helpers; **Lead Enquiry form (one-per-order order_enquiry) in the Customer tab**; dynamic business-slug routing; reserved-slug blocking; slug validation + Business-Not-Found; per-tenant quick-adds; go-forward db/dev-seed workflow + MS1 multi-store demo user; **quotation (16B–16E)**: conditional Quote tab with autosaved non-itemised/itemised quote draft editor and draft Preview PDF, Send by Email (issue/resend with a stored immutable issued PDF) and Cancel quote, Customer Quote sub-tab (Sent / Opened / Not delivered, stored issued PDF preview), and the public read-only quote page `/q/{token}` with viewed tracking. Quote acceptance/remote signing and invoice conversion are **future (16F)**; quote email is recording-only in this build (see Quotation rules).
 
 ---
 
@@ -83,7 +96,7 @@ Local DB:  Docker Postgres 17 (infra/docker-compose.yml) —
 ```bash
 # local DB
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal && docker compose -f infra/docker-compose.yml up -d
-# backend (Flyway applies V1–V15 on boot)
+# backend (Flyway applies V1–V18 on boot)
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal/backend && ./mvnw spring-boot:run
 # frontend
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal/frontend && npm run dev
@@ -111,6 +124,7 @@ Tenant app URLs use the business slug as the first path segment; API calls use t
 /{business-slug}/login · /select-store · /dashboard · /orders/new · /orders/{orderId}
 API:  /api/v1/{slug}/...
 Application site:  floorxtack.com/{business-slug}      Marketing site:  tradextack.com
+Public quote (16E-C, slugless, token-only):  page /q/{token} · API /api/v1/public/quotes/{token}
 ```
 
 - Bare `/` and reserved/no-slug app paths redirect to the marketing URL (external `window.location`, NOT React Router `<Navigate>`).
@@ -122,33 +136,37 @@ Application site:  floorxtack.com/{business-slug}      Marketing site:  tradexta
 
 ## Reserved business slugs
 
-Backend `V11` reserves app/system route words as invalid slugs:
+Backend `V11` reserves app/system route words as invalid slugs; `V18` replaces that same `chk_business_slug_reserved` constraint with the V11 list plus `q` (the top-level, slugless public quote page `/q/{token}` would otherwise shadow a business whose slug is `q`):
 
 ```text
 admin · api · login · static · auth · health · dashboard · orders ·
-select-store · assets · new · logout · account · settings · public
+select-store · assets · new · logout · account · settings · public · q
 ```
 
-The frontend guard (`RESERVED_BUSINESS_SLUGS` in `frontend/src/lib/tenant.ts`, via `isReservedBusinessSlug`) MUST mirror backend `V11 chk_business_slug_reserved`. If the backend list changes, update the frontend list too.
+The frontend guard (`RESERVED_BUSINESS_SLUGS` in `frontend/src/lib/tenant.ts`, via `isReservedBusinessSlug`) MUST mirror the backend `chk_business_slug_reserved` constraint as last replaced by `V18` (it already includes `q`). If the backend list changes, update the frontend list too.
 
 ---
 
 ## Migration rules
 
 ```text
-Current migrations are V1–V15:
+Current migrations are V1–V18:
   V1–V7 base · V8 LM/SQM factor · V9 negative-price constraint · V10 invoice accept/signature/email
   V11 reserved slug words · V12 per-tenant branding/invoice-legal/quick-add · V13 per-type terms
   V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
+  V16 quote tables (quote_draft/_line, quote_version/_line, quote_token)
+  V17 quote_version customer name + billing-line snapshots (frozen at issue)
+  V18 reserved slug 'q' (replaces the V11 chk_business_slug_reserved constraint)
 
 Never edit any committed migration. Any schema change is a NEW migration.
 Phase 16A added NO migration (invoice tab + PDF logo path + Aire Compact PDF were app/template only).
-CI "Locked migration protection" guards V1–V13 only (latest-known). V14 and V15 are on main but
-  NOT yet locked unless live CI says otherwise. Any migration/CI work before the Phase 17 squash must
-  explicitly account for V14/V15. Do not casually expand or rewrite the guard if the Phase 17
-  squash/baseline will supersede it.
+CI "Locked migration protection" guards V1–V13 only (.github/workflows/ci.yml). V14–V18 are on main
+  but OUTSIDE the guard — they are still never edited; the rule applies regardless of guard coverage.
+  Any migration/CI work before the Phase 17 squash must explicitly account for V14–V18. Do not
+  casually expand or rewrite the guard if the Phase 17 squash/baseline will supersede it.
 The Phase 17 schema-only squash/baseline must collapse ALL committed pre-production migrations —
-  including V1–V15 and any Phase 16 quotation migrations — into one clean baseline and re-lock it in CI.
+  V1–V18 plus any later pre-production migrations — into one clean baseline before any real store
+  data exists, and re-lock it in CI.
 Do NOT create a Flyway migration per customer/tenant — onboarding seeds are not product migrations.
 ```
 
@@ -160,11 +178,11 @@ demo/dev data = db/dev-seed (manual, idempotent, run by hand — NEVER auto-runs
 new tests     = self-seed required data; do NOT depend on the V4 legacy seed
 ```
 
-Dev-seed scripts live in `backend/src/main/resources/db/dev-seed/` (sibling of `db/migration`). Flyway scans only `classpath:db/migration` and `spring.sql.init.mode=never`, so dev-seed files never auto-apply. Run them MANUALLY after Flyway, in order:
+Dev-seed scripts live in `backend/src/main/resources/db/dev-seed/` (sibling of `db/migration`). Flyway scans only `classpath:db/migration` and `spring.sql.init.mode=never`, so dev-seed files never auto-apply. Run them MANUALLY after Flyway, in order. Host `psql` is not installed on the dev Mac — the exact `docker exec -i flooring-sales-portal-postgres psql …` command for each step is in `backend/src/main/resources/db/dev-seed/README.md`; the list below is shorthand:
 
 ```text
 1. start Postgres
-2. start backend (Flyway applies V1–V15)
+2. start backend (Flyway applies V1–V18)
 3. psql -f db/dev-seed/quick_descriptions_demo.sql
 4. psql -f db/dev-seed/multi_store_user_demo.sql
 5. psql -f db/dev-seed/payment_helpers_demo.sql      # bank + Stripe-link demo data (Phase 15E)
@@ -271,6 +289,41 @@ Negative sale_price_ex_gst persists through line CRUD (never clamped); only invo
 Costs are NEVER exposed in the salesperson frontend; catalog search is cost-free.
 ```
 
+### Quotation (Phase 16B–16E — shipped; 16F/16G planned)
+
+Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-Quotation-UX-Lock.md`. Quote state is separate from order status.
+
+```text
+- Quote ≠ invoice. Quote draft saves AND issue/send never write the order sale-price override or
+  sales_order header financials; quote lines never mutate Products & Charges. Path B (existing
+  Details of Sale -> Create Invoice) uses the order's working price and ignores the quote; Path A
+  (planned 16F) will bill the ACCEPTED quote snapshot, never the live order price.
+- Draft (one per order): itemised total = sum of lines (a direct reduction auto-adds a negative
+  ADJUSTMENT; above the line sum -> 422 QUOTE_TOTAL_EXCEEDS_LINES); non-itemised = final total only.
+  Below cost is blocked at save and send (QUOTE_BELOW_COST). Itemised rows are RETAINED as dormant
+  rows on non-itemised saves and restored on toggle-ON (contract §6.1) — the active rule until #108
+  (Batch A) changes it in its own PR.
+- Issue/send: append-only quote_version snapshot (lines, totals, flooring type, details of sale,
+  frozen terms, V17 customer name + billing lines) + stored immutable issued PDF + hashed 7-day
+  token. A changed draft OR changed customer name/billing -> NEW version (prior SUPERSEDED);
+  otherwise resend = same version, stored PDF re-delivered verbatim, new token (old REPLACED).
+- LAID: draft save and send blocked (ORDER_LOCKED); workspace read, previews, stored PDF, cancel allowed.
+- Public /q/{token}: slugless, token-only, read-only + write-once viewed_at; cost-free, no internal
+  IDs; never reuses or weakens the HttpSession model. Customer identity comes from the V17 issue
+  snapshot; the approved business presentation fields (name, logo, accent, ABN, direct-deposit
+  bank details, Stripe link) are read LIVE.
+- Delivery is EMAIL ONLY. Quote email uses the in-memory RecordingQuoteEmailSender — NO real email
+  is sent. The recorded message (with the bearer link) is logged only when DEBUG is explicitly
+  enabled for that class; application.properties does not enable it. Real email = Phase 17.
+- SMS is NOT approved customer delivery. Dormant backend support exists (send-sms endpoint, SMS
+  enum value/error codes, recording-only SmsSender, no provider) and the "Send by Phone/SMS"
+  button is disabled. Do not activate or extend it.
+- The display-only 40% deposit is hardcoded (QuotePdfGenerator + PublicQuoteService). Configurable
+  deposit is #112 (Batch B) — not implemented.
+- The quote accept-name source (live saved customer vs the V17 issued snapshot) is an OPEN
+  16F-gate question — do not decide it in code or docs.
+```
+
 ---
 
 ## Operational invariants — do not break
@@ -298,7 +351,8 @@ Costs are NEVER exposed in the salesperson frontend; catalog search is cost-free
   (e.g. &#183;), NOT named HTML entities (&middot; / &nbsp; / &hellip;). Old stored PDFs do NOT
   auto-update on template change — rewrite/regenerate to see changes.
 - Quick-adds: DetailsOfSaleTab reads the tenant list; EMPTY if none — no hardcoded fallback.
-- Accepted customer name comes from the SAVED customer record — not typed at accept time.
+- Accepted customer name (invoice acceptance) comes from the SAVED customer record — not typed at
+  accept time. The quote equivalent is an open 16F-gate question (see Quotation above).
 - Never leave follow-ups untracked — file a GitHub issue (the PR #71 lesson).
 - business_quick_description column is `description`, NOT `text` (Postgres type-name footgun);
   its FK to business has no ON DELETE — wipe child rows before the business row.
@@ -337,8 +391,11 @@ UI must be: corporate, compact, clean, professional, iPad-friendly. No bulky sid
 Order Workspace tab order:
 
 ```text
-1. Customer  2. Products & Charges  3. Details of Sale  4. Notes & Photos  5. Payments  6. Invoice
+1. Customer  2. Products & Charges  3. Details of Sale  4. Notes & Photos  5. Payments
+6. Quote (conditional)  7. Invoice
 ```
+
+The Quote tab is hidden by default. It appears when the user clicks Create Quote in the Details of Sale action modal (for the rest of that workspace session), or on load when the quote-workspace probe succeeds and returns a saved draft or an active issued quote. A failed probe is never treated as "no quote" — the tab stays hidden and Create Quote stays unavailable (with a retry) until a probe succeeds.
 
 ---
 
@@ -350,23 +407,27 @@ advanced quote comparison · room-level complexity · AI features ·
 payment edit / hard delete (only soft void is in scope) · refunds · finance products ·
 Stripe Connect / full payment-gateway build / webhooks ·
 major frontend redesign / FloorxTack chrome (Phase 18) · invoice version-history UI ·
-tenant logo upload UI / S3 serving (Phase 17) · configurable per-store guarantee text above terms
+tenant logo upload UI / S3 serving (Phase 17) · configurable per-store guarantee text above terms ·
+SMS delivery of quotes or invoices (email only; SMS support is dormant) ·
+Operations settings/roles-management UI and self-service onboarding (after launch)
 ```
 
 ---
 
 ## Open / deferred issues
 
-```text
-#75  centralize backend auth enforcement (fail-closed) before production   -> Phase 17
-#29  CSRF protection before production                                     -> Phase 17
-#30  production CORS origins                                               -> Phase 17
-#34  app/database timezone before production                              -> Phase 17
-#55  financial summary versioning (concurrent mutations)                  -> deferred-hardening (post-pilot)
-#69  backend version precondition on invoice accept                       -> deferred-hardening (post-pilot)
-```
+Issue base: https://github.com/MuneebHash/flooring-sales-portal/issues/
 
-GitHub issue labels may still read `phase-16` for #29/#30/#34/#75 — these are Phase 17 now; update the labels when convenient. Docs are authoritative for phase numbering.
+- [#75](https://github.com/MuneebHash/flooring-sales-portal/issues/75) centralize backend auth enforcement (fail-closed) before production → Phase 17
+- [#29](https://github.com/MuneebHash/flooring-sales-portal/issues/29) CSRF protection before production → Phase 17
+- [#30](https://github.com/MuneebHash/flooring-sales-portal/issues/30) production CORS origins → Phase 17
+- [#34](https://github.com/MuneebHash/flooring-sales-portal/issues/34) app/database timezone before production → Phase 17
+- [#69](https://github.com/MuneebHash/flooring-sales-portal/issues/69) backend version precondition on invoice accept → **required for 16G**: must cover both the current in-app acceptance and the new remote invoice signing
+- [#55](https://github.com/MuneebHash/flooring-sales-portal/issues/55) financial summary versioning (concurrent mutations) → deferred-hardening (post-pilot)
+- Batch A (own PR after 16G): [#107](https://github.com/MuneebHash/flooring-sales-portal/issues/107) · [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108) · [#104](https://github.com/MuneebHash/flooring-sales-portal/issues/104) · [#109](https://github.com/MuneebHash/flooring-sales-portal/issues/109) · [#110](https://github.com/MuneebHash/flooring-sales-portal/issues/110) · [#96](https://github.com/MuneebHash/flooring-sales-portal/issues/96) · [#101](https://github.com/MuneebHash/flooring-sales-portal/issues/101) — details in `docs/Phases.md` §7
+- Batch B (own PR after Batch A): [#111](https://github.com/MuneebHash/flooring-sales-portal/issues/111) · [#112](https://github.com/MuneebHash/flooring-sales-portal/issues/112) · [#113](https://github.com/MuneebHash/flooring-sales-portal/issues/113) · [#114](https://github.com/MuneebHash/flooring-sales-portal/issues/114) — details in `docs/Phases.md` §7
+
+Docs are authoritative for phase numbering.
 
 Other deferred-hardening (not all ticketed): secure cookies for HTTPS, production email provider (SES), DB backup strategy, S3/object storage for production uploads.
 
@@ -381,6 +442,8 @@ docs/Phases.md
 docs/API-Conventions.md
 docs/API-Contracts-Chunk-1.md … Chunk-4.md
 docs/API-Contracts-Phase13-Acceptance-Signature-Email.md
+docs/API-Contracts-Phase16B-Quotation.md     (quotation contract)
+docs/Phase16D-Quotation-UX-Lock.md           (quotation UX lock)
 docs/openapi.yaml
 backend/src/main/resources/db/migration/V*.sql
 backend/src/main/resources/db/dev-seed/

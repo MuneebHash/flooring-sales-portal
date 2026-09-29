@@ -1577,8 +1577,9 @@ paths:
       operationId: getQuoteWorkspace
       description: >
         Loads the full quote state for the order's Quote tab (Phase 16B): the editable draft, the
-        active issued version summary, and the latest accepted version summary. Cost/GP flags are
-        present on this protected view only. Allowed when order_status is LAID (read).
+        active issued version summary, and the latest accepted version summary (planned 16F; always
+        null at this base). Cost/GP flags are present on this protected view only. Allowed when
+        order_status is LAID (read).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       responses:
@@ -1700,10 +1701,13 @@ paths:
       summary: Send quote by email
       operationId: sendQuoteEmail
       description: >
-        Issues (or resends) the quote and emails it (issued PDF attachment + signing link + body)
-        (Phase 16B). Draft changed since last issue creates a new ISSUED version that supersedes
-        the previous one; draft unchanged resends the same version with a new ACTIVE token (old
-        token REPLACED). Either way the issued PDF + token are stored before delivery. Re-checks
+        Issues (or resends) the quote and emails it (issued PDF attachment + public quote link +
+        body; the link is view-only until 16F adds signing) (Phase 16B; implemented 16E-A). A draft
+        or customer name/billing change since the last issue (compared with the V17 issue-time
+        snapshot) creates a new ISSUED version that supersedes the previous one; otherwise the same
+        version and its stored PDF are re-sent verbatim with a new ACTIVE token (old token
+        REPLACED). Either way the issued PDF + token are stored before delivery. In the current
+        build delivery is recorded in memory only - no real email is sent. Re-checks
         below-cost (QUOTE_BELOW_COST, 422) and requires a valid customer email
         (CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID, 422). Blocked when LAID (ORDER_LOCKED,
         422). On provider failure returns 502 (EMAIL_SEND_FAILED); the issued version/PDF/token
@@ -1745,8 +1749,11 @@ paths:
       summary: Send quote by SMS
       operationId: sendQuoteSms
       description: >
-        Issues (or resends) the quote and sends an SMS containing the signing link only (no PDF)
-        (Phase 16B). Same issue/resend + token logic as send-email. Requires a valid customer
+        DORMANT - existing backend support that is excluded from the approved delivery roadmap
+        (delivery is email only). The frontend never calls it and no SMS provider exists
+        (in-memory recording sender only); the definition is kept, not promised.
+        Issues (or resends) the quote and sends an SMS containing the public quote link only (no
+        PDF) (Phase 16B). Same issue/resend + token logic as send-email. Requires a valid customer
         mobile (CUSTOMER_MOBILE_REQUIRED / CUSTOMER_MOBILE_INVALID, 422). Blocked when LAID
         (ORDER_LOCKED, 422). On provider failure returns 502 (SMS_SEND_FAILED); the issued
         version/PDF/token are kept and the salesperson resends.
@@ -1829,6 +1836,8 @@ paths:
       summary: Create invoice from accepted quote (Path A)
       operationId: createInvoiceFromQuote
       description: >
+        PLANNED 16F - NOT IMPLEMENTED at this base (no handler exists; this definition is the
+        contract 16F builds to).
         Creates an invoice from the latest accepted quote (Phase 16B, Path A). The invoice sale
         price is the accepted quote snapshot total, the terms are the quote's frozen
         terms_snapshot, and the acceptance/signature is inherited (the customer does not re-sign);
@@ -1873,7 +1882,8 @@ paths:
       operationId: downloadQuotePdf
       description: >
         Streams a stored quote PDF for the salesperson (Phase 16B): type=issued returns the active
-        issued version PDF; type=accepted returns the accepted signed PDF. The signed PDF is
+        issued version PDF; type=accepted returns the accepted signed PDF (planned 16F - until then
+        type=accepted always returns 404 QUOTE_PDF_NOT_FOUND). The signed PDF is
         portal only and is never served on the public surface. Missing requested artifact returns
         404 (QUOTE_PDF_NOT_FOUND). Allowed when order_status is LAID (read).
       parameters:
@@ -1920,13 +1930,17 @@ paths:
       operationId: getPublicQuote
       security: []
       description: >
-        Public, token-only quote view (Phase 16B). No session; the secret token is the only
+        Public, token-only quote view (Phase 16B; implemented 16E-C behind the slugless page
+        /q/{token}). No session; the secret token is the only
         credential and the endpoint exposes only the single quote behind it (cost-free, no
-        internal IDs). Returns a state derived from the token: ACTIVE (viewable + signable),
+        internal IDs). Never stamps viewed_at. Returns a state derived from the token: ACTIVE
+        (viewable; signable once the planned 16F accept exists),
         EXPIRED, SUPERSEDED, CANCELLED, or INACTIVE (signed; link dead, not a viewable signed
         copy). An unknown token returns 404 (QUOTE_TOKEN_NOT_FOUND). Only an ACTIVE token on an
-        ISSUED quote can lazily expire on access. Rate-limited against rapid repeated access by
-        token/IP (infra-level; not a documented response).
+        ISSUED quote can lazily expire on access. Rate limiting against rapid repeated access by
+        token/IP is required by the contract (§8) before production but is NOT implemented at this
+        base; whether it is done at application or infrastructure level is undecided (Phase 17).
+        Not a documented response.
       parameters:
         - $ref: '#/components/parameters/Token'
       responses:
@@ -1951,8 +1965,9 @@ paths:
       operationId: markPublicQuoteViewed
       security: []
       description: >
-        Marks the quote viewed_at (Phase 16B). Idempotent; only meaningful while the token is
-        ACTIVE. Empty JSON object body. Unknown token returns 404; a dead link returns 410.
+        Marks the quote viewed_at (Phase 16B; implemented 16E-C). Write-once and idempotent (later
+        calls are no-ops); only meaningful while the token is ACTIVE. Empty JSON object body.
+        Unknown token returns 404; a dead link returns 410.
       parameters:
         - $ref: '#/components/parameters/Token'
       requestBody:
@@ -1987,9 +2002,13 @@ paths:
       operationId: acceptPublicQuote
       security: []
       description: >
+        PLANNED 16F - NOT IMPLEMENTED at this base (no handler exists; this definition is the
+        contract 16F builds to).
         Customer signs the quote on their phone (Phase 16B). multipart/form-data with a signature
         image (image/png, max 2 MB); accepted_customer_name is taken server-side from the saved
-        order customer (the customer does not type or edit it in MVP). On success: version becomes
+        order customer (the customer does not type or edit it in MVP) - whether that means the
+        live saved customer record or the V17 issued customer snapshot is an open question for
+        the 16F verify gate. On success: version becomes
         ACCEPTED, the snapshot is locked as the legal billing number, the signed quote PDF is
         stored, the token becomes CONSUMED (the public link dies), and the store is notified by
         email (post-commit, non-fatal). The token state must be ACTIVE;
@@ -2035,7 +2054,8 @@ paths:
       operationId: downloadPublicQuotePdf
       security: []
       description: >
-        Streams the issued quote PDF to the customer only while the token is ACTIVE (Phase 16B).
+        Streams the issued quote PDF to the customer only while the token is ACTIVE (Phase 16B;
+        implemented 16E-C - the stored issued bytes, never regenerated).
         Cost-free. Once the token is CONSUMED (signed) or otherwise dead the endpoint returns 410;
         an unknown token returns 404. The signed PDF is never served here - it is portal only.
       parameters:
@@ -4267,6 +4287,9 @@ components:
 
     QuoteChannel:
       type: string
+      description: >-
+        Delivery channel of the latest send. Approved delivery is EMAIL only; SMS is dormant
+        existing backend support (send-sms), excluded from the approved delivery roadmap.
       enum:
         - EMAIL
         - SMS
@@ -4481,6 +4504,9 @@ components:
     QuoteAcceptedSummary:
       type: object
       additionalProperties: false
+      description: >-
+        Latest accepted quote version (planned 16F). No accepted version can exist at this base,
+        so the workspace always returns accepted as null until 16F.
       required:
         - quote_version_id
         - version_number
@@ -4614,9 +4640,17 @@ components:
       description: >
         Public, token-only quote view. Phase 16E-C extends the original 16B shape ADDITIVELY with
         the document fields the public quote page renders (Quotation To, Details of Sale, totals
-        breakdown, deposit) — all nullable, populated only when state is ACTIVE, sourced from the
-        frozen issued snapshot plus the same live presentation context the issued PDF reads
-        (business branding, saved customer name/billing address). Still cost-free, GP-free and
+        breakdown, deposit) — all nullable, populated only when state is ACTIVE. Quote content
+        (lines or single amount, totals, terms, details of sale, flooring type) and the
+        Quotation To customer name + billing lines come from the issued snapshot frozen at issue;
+        since V17 the customer identity is read from the version's customer snapshot columns,
+        never the live customer record. The deposit is computed at request time as the hardcoded
+        40% of the frozen inc-GST total (not stored on the version; #112 is future work).
+        order_number (from the order row) and expires_at (from the presented token) are also read
+        at request time, not snapshot fields. The approved business presentation context (business
+        name, logo, accent, ABN, direct-deposit bank fields, Stripe payment link) is read LIVE
+        from the tenant's current settings, so after a business-settings change it can differ
+        from the stored issued PDF. Still cost-free, GP-free and
         internal-ID-free: order_number is the business-facing document number already printed on
         the delivered PDF, not an internal id. A non-ACTIVE state returns the minimal payload
         (state, business_name, message; every document field null).
@@ -4625,36 +4659,52 @@ components:
           $ref: '#/components/schemas/PublicQuoteState'
         business_name:
           type: string
+          description: Business display name, read live from current business settings.
         business_logo_url:
           type: string
           nullable: true
+          description: Business logo path, read live from current business settings.
         accent_color:
           type: string
           nullable: true
+          description: Business accent colour, read live from current business settings.
         business_abn:
           type: string
           nullable: true
-          description: Business ABN as shown on the issued PDF; present when state is ACTIVE.
+          description: >-
+            Business ABN, read live from current business settings (the same source the issued PDF
+            used when it was generated, so it can differ from the stored PDF after a settings
+            change); present when state is ACTIVE.
         payment_account_name:
           type: string
           nullable: true
-          description: Direct-deposit account name as shown on the issued PDF; present when state is ACTIVE.
+          description: >-
+            Direct-deposit account name, read live from current business settings (may differ from
+            the stored issued PDF after a settings change); present when state is ACTIVE.
         payment_bank_name:
           type: string
           nullable: true
-          description: Direct-deposit bank name as shown on the issued PDF; present when state is ACTIVE.
+          description: >-
+            Direct-deposit bank name, read live from current business settings (may differ from the
+            stored issued PDF after a settings change); present when state is ACTIVE.
         payment_bsb:
           type: string
           nullable: true
-          description: Direct-deposit BSB as shown on the issued PDF; present when state is ACTIVE.
+          description: >-
+            Direct-deposit BSB, read live from current business settings (may differ from the stored
+            issued PDF after a settings change); present when state is ACTIVE.
         payment_account_number:
           type: string
           nullable: true
-          description: Direct-deposit account number as shown on the issued PDF; present when state is ACTIVE.
+          description: >-
+            Direct-deposit account number, read live from current business settings (may differ
+            from the stored issued PDF after a settings change); present when state is ACTIVE.
         payment_stripe_link_url:
           type: string
           nullable: true
-          description: Tenant Stripe payment-link URL as used by the Payments tab; present when state is ACTIVE.
+          description: >-
+            Tenant Stripe payment-link URL as used by the Payments tab (HTTPS only), read live from
+            current business settings; present when state is ACTIVE.
         order_number:
           type: string
           nullable: true
@@ -4667,15 +4717,21 @@ components:
         customer_name:
           type: string
           nullable: true
-          description: Quotation To — the saved customer name; present when state is ACTIVE.
+          description: >-
+            Quotation To — the customer name frozen at issue (V17 customer_name_snapshot), never
+            the live customer record; present when state is ACTIVE.
         customer_address_line1:
           type: string
           nullable: true
-          description: Quotation To billing address line 1; present when state is ACTIVE.
+          description: >-
+            Quotation To billing address line 1, frozen at issue (V17 snapshot); present when state
+            is ACTIVE.
         customer_address_line2:
           type: string
           nullable: true
-          description: Quotation To billing address line 2; present when state is ACTIVE.
+          description: >-
+            Quotation To billing address line 2, frozen at issue (V17 snapshot); present when state
+            is ACTIVE.
         details_of_sale:
           type: string
           nullable: true
@@ -4713,8 +4769,11 @@ components:
             - $ref: '#/components/schemas/Money'
           nullable: true
           description: >
-            Display-only 40% of the inc-GST total, server-computed with the exact issued-PDF
-            rounding (HALF_UP 2dp); present when state is ACTIVE. Never persisted.
+            Display-only deposit, computed at request time as the hardcoded 40% of the frozen
+            inc-GST total (same HALF_UP 2dp math as the issued PDF); present when state is ACTIVE.
+            Not stored as a field on quote_version (the amount does appear in the stored issued
+            PDF). The percentage is not frozen on the version; a per-business, issue-frozen
+            percentage is future work (#112, Batch B).
         terms_html:
           type: string
           nullable: true
@@ -4751,7 +4810,9 @@ components:
           description: >
             Customer signature image. PNG only (image/png), non-empty, max 2 MB (2097152 bytes).
             accepted_customer_name is NOT accepted here - it is taken server-side from the saved
-            order customer (Phase 16B).
+            order customer (Phase 16B). Planned 16F (the accept endpoint is not implemented at
+            this base); whether the name comes from the live saved customer record or the V17
+            issued customer snapshot is an open question for the 16F verify gate.
 
     PublicQuoteAcceptResult:
       type: object
