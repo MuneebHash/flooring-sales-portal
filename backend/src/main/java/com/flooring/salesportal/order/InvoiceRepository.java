@@ -10,6 +10,7 @@ import java.sql.Date;
 import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -26,6 +27,15 @@ import java.util.Optional;
  * the E.2 contract columns — {@code stored_file_id} is written but never selected back, so it cannot
  * leak into a response. The file lookup ({@link #findCurrentFileByOrderId}) returns the linked
  * {@code stored_file} metadata for binary streaming only (never exposed as JSON).
+ *
+ * <p>Phase 16F PR2 adds the two {@code V19} columns to every insert and read:
+ * {@code source_quote_version_id} (the accepted quote version a Path A invoice was created from) and
+ * {@code terms_snapshot} (that quote's frozen terms). Both ride on {@link InvoiceRow} as
+ * SERVER-INTERNAL values: the source id is never serialized, and the terms reach the API only through
+ * the {@link InvoiceTermsSelection} rule. Because the {@code V19} foreign key is single-column, the
+ * database does not guarantee that a source quote version belongs to the invoice's own order, so
+ * {@link #insertInvoice} verifies that ownership in code for EVERY writer (Path A, payment, void,
+ * D.8) before the row is inserted.
  */
 @Repository
 public class InvoiceRepository {
@@ -42,9 +52,10 @@ public class InvoiceRepository {
             """;
 
     // RETURNING projection = the E.2 invoice_detail columns (NO stored_file_id) plus the Phase 13
-    // acceptance/email columns. accepted_signature_file_id is SERVER-INTERNAL: it rides on InvoiceRow
-    // only so the services can derive accepted_signature_present / the signature download path (and so
-    // later Phase 13 branches can carry it forward); the DTO mapping never exposes the id itself.
+    // acceptance/email columns and the two Phase 16F PR2 (V19) quote-source columns.
+    // accepted_signature_file_id and source_quote_version_id are SERVER-INTERNAL: they ride on
+    // InvoiceRow only so the services can derive accepted_signature_present / the signature download
+    // path and the terms source, and carry both forward; the DTO mapping never exposes either id.
     private static final String RETURN_COLUMNS = """
                 invoice_id,
                 order_id,
@@ -61,26 +72,41 @@ public class InvoiceRepository {
                 accepted_at,
                 accepted_customer_name,
                 accepted_signature_file_id,
-                last_emailed_at
+                last_emailed_at,
+                source_quote_version_id,
+                terms_snapshot
             """;
 
-    // The four Phase 13 acceptance/email columns are written explicitly: Create / Rewrite / payment
-    // pass nulls (an unaccepted version), the Accept flow (D.8) passes the captured acceptance values
-    // with last_emailed_at = null (stamped post-commit on email success), and the later 13C
-    // payment-carry-forward branch passes the previous version's acceptance values.
+    // The four Phase 13 acceptance/email columns are written explicitly: Create / Rewrite pass nulls
+    // (an unaccepted version), the Accept flow (D.8) passes the captured acceptance values with
+    // last_emailed_at = null (stamped post-commit on email success), payment / void carry the previous
+    // version's acceptance values forward, and Path A (16F PR2) passes the accepted quote's inherited
+    // acceptance. The two V19 columns follow the 16F PR2 write table: Path A writes the selected quote
+    // version id + its frozen terms (including null terms); D.1 Create and D.2 Rewrite write null/null;
+    // payment, void and D.8 carry both verbatim from the current invoice.
     private static final String INSERT_INVOICE_SQL = """
             INSERT INTO invoice
                 (order_id, version_number, invoice_date, due_date, details_of_sale_snapshot,
                  sale_price_ex_gst, sale_price_inc_gst, total_paid, balance_due,
                  stored_file_id, created_by_user_id,
-                 accepted_at, accepted_customer_name, accepted_signature_file_id, last_emailed_at)
+                 accepted_at, accepted_customer_name, accepted_signature_file_id, last_emailed_at,
+                 source_quote_version_id, terms_snapshot)
             VALUES
                 (:orderId, :versionNumber, :invoiceDate, :dueDate, :detailsOfSaleSnapshot,
                  :salePriceExGst, :salePriceIncGst, :totalPaid, :balanceDue,
                  :storedFileId, :createdByUserId,
-                 :acceptedAt, :acceptedCustomerName, :acceptedSignatureFileId, :lastEmailedAt)
+                 :acceptedAt, :acceptedCustomerName, :acceptedSignatureFileId, :lastEmailedAt,
+                 :sourceQuoteVersionId, :termsSnapshot)
             RETURNING
             """ + RETURN_COLUMNS;
+
+    // Phase 16F PR2 source-ownership check (see insertInvoice): the owning order of a quote version.
+    // quote_version.order_id is NOT NULL and never updated, so this read is the authority.
+    private static final String SOURCE_QUOTE_VERSION_ORDER_SQL = """
+            SELECT order_id
+            FROM quote_version
+            WHERE quote_version_id = :quoteVersionId
+            """;
 
     // Current invoice = highest version_number for the order. SELECT the same E.2 projection so the
     // shared ROW_MAPPER applies; stored_file_id is NOT selected (never leaks).
@@ -156,10 +182,23 @@ public class InvoiceRepository {
 
     /**
      * Insert one invoice row and return its E.2 columns (stored_file_id is written but not returned).
-     * The four acceptance/email parameters are nullable: Create / Rewrite / payment pass nulls; the
-     * Accept flow (D.8) passes {@code acceptedAt} / {@code acceptedCustomerName} /
-     * {@code acceptedSignatureFileId} with {@code lastEmailedAt = null} (the email-success timestamp is
-     * stamped post-commit via {@link #updateInvoiceLastEmailedAt}).
+     * The four acceptance/email parameters are nullable: Create / Rewrite pass nulls; the Accept flow
+     * (D.8) passes {@code acceptedAt} / {@code acceptedCustomerName} / {@code acceptedSignatureFileId}
+     * with {@code lastEmailedAt = null} (the email-success timestamp is stamped post-commit via
+     * {@link #updateInvoiceLastEmailedAt}); payment / void and Path A pass carried or inherited
+     * acceptance values.
+     *
+     * <p>Phase 16F PR2 - {@code sourceQuoteVersionId} / {@code termsSnapshot} are the {@code V19}
+     * columns (both nullable; see the write table on {@code INSERT_INVOICE_SQL}). <b>Source ownership
+     * is enforced HERE, at the one write boundary every writer shares:</b> when
+     * {@code sourceQuoteVersionId} is non-null, the referenced {@code quote_version} must exist and
+     * belong to {@code orderId}, otherwise an {@link IllegalStateException} is thrown BEFORE the
+     * insert (the caller's transaction then rolls back). The single-column {@code V19} foreign key only
+     * proves the version exists somewhere, never that it is this order's, so a passing FK is not
+     * sufficient on its own. Because this class is a {@code @Repository}, Spring's persistence-exception
+     * translation hands callers of the bean the {@code IllegalStateException} wrapped as the cause of an
+     * {@code InvalidDataAccessApiUsageException}; either way it is an unhandled invariant failure (a
+     * generic 500) and the transaction rolls back.
      */
     public InvoiceRow insertInvoice(long orderId,
                                     int versionNumber,
@@ -175,7 +214,12 @@ public class InvoiceRepository {
                                     LocalDateTime acceptedAt,
                                     String acceptedCustomerName,
                                     Long acceptedSignatureFileId,
-                                    LocalDateTime lastEmailedAt) {
+                                    LocalDateTime lastEmailedAt,
+                                    Long sourceQuoteVersionId,
+                                    String termsSnapshot) {
+        if (sourceQuoteVersionId != null) {
+            requireSourceQuoteVersionOfOrder(orderId, sourceQuoteVersionId);
+        }
         MapSqlParameterSource params = new MapSqlParameterSource()
                 .addValue("orderId", orderId)
                 .addValue("versionNumber", versionNumber)
@@ -191,8 +235,29 @@ public class InvoiceRepository {
                 .addValue("acceptedAt", acceptedAt == null ? null : Timestamp.valueOf(acceptedAt))
                 .addValue("acceptedCustomerName", acceptedCustomerName)
                 .addValue("acceptedSignatureFileId", acceptedSignatureFileId)
-                .addValue("lastEmailedAt", lastEmailedAt == null ? null : Timestamp.valueOf(lastEmailedAt));
+                .addValue("lastEmailedAt", lastEmailedAt == null ? null : Timestamp.valueOf(lastEmailedAt))
+                .addValue("sourceQuoteVersionId", sourceQuoteVersionId)
+                .addValue("termsSnapshot", termsSnapshot);
         return jdbc.queryForObject(INSERT_INVOICE_SQL, params, ROW_MAPPER);
+    }
+
+    /**
+     * Phase 16F PR2 - the source quote version of an invoice row must exist and belong to the
+     * invoice's own order. Missing or cross-order → {@link IllegalStateException} (an invariant breach,
+     * surfaced as a generic 500; the caller's transaction rolls back and no invoice row is written).
+     */
+    private void requireSourceQuoteVersionOfOrder(long orderId, long sourceQuoteVersionId) {
+        List<Long> owners = jdbc.queryForList(SOURCE_QUOTE_VERSION_ORDER_SQL,
+                new MapSqlParameterSource("quoteVersionId", sourceQuoteVersionId), Long.class);
+        if (owners.isEmpty()) {
+            throw new IllegalStateException("Invoice source quote_version " + sourceQuoteVersionId
+                    + " does not exist (invoice for order " + orderId + ")");
+        }
+        long owningOrderId = owners.get(0);
+        if (owningOrderId != orderId) {
+            throw new IllegalStateException("Invoice source quote_version " + sourceQuoteVersionId
+                    + " belongs to order " + owningOrderId + ", not to the invoice's order " + orderId);
+        }
     }
 
     /** The current (highest {@code version_number}) invoice's E.2 columns, or empty if none exist (D.3). */
@@ -269,7 +334,9 @@ public class InvoiceRepository {
                 acceptedAt == null ? null : acceptedAt.toLocalDateTime(),
                 rs.getString("accepted_customer_name"),
                 rs.getObject("accepted_signature_file_id", Long.class),
-                lastEmailedAt == null ? null : lastEmailedAt.toLocalDateTime());
+                lastEmailedAt == null ? null : lastEmailedAt.toLocalDateTime(),
+                rs.getObject("source_quote_version_id", Long.class),
+                rs.getString("terms_snapshot"));
     };
 
     private static final RowMapper<InvoiceFile> FILE_ROW_MAPPER = (rs, n) -> new InvoiceFile(
@@ -280,11 +347,13 @@ public class InvoiceRepository {
 
     /**
      * The E.2 invoice columns returned by an insert / current read (no stored_file_id / storage_path),
-     * plus the Phase 13 acceptance/email columns. {@code acceptedSignatureFileId} is SERVER-INTERNAL —
-     * the services derive {@code accepted_signature_present} / the signature download path from it and
-     * never serialize the id itself. Create / Rewrite / payment inserts leave all four acceptance/email
-     * columns NULL; the Accept flow (D.8) writes the three acceptance columns on its appended version
-     * (payment carry-forward of acceptance is the later 13C branch).
+     * plus the Phase 13 acceptance/email columns and the Phase 16F PR2 {@code V19} quote-source
+     * columns. {@code acceptedSignatureFileId} and {@code sourceQuoteVersionId} are SERVER-INTERNAL -
+     * the services derive {@code accepted_signature_present} / the signature download path and the
+     * terms source from them and never serialize either id. Create / Rewrite inserts leave the
+     * acceptance/email and quote-source columns NULL; D.8 writes the three acceptance columns on its
+     * appended version; payment / void carry acceptance and quote source forward; Path A writes the
+     * inherited acceptance plus its source quote version and frozen {@code termsSnapshot}.
      */
     public record InvoiceRow(
             long invoiceId,
@@ -302,7 +371,9 @@ public class InvoiceRepository {
             LocalDateTime acceptedAt,
             String acceptedCustomerName,
             Long acceptedSignatureFileId,
-            LocalDateTime lastEmailedAt) {
+            LocalDateTime lastEmailedAt,
+            Long sourceQuoteVersionId,
+            String termsSnapshot) {
     }
 
     /**

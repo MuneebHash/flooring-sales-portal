@@ -12,9 +12,10 @@ import java.time.LocalDateTime;
  * {@code InvoiceDetail}). Returned inside {@link InvoiceResponse} by D.1 Create (and reused by the
  * later D.2 Rewrite / D.3 Read branches).
  *
- * <p>Only the thirteen Phase 12 contract columns plus the five Phase 13 acceptance/email fields are
- * exposed. The internal {@code invoice.stored_file_id}, {@code invoice.accepted_signature_file_id},
- * and {@code stored_file.storage_path} (server disk path) are NEVER returned — the PDF is reached only
+ * <p>Only the thirteen Phase 12 contract columns plus the five Phase 13 acceptance/email fields and
+ * the two Phase 16F PR2 terms fields are exposed. The internal {@code invoice.stored_file_id},
+ * {@code invoice.accepted_signature_file_id}, {@code invoice.source_quote_version_id} and
+ * {@code stored_file.storage_path} (server disk path) are NEVER returned - the PDF is reached only
  * via {@code pdf_download_path} and the signature only via {@code accepted_signature_download_path},
  * relative URLs built backend-side from the request slug + ids. Jackson's global snake_case strategy
  * renders the field names ({@code invoiceId} -> {@code invoice_id}); the date / timestamp formats match
@@ -23,10 +24,18 @@ import java.time.LocalDateTime;
  * {@code proposed_lay_date}).
  *
  * <p>The five Phase 13 fields are ALWAYS present in the JSON; null values serialize as {@code null}.
- * An unsigned/unaccepted invoice (every Create / Rewrite / payment version on this branch) returns
- * {@code accepted_at: null}, {@code accepted_customer_name: null},
+ * An unsigned/unaccepted invoice (every Create / Rewrite version, and payment versions of one)
+ * returns {@code accepted_at: null}, {@code accepted_customer_name: null},
  * {@code accepted_signature_present: false}, {@code accepted_signature_download_path: null},
  * {@code last_emailed_at: null}.
+ *
+ * <p>Phase 16F PR2 (decision D7) - {@code terms_html} and {@code terms_source} are ALWAYS present,
+ * selected by the one invoice terms rule ({@code InvoiceTermsSelection}) the invoice PDF also uses.
+ * {@code terms_source} is {@code QUOTE} when the invoice row carries a source quote version (Path A
+ * and its carried versions): {@code terms_html} is then the invoice's frozen terms snapshot verbatim,
+ * and {@code null} means frozen "no terms" (never a fall-back to live terms). Otherwise
+ * {@code terms_source} is {@code LIVE} and {@code terms_html} is the business's current
+ * per-flooring-type terms, sanitised ({@code null} when none are set).
  */
 public record InvoiceDetailDto(
         long invoiceId,
@@ -46,6 +55,8 @@ public record InvoiceDetailDto(
         @JsonInclude(JsonInclude.Include.ALWAYS) String acceptedCustomerName,
         boolean acceptedSignaturePresent,
         @JsonInclude(JsonInclude.Include.ALWAYS) String acceptedSignatureDownloadPath,
-        @JsonInclude(JsonInclude.Include.ALWAYS) @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss") LocalDateTime lastEmailedAt
+        @JsonInclude(JsonInclude.Include.ALWAYS) @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss") LocalDateTime lastEmailedAt,
+        @JsonInclude(JsonInclude.Include.ALWAYS) String termsHtml,
+        @JsonInclude(JsonInclude.Include.ALWAYS) String termsSource
 ) {
 }

@@ -1314,9 +1314,11 @@ paths:
         Resend to retry. Phase 16F PR1 (decision D5(c)): the same transaction also cancels the
         order's ISSUED quote version, if any, and its ACTIVE public-link token (both CANCELLED; the
         public quote link then reports CANCELLED); with no ISSUED quote this is a silent no-op.
-        Only the version ISSUED at that moment is affected - a quote sent later can still be signed
-        (known open item, quotation contract §13). An ACCEPTED quote never blocks this endpoint and
-        is never touched (D5(d)).
+        Only the version ISSUED at that moment is affected: a quote sent later can still be signed,
+        and because its signature is then strictly newer than this invoice's, createInvoiceFromQuote
+        (Path A, 16F PR2) may convert it by appending a new invoice version, with this signed
+        version kept in history (decision D5(b) as amended on 8 October 2026; quotation contract
+        section 13). An ACCEPTED quote never blocks this endpoint and is never touched (D5(d)).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1857,14 +1859,47 @@ paths:
       summary: Create invoice from accepted quote (Path A)
       operationId: createInvoiceFromQuote
       description: >
-        PLANNED 16F PR2 - NOT IMPLEMENTED at this base (no handler exists; this definition is the
-        contract 16F PR2 builds to).
-        Creates an invoice from the latest accepted quote (Phase 16B, Path A). The invoice sale
-        price is the accepted quote snapshot total, the terms are the quote's frozen
-        terms_snapshot, and the acceptance/signature is inherited (the customer does not re-sign);
-        the signed invoice PDF is generated. Requires at least one ACCEPTED quote version
-        (QUOTE_NOT_ACCEPTED, 422). Not blocked by an unsigned draft. Follows the existing
-        invoice-create LAID rule.
+        IMPLEMENTED 16F PR2 (backend; the Accepted Quote Create Invoice button is planned 16F PR3).
+        Creates an invoice version from the order's LATEST ACCEPTED quote version (highest
+        version_number with status ACCEPTED; a newer draft or ISSUED, SUPERSEDED, CANCELLED or
+        EXPIRED version never replaces it), inheriting its signature so the customer does not
+        re-sign. The request body must be an empty JSON object, as for the other invoice actions
+        (the server also accepts an absent body); any field (for example a quote-version
+        selector, price, terms, signature id or due date) returns 400 VALIDATION_FAILED and an
+        unparseable body 400 MALFORMED_JSON. Checks run in this order: standard guard, positive
+        orderId, then the order scoped to the session business and store, which takes the order
+        row lock (404 ORDER_NOT_FOUND); every later check, the PDF and file work, the insert and
+        the mirror reset run under that lock: empty body, the latest accepted version (none: 422
+        QUOTE_NOT_ACCEPTED "This quote has not been accepted yet."), then
+        signature precedence against the current invoice (decision D5(b) as amended on 8 October
+        2026): allowed when there is no invoice (new version 1), when the current invoice is
+        unsigned, or when the quote's accepted_at is strictly later than the current invoice's
+        accepted_at (new version = current + 1); an equal or earlier quote signature returns 409
+        INVOICE_ALREADY_ACCEPTED with "The current invoice was signed at the same time or later
+        than this quote. A newer signed quote is required to create an invoice from a quote." and
+        nothing is appended (signature times are compared, never creation times, version numbers
+        or email times). Then the collected preconditions (422 INVOICE_PRECONDITIONS_NOT_MET with
+        section/field/message details): customer first and last name, installation and billing
+        address rows, proposed lay date and lay date status (as Path B), a non-blank frozen
+        details of sale on the accepted quote (details/details_of_sale), and accepted quote totals
+        greater than zero (financial/sale_price_ex_gst and financial/sale_price_inc_gst). Live
+        priced lines, the live order price, the live details of sale and the customer email are
+        not checked (no email gate). Then active (non-voided) payments must not exceed the signed
+        inc-GST total (else 422 BUSINESS_RULE_VIOLATION "Recorded payments exceed the accepted
+        quote total. Void the excess payments before creating an invoice from this quote.";
+        exactly paid is allowed). Allowed when order_status is LAID in every permitted case. The
+        invoice copies the accepted quote's details_of_sale_snapshot, quote_total_ex_gst and
+        quote_total_inc_gst verbatim, its frozen terms_snapshot (including null) and
+        source_quote_version_id, and inherits accepted_at, accepted_customer_name and the same
+        signature stored_file (no new signature file); invoice_date is today, due_date is the
+        order's proposed lay date minus 2 days, Invoice To is the live saved customer and billing
+        address, total_paid is the active payment sum, balance_due is the signed inc total minus
+        it, and last_emailed_at is null (sales_order.last_emailed_at is reset to null). The signed
+        invoice PDF is stored; the invoice has no lines. The order status, working price, lines,
+        quote draft, quote versions and tokens (an ISSUED quote stays live), customer data and
+        payments are not changed, and no email or notification is sent. Any failure rolls back
+        every write and deletes only the new invoice PDF. 201 returns the InvoiceDetail (accepted,
+        terms_source QUOTE) with the message "Invoice created from accepted quote."
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -2125,7 +2160,7 @@ paths:
         Like any override the adjustment then stays fixed: later Products & Charges edits (only
         while the order is not LAID) shift the working price relative to the signed total, and the
         manual override/reset remain the correction tools; Path A (createInvoiceFromQuote,
-        planned 16F PR2) bills the frozen accepted snapshot, never the working order price.
+        implemented 16F PR2) bills the frozen accepted snapshot, never the working order price.
         Nothing else on the order changes (draft, lines, order status, invoices, payments). Any failure rolls the whole acceptance back and deletes only
         the files this request wrote. Allowed when order_status is LAID, including the price write
         (decision D4); the protected sale-price endpoints keep their LAID gate.
@@ -3069,6 +3104,8 @@ components:
         - accepted_signature_present
         - accepted_signature_download_path
         - last_emailed_at
+        - terms_html
+        - terms_source
       properties:
         invoice_id:
           type: integer
@@ -3117,6 +3154,25 @@ components:
           nullable: true
           allOf:
             - $ref: '#/components/schemas/Timestamp'
+        terms_html:
+          type: string
+          nullable: true
+          description: >-
+            Phase 16F PR2 (decision D7). Always present. The invoice's terms HTML, selected by the
+            same rule the invoice PDF uses. When terms_source is QUOTE it is the invoice's frozen
+            quote terms snapshot, verbatim; null means frozen "no terms" and never falls back to
+            the live terms. When terms_source is LIVE it is the business's current
+            per-flooring-type terms, sanitised; null when none are set.
+        terms_source:
+          type: string
+          enum:
+            - QUOTE
+            - LIVE
+          description: >-
+            Phase 16F PR2. Always present. QUOTE when the invoice was created from an accepted
+            quote (Path A, and the payment, void and in-app accept versions carried from it); LIVE
+            for invoices from Create or Rewrite (Path B). A manual rewrite returns to LIVE. The
+            internal source quote version id is never exposed.
 
     InvoiceResponse:
       type: object
@@ -4678,12 +4734,15 @@ components:
         invoice_eligible:
           type: boolean
           description: >-
-            False when the order's current invoice (highest version_number) is already accepted
-            (16F decision D5(b): Create Invoice from the accepted quote is then unavailable -
-            "Invoice already accepted"); true when the order has no invoice or its current invoice
-            is unsigned. An unsigned draft or a newer issued quote never makes it false. Read-only
-            flag; Create Invoice from the accepted quote (createInvoiceFromQuote, Path A) is
-            planned 16F PR2.
+            Phase 16F PR2 (decision D5(b) as amended on 8 October 2026): the same strict
+            signature-precedence rule createInvoiceFromQuote (Path A, implemented) enforces. True
+            when the order has no invoice, when its current invoice (highest version_number) is
+            unsigned, or when this quote's accepted_at is strictly later than the current invoice's
+            accepted_at; false when the current invoice was signed at the same time or later than
+            this quote (a newer signed quote is then required). Signature times are compared, never
+            invoice creation times or version numbers. It reflects this rule only: LAID, a draft or
+            a newer issued quote, missing invoice preconditions, a blank details of sale, a zero
+            total or overpayment never make it false (the endpoint validates those itself).
         quote_total_ex_gst:
           $ref: '#/components/schemas/Money'
         itemised:
