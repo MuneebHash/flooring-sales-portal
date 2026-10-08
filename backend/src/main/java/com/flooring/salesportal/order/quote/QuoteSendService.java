@@ -67,10 +67,14 @@ import java.util.Objects;
 import java.util.Optional;
 
 /**
- * Phase 16E-A — quote delivery: issue/resend by email or SMS, cancel, and the stored issued-PDF
- * download (contract §5/§7.1/§8/§9). Sits beside {@link QuoteService} (draft layer) and owns the
+ * Phase 16E-A — quote delivery: issue/resend by email or SMS, cancel, and the stored quote-PDF
+ * downloads (contract §5/§7.1/§8/§9). Sits beside {@link QuoteService} (draft layer) and owns the
  * append-only issued layer ({@code quote_version} / {@code quote_version_line} /
- * {@code quote_token}) via {@link QuoteVersionRepository}.
+ * {@code quote_token}) via {@link QuoteVersionRepository}. Phase 16F PR1: quote email is LINK-ONLY
+ * (no PDF attachment — the issued PDF is still generated and stored on issue), and the protected
+ * accepted reads stream the latest accepted version's stored signed PDF ({@code type=accepted}) and
+ * signature image. Sending after an acceptance is allowed and issues a NEW version (decision D9);
+ * a send never writes the order price (the D6b price write belongs to the public accept only).
  *
  * <p><b>Send choreography (locked §7.1 send-failure rule; the {@code OrderInvoiceService}
  * TransactionTemplate pattern).</b> The send methods are deliberately NOT {@code @Transactional}:
@@ -78,7 +82,7 @@ import java.util.Optional;
  *   <li><b>Transaction 1</b> ({@link #prepareSend}, order held {@code FOR UPDATE} from its first
  *       statement): gates → recipient gate → draft load → live below-cost re-check →
  *       changed-detection → persist (new version + snapshot lines + stored issued PDF, or reuse
- *       the unchanged issued version + its stored PDF) → token transitions + fresh {@code ACTIVE}
+ *       the unchanged issued version) → token transitions + fresh {@code ACTIVE}
  *       token mint → pre-delivery ATTEMPT markers ({@code sent_channel} / {@code first_sent_at} /
  *       {@code last_sent_at}). Commit. Everything here is durable regardless of delivery.</li>
  *   <li><b>Delivery</b> strictly after commit. A provider failure → 502
@@ -224,8 +228,8 @@ public class QuoteSendService {
     // ------------------------------------------------------------------
 
     /**
-     * Issue (or resend) the quote and email it: issued PDF attachment + public link + plain-text
-     * body (contract §7.1). Provider failure → 502 {@code EMAIL_SEND_FAILED} with the issued
+     * Issue (or resend) the quote and email it: public link + plain-text body, LINK-ONLY since 16F
+     * PR1 (no PDF attachment; the issued PDF is still stored) (contract §7.1). Provider failure → 502 {@code EMAIL_SEND_FAILED} with the issued
      * version / PDF / token / attempt markers KEPT. On success the success-only
      * {@code last_emailed_at} is stamped in a short follow-up transaction. 201 issued summary.
      */
@@ -240,12 +244,12 @@ public class QuoteSendService {
                 prepareSend(ctx, orderId, body, CHANNEL_EMAIL));
 
         try {
+            // LINK-ONLY (16F PR1): the email carries the public link + a short body, never the PDF —
+            // QuoteEmailRequest has no attachment field. The issued PDF stays stored and readable.
             quoteEmailSender.send(new QuoteEmailRequest(
                     prepared.recipient(),
                     emailSubject(ctx.business().getName()),
                     emailBody(prepared.orderNumber(), ctx.business().getName(), prepared.publicLink()),
-                    prepared.pdfBytes(),
-                    prepared.pdfFileName(),
                     orderId,
                     prepared.row().versionNumber()));
         } catch (QuoteEmailException ex) {
@@ -309,8 +313,8 @@ public class QuoteSendService {
     /**
      * Cancel the active issued quote (contract §7.1): version → {@code CANCELLED}, its ACTIVE
      * token → {@code CANCELLED} (kept for messaging; link dead). No active ISSUED version → 422
-     * {@code QUOTE_NOT_ISSUED}; an already-accepted quote (defensive — unreachable via the 16E-A
-     * API, valid data once 16F lands) → 409 {@code QUOTE_ALREADY_ACCEPTED}. <b>ALLOWED when LAID</b>
+     * {@code QUOTE_NOT_ISSUED}; an already-accepted quote with nothing newer issued (reachable since
+     * the 16F PR1 public accept) → 409 {@code QUOTE_ALREADY_ACCEPTED}. <b>ALLOWED when LAID</b>
      * as the contract's narrow exception: its only effect is killing a public link — it is not an
      * order mutation — so {@code requireNotLaid} is deliberately not called. 200 cancelled summary.
      */
@@ -361,11 +365,12 @@ public class QuoteSendService {
 
     /**
      * Salesperson download of a STORED quote PDF (contract §7.1). {@code type=issued} streams the
-     * active issued version's stored PDF; {@code type=accepted} is the 16F signed-PDF artifact —
-     * no acceptance surface exists in 16E-A, so no signed PDF can exist and the contract-safe
-     * response is always 404 {@code QUOTE_PDF_NOT_FOUND}. Read-only; allowed when LAID. The type
-     * parameter is validated AFTER the scoped order lookup so a bad value can never 400 ahead of
-     * the 404 (no existence leak).
+     * active issued version's stored PDF; {@code type=accepted} (Phase 16F PR1) streams the LATEST
+     * accepted version's stored SIGNED PDF (portal-only — never served on the public surface). A
+     * missing requested artifact (no active issued version / no accepted version / no stored signed
+     * PDF) → 404 {@code QUOTE_PDF_NOT_FOUND}. Read-only; allowed when LAID. The type parameter is
+     * validated AFTER the scoped order lookup so a bad value can never 400 ahead of the 404 (no
+     * existence leak).
      */
     @Transactional(readOnly = true)
     public QuoteStoredPdf downloadStoredPdf(String slug,
@@ -383,15 +388,21 @@ public class QuoteSendService {
             throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(),
                     List.of(new ErrorDetail(null, "type", "Must be issued or accepted.")));
         }
-        if (TYPE_ACCEPTED.equals(type)) {
-            // 16F artifact (signed PDF). Nothing in 16E-A can create one → contract-safe 404.
-            throw new NotFoundException(ErrorCode.QUOTE_PDF_NOT_FOUND,
-                    ErrorCode.QUOTE_PDF_NOT_FOUND.defaultMessage());
-        }
 
-        QuoteFile file = quoteVersionRepository.findIssuedFileByOrderId(orderId)
-                .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_PDF_NOT_FOUND,
-                        ErrorCode.QUOTE_PDF_NOT_FOUND.defaultMessage()));
+        QuoteFile file;
+        if (TYPE_ACCEPTED.equals(type)) {
+            // The latest ACCEPTED version's stored signed PDF (16F PR1). Resolved strictly after the
+            // business/store-scoped order lookup above, so an out-of-scope order is a 404 first.
+            file = quoteVersionRepository.findLatestAcceptedByOrderId(orderId)
+                    .flatMap(accepted -> quoteVersionRepository
+                            .findSignedPdfFileByVersionId(accepted.version().quoteVersionId()))
+                    .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_PDF_NOT_FOUND,
+                            ErrorCode.QUOTE_PDF_NOT_FOUND.defaultMessage()));
+        } else {
+            file = quoteVersionRepository.findIssuedFileByOrderId(orderId)
+                    .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_PDF_NOT_FOUND,
+                            ErrorCode.QUOTE_PDF_NOT_FOUND.defaultMessage()));
+        }
 
         // Missing-on-disk -> UncheckedIOException -> generic 500 via the standard JSON wrapper
         // (same posture as the invoice D.4 download). storage_path is never returned.
@@ -399,8 +410,61 @@ public class QuoteSendService {
         return new QuoteStoredPdf(bytes, file.fileName());
     }
 
-    /** Carrier for the stored-PDF binary response (file name is the stored quote-...-v{n}.pdf). */
+    /**
+     * Carrier for the stored-PDF binary response (file name is the stored
+     * {@code quote-{order}-v{n}.pdf} issued artifact or {@code quote-{order}-v{n}-signed.pdf} signed one).
+     */
     public record QuoteStoredPdf(byte[] bytes, String fileName) {
+    }
+
+    // ------------------------------------------------------------------
+    // GET /orders/{orderId}/quote/accepted/signature (Phase 16F PR1)
+    // ------------------------------------------------------------------
+
+    /**
+     * Stream the LATEST accepted quote version's stored signature image (the quote analogue of the
+     * invoice signature download). Protected portal read: scoped order lookup first (404
+     * {@code ORDER_NOT_FOUND}, never 403/leak), then no accepted version / no signature reference →
+     * 404 {@code QUOTE_SIGNATURE_NOT_FOUND}. Allowed when LAID (read). A referenced file missing on
+     * disk → {@code UncheckedIOException} → generic 500 (the established invoice-signature posture).
+     * The download name is backend-built from the locked order number + the accepted version number;
+     * {@code storage_path} is never returned.
+     */
+    @Transactional(readOnly = true)
+    public QuoteSignatureImage downloadAcceptedSignature(String slug,
+                                                         String orderIdRaw,
+                                                         HttpServletRequest httpRequest) {
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+        long orderId = parseOrderId(orderIdRaw);
+
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        QuoteVersionRepository.AcceptedQuoteVersionRow accepted = quoteVersionRepository
+                .findLatestAcceptedByOrderId(orderId)
+                .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_SIGNATURE_NOT_FOUND,
+                        ErrorCode.QUOTE_SIGNATURE_NOT_FOUND.defaultMessage()));
+        if (accepted.acceptedSignatureFileId() == null) {
+            throw new NotFoundException(ErrorCode.QUOTE_SIGNATURE_NOT_FOUND,
+                    ErrorCode.QUOTE_SIGNATURE_NOT_FOUND.defaultMessage());
+        }
+        // The FK makes a missing stored_file row impossible; treated as a data-integrity 500 (the
+        // invoice-signature precedent), never as a client-facing 404.
+        QuoteFile file = quoteVersionRepository
+                .findSignatureFileByVersionId(accepted.version().quoteVersionId())
+                .orElseThrow(() -> new IllegalStateException(
+                        "Signature stored_file row missing for accepted quote_version "
+                                + accepted.version().quoteVersionId()));
+
+        byte[] bytes = fileStorageService.read(file.storagePath());
+        String downloadName = "quote-signature-" + order.getOrderNumber()
+                + "-v" + accepted.version().versionNumber() + ".png";
+        return new QuoteSignatureImage(bytes, file.mimeType(), downloadName);
+    }
+
+    /** Carrier for the accepted-signature binary response (image bytes + mime + download name). */
+    public record QuoteSignatureImage(byte[] bytes, String mimeType, String fileName) {
     }
 
     // ------------------------------------------------------------------
@@ -455,27 +519,24 @@ public class QuoteSendService {
                 && !draftChangedSinceIssue(draft, draftLines, order, issuedOpt.get());
 
         long quoteVersionId;
-        byte[] pdfBytes;
-        String pdfFileName;
         if (resend) {
-            // Unchanged draft → resend the SAME version and its stored PDF verbatim (no
-            // regeneration — the D.9 precedent). Old ACTIVE token → REPLACED (kept), new one below.
+            // Unchanged draft → resend the SAME version (no new snapshot, nothing regenerated — the
+            // stored issued PDF stays the frozen artifact the public page and the protected read
+            // serve). The email is link-only since 16F PR1, so the stored bytes are not read here.
+            // Old ACTIVE token → REPLACED (kept), new one below.
             QuoteVersionRow issued = issuedOpt.get();
             quoteVersionId = issued.quoteVersionId();
-            QuoteFile file = quoteVersionRepository.findIssuedFileByOrderId(orderId)
-                    .orElseThrow(() -> new IllegalStateException(
-                            "Issued quote version has no stored PDF for order " + orderId));
-            pdfBytes = fileStorageService.read(file.storagePath());
-            pdfFileName = file.fileName();
             quoteVersionRepository.killActiveToken(quoteVersionId, TOKEN_REPLACED, now);
         } else {
             // Changed draft (or no active issued version) → NEW issued version from a fresh
             // snapshot. The snapshot object feeds BOTH the DB rows and the PDF (they can't drift),
-            // and its line set is mode-scoped (the §6.1 dormant-row guard).
+            // and its line set is mode-scoped (the §6.1 dormant-row guard). The issued PDF is still
+            // generated and STORED (the immutable issued artifact) even though the email is
+            // link-only (16F PR1).
             QuoteIssueSnapshot snapshot = buildIssueSnapshot(ctx.businessId(), orderId, order, draft, draftLines);
             int versionNumber = quoteVersionRepository.maxVersionNumber(orderId) + 1;
-            pdfFileName = "quote-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
-            pdfBytes = quotePdfGenerator.render(
+            String pdfFileName = "quote-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
+            byte[] pdfBytes = quotePdfGenerator.render(
                     quotePdfModelAssembler.assembleIssued(ctx.business(), order, orderId, snapshot));
 
             // File-write-first with rollback cleanup (the OrderAttachment/Invoice pattern): a disk
@@ -521,7 +582,7 @@ public class QuoteSendService {
         // <app-base>/q/{token}. This is the ONLY place the plaintext token appears (exactly once,
         // inside the delivered message body); it is never persisted and never in an API response.
         String publicLink = publicBaseUrl + "/q/" + plainToken;
-        return new PreparedSend(finalRow, expiresAt, recipient, pdfBytes, pdfFileName,
+        return new PreparedSend(finalRow, expiresAt, recipient,
                 publicLink, order.getOrderNumber(), summaryLines);
     }
 
@@ -714,10 +775,11 @@ public class QuoteSendService {
         return "Your quote from " + businessName;
     }
 
-    // The public link is the ONLY place the plaintext token appears — exactly once, no internal IDs.
+    // LINK-ONLY body (16F PR1 — no attachment). The public link is the ONLY place the plaintext token
+    // appears — exactly once, no internal IDs.
     private static String emailBody(String orderNumber, String businessName, String publicLink) {
-        return "Hi,\n\nPlease find your quote " + orderNumber + " from " + businessName
-                + " attached.\n\nYou can view your quote online here: " + publicLink
+        return "Hi,\n\nYour quote " + orderNumber + " from " + businessName
+                + " is ready. You can view your quote online here: " + publicLink
                 + "\n\nThank you.";
     }
 
@@ -876,17 +938,15 @@ public class QuoteSendService {
 
     /**
      * Everything transaction 1 hands to the post-commit delivery + response building: the re-read
-     * version row (summary basis), the fresh token's expiry, the resolved recipient, the PDF bytes
-     * + file name (stored bytes reused verbatim on a resend), the public link carrying the
-     * plaintext token (never serialized in any response), the order number for the message
-     * wording, and the version's snapshot lines for the 16E-B summary body (read inside
-     * transaction 1; immutable, empty for a non-itemised issue). Never serialized itself.
+     * version row (summary basis), the fresh token's expiry, the resolved recipient, the public link
+     * carrying the plaintext token (never serialized in any response), the order number for the
+     * message wording, and the version's snapshot lines for the 16E-B summary body (read inside
+     * transaction 1; immutable, empty for a non-itemised issue). No PDF bytes: delivery is link-only
+     * since 16F PR1. Never serialized itself.
      */
     private record PreparedSend(QuoteVersionRow row,
                                 LocalDateTime tokenExpiresAt,
                                 String recipient,
-                                byte[] pdfBytes,
-                                String pdfFileName,
                                 String publicLink,
                                 String orderNumber,
                                 List<QuoteVersionLineRow> summaryLines) {

@@ -31,6 +31,13 @@ import java.util.Optional;
  * lazy-expiry pair additionally takes the SAME order row lock first
  * ({@link #lockOrderRowForPublicTransition}) so it serialises with the protected transitions,
  * while the first-view stamp stays lock-free (write-once by its {@code IS NULL} guard).
+ *
+ * <p>Phase 16F PR1 adds the accepted layer: the public accept takes the same order row lock, then
+ * moves the version {@code ISSUED -> ACCEPTED} ({@link #acceptIssuedVersion}) and the presented
+ * token {@code ACTIVE -> CONSUMED} ({@link #consumeActiveToken}) with status-guarded statements; the
+ * protected reads resolve the latest accepted version ({@link #findLatestAcceptedByOrderId}) and its
+ * stored signed PDF / signature. The acceptance stored_file ids ride only on the server-internal
+ * {@link AcceptedQuoteVersionRow}, never on a response.
  */
 @Repository
 public class QuoteVersionRepository {
@@ -83,7 +90,7 @@ public class QuoteVersionRepository {
     // A new version is always inserted as ISSUED with no delivery markers; sent_channel /
     // first_sent_at / last_sent_at are stamped by stampAttemptMarkers in the same transaction,
     // after the token mint (they mark the send ATTEMPT — locked 16E-A decision). created_at
-    // defaults to now(); acceptance columns stay NULL until 16F.
+    // defaults to now(); acceptance columns stay NULL until a public accept sets them (16F PR1).
     private static final String INSERT_VERSION_SQL = "\n"
             + """
             INSERT INTO quote_version
@@ -164,7 +171,7 @@ public class QuoteVersionRepository {
             WHERE quote_version_id = :quoteVersionId AND status = 'ACTIVE'
             """;
 
-    // The active issued version's stored PDF metadata for streaming/resend. storage_path is
+    // The active issued version's stored PDF metadata for streaming. storage_path is
     // server-internal — used only to read the bytes, never returned in any response.
     private static final String FIND_ISSUED_FILE_SQL = """
             SELECT sf.file_name, sf.storage_path, sf.mime_type, sf.file_size
@@ -227,6 +234,63 @@ public class QuoteVersionRepository {
             SELECT sf.file_name, sf.storage_path, sf.mime_type, sf.file_size
             FROM quote_version v
             JOIN stored_file sf ON sf.stored_file_id = v.issued_pdf_file_id
+            WHERE v.quote_version_id = :quoteVersionId
+            """;
+
+    // ------------------------------------------------------------------
+    // Phase 16F PR1 — the accepted layer (public accept + protected accepted reads)
+    // ------------------------------------------------------------------
+
+    // The LATEST accepted version of an order (contract §4.3: latest accepted = max(version_number)
+    // WHERE status = 'ACCEPTED'), independent of any draft / ISSUED state. The two stored_file ids are
+    // selected ONLY onto the server-internal AcceptedQuoteVersionRow (never serialized) so the
+    // protected reads can derive "signature present" / "signed PDF available" and stream the bytes.
+    private static final String FIND_LATEST_ACCEPTED_SQL = "SELECT" + VERSION_COLUMNS + """
+                , accepted_at,
+                accepted_customer_name,
+                accepted_signature_file_id,
+                signed_pdf_file_id
+            FROM quote_version
+            WHERE order_id = :orderId AND status = 'ACCEPTED'
+            ORDER BY version_number DESC
+            LIMIT 1
+            """;
+
+    // ISSUED -> ACCEPTED with the frozen acceptance fields, guarded on the FROM status (the public
+    // accept holds the order row lock and has just re-read the version under it, so a 0-row update is
+    // an invariant breach and the caller rolls back). Only the acceptance columns + status move; the
+    // issued snapshot columns are never touched (append-only issued layer, contract §13).
+    private static final String ACCEPT_ISSUED_VERSION_SQL = """
+            UPDATE quote_version
+            SET status = 'ACCEPTED',
+                accepted_at = :acceptedAt,
+                accepted_customer_name = :acceptedCustomerName,
+                accepted_signature_file_id = :acceptedSignatureFileId,
+                signed_pdf_file_id = :signedPdfFileId
+            WHERE quote_version_id = :quoteVersionId AND status = 'ISSUED'
+            """;
+
+    // ACTIVE -> CONSUMED for the ONE presented token (the link dies; the row is kept for the INACTIVE
+    // message, contract §4.5). Guarded on ACTIVE so a token that died under a concurrent transition
+    // can never be consumed; 0 rows = the caller's locked re-read was wrong (invariant -> rollback).
+    private static final String CONSUME_ACTIVE_TOKEN_SQL = """
+            UPDATE quote_token SET status = 'CONSUMED', dead_at = :deadAt
+            WHERE quote_token_id = :quoteTokenId AND status = 'ACTIVE'
+            """;
+
+    // A version's stored SIGNED PDF (portal-only artifact). storage_path is server-internal.
+    private static final String FIND_SIGNED_PDF_FILE_BY_VERSION_SQL = """
+            SELECT sf.file_name, sf.storage_path, sf.mime_type, sf.file_size
+            FROM quote_version v
+            JOIN stored_file sf ON sf.stored_file_id = v.signed_pdf_file_id
+            WHERE v.quote_version_id = :quoteVersionId
+            """;
+
+    // A version's stored accepted SIGNATURE image (portal-only artifact). storage_path is internal.
+    private static final String FIND_SIGNATURE_FILE_BY_VERSION_SQL = """
+            SELECT sf.file_name, sf.storage_path, sf.mime_type, sf.file_size
+            FROM quote_version v
+            JOIN stored_file sf ON sf.stored_file_id = v.accepted_signature_file_id
             WHERE v.quote_version_id = :quoteVersionId
             """;
 
@@ -376,7 +440,7 @@ public class QuoteVersionRepository {
                 .stream().findFirst();
     }
 
-    /** The active issued version's stored PDF metadata for streaming/resend, or empty. */
+    /** The active issued version's stored PDF metadata for streaming, or empty. */
     public Optional<QuoteFile> findIssuedFileByOrderId(long orderId) {
         return jdbc.query(FIND_ISSUED_FILE_SQL, new MapSqlParameterSource("orderId", orderId), FILE_ROW_MAPPER)
                 .stream().findFirst();
@@ -394,10 +458,13 @@ public class QuoteVersionRepository {
 
     /**
      * Take the protected transitions' ORDER row lock ({@code SELECT ... FOR UPDATE}) so a public
-     * lazy expiry serialises behind any in-flight send/cancel and vice versa. Called ONLY from
-     * the lazy-expiry branch (at most once per token lifetime — after the flip the token is never
-     * ACTIVE again, so an unauthenticated caller cannot use this to hold locks repeatedly). Held
-     * until the surrounding resolution transaction commits.
+     * transition serialises behind any in-flight send/cancel/invoice/line/price mutation and vice
+     * versa. Called from (a) the lazy-expiry branch (at most once per token lifetime — after the flip
+     * the token is never ACTIVE again) and (b) the Phase 16F public accept, which reaches it only for a
+     * token that resolved ACTIVE AND a multipart body that already passed the application-level
+     * signature validation (invalid attempts never take the lock); a successful accept consumes the
+     * token, so a link can hold the lock for a successful acceptance at most once. Held until the
+     * surrounding transaction commits.
      */
     public void lockOrderRowForPublicTransition(long orderId) {
         Long locked = jdbc.queryForObject(LOCK_ORDER_ROW_SQL,
@@ -449,6 +516,62 @@ public class QuoteVersionRepository {
                 .stream().findFirst();
     }
 
+    // ------------------------------------------------------------------
+    // Phase 16F PR1 — accepted layer
+    // ------------------------------------------------------------------
+
+    /**
+     * The order's LATEST accepted version ({@code max(version_number)} among {@code ACCEPTED}), or
+     * empty. Independent of the draft and of any newer {@code ISSUED} version — older accepted versions
+     * remain signed history and are never surfaced here (contract §4.3).
+     */
+    public Optional<AcceptedQuoteVersionRow> findLatestAcceptedByOrderId(long orderId) {
+        return jdbc.query(FIND_LATEST_ACCEPTED_SQL, new MapSqlParameterSource("orderId", orderId),
+                ACCEPTED_ROW_MAPPER).stream().findFirst();
+    }
+
+    /**
+     * Guarded {@code ISSUED -> ACCEPTED} transition carrying the frozen acceptance fields. Returns the
+     * number of rows moved (exactly 1 under the caller's order lock; anything else is an invariant
+     * breach the caller must turn into a rollback).
+     */
+    public int acceptIssuedVersion(long quoteVersionId,
+                                   LocalDateTime acceptedAt,
+                                   String acceptedCustomerName,
+                                   long acceptedSignatureFileId,
+                                   long signedPdfFileId) {
+        return jdbc.update(ACCEPT_ISSUED_VERSION_SQL, new MapSqlParameterSource()
+                .addValue("quoteVersionId", quoteVersionId)
+                .addValue("acceptedAt", Timestamp.valueOf(acceptedAt))
+                .addValue("acceptedCustomerName", acceptedCustomerName)
+                .addValue("acceptedSignatureFileId", acceptedSignatureFileId)
+                .addValue("signedPdfFileId", signedPdfFileId));
+    }
+
+    /**
+     * Guarded {@code ACTIVE -> CONSUMED} transition for ONE token (the link dies; the row is kept).
+     * Returns the number of rows moved (exactly 1 under the caller's order lock).
+     */
+    public int consumeActiveToken(long quoteTokenId, LocalDateTime deadAt) {
+        return jdbc.update(CONSUME_ACTIVE_TOKEN_SQL, new MapSqlParameterSource()
+                .addValue("quoteTokenId", quoteTokenId)
+                .addValue("deadAt", Timestamp.valueOf(deadAt)));
+    }
+
+    /** A version's stored signed-PDF metadata (protected portal read), or empty when none is stored. */
+    public Optional<QuoteFile> findSignedPdfFileByVersionId(long quoteVersionId) {
+        return jdbc.query(FIND_SIGNED_PDF_FILE_BY_VERSION_SQL,
+                        new MapSqlParameterSource("quoteVersionId", quoteVersionId), FILE_ROW_MAPPER)
+                .stream().findFirst();
+    }
+
+    /** A version's stored accepted-signature metadata (protected portal read), or empty when none. */
+    public Optional<QuoteFile> findSignatureFileByVersionId(long quoteVersionId) {
+        return jdbc.query(FIND_SIGNATURE_FILE_BY_VERSION_SQL,
+                        new MapSqlParameterSource("quoteVersionId", quoteVersionId), FILE_ROW_MAPPER)
+                .stream().findFirst();
+    }
+
     private static final RowMapper<QuoteVersionRow> VERSION_ROW_MAPPER = (rs, n) -> new QuoteVersionRow(
             rs.getLong("quote_version_id"),
             rs.getLong("order_id"),
@@ -483,6 +606,14 @@ public class QuoteVersionRepository {
             rs.getString("storage_path"),
             rs.getString("mime_type"),
             rs.getLong("file_size"));
+
+    private static final RowMapper<AcceptedQuoteVersionRow> ACCEPTED_ROW_MAPPER = (rs, n) ->
+            new AcceptedQuoteVersionRow(
+                    VERSION_ROW_MAPPER.mapRow(rs, n),
+                    toLocalDateTime(rs.getTimestamp("accepted_at")),
+                    rs.getString("accepted_customer_name"),
+                    rs.getObject("accepted_signature_file_id", Long.class),
+                    rs.getObject("signed_pdf_file_id", Long.class));
 
     private static final RowMapper<QuoteTokenRow> TOKEN_ROW_MAPPER = (rs, n) -> new QuoteTokenRow(
             rs.getLong("quote_token_id"),
@@ -534,6 +665,20 @@ public class QuoteVersionRepository {
 
     /** Stored-PDF metadata for binary streaming; {@code storagePath} is never returned to a client. */
     public record QuoteFile(String fileName, String storagePath, String mimeType, long fileSize) {
+    }
+
+    /**
+     * The latest ACCEPTED version (Phase 16F PR1): the frozen {@link QuoteVersionRow} plus the
+     * acceptance fields. SERVER-INTERNAL: {@code acceptedSignatureFileId} / {@code signedPdfFileId}
+     * ride here only so the protected reads can derive "signature present" / "signed PDF available"
+     * and resolve the stored bytes — they must never be serialized into any response.
+     */
+    public record AcceptedQuoteVersionRow(
+            QuoteVersionRow version,
+            LocalDateTime acceptedAt,
+            String acceptedCustomerName,
+            Long acceptedSignatureFileId,
+            Long signedPdfFileId) {
     }
 
     /**

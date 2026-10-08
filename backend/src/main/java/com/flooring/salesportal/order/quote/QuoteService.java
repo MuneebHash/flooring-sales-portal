@@ -11,11 +11,13 @@ import com.flooring.salesportal.common.error.NotFoundException;
 import com.flooring.salesportal.common.error.ValidationException;
 import com.flooring.salesportal.common.session.RequestContext;
 import com.flooring.salesportal.common.session.RequestContextGuard;
+import com.flooring.salesportal.order.InvoiceRepository;
 import com.flooring.salesportal.order.OrderChargeLineReadRepository;
 import com.flooring.salesportal.order.OrderProductLineRepository;
 import com.flooring.salesportal.order.SalesOrder;
 import com.flooring.salesportal.order.SalesOrderRepository;
 import com.flooring.salesportal.order.financial.LineFinancials;
+import com.flooring.salesportal.order.quote.dto.QuoteAcceptedSummaryDto;
 import com.flooring.salesportal.order.quote.dto.QuoteDraftDto;
 import com.flooring.salesportal.order.quote.dto.QuoteDraftLineDto;
 import com.flooring.salesportal.order.quote.dto.QuoteIssuedSummaryDto;
@@ -38,7 +40,7 @@ import java.util.Set;
  * Phase 16C PR1 — quote money/data core. Backs the two protected endpoints:
  * <ul>
  *   <li>GET {@code /orders/{orderId}/quote/workspace} — loads the draft + the active issued summary
- *       (16E-A; accepted stays null until 16F).</li>
+ *       (16E-A) + the latest accepted summary (16F PR1).</li>
  *   <li>PUT {@code /orders/{orderId}/quote/draft} — full-replace upsert of the editable draft.</li>
  * </ul>
  *
@@ -99,6 +101,7 @@ public class QuoteService {
     private final QuoteVersionRepository quoteVersionRepository;
     private final QuotePdfModelAssembler quotePdfModelAssembler;
     private final QuotePdfGenerator quotePdfGenerator;
+    private final InvoiceRepository invoiceRepository;
     private final ObjectMapper objectMapper;
 
     public QuoteService(RequestContextGuard requestContextGuard,
@@ -112,6 +115,7 @@ public class QuoteService {
                         QuoteVersionRepository quoteVersionRepository,
                         QuotePdfModelAssembler quotePdfModelAssembler,
                         QuotePdfGenerator quotePdfGenerator,
+                        InvoiceRepository invoiceRepository,
                         ObjectMapper objectMapper) {
         this.requestContextGuard = requestContextGuard;
         this.salesOrderRepository = salesOrderRepository;
@@ -124,6 +128,7 @@ public class QuoteService {
         this.quoteVersionRepository = quoteVersionRepository;
         this.quotePdfModelAssembler = quotePdfModelAssembler;
         this.quotePdfGenerator = quotePdfGenerator;
+        this.invoiceRepository = invoiceRepository;
         this.objectMapper = objectMapper;
     }
 
@@ -131,8 +136,17 @@ public class QuoteService {
     // GET /orders/{orderId}/quote/workspace
     // ------------------------------------------------------------------
 
-    /** Read the quote workspace. LAID read is allowed. accepted is null until 16F. */
-    @Transactional(readOnly = true)
+    /**
+     * Read the quote workspace. LAID read is allowed. accepted = the latest ACCEPTED version (16F PR1)
+     * or null.
+     *
+     * <p><b>One snapshot (REPEATABLE_READ, 16F PR1).</b> draft, current_issued, accepted and
+     * invoice_eligible are read in separate statements; under READ COMMITTED a public accept (or a
+     * send / cancel / invoice acceptance) committing between them could return the SAME version both
+     * as current_issued and as accepted. A read-only REPEATABLE_READ transaction pins every read to one
+     * snapshot, takes no row locks and never blocks a writer (the {@link #previewPdf} precedent).
+     */
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public QuoteWorkspaceDto getWorkspace(String slug, String orderIdRaw, HttpServletRequest httpRequest) {
         RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
         long orderId = parseOrderId(orderIdRaw);
@@ -154,9 +168,22 @@ public class QuoteService {
                         quoteVersionRepository.findVersionLines(row.quoteVersionId())))
                 .orElse(null);
 
+        // Phase 16F PR1: the LATEST accepted version summary (or null) — selected independently of
+        // the draft and of current_issued (contract §4.3 / §7.1). Frozen body + acceptance fields
+        // only; the stored_file ids stay server-internal (derived booleans + the backend-built
+        // protected signature path). invoice_eligible is false once the CURRENT invoice is accepted.
+        QuoteAcceptedSummaryDto accepted = quoteVersionRepository.findLatestAcceptedByOrderId(orderId)
+                .map(row -> QuoteAcceptedSummaryDto.from(row,
+                        quoteVersionRepository.findVersionLines(row.version().quoteVersionId()),
+                        acceptedSignatureDownloadPath(slug, orderId),
+                        invoiceRepository.findCurrentByOrderId(orderId)
+                                .map(invoice -> invoice.acceptedAt() == null)
+                                .orElse(true)))
+                .orElse(null);
+
         Optional<QuoteDraft> draftOpt = quoteDraftRepository.findByOrderId(orderId);
         if (draftOpt.isEmpty()) {
-            return QuoteWorkspaceDto.of(null, currentIssued);
+            return QuoteWorkspaceDto.of(null, currentIssued, accepted);
         }
 
         QuoteDraft draft = draftOpt.get();
@@ -177,7 +204,15 @@ public class QuoteService {
                 belowCost,
                 toLineDtos(lineEntities),
                 draft.getUpdatedAt());
-        return QuoteWorkspaceDto.of(draftDto, currentIssued);
+        return QuoteWorkspaceDto.of(draftDto, currentIssued, accepted);
+    }
+
+    /**
+     * Backend-built protected path of the latest accepted quote's signature image (Phase 16F PR1;
+     * consumed verbatim by clients, like the invoice {@code accepted_signature_download_path}).
+     */
+    static String acceptedSignatureDownloadPath(String slug, long orderId) {
+        return "/api/v1/" + slug + "/orders/" + orderId + "/quote/accepted/signature";
     }
 
     // ------------------------------------------------------------------

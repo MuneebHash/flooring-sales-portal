@@ -27,8 +27,10 @@ import javax.imageio.ImageIO;
 
 /**
  * Phase 16C PR2 — single assembly point for the quote PDF model: the on-demand DRAFT preview
- * ({@link #assemble}) and, since Phase 16E-A, the ISSUED snapshot render
- * ({@link #assembleIssued}). The quote analogue of {@code InvoicePdfModelAssembler}: it enriches
+ * ({@link #assemble}), since Phase 16E-A the ISSUED snapshot render ({@link #assembleIssued}), and
+ * since Phase 16F PR1 the SIGNED render ({@link #assembleAccepted} — called from the public,
+ * sessionless acceptance with the order already resolved from the token; it takes the "Quotation To"
+ * identity from the version's V17 snapshot and never reads the live customer/address). The quote analogue of {@code InvoicePdfModelAssembler}: it enriches
  * the quote body with the tenant invoice layout data (private config — ABN, bank details,
  * per-flooring-type terms, logo), the store contact/address, the order-bound salesperson, and the
  * customer + billing address.
@@ -134,9 +136,52 @@ public class QuotePdfModelAssembler {
     }
 
     /**
+     * Phase 16F PR1 — build the {@link QuotePdfModel} for the SIGNED quote PDF rendered at remote
+     * acceptance. ALL legal content comes from the immutable issued version: the itemised flag, the
+     * frozen totals, the snapshot lines (consulted ONLY for an itemised version — a non-itemised version
+     * structurally has none, and dormant retained draft rows are never read here), the frozen
+     * flooring type, details of sale, the frozen {@code terms_snapshot} (null = no terms page — the
+     * frozen absence is preserved), and the V17 "Quotation To" customer name + billing lines. Unlike
+     * {@link #assemble} / {@link #assembleIssued}, this path NEVER reads the live draft, the live
+     * order_customer / order_address rows, or the live tenant terms. The acceptance block is filled
+     * with the stored signature, the frozen accepted name and the accepted timestamp.
+     *
+     * <p>Business presentation context (name, logo, ABN, bank, store contact, salesperson) is read live
+     * at acceptance time — the existing approved live-presentation model, the same set the issued PDF
+     * read at issue and the public page reads per request; the signed bytes then freeze it.
+     */
+    public QuotePdfModel assembleAccepted(Business business, SalesOrder order,
+                                          QuoteVersionRepository.QuoteVersionRow version,
+                                          List<QuoteVersionRepository.QuoteVersionLineRow> versionLines,
+                                          java.time.LocalDateTime acceptedAt,
+                                          String acceptedCustomerName,
+                                          byte[] signaturePng) {
+        BusinessInvoiceConfigView config = businessRepository
+                .findInvoiceConfigByBusinessId(business.getBusinessId())
+                .orElse(null);
+
+        List<QuotePdfLine> pdfLines = version.itemised()
+                ? versionLinesToPdfLines(versionLines)
+                : List.of();
+
+        return buildModelWithIdentity(business, order, config,
+                version.itemised(), pdfLines,
+                version.quoteTotalExGst(), version.quoteTotalIncGst(),
+                version.flooringTypeSnapshot(),
+                blankToNull(version.detailsOfSaleSnapshot()),
+                blankToNull(version.termsSnapshot()),
+                blankToNull(version.customerNameSnapshot()),
+                blankToNull(version.customerAddressLine1Snapshot()),
+                blankToNull(version.customerAddressLine2Snapshot()),
+                acceptedAt, acceptedCustomerName, signaturePng);
+    }
+
+    /**
      * Shared model construction: live presentation context (config bank/ABN, store, salesperson,
      * logo, customer, billing address) around a caller-supplied quote body. The preview path feeds
-     * the live draft + live sanitized terms; the issued path feeds the frozen snapshot.
+     * the live draft + live sanitized terms; the issued path feeds the frozen snapshot. Both read the
+     * customer + billing LIVE (at issue time that equals the V17 snapshot frozen in the same
+     * transaction); the signed path uses {@link #assembleAccepted} instead and never reads them live.
      */
     private QuotePdfModel buildModel(Business business, SalesOrder order, long orderId,
                                      BusinessInvoiceConfigView config,
@@ -144,6 +189,31 @@ public class QuotePdfModelAssembler {
                                      java.math.BigDecimal quoteTotalExGst,
                                      java.math.BigDecimal quoteTotalIncGst,
                                      String flooringType, String detailsOfSale, String termsHtml) {
+        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
+        List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
+
+        return buildModelWithIdentity(business, order, config, itemised, pdfLines,
+                quoteTotalExGst, quoteTotalIncGst, flooringType, detailsOfSale, termsHtml,
+                customer == null ? null : blankToNull(customerName(customer)),
+                blankToNull(billingLine1(addresses)),
+                blankToNull(billingLine2(addresses)),
+                null, null, null);
+    }
+
+    /**
+     * The model around a caller-resolved "Quotation To" identity and optional acceptance fields
+     * (all null = the unsigned acceptance area).
+     */
+    private QuotePdfModel buildModelWithIdentity(Business business, SalesOrder order,
+                                                 BusinessInvoiceConfigView config,
+                                                 boolean itemised, List<QuotePdfLine> pdfLines,
+                                                 java.math.BigDecimal quoteTotalExGst,
+                                                 java.math.BigDecimal quoteTotalIncGst,
+                                                 String flooringType, String detailsOfSale, String termsHtml,
+                                                 String customerName, String billingLine1, String billingLine2,
+                                                 java.time.LocalDateTime acceptedAt,
+                                                 String acceptedCustomerName,
+                                                 byte[] signaturePng) {
         Long businessId = business.getBusinessId();
 
         Store store = storeRepository
@@ -152,9 +222,6 @@ public class QuotePdfModelAssembler {
 
         String salespersonName = salespersonResolver.resolveName(order.getUserId(), businessId);
         String logoDataUri = resolveLogoDataUri(business.getLogoPath());
-
-        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
-        List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
 
         return new QuotePdfModel(
                 business.getName(),
@@ -168,9 +235,9 @@ public class QuotePdfModelAssembler {
                 store == null ? null : blankToNull(store.getEmail()),
                 order.getOrderNumber(),
                 salespersonName,
-                customer == null ? null : blankToNull(customerName(customer)),
-                blankToNull(billingLine1(addresses)),
-                blankToNull(billingLine2(addresses)),
+                customerName,
+                billingLine1,
+                billingLine2,
                 detailsOfSale,
                 itemised,
                 pdfLines,
@@ -180,7 +247,27 @@ public class QuotePdfModelAssembler {
                 blankToNull(config == null ? null : config.getBsb()),
                 blankToNull(config == null ? null : config.getAccountName()),
                 blankToNull(config == null ? null : config.getAccountNumber()),
-                termsHtml);
+                termsHtml,
+                acceptedAt,
+                acceptedCustomerName,
+                signaturePng);
+    }
+
+    private static List<QuotePdfLine> versionLinesToPdfLines(
+            List<QuoteVersionRepository.QuoteVersionLineRow> lines) {
+        List<QuotePdfLine> out = new ArrayList<>(lines == null ? 0 : lines.size());
+        if (lines == null) {
+            return out;
+        }
+        for (QuoteVersionRepository.QuoteVersionLineRow line : lines) {
+            out.add(new QuotePdfLine(
+                    line.lineType(),
+                    line.description(),
+                    line.quantity(),
+                    line.unitPriceExGst(),
+                    line.lineTotalExGst()));
+        }
+        return out;
     }
 
     private static List<QuotePdfLine> snapshotToPdfLines(List<QuoteIssueSnapshot.Line> lines) {

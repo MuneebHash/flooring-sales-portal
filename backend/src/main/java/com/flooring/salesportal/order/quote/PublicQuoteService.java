@@ -42,8 +42,8 @@ import java.util.regex.Pattern;
  * mark first view, and stream the stored issued PDF. This is a NEW, SEPARATE unauthenticated
  * surface authenticated ONLY by the secret token — it deliberately never touches the session,
  * never calls {@code RequestContextGuard}, takes no slug, and can expose nothing beyond the
- * single quote behind the presented token. Signing/acceptance is Phase 16F and does not exist
- * here.
+ * single quote behind the presented token. The Phase 16F remote acceptance (signing) lives in
+ * {@link QuoteAcceptanceService}, which reuses this class's token resolution as its gate.
  *
  * <p><b>Token resolution (§8).</b> The presented token's basic shape is validated first
  * (URL-safe Base64, minted length or longer — anything else is indistinguishable from unknown:
@@ -228,8 +228,12 @@ public class PublicQuoteService {
      * version, or for the token/version row locks to deadlock on inverted acquisition order —
      * both sides now serialise on the order row before touching either. An over-age token's
      * {@code expires_at} is immutable, so the pre-lock "past expiry" fact cannot go stale.
+     *
+     * <p>Package-private since Phase 16F PR1: {@link QuoteAcceptanceService} reuses this exact
+     * resolution (shape gate, hash lookup, constant-time verify, committed lazy expiry) as the token
+     * gate of the public accept, before any application-level multipart validation.
      */
-    private ResolvedToken resolve(String token) {
+    ResolvedToken resolve(String token) {
         if (token == null || !TOKEN_SHAPE.matcher(token).matches()) {
             throw tokenNotFound();
         }
@@ -286,8 +290,8 @@ public class PublicQuoteService {
         return resolved;
     }
 
-    /** Customer-facing state from the token status (contract §4.5 table). */
-    private static String toPublicState(String tokenStatus) {
+    /** Customer-facing state from the token status (contract §4.5 table). Package-private (16F accept). */
+    static String toPublicState(String tokenStatus) {
         return switch (tokenStatus) {
             case TOKEN_ACTIVE -> STATE_ACTIVE;
             case TOKEN_REPLACED, TOKEN_SUPERSEDED -> STATE_SUPERSEDED;
@@ -298,9 +302,17 @@ public class PublicQuoteService {
         };
     }
 
-    /** The viewed/pdf action gate: any non-ACTIVE state → its documented 410 (contract §12). */
-    private static void requireActive(ResolvedToken resolved) {
-        ErrorCode code = switch (resolved.state()) {
+    /**
+     * The viewed/pdf/accept action gate: any non-ACTIVE state → its documented 410 (contract §12).
+     * Package-private (16F accept reuses it for both the initial gate and its locked re-read).
+     */
+    static void requireActive(ResolvedToken resolved) {
+        requireActiveState(resolved.state());
+    }
+
+    /** The 410 mapping for a public state (ACTIVE passes). Package-private (16F accept). */
+    static void requireActiveState(String state) {
+        ErrorCode code = switch (state) {
             case STATE_ACTIVE -> null;
             case STATE_EXPIRED -> ErrorCode.QUOTE_LINK_EXPIRED;
             case STATE_SUPERSEDED -> ErrorCode.QUOTE_LINK_SUPERSEDED;
@@ -327,8 +339,11 @@ public class PublicQuoteService {
                 ErrorCode.QUOTE_TOKEN_NOT_FOUND.defaultMessage());
     }
 
-    /** The resolved token row plus its EFFECTIVE public state (post lazy expiry). Server-internal. */
-    private record ResolvedToken(QuoteTokenRow token, String state) {
+    /**
+     * The resolved token row plus its EFFECTIVE public state (post lazy expiry). Server-internal and
+     * package-private (16F accept) — never serialized.
+     */
+    record ResolvedToken(QuoteTokenRow token, String state) {
     }
 
     // ------------------------------------------------------------------

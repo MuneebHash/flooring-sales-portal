@@ -1,14 +1,19 @@
 package com.flooring.salesportal.order.quote;
 
 import com.flooring.salesportal.order.quote.QuotePdfModel.QuotePdfLine;
+import org.apache.pdfbox.contentstream.operator.Operator;
+import org.apache.pdfbox.cos.COSNumber;
+import org.apache.pdfbox.pdfparser.PDFStreamParser;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -25,6 +30,12 @@ import java.util.regex.Pattern;
  * appear. The Customer Acceptance heading and the "Customer signature" caption are deliberately
  * SHARED with the invoice document (16D-C fix round 2). Guards against a malformed
  * (non-XML-well-formed) template, a missing PDF dependency, or a broken variable binding.
+ *
+ * <p>Phase 16F PR1 adds the SIGNED render (acceptance fields set on the model): the one quote
+ * document where "Accepted by {name} on {dd/MM/yyyy HH:mm}" legitimately appears, with the stored
+ * signature embedded as an image and both declaration squares ticked (pure CSS fills, proven via the
+ * page content stream). The default {@link M} model stays UNSIGNED; signed tests opt in through
+ * {@link M#buildSigned}.
  */
 class QuotePdfGeneratorTest {
 
@@ -36,6 +47,17 @@ class QuotePdfGeneratorTest {
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
     private static final String ONE_PIXEL_PNG_DATA_URI =
             "data:image/png;base64," + Base64.getEncoder().encodeToString(ONE_PIXEL_PNG);
+
+    // Phase 16F PR1: a second real, decodable PNG (2x2) whose bytes DIFFER from ONE_PIXEL_PNG.
+    // openhtmltopdf reuses ONE image XObject for byte-identical data URIs, so a signature identical
+    // to the logo would never add a second image — logo + signature tests must use distinct bytes.
+    private static final byte[] TWO_BY_TWO_PNG = Base64.getDecoder().decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4XmPgtzUDIgYIBQANqgIJTdLlxQAAAABJRU5ErkJggg==");
+
+    // Phase 16F PR1 acceptance time. Single-digit day/month/hour/minute + non-zero seconds prove the
+    // caption uses the zero-padded "dd/MM/yyyy HH:mm" pattern and drops the seconds.
+    private static final LocalDateTime ACCEPTED_AT = LocalDateTime.of(2026, 3, 7, 9, 5, 42);
+    private static final String ACCEPTED_AT_DISPLAY = "07/03/2026 09:05";
 
     private static QuotePdfLine item(String desc, String qty, String unit, String total) {
         return new QuotePdfLine("ITEM", desc, bd(qty), bd(unit), bd(total));
@@ -87,6 +109,21 @@ class QuotePdfGeneratorTest {
                     itemised, lines, quoteTotalExGst, quoteTotalIncGst,
                     bankName, bsb, accountName, accountNumber,
                     termsHtml);
+        }
+
+        /**
+         * Phase 16F PR1 — the SAME quote as {@link #build()} but SIGNED (canonical constructor with the
+         * acceptance fields set), so a test can render one model both unsigned and signed and compare.
+         */
+        QuotePdfModel buildSigned(LocalDateTime acceptedAt, String acceptedCustomerName, byte[] signaturePng) {
+            return new QuotePdfModel(
+                    businessName, abn, logoDataUri, flooringTypeLabel,
+                    storeName, storeAddressLine1, storeAddressLine2, storePhone, storeEmail,
+                    orderNumber, salespersonName, customerName, billingLine1, billingLine2, detailsOfSale,
+                    itemised, lines, quoteTotalExGst, quoteTotalIncGst,
+                    bankName, bsb, accountName, accountNumber,
+                    termsHtml,
+                    acceptedAt, acceptedCustomerName, signaturePng);
         }
     }
 
@@ -141,6 +178,107 @@ class QuotePdfGeneratorTest {
         return images;
     }
 
+    private static int countImagesOnPage(byte[] pdf, int page) throws IOException {
+        int images = 0;
+        try (PDDocument document = PDDocument.load(pdf)) {
+            var resources = document.getPage(page - 1).getResources();
+            for (var name : resources.getXObjectNames()) {
+                if (resources.isImageXObject(name)) {
+                    images++;
+                }
+            }
+        }
+        return images;
+    }
+
+    /**
+     * Phase 16F PR1 — what one page's content stream PAINTS: {@code fills} = the number of fill
+     * operators; {@code tickSquares} = how many of those fills paint a small (3–7pt) square.
+     */
+    private record PagePaint(int fills, int tickSquares) {
+    }
+
+    /**
+     * Tokenises one page's (decoded) content stream with PDFBox's {@link PDFStreamParser} and counts
+     * the painted shapes. openhtmltopdf emits every CSS border and background as a closed path
+     * ({@code m}/{@code l}/{@code h}) in page points followed by a fill operator ({@code f}); it emits
+     * no {@code re} operators, but {@code re} is handled too. The bounding box of the current path is
+     * tracked so each fill can be classified: a declaration square's 1pt border paints four thin 9pt x
+     * 1pt trapezoids, table rules paint long thin strips, and only the signed render's inner tick
+     * ({@code .chk-tick}, a 5pt x 5pt background) paints a small square. Clip paths ({@code W n}) and
+     * strokes reset the box without counting as fills.
+     */
+    private static PagePaint pagePaint(byte[] pdf, int page) throws IOException {
+        byte[] content;
+        try (PDDocument document = PDDocument.load(pdf);
+             InputStream in = document.getPage(page - 1).getContents()) {
+            content = in.readAllBytes();
+        }
+        PDFStreamParser parser = new PDFStreamParser(content);
+        List<Float> operands = new ArrayList<>();
+        float minX = Float.MAX_VALUE;
+        float minY = Float.MAX_VALUE;
+        float maxX = -Float.MAX_VALUE;
+        float maxY = -Float.MAX_VALUE;
+        int fills = 0;
+        int tickSquares = 0;
+        Object token;
+        while ((token = parser.parseNextToken()) != null) {
+            if (!(token instanceof Operator op)) {
+                if (token instanceof COSNumber number) {
+                    operands.add(number.floatValue());
+                }
+                continue;
+            }
+            switch (op.getName()) {
+                case "m", "l", "c" -> {
+                    for (int i = 0; i + 1 < operands.size(); i += 2) {
+                        minX = Math.min(minX, operands.get(i));
+                        maxX = Math.max(maxX, operands.get(i));
+                        minY = Math.min(minY, operands.get(i + 1));
+                        maxY = Math.max(maxY, operands.get(i + 1));
+                    }
+                }
+                case "re" -> {
+                    if (operands.size() == 4) {
+                        float x = operands.get(0);
+                        float y = operands.get(1);
+                        float w = operands.get(2);
+                        float h = operands.get(3);
+                        minX = Math.min(minX, Math.min(x, x + w));
+                        maxX = Math.max(maxX, Math.max(x, x + w));
+                        minY = Math.min(minY, Math.min(y, y + h));
+                        maxY = Math.max(maxY, Math.max(y, y + h));
+                    }
+                }
+                case "f", "F", "f*", "B", "B*", "b", "b*" -> {
+                    fills++;
+                    float width = maxX - minX;
+                    float height = maxY - minY;
+                    if (width >= 3f && width <= 7f && height >= 3f && height <= 7f
+                            && Math.abs(width - height) < 0.5f) {
+                        tickSquares++;
+                    }
+                    minX = Float.MAX_VALUE;
+                    minY = Float.MAX_VALUE;
+                    maxX = -Float.MAX_VALUE;
+                    maxY = -Float.MAX_VALUE;
+                }
+                case "S", "s", "n" -> {
+                    minX = Float.MAX_VALUE;
+                    minY = Float.MAX_VALUE;
+                    maxX = -Float.MAX_VALUE;
+                    maxY = -Float.MAX_VALUE;
+                }
+                default -> {
+                    // Text, colour, state and image operators paint no path.
+                }
+            }
+            operands.clear();
+        }
+        return new PagePaint(fills, tickSquares);
+    }
+
     private static void assertPdfHeader(byte[] pdf) {
         Assertions.assertNotNull(pdf);
         Assertions.assertTrue(pdf.length > 500, () -> "PDF unexpectedly small: " + pdf.length + " bytes");
@@ -162,6 +300,8 @@ class QuotePdfGeneratorTest {
      * Invoice To, Payment Made, Balance Due, "Accepted by" (accepted-state caption), and the
      * invoice-specific declaration fragments "of this invoice" / "value shown on this invoice".
      * The recipient label is CSS-uppercased, so PDFBox extracts it as "QUOTATION TO".
+     * UNSIGNED renders only — a Phase 16F PR1 signed render REQUIRES the accepted caption; use
+     * {@link #assertSignedQuotationNotInvoice} for those.
      */
     private static void assertQuoteNotInvoice(String text) {
         Assertions.assertTrue(STANDALONE_QUOTATION.matcher(text).find(),
@@ -179,6 +319,34 @@ class QuotePdfGeneratorTest {
                 () -> "invoice declaration wording leaked into the quote: " + text);
         Assertions.assertFalse(text.contains("value shown on this invoice"),
                 () -> "invoice agreement wording leaked into the quote: " + text);
+    }
+
+    /**
+     * Phase 16F PR1 — the SIGNED counterpart of {@link #assertQuoteNotInvoice}: the same
+     * QUOTATION-not-invoice wording checks, except the accepted caption ("Accepted by ...") is now
+     * REQUIRED exactly once (it is no longer invoice-only) and the blank "Customer signature"
+     * caption must be gone (the signed cell replaces it). Expects whitespace-normalised text.
+     */
+    private static void assertSignedQuotationNotInvoice(String text) {
+        Assertions.assertTrue(STANDALONE_QUOTATION.matcher(text).find(),
+                () -> "signed render lost the standalone QUOTATION title: " + text);
+        Assertions.assertFalse(STANDALONE_QUOTE.matcher(text).find(),
+                () -> "standalone QUOTE word must not appear on the signed render: " + text);
+        Assertions.assertTrue(text.contains("QUOTATION TO"), () -> "signed render lost Quotation To: " + text);
+        Assertions.assertFalse(text.contains("QUOTE TO"), () -> "stale Quote To block in: " + text);
+        Assertions.assertFalse(text.contains("TAX INVOICE"), () -> "signed quote must not say TAX INVOICE: " + text);
+        Assertions.assertFalse(text.toUpperCase().contains("INVOICE TO"),
+                () -> "signed quote must not say Invoice To: " + text);
+        Assertions.assertFalse(text.contains("Payment Made"), () -> "signed quote must not show Payment Made: " + text);
+        Assertions.assertFalse(text.contains("Balance Due"), () -> "signed quote must not show Balance Due: " + text);
+        Assertions.assertFalse(text.contains("of this invoice"),
+                () -> "invoice declaration wording leaked into the signed quote: " + text);
+        Assertions.assertFalse(text.contains("value shown on this invoice"),
+                () -> "invoice agreement wording leaked into the signed quote: " + text);
+        Assertions.assertEquals(1, countOccurrences(text, "Accepted by"),
+                () -> "signed quote must carry exactly one accepted caption: " + text);
+        Assertions.assertFalse(text.contains("Customer signature"),
+                () -> "the blank Customer signature caption must not render on a signed quote: " + text);
     }
 
     @Test
@@ -537,5 +705,217 @@ class QuotePdfGeneratorTest {
         String text = extractText(pdf).replaceAll("\\s+", " ");
         assertQuoteNotInvoice(text);
         Assertions.assertFalse(text.contains("PAYMENT METHODS"), () -> "bank heading shown with no bank data: " + text);
+    }
+
+    // ------------------------------------------------------------------
+    // Phase 16F PR1 — SIGNED quote PDF (remote acceptance)
+    // ------------------------------------------------------------------
+
+    @Test
+    void render_signed_showsAcceptedCaptionOnce_keepsQuotationDepositTotals_addsSignatureImage() throws IOException {
+        M m = new M();
+        byte[] unsigned = GENERATOR.render(m.build());
+        byte[] signed = GENERATOR.render(m.buildSigned(ACCEPTED_AT, "James Wilson", ONE_PIXEL_PNG));
+        assertPdfHeader(signed);
+
+        String text = extractText(signed).replaceAll("\\s+", " ");
+        assertSignedQuotationNotInvoice(text);
+        // ONE server-built caption node, so the name and zero-padded time stay in reading order.
+        String caption = "Accepted by James Wilson on " + ACCEPTED_AT_DISPLAY;
+        Assertions.assertEquals(1, countOccurrences(text, caption),
+                () -> "expected exactly one '" + caption + "' caption in: " + text);
+        Assertions.assertFalse(text.contains("09:05:42"), () -> "the caption must not show seconds: " + text);
+
+        // Still the same QUOTATION body: deposit sentence (40% of 244.20 = 97.68) and the totals.
+        Assertions.assertTrue(text.contains("A deposit of"), () -> "missing deposit sentence lead in: " + text);
+        Assertions.assertTrue(text.contains("is required to proceed with this quotation."),
+                () -> "missing deposit sentence tail in: " + text);
+        Assertions.assertTrue(noSpace(text).contains("$97.68"), () -> "missing 40% deposit amount in: " + text);
+        Assertions.assertTrue(noSpace(text).contains("Subtotal(exGST)$222.00"), () -> "missing subtotal in: " + text);
+        Assertions.assertTrue(noSpace(text).contains("GST$22.20"), () -> "missing GST in: " + text);
+        Assertions.assertTrue(noSpace(text).contains("Total(incGST)$244.20"), () -> "missing inc-GST total in: " + text);
+        Assertions.assertTrue(text.contains("I accept the terms and conditions of this quotation."),
+                () -> "missing acceptance sentence in: " + text);
+        Assertions.assertEquals(1, countOccurrences(text, "GST included where applicable"),
+                () -> "footer must still render exactly once on the signed quote: " + text);
+
+        // The signature is the ONE extra embedded image (no logo on this model: 0 -> 1).
+        Assertions.assertEquals(0, countImages(unsigned), "unsigned model without a logo embeds no image");
+        Assertions.assertEquals(countImages(unsigned) + 1, countImages(signed),
+                "the signed render must embed exactly one more image (the signature) than the unsigned render");
+    }
+
+    @Test
+    void render_signed_ticksBothDeclarationSquares_twoExtraFilledSquaresInPage1ContentStream() throws IOException {
+        // The ticks are pure CSS (an inner .chk-tick div with a background fill inside each bordered
+        // square) and carry no glyph, so text extraction cannot see them. Technique: render the SAME
+        // model unsigned and signed, tokenise each page 1 content stream with PDFBox's PDFStreamParser
+        // (see pagePaint) and compare what is painted. openhtmltopdf paints every border/background as
+        // a closed path + fill operator ('f'), so the signed page must carry at least two more fills,
+        // and exactly two small filled squares (the 5pt ticks) where the unsigned page has none (its
+        // empty squares' borders are thin 9pt x 1pt trapezoids, never small squares).
+        M m = new M();
+        PagePaint unsignedPaint = pagePaint(GENERATOR.render(m.build()), 1);
+        PagePaint signedPaint = pagePaint(GENERATOR.render(m.buildSigned(ACCEPTED_AT, "James Wilson", ONE_PIXEL_PNG)), 1);
+
+        Assertions.assertTrue(signedPaint.fills() - unsignedPaint.fills() >= 2,
+                () -> "signed page 1 must paint at least two more filled shapes (the ticks): unsigned="
+                        + unsignedPaint + " signed=" + signedPaint);
+        Assertions.assertEquals(0, unsignedPaint.tickSquares(),
+                () -> "unsigned declaration squares must stay empty (no tick fill): " + unsignedPaint);
+        Assertions.assertEquals(2, signedPaint.tickSquares(),
+                () -> "both declaration squares must be ticked on the signed render: " + signedPaint);
+    }
+
+    @Test
+    void render_unsignedModel_from24ArgConstructor_keepsBlankAcceptanceArea() throws IOException {
+        // Regression: the draft preview and the issued PDF build their model through the unsigned
+        // 24-argument constructor. It must leave every acceptance field null and render the blank
+        // pre-16F print-and-sign area: the "Customer signature" caption, no "Accepted by", no embedded
+        // image (no logo here) and empty declaration squares.
+        List<QuotePdfLine> lines = new ArrayList<>(List.of(item("Carpet", "2.00", "111.00", "222.00")));
+        QuotePdfModel unsigned = new QuotePdfModel(
+                "Aussie Floors Group", null, null, null,
+                null, null, null, null, null,
+                "SYD-CBD.LC1.00001", null, "James Wilson", "42 Oxford Street", "Paddington NSW 2021",
+                "Supply and install plush carpet to lounge and dining rooms.",
+                true, lines, bd("222.00"), bd("244.20"),
+                null, null, null, null,
+                null);
+        Assertions.assertNull(unsigned.acceptedAt(), "24-arg constructor must leave acceptedAt null");
+        Assertions.assertNull(unsigned.acceptedCustomerName(), "24-arg constructor must leave the accepted name null");
+        Assertions.assertNull(unsigned.signaturePng(), "24-arg constructor must leave the signature null");
+        Assertions.assertFalse(unsigned.accepted(), "a model without acceptedAt is not accepted");
+        Assertions.assertEquals(new QuotePdfModel(
+                        "Aussie Floors Group", null, null, null,
+                        null, null, null, null, null,
+                        "SYD-CBD.LC1.00001", null, "James Wilson", "42 Oxford Street", "Paddington NSW 2021",
+                        "Supply and install plush carpet to lounge and dining rooms.",
+                        true, lines, bd("222.00"), bd("244.20"),
+                        null, null, null, null,
+                        null,
+                        null, null, null),
+                unsigned, "the 24-arg constructor must equal the canonical one with null acceptance fields");
+
+        byte[] pdf = GENERATOR.render(unsigned);
+        assertPdfHeader(pdf);
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        assertQuoteNotInvoice(text);
+        Assertions.assertEquals(1, countOccurrences(text, "Customer signature"),
+                () -> "the blank signature caption must render exactly once: " + text);
+        Assertions.assertEquals(0, countImages(pdf), "unsigned render without a logo must embed no image");
+        Assertions.assertEquals(0, pagePaint(pdf, 1).tickSquares(), "unsigned declaration squares must stay empty");
+
+        // With a logo the unsigned image count is unchanged: exactly the logo.
+        M withLogo = new M();
+        withLogo.logoDataUri = ONE_PIXEL_PNG_DATA_URI;
+        Assertions.assertEquals(1, countImages(GENERATOR.render(withLogo.build())),
+                "an unsigned render with a logo must embed exactly the logo");
+    }
+
+    @Test
+    void render_acceptedAtNull_ignoresStrayNameAndSignature_rendersUnsigned() throws IOException {
+        // The signed state is driven SOLELY by acceptedAt: a model that carries a name + signature bytes
+        // but no acceptedAt must still render the blank area — no signature can leak into an unsigned
+        // (preview / issued) PDF.
+        byte[] pdf = GENERATOR.render(new M().buildSigned(null, "Stray Name", ONE_PIXEL_PNG));
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        assertQuoteNotInvoice(text);
+        Assertions.assertTrue(text.contains("Customer signature"), () -> "blank caption must render: " + text);
+        Assertions.assertFalse(text.contains("Stray Name"), () -> "a stray accepted name leaked into: " + text);
+        Assertions.assertEquals(0, countImages(pdf), "a stray signature must not be embedded without acceptedAt");
+        Assertions.assertEquals(0, pagePaint(pdf, 1).tickSquares(), "squares must stay empty without acceptedAt");
+    }
+
+    @Test
+    void render_signed_withLogo_embedsSignatureAsSecondImageOnPage1() throws IOException {
+        // The signature is embedded IN ADDITION to the tenant logo (both on page 1). TWO_BY_TWO_PNG keeps
+        // the signature bytes distinct from the logo (identical data URIs share one XObject).
+        M m = new M();
+        m.logoDataUri = ONE_PIXEL_PNG_DATA_URI;
+        byte[] unsigned = GENERATOR.render(m.build());
+        byte[] signed = GENERATOR.render(m.buildSigned(ACCEPTED_AT, "James Wilson", TWO_BY_TWO_PNG));
+
+        Assertions.assertEquals(1, countImagesOnPage(unsigned, 1), "unsigned page 1 embeds only the logo");
+        Assertions.assertEquals(2, countImagesOnPage(signed, 1), "signed page 1 embeds the logo AND the signature");
+        Assertions.assertEquals(countImages(unsigned) + 1, countImages(signed),
+                "the signature is the only additional image");
+        String text = extractText(signed).replaceAll("\\s+", " ");
+        Assertions.assertEquals(1, countOccurrences(text, "Accepted by James Wilson on " + ACCEPTED_AT_DISPLAY),
+                () -> "missing accepted caption in: " + text);
+    }
+
+    @Test
+    void render_signed_withTerms_acceptanceOnPage1_termsAloneOnPage2() throws IOException {
+        // The signed render keeps the locked layout: acceptance (caption, signature, ticks) on page 1,
+        // the frozen terms on their own page 2, footer once.
+        M m = new M();
+        m.flooringTypeLabel = "Soft Flooring";
+        m.termsHtml = "<p>Soft flooring stain warranty applies for twelve months.</p>";
+        byte[] pdf = GENERATOR.render(m.buildSigned(ACCEPTED_AT, "James Wilson", ONE_PIXEL_PNG));
+        assertPdfHeader(pdf);
+
+        Assertions.assertEquals(2, pageCount(pdf), "signed quote with terms keeps the dedicated terms page");
+        String page1 = extractPageText(pdf, 1).replaceAll("\\s+", " ");
+        String page2 = extractPageText(pdf, 2).replaceAll("\\s+", " ");
+        Assertions.assertTrue(page1.contains("Accepted by James Wilson on " + ACCEPTED_AT_DISPLAY),
+                () -> "the accepted caption belongs on page 1: " + page1);
+        Assertions.assertFalse(page1.contains("Soft flooring stain warranty"), () -> "page 1 must not carry terms: " + page1);
+        Assertions.assertFalse(page1.contains("TERMS"), () -> "page 1 must not carry a terms heading: " + page1);
+        Assertions.assertTrue(page2.contains("Soft flooring stain warranty"), () -> "page 2 must carry the terms: " + page2);
+        Assertions.assertFalse(page2.contains("Accepted by"), () -> "page 2 must not repeat the caption: " + page2);
+        Assertions.assertEquals(1, countImagesOnPage(pdf, 1), "the signature image is on page 1");
+        Assertions.assertEquals(0, countImagesOnPage(pdf, 2), "the terms page embeds no image");
+        Assertions.assertEquals(2, pagePaint(pdf, 1).tickSquares(), "both ticks render on page 1");
+        String all = extractText(pdf).replaceAll("\\s+", " ");
+        Assertions.assertEquals(1, countOccurrences(all, "GST included where applicable"),
+                () -> "footer must render exactly once on a signed quote with terms: " + all);
+    }
+
+    @Test
+    void render_signed_longAcceptedName_over150Chars_rendersInFull() throws IOException {
+        // V19 widened accepted_customer_name to TEXT: the frozen name is never truncated. The long
+        // name wraps across several caption lines, so the check is whitespace-stripped containment
+        // of the WHOLE caption (prefix + full name + time, in order).
+        String longName = "Alexandria Catherine Montgomery-Fitzwilliam Beauchamp-Wellesley Pemberton-Ashworth "
+                + "Worthington-Fairfax Kensington-Huntingdon Carrington-Delacourt Ravensworth-Ellingham Stratford";
+        Assertions.assertTrue(longName.length() > 150, "fixture must exceed the old VARCHAR(150) cap");
+
+        byte[] pdf = GENERATOR.render(new M().buildSigned(ACCEPTED_AT, longName, ONE_PIXEL_PNG));
+        assertPdfHeader(pdf);
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        Assertions.assertTrue(
+                noSpace(text).contains(noSpace("Accepted by " + longName + " on " + ACCEPTED_AT_DISPLAY)),
+                () -> "the long accepted name must render in full inside the caption: " + text);
+        Assertions.assertEquals(1, countOccurrences(text, "Accepted by"),
+                () -> "exactly one accepted caption expected: " + text);
+    }
+
+    @Test
+    void render_signedNonItemised_ignoresLinesPassedIn_rendersHeaderTotalsAndCaption() throws IOException {
+        // The line table is gated on the itemised flag alone: a signed NON-itemised model renders no line
+        // table and none of the lines handed to it — details + header totals + deposit + acceptance only.
+        M m = new M();
+        m.itemised = false;
+        m.lines = new ArrayList<>(List.of(
+                item("Dormant carpet row", "2.00", "100.00", "200.00"),
+                adjustment("Dormant discount", "-30.00")));
+        m.quoteTotalExGst = bd("900.00");
+        m.quoteTotalIncGst = bd("990.00");
+        byte[] pdf = GENERATOR.render(m.buildSigned(ACCEPTED_AT, "James Wilson", ONE_PIXEL_PNG));
+        assertPdfHeader(pdf);
+
+        String text = extractText(pdf).replaceAll("\\s+", " ");
+        assertSignedQuotationNotInvoice(text);
+        Assertions.assertFalse(text.contains("Qty"), () -> "signed non-itemised quote rendered a line table: " + text);
+        Assertions.assertFalse(text.contains("Dormant carpet row"), () -> "ITEM line leaked into the signed PDF: " + text);
+        Assertions.assertFalse(text.contains("Dormant discount"), () -> "ADJUSTMENT line leaked into the signed PDF: " + text);
+        Assertions.assertFalse(noSpace(text).contains("200.00"), () -> "line amount leaked into the signed PDF: " + text);
+        Assertions.assertTrue(noSpace(text).contains("990.00"), () -> "missing header inc-GST total in: " + text);
+        Assertions.assertTrue(noSpace(text).contains("900.00"), () -> "missing header ex-GST subtotal in: " + text);
+        Assertions.assertTrue(noSpace(text).contains("$396.00"), () -> "missing header-derived 40% deposit in: " + text);
+        Assertions.assertTrue(text.contains("Supply and install plush carpet"), () -> "missing details of sale in: " + text);
+        Assertions.assertEquals(1, countOccurrences(text, "Accepted by James Wilson on " + ACCEPTED_AT_DISPLAY),
+                () -> "missing accepted caption in: " + text);
     }
 }

@@ -1311,7 +1311,12 @@ paths:
         order customer's email, updating last_emailed_at. Requires a current invoice that is not
         already accepted and a valid customer email. Allowed when order_status is LAID. If the
         email send fails the acceptance is still persisted (201) with last_emailed_at null; use
-        Resend to retry.
+        Resend to retry. Phase 16F PR1 (decision D5(c)): the same transaction also cancels the
+        order's ISSUED quote version, if any, and its ACTIVE public-link token (both CANCELLED; the
+        public quote link then reports CANCELLED); with no ISSUED quote this is a silent no-op.
+        Only the version ISSUED at that moment is affected - a quote sent later can still be signed
+        (known open item, quotation contract §13). An ACCEPTED quote never blocks this endpoint and
+        is never touched (D5(d)).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1577,9 +1582,12 @@ paths:
       operationId: getQuoteWorkspace
       description: >
         Loads the full quote state for the order's Quote tab (Phase 16B): the editable draft, the
-        active issued version summary, and the latest accepted version summary (planned 16F; always
-        null at this base). Cost/GP flags are present on this protected view only. Allowed when
-        order_status is LAID (read).
+        active issued version summary, and the latest accepted version summary (Phase 16F PR1: the
+        highest-numbered ACCEPTED version, or null when none; selected independently of the draft
+        and of current_issued). The read runs in one read-only REPEATABLE_READ transaction (no row
+        locks; never blocks a writer), so all members come from one consistent snapshot and the
+        same version never appears as both current_issued and accepted. Cost/GP flags are present
+        on this protected view only. Allowed when order_status is LAID (read).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       responses:
@@ -1701,13 +1709,23 @@ paths:
       summary: Send quote by email
       operationId: sendQuoteEmail
       description: >
-        Issues (or resends) the quote and emails it (issued PDF attachment + public quote link +
-        body; the link is view-only until 16F adds signing) (Phase 16B; implemented 16E-A). A draft
-        or customer name/billing change since the last issue (compared with the V17 issue-time
-        snapshot) creates a new ISSUED version that supersedes the previous one; otherwise the same
-        version and its stored PDF are re-sent verbatim with a new ACTIVE token (old token
-        REPLACED). Either way the issued PDF + token are stored before delivery. In the current
-        build delivery is recorded in memory only - no real email is sent. Re-checks
+        Issues (or resends) the quote and emails the public quote link (Phase 16B; implemented
+        16E-A). Link-only since 16F PR1: a short plain-text body carrying the public quote link
+        exactly once and NO PDF attachment (16E-A attached the issued PDF). The immutable issued PDF
+        is still generated and stored when a new version is issued; the customer opens it from the
+        public page (GET /public/quotes/{token}/pdf) and the salesperson via
+        GET /orders/{orderId}/quote/pdf?type=issued. The link's token is the credential for the
+        public view, viewed, PDF and accept endpoints (acceptPublicQuote implemented 16F PR1; the
+        public signing UI is planned 16F PR3). A draft or customer name/billing change since the
+        last issue (compared with the V17 issue-time snapshot), or no active ISSUED version at all
+        (never sent, cancelled, expired or accepted), creates a new ISSUED version (next
+        version_number) that supersedes any previous ISSUED one; otherwise the same version is
+        re-sent with a new ACTIVE token (old token REPLACED) and its stored PDF is kept as is
+        (never regenerated). Either way the issued version, its stored PDF and the new token are
+        persisted before delivery. Sending after an acceptance is allowed (16F decision D9): it
+        issues a new version that needs a new signature and never changes the ACCEPTED version. A
+        send never writes the order sale price (only acceptPublicQuote does, decision D6b). In the
+        current build delivery is recorded in memory only - no real email is sent. Re-checks
         below-cost (QUOTE_BELOW_COST, 422) and requires a valid customer email
         (CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID, 422). Blocked when LAID (ORDER_LOCKED,
         422). On provider failure returns 502 (EMAIL_SEND_FAILED); the issued version/PDF/token
@@ -1795,10 +1813,13 @@ paths:
       operationId: cancelQuote
       description: >
         Cancels the active issued quote (Phase 16B): version becomes CANCELLED and the active
-        token becomes CANCELLED (kept for messaging; link dead). Requires an active ISSUED version
-        (QUOTE_NOT_ISSUED, 422); an already accepted quote returns 409 (QUOTE_ALREADY_ACCEPTED).
-        Empty JSON object body. Allowed when LAID as a narrow exception (kills a public link only;
-        not an order mutation).
+        token becomes CANCELLED (kept for messaging; link dead). Requires an active ISSUED version:
+        with none, an order that has an ACCEPTED quote version returns 409
+        (QUOTE_ALREADY_ACCEPTED - reachable since 16F PR1 creates ACCEPTED versions), otherwise 422
+        (QUOTE_NOT_ISSUED). An ISSUED version sent after an acceptance is cancelled normally; an
+        ACCEPTED version is never touched. Never writes the order sale price. Empty JSON object
+        body. Allowed when LAID as a narrow exception (kills a public link only; not an order
+        mutation).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1836,8 +1857,8 @@ paths:
       summary: Create invoice from accepted quote (Path A)
       operationId: createInvoiceFromQuote
       description: >
-        PLANNED 16F - NOT IMPLEMENTED at this base (no handler exists; this definition is the
-        contract 16F builds to).
+        PLANNED 16F PR2 - NOT IMPLEMENTED at this base (no handler exists; this definition is the
+        contract 16F PR2 builds to).
         Creates an invoice from the latest accepted quote (Phase 16B, Path A). The invoice sale
         price is the accepted quote snapshot total, the terms are the quote's frozen
         terms_snapshot, and the acceptance/signature is inherited (the customer does not re-sign);
@@ -1882,10 +1903,13 @@ paths:
       operationId: downloadQuotePdf
       description: >
         Streams a stored quote PDF for the salesperson (Phase 16B): type=issued returns the active
-        issued version PDF; type=accepted returns the accepted signed PDF (planned 16F - until then
-        type=accepted always returns 404 QUOTE_PDF_NOT_FOUND). The signed PDF is
-        portal only and is never served on the public surface. Missing requested artifact returns
-        404 (QUOTE_PDF_NOT_FOUND). Allowed when order_status is LAID (read).
+        issued version's stored PDF (inline filename quote-{order_number}-v{n}.pdf); type=accepted
+        returns the latest ACCEPTED version's stored signed PDF (implemented 16F PR1 - the
+        immutable bytes stored at acceptance, never regenerated; inline filename
+        quote-{order_number}-v{n}-signed.pdf). The signed PDF is portal only and is never served on
+        the public surface. Missing requested artifact (no active issued version for type=issued;
+        no accepted version or no stored signed PDF for type=accepted) returns 404
+        (QUOTE_PDF_NOT_FOUND). Allowed when order_status is LAID (read).
       parameters:
         - $ref: '#/components/parameters/OrderId'
         - name: type
@@ -1920,6 +1944,57 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
+  /orders/{orderId}/quote/accepted/signature:
+    get:
+      tags:
+        - Quotes
+      summary: Download accepted quote signature image
+      operationId: downloadAcceptedQuoteSignature
+      description: >
+        Streams the customer signature image (image/png) stored when the order's latest ACCEPTED
+        quote version was signed on the public link (Phase 16F PR1; the quote analogue of
+        downloadCurrentInvoiceSignature). The bytes are the stored server-normalised PNG,
+        streamed verbatim: the upload's decoded pixels re-encoded at acceptance (same dimensions
+        and pixels; ancillary chunks and trailing bytes dropped), so they are not byte-identical
+        to the customer's upload. The workspace accepted.signature_download_path points
+        here; consume it verbatim. Inline filename quote-signature-{order_number}-v{n}.png. The
+        order is resolved within the session business/store first (an order outside them returns
+        404 ORDER_NOT_FOUND; existence is never leaked). No accepted quote version, or no stored
+        signature on the latest one, returns 404 (QUOTE_SIGNATURE_NOT_FOUND). A referenced file
+        missing from storage returns 500. Allowed when order_status is LAID (read). Portal only -
+        never served on the public surface. Not an old-version signature-history endpoint.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+      responses:
+        '200':
+          description: Accepted quote signature image streamed
+          headers:
+            Content-Disposition:
+              description: Inline signature filename generated by backend.
+              schema:
+                type: string
+            Content-Length:
+              description: Signature file size in bytes.
+              schema:
+                type: integer
+                format: int64
+                minimum: 0
+          content:
+            image/png:
+              schema:
+                type: string
+                format: binary
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+
   /public/quotes/{token}:
     servers:
       - url: /api/v1
@@ -1934,9 +2009,10 @@ paths:
         /q/{token}). No session; the secret token is the only
         credential and the endpoint exposes only the single quote behind it (cost-free, no
         internal IDs). Never stamps viewed_at. Returns a state derived from the token: ACTIVE
-        (viewable; signable once the planned 16F accept exists),
-        EXPIRED, SUPERSEDED, CANCELLED, or INACTIVE (signed; link dead, not a viewable signed
-        copy). An unknown token returns 404 (QUOTE_TOKEN_NOT_FOUND). Only an ACTIVE token on an
+        (viewable, and signable via acceptPublicQuote - implemented 16F PR1; the page's signing UI
+        is planned 16F PR3), EXPIRED, SUPERSEDED, CANCELLED (including a quote cancelled by an
+        in-app invoice acceptance, 16F decision D5(c)), or INACTIVE (signed; link dead, not a
+        viewable signed copy). An unknown token returns 404 (QUOTE_TOKEN_NOT_FOUND). Only an ACTIVE token on an
         ISSUED quote can lazily expire on access. Rate limiting against rapid repeated access by
         token/IP is required by the contract (§8) before production but is NOT implemented at this
         base; whether it is done at application or infrastructure level is undecided (Phase 17).
@@ -2002,19 +2078,63 @@ paths:
       operationId: acceptPublicQuote
       security: []
       description: >
-        PLANNED 16F - NOT IMPLEMENTED at this base (no handler exists; this definition is the
-        contract 16F builds to).
-        Customer signs the quote on their phone (Phase 16B). multipart/form-data with a signature
-        image (image/png, max 2 MB); accepted_customer_name is taken server-side from the saved
-        order customer (the customer does not type or edit it in MVP) - whether that means the
-        live saved customer record or the V17 issued customer snapshot is an open question for
-        the 16F verify gate. On success: version becomes
-        ACCEPTED, the snapshot is locked as the legal billing number, the signed quote PDF is
-        stored, the token becomes CONSUMED (the public link dies), and the store is notified by
-        email (post-commit, non-fatal). The token state must be ACTIVE;
-        expired/superseded/cancelled/signed tokens return 410 (QUOTE_LINK_EXPIRED /
-        QUOTE_LINK_SUPERSEDED / QUOTE_LINK_CANCELLED / QUOTE_LINK_INACTIVE). Unknown token returns
-        404.
+        Customer accepts (signs) the issued quote remotely (Phase 16B; implemented 16F PR1). No
+        session and no slug: the secret token is the only credential, and nothing beyond the single
+        quote behind it is readable or writable. The request is multipart/form-data with exactly
+        one part, signature (see QuoteAcceptRequest). accepted_customer_name is not a request part:
+        it is taken server-side from the issued version's frozen V17 customer_name_snapshot (16F
+        decision D1) - never the live customer record, never typed, never truncated. The
+        declaration checkboxes are a frontend gate only and are not sent (decision D8); the signed
+        PDF renders them ticked.
+        Order of checks. Transport-level rejections happen first, in the framework, before the
+        token gate (unchanged global behaviour): a request that is not multipart/form-data returns
+        415 (code VALIDATION_FAILED), and a request over the global multipart limit (15 MB file /
+        16 MB request) returns 400 FILE_TOO_LARGE. (1) Token gate, before any application-level
+        body validation: an unknown or malformed token returns 404 (QUOTE_TOKEN_NOT_FOUND); a dead
+        link returns 410 even when the body is also invalid - QUOTE_LINK_EXPIRED (including a link that lapses on this access),
+        QUOTE_LINK_SUPERSEDED, QUOTE_LINK_CANCELLED (including a quote cancelled by an in-app
+        invoice acceptance, 16F decision D5(c)) or QUOTE_LINK_INACTIVE (already signed).
+        (2) Body validation, with no database access or lock: any file part, form field or request
+        parameter other than a single signature part (including a repeated signature) returns 400
+        (VALIDATION_FAILED, one detail per offending part); a missing or empty signature returns
+        422 (SIGNATURE_REQUIRED, message "A signature is required to accept this quote."); a
+        signature that breaks the QuoteAcceptRequest rules (declared type not image/png, over
+        2097152 bytes, no PNG signature, first chunk not a 13-byte IHDR, outside the safe-decode
+        bounds - over 8192 px per side or 4000000 px, bit depth over 8, or an invalid colour type -
+        or not decodable by the PNG reader) returns 400 (SIGNATURE_INVALID). (3) One transaction under the order row lock that every
+        protected quote, invoice, line and price mutation also takes. The token is re-read under
+        the lock: a link that died while waiting returns its 410, and a link whose expiry fell due
+        is expired (committed) and returns 410 QUOTE_LINK_EXPIRED. Then, before anything is
+        written and in this order, a missing name snapshot (ACCEPTED_CUSTOMER_NAME_REQUIRED), a
+        frozen quote total ex GST below the order's live product + charge line cost
+        (QUOTE_BELOW_COST, decision D11) or an order price that cannot be stored (a value outside
+        DECIMAL(10,2) or a negative total cost - BUSINESS_RULE_VIOLATION) returns 422 with the same public-safe message "This quote can no
+        longer be accepted online. Please contact the store." (no cost or GP figures), and nothing
+        is written. A blank details of sale or a zero total does not block acceptance.
+        On success the same transaction stores the server-normalised signature PNG (the decoded
+        pixels re-encoded: same dimensions and pixels as the upload, ancillary chunks and trailing
+        bytes dropped - the bytes the signed PDF embeds and downloadAcceptedQuoteSignature
+        streams) and the signed quote PDF (rendered from the frozen issued snapshot with the
+        acceptance area filled), moves the version ISSUED -> ACCEPTED (its snapshot total is the
+        legal billing number) and the token ACTIVE -> CONSUMED (the link is dead: GET then returns
+        state INACTIVE; viewed, pdf and accept return 410 QUOTE_LINK_INACTIVE), and applies the
+        signed total inc GST as the order's standard sale-price override (16F decision D6b, the
+        one amendment to the 16D-A quote/order price separation): price_adjustment_inc_gst =
+        accepted total inc GST - the calculated line total inc GST at acceptance (replacing any
+        earlier override), and sale_price_ex_gst, total_cost, gp and gp_percent are recomputed.
+        Like any override the adjustment then stays fixed: later Products & Charges edits (only
+        while the order is not LAID) shift the working price relative to the signed total, and the
+        manual override/reset remain the correction tools; Path A (createInvoiceFromQuote,
+        planned 16F PR2) bills the frozen accepted snapshot, never the working order price.
+        Nothing else on the order changes (draft, lines, order status, invoices, payments). Any failure rolls the whole acceptance back and deletes only
+        the files this request wrote. Allowed when order_status is LAID, including the price write
+        (decision D4); the protected sale-price endpoints keep their LAID gate.
+        After commit only, the store is emailed an acceptance notification (to the order's store
+        email; skipped with a WARN log when blank; no attachment, link, token, cost or GP;
+        recording-only in this build - no real email is sent). A notification failure is logged
+        and never undoes the acceptance. The signed PDF is portal-only
+        (GET /orders/{orderId}/quote/pdf?type=accepted) and is never served on the public surface.
+        Rate limiting (contract §8) is not implemented at this base (Phase 17).
       parameters:
         - $ref: '#/components/parameters/Token'
       requestBody:
@@ -2028,7 +2148,10 @@ paths:
                 contentType: image/png
       responses:
         '201':
-          description: Quote accepted; public link now dead
+          description: >-
+            Quote accepted; the public link is now dead. data.state is always INACTIVE and message
+            is "Quote accepted." - no id, amount, name, timestamp, file reference or token is
+            returned.
           content:
             application/json:
               schema:
@@ -2039,6 +2162,14 @@ paths:
           $ref: '#/components/responses/NotFound'
         '410':
           $ref: '#/components/responses/Gone'
+        '415':
+          description: >-
+            Not multipart/form-data (transport-level rejection by the framework, before the token
+            gate); error.code VALIDATION_FAILED.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StandardErrorResponse'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
         '500':
@@ -4505,8 +4636,12 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        Latest accepted quote version (planned 16F). No accepted version can exist at this base,
-        so the workspace always returns accepted as null until 16F.
+        The order's LATEST accepted quote version (max(version_number) among ACCEPTED versions;
+        Phase 16F PR1), selected independently of the draft and of current_issued; older accepted
+        versions remain signed history and are not surfaced. Every body field is the frozen
+        accepted snapshot - never the live draft or order; quote_total_inc_gst is the legal billing
+        number. All fields are always present (nullable ones as null). Protected portal view only:
+        no stored_file id, storage path, token, hash, cost or GP field.
       required:
         - quote_version_id
         - version_number
@@ -4515,6 +4650,13 @@ components:
         - accepted_customer_name
         - accepted_signature_present
         - invoice_eligible
+        - quote_total_ex_gst
+        - itemised
+        - flooring_type
+        - details_of_sale
+        - lines
+        - signature_download_path
+        - signed_pdf_available
       properties:
         quote_version_id:
           type: integer
@@ -4527,11 +4669,49 @@ components:
           $ref: '#/components/schemas/Timestamp'
         accepted_customer_name:
           type: string
+          description: >-
+            Frozen at acceptance from the issued version's V17 customer_name_snapshot (16F decision
+            D1) - never the live customer record, never typed, never truncated.
         accepted_signature_present:
           type: boolean
+          description: True when a signature image is stored for this accepted version.
         invoice_eligible:
           type: boolean
-          description: True for the latest accepted version (the invoice-eligible one).
+          description: >-
+            False when the order's current invoice (highest version_number) is already accepted
+            (16F decision D5(b): Create Invoice from the accepted quote is then unavailable -
+            "Invoice already accepted"); true when the order has no invoice or its current invoice
+            is unsigned. An unsigned draft or a newer issued quote never makes it false. Read-only
+            flag; Create Invoice from the accepted quote (createInvoiceFromQuote, Path A) is
+            planned 16F PR2.
+        quote_total_ex_gst:
+          $ref: '#/components/schemas/Money'
+        itemised:
+          type: boolean
+        flooring_type:
+          $ref: '#/components/schemas/FlooringType'
+        details_of_sale:
+          type: string
+          nullable: true
+          description: The frozen details_of_sale_snapshot as issued (may be null or blank).
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/QuoteIssuedLine'
+          description: >-
+            Accepted snapshot lines in display order; always empty when the accepted quote is
+            non-itemised.
+        signature_download_path:
+          type: string
+          nullable: true
+          description: >-
+            Backend-built protected path /api/v1/{slug}/orders/{orderId}/quote/accepted/signature
+            (downloadAcceptedQuoteSignature); consume verbatim. Null when no signature is stored.
+        signed_pdf_available:
+          type: boolean
+          description: >-
+            True when the stored signed PDF exists; stream it via
+            GET /orders/{orderId}/quote/pdf?type=accepted.
 
     QuoteWorkspace:
       type: object
@@ -4553,6 +4733,10 @@ components:
           allOf:
             - $ref: '#/components/schemas/QuoteAcceptedSummary'
           nullable: true
+          description: >-
+            The order's latest ACCEPTED quote version (Phase 16F PR1), or null when none exists.
+            Selected independently of draft and current_issued, so it stays present beside a newer
+            draft or a newer issued version.
 
     QuoteWorkspaceResponseWrapper:
       type: object
@@ -4808,11 +4992,21 @@ components:
           type: string
           format: binary
           description: >
-            Customer signature image. PNG only (image/png), non-empty, max 2 MB (2097152 bytes).
-            accepted_customer_name is NOT accepted here - it is taken server-side from the saved
-            order customer (Phase 16B). Planned 16F (the accept endpoint is not implemented at
-            this base); whether the name comes from the live saved customer record or the V17
-            issued customer snapshot is an open question for the 16F verify gate.
+            Customer signature image (implemented 16F PR1). The ONLY part: any other file part,
+            form field or request parameter, or a second signature part, is rejected (400
+            VALIDATION_FAILED). Missing or empty returns 422 (SIGNATURE_REQUIRED). PNG only: the
+            declared content type must be image/png and the size at most 2 MB (2097152 bytes;
+            exactly 2097152 is allowed); the bytes must start with the 8-byte PNG signature, the
+            first chunk must be a 13-byte IHDR, and the IHDR (checked before any pixel is decoded)
+            must be within the safe-decode bounds - at most 8192 px per side, at most 4000000 px in
+            total, bit depth at most 8 (16-bit PNGs are rejected) and a valid PNG colour type - and
+            the PNG reader must decode it; otherwise 400 (SIGNATURE_INVALID). Server normalisation:
+            the decoded pixels are re-encoded as a clean PNG and only those bytes are stored and
+            embedded in the signed PDF - same dimensions and pixels as the upload, but ancillary
+            chunks and any bytes after IEND are dropped, so the stored signature (and the protected
+            downloadAcceptedQuoteSignature response) is not byte-identical to the upload.
+            accepted_customer_name is NOT a part: it is taken server-side from the issued version's
+            frozen V17 customer_name_snapshot (16F decision D1), never the live customer record.
 
     PublicQuoteAcceptResult:
       type: object

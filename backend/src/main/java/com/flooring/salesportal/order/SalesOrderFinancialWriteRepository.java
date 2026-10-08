@@ -28,6 +28,11 @@ import java.time.LocalDateTime;
  * and use {@link #updateHeaderFinancialsWithAdjustment} instead — the only write path that includes that
  * column in its SET list. {@link #updateHeaderFinancials} (Branch 2 line mutations) deliberately leaves
  * {@code price_adjustment_inc_gst} untouched so a line edit never changes the stored adjustment.
+ *
+ * <p>Phase 16F PR1 (decision D6b) adds one more caller of {@link #updateHeaderFinancialsWithAdjustment}:
+ * the public quote acceptance ({@code QuoteAcceptanceService}), which writes the signed quote's inc-GST
+ * total as the order's override from inside its own programmatic (TransactionTemplate) transaction
+ * while holding the order row lock. The protected override / reset endpoints are unchanged.
  */
 @Repository
 public class SalesOrderFinancialWriteRepository {

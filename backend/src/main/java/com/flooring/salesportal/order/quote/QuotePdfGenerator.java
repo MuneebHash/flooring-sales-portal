@@ -13,17 +13,20 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
 /**
- * Phase 16C PR2 — renders a {@link QuotePdfModel} to PDF bytes for the on-demand quote PREVIEW. A
- * Thymeleaf template ({@code templates/quote.html}, well-formed XHTML) is processed to an HTML string,
- * then converted to PDF by openhtmltopdf-pdfbox. The bytes are streamed to the client and NEVER stored
- * (no {@code stored_file}, no {@code FileStorageService}).
+ * Phase 16C PR2 — renders a {@link QuotePdfModel} to PDF bytes: the on-demand draft PREVIEW (streamed,
+ * never stored), the ISSUED PDF (16E-A — the caller stores it) and the SIGNED PDF (16F PR1 — the
+ * acceptance caller stores it). A Thymeleaf template ({@code templates/quote.html}, well-formed XHTML)
+ * is processed to an HTML string, then converted to PDF by openhtmltopdf-pdfbox. This class itself
+ * never stores anything.
  *
  * <p>PURE: {@code model -> byte[]}, with no DB access, no file IO, and no mutation — the same shape as
  * {@code InvoicePdfGenerator}. A dedicated standalone {@link TemplateEngine} with a
@@ -38,6 +41,9 @@ public class QuotePdfGenerator {
     // Locale pinned so the customer-facing PDF renders amounts consistently regardless of the JVM
     // default locale (e.g. a comma decimal separator under de_DE would otherwise corrupt amounts).
     private static final Locale DISPLAY_LOCALE = Locale.ENGLISH;
+    // Accepted timestamp display — the exact InvoicePdfGenerator signed-invoice pattern.
+    private static final DateTimeFormatter DISPLAY_DATE_TIME =
+            DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm", DISPLAY_LOCALE);
     private static final int MONEY_SCALE = 2;
 
     // Phase 16D-C: hardcoded, display-only deposit — 40% of the inc-GST total for every tenant/store
@@ -109,6 +115,22 @@ public class QuotePdfGenerator {
         // them on a dedicated page when present (gated solely on termsHtml != null, SOFT and HARD alike).
         // Rendered with th:utext; everything else stays th:text-escaped.
         context.setVariable("termsHtml", model.termsHtml());
+
+        // Phase 16F PR1 acceptance block. Unsigned (preview / issued): accepted = false and the
+        // template renders the blank print-and-sign area exactly as before. Signed (remote acceptance):
+        // the two declaration squares render ticked and the stored signature image + "Accepted by
+        // {name} on {time}" fill the signature line. The signature is embedded as a base64 data URI —
+        // withHtmlContent(html, null) below has a NULL baseUri (the InvoicePdfGenerator precedent).
+        context.setVariable("accepted", model.accepted());
+        // ONE server-built caption text node (the template never concatenates spans), so the frozen
+        // name — never truncated — and the timestamp stay in reading order for text extraction.
+        context.setVariable("acceptedCaption", model.accepted()
+                ? "Accepted by " + model.acceptedCustomerName()
+                        + " on " + DISPLAY_DATE_TIME.format(model.acceptedAt())
+                : null);
+        context.setVariable("signatureDataUri", model.signaturePng() == null
+                ? null
+                : "data:image/png;base64," + Base64.getEncoder().encodeToString(model.signaturePng()));
 
         String html = templateEngine.process("quote", context);
 

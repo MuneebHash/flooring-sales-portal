@@ -1,6 +1,7 @@
 package com.flooring.salesportal.order.quote;
 
 import com.flooring.salesportal.common.api.ApiResponse;
+import com.flooring.salesportal.order.quote.QuoteSendService.QuoteSignatureImage;
 import com.flooring.salesportal.order.quote.QuoteSendService.QuoteStoredPdf;
 import com.flooring.salesportal.order.quote.QuoteService.QuotePreviewResult;
 import com.flooring.salesportal.order.quote.dto.QuoteDraftDto;
@@ -58,7 +59,7 @@ public class QuoteController {
         this.quoteSendService = quoteSendService;
     }
 
-    /** GET .../quote/workspace — draft + current_issued (accepted is null until 16F). LAID read allowed. */
+    /** GET .../quote/workspace — draft + current_issued + accepted (latest ACCEPTED, 16F PR1). LAID read allowed. */
     @GetMapping("/workspace")
     public ApiResponse<QuoteWorkspaceDto> getWorkspace(
             @PathVariable String slug,
@@ -105,8 +106,8 @@ public class QuoteController {
     }
 
     /**
-     * POST .../quote/send-email — issue (or resend) the quote and email it (issued PDF + link +
-     * body). Empty body only. LAID write blocked (422); provider failure → 502 EMAIL_SEND_FAILED
+     * POST .../quote/send-email — issue (or resend) the quote and email it (link + body; link-only
+     * since 16F PR1 — the issued PDF is stored, never attached). Empty body only. LAID write blocked (422); provider failure → 502 EMAIL_SEND_FAILED
      * with the issued version/PDF/token kept. 201 issued summary (never the token).
      */
     @PostMapping("/send-email")
@@ -151,7 +152,8 @@ public class QuoteController {
     /**
      * GET .../quote/pdf?type=issued|accepted — stream a STORED quote PDF (salesperson download;
      * LAID read allowed). type=issued → the active issued version's stored PDF; type=accepted →
-     * the 16F signed PDF (always 404 QUOTE_PDF_NOT_FOUND in 16E-A). Raw binary like the preview.
+     * the latest accepted version's stored SIGNED PDF (16F PR1; portal-only). Missing artifact →
+     * 404 QUOTE_PDF_NOT_FOUND. Raw binary like the preview.
      */
     @GetMapping("/pdf")
     public ResponseEntity<byte[]> downloadStoredPdf(
@@ -170,5 +172,30 @@ public class QuoteController {
                 .contentLength(pdf.bytes().length)
                 .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition)
                 .body(pdf.bytes());
+    }
+
+    /**
+     * GET .../quote/accepted/signature — stream the LATEST accepted quote version's stored signature
+     * image (16F PR1; the quote analogue of the invoice signature download). Raw {@code image/png}
+     * bytes, inline, backend-built file name {@code quote-signature-{order_number}-v{n}.png}. LAID read
+     * allowed. No accepted version / no stored signature → 404 QUOTE_SIGNATURE_NOT_FOUND; errors use
+     * the standard JSON wrapper. The workspace {@code accepted.signature_download_path} points here.
+     */
+    @GetMapping("/accepted/signature")
+    public ResponseEntity<byte[]> downloadAcceptedSignature(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            HttpServletRequest httpRequest) {
+        QuoteSignatureImage signature = quoteSendService.downloadAcceptedSignature(slug, orderId, httpRequest);
+
+        String contentDisposition = ContentDisposition.inline()
+                .filename(signature.fileName(), StandardCharsets.UTF_8)
+                .build()
+                .toString();
+        return ResponseEntity.ok()
+                .contentType(MediaType.parseMediaType(signature.mimeType()))
+                .contentLength(signature.bytes().length)
+                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition)
+                .body(signature.bytes());
     }
 }
