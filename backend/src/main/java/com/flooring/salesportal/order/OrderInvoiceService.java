@@ -26,6 +26,7 @@ import com.flooring.salesportal.order.dto.InvoiceDetailDto;
 import com.flooring.salesportal.order.dto.InvoiceResponse;
 import com.flooring.salesportal.order.dto.OrderFinancialSummaryDto;
 import com.flooring.salesportal.order.financial.OrderFinancialCalculator;
+import com.flooring.salesportal.order.quote.QuoteVersionRepository;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -87,6 +88,9 @@ public class OrderInvoiceService {
     private static final String PDF_EXTENSION = "pdf";
     private static final String ADDRESS_BILLING = "BILLING";
     private static final String STATUS_LAID = "LAID";
+    // Phase 16F PR1 D5(c): the quote version / token status written when D.8 kills an active link.
+    private static final String QUOTE_VERSION_CANCELLED = "CANCELLED";
+    private static final String QUOTE_TOKEN_CANCELLED = "CANCELLED";
 
     // Phase 13 D.8 Accept multipart contract (§5.1): exactly two parts, any other part name -> 400.
     private static final String SIGNATURE_PART = "signature";
@@ -95,8 +99,9 @@ public class OrderInvoiceService {
     private static final String SIGNATURE_EXTENSION = "png";
     // Exactly 2 MB. size > this -> 400 SIGNATURE_INVALID; size == this is allowed.
     private static final long MAX_SIGNATURE_SIZE_BYTES = 2_097_152L;
-    // Matches invoice.accepted_customer_name VARCHAR(150): over-length is a clean 400 (mirrors the
-    // payment_reference length guard) rather than a DB value-too-long 500.
+    // The D.8 REQUEST rule (Phase 13 §5.1: max 150 chars), a clean 400 that mirrors the
+    // payment_reference length guard. The column itself is TEXT since V19 (16F PR1 — remotely signed
+    // quotes inherit untruncated frozen names); widening storage does not widen this request rule.
     private static final int MAX_ACCEPTED_NAME_LENGTH = 150;
 
     // Locked Phase 13 response messages (§5.1 / §5.2).
@@ -120,6 +125,7 @@ public class OrderInvoiceService {
     private final InvoicePdfModelAssembler invoicePdfModelAssembler;
     private final FileStorageService fileStorageService;
     private final InvoiceEmailSender invoiceEmailSender;
+    private final QuoteVersionRepository quoteVersionRepository;
     private final ObjectMapper objectMapper;
     // Programmatic transactions for the Phase 13 accept/resend flows: the email send must run AFTER
     // the acceptance commit (and the email-success stamp in its own follow-up transaction), so those
@@ -142,6 +148,7 @@ public class OrderInvoiceService {
                                InvoicePdfModelAssembler invoicePdfModelAssembler,
                                FileStorageService fileStorageService,
                                InvoiceEmailSender invoiceEmailSender,
+                               QuoteVersionRepository quoteVersionRepository,
                                PlatformTransactionManager transactionManager,
                                ObjectMapper objectMapper) {
         this.requestContextGuard = requestContextGuard;
@@ -159,6 +166,7 @@ public class OrderInvoiceService {
         this.invoicePdfModelAssembler = invoicePdfModelAssembler;
         this.fileStorageService = fileStorageService;
         this.invoiceEmailSender = invoiceEmailSender;
+        this.quoteVersionRepository = quoteVersionRepository;
         this.objectMapper = objectMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
@@ -437,6 +445,12 @@ public class OrderInvoiceService {
      * {@code last_emailed_at = null} and a message pointing at Re-send (contract §13 — D.9 Resend is
      * the only path that surfaces {@code EMAIL_SEND_FAILED}). The response DTO is built from the FINAL
      * post-email state, so {@code last_emailed_at} reflects the actual send outcome.
+     *
+     * <p>Phase 16F PR1 (decision D5(c)/(d)): the same persist transaction also cancels the order's
+     * ISSUED quote version + its ACTIVE token, if one exists, so a quote link can no longer be signed
+     * once the invoice is signed in-app. An accepted quote never blocks this endpoint and is never
+     * revoked by it; the request contract, validation order, LAID allowance and email behaviour are
+     * unchanged.
      */
     public ApiResponse<InvoiceResponse> acceptCurrentInvoice(String slug,
                                                              String orderIdRaw,
@@ -547,6 +561,13 @@ public class OrderInvoiceService {
                 // reset to null here; the post-commit email-success stamp sets both to the same value.
                 invoiceRepository.updateSalesOrderLastEmailedAt(orderId, row.lastEmailedAt());
 
+                // Phase 16F PR1 — decision D5(c): the in-app invoice signature kills an ACTIVE quote
+                // link so the quote can no longer be signed remotely. Same transaction and same order
+                // lock as this acceptance, so both commit or roll back together (never post-commit,
+                // never dependent on the email below). One direction only (D5(d)): an already
+                // ACCEPTED quote is never touched and never blocks D.8; no ISSUED version → no-op.
+                cancelActiveQuoteLink(orderId, acceptedAt);
+
                 return new AcceptedInvoice(
                         row, order.getOrderNumber(), customer.getEmail().trim(), pdfBytes, pdfFileName);
             } catch (RuntimeException ex) {
@@ -557,6 +578,24 @@ public class OrderInvoiceService {
             fileStorageService.deleteQuietly(signaturePath);
             throw ex;
         }
+    }
+
+    /**
+     * Phase 16F PR1 — decision D5(c). Cancel the order's ISSUED quote version (if any) and kill its
+     * ACTIVE token with the {@code CANCELLED} reason, inside the caller's D.8 persist transaction
+     * (the order row is already held {@code FOR UPDATE}). Deliberately NOT the protected "Cancel
+     * quote" endpoint: that one fails with 422 {@code QUOTE_NOT_ISSUED} / 409
+     * {@code QUOTE_ALREADY_ACCEPTED} when nothing is issued, which must never block an invoice
+     * acceptance. Here no ISSUED version is a silent no-op; ACCEPTED / SUPERSEDED / EXPIRED /
+     * CANCELLED versions and their (already dead) tokens are never touched. The guarded
+     * {@code moveIssuedVersionTo} cannot miss under the held order lock (every quote transition,
+     * including the public lazy expiry and accept, takes the same lock).
+     */
+    private void cancelActiveQuoteLink(long orderId, LocalDateTime cancelledAt) {
+        quoteVersionRepository.findIssuedByOrderId(orderId).ifPresent(issued -> {
+            quoteVersionRepository.moveIssuedVersionTo(issued.quoteVersionId(), QUOTE_VERSION_CANCELLED);
+            quoteVersionRepository.killActiveToken(issued.quoteVersionId(), QUOTE_TOKEN_CANCELLED, cancelledAt);
+        });
     }
 
     // ------------------------------------------------------------------

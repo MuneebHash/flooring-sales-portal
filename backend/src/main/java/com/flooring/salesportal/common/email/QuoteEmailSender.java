@@ -4,9 +4,9 @@ package com.flooring.salesportal.common.email;
  * Provider-agnostic QUOTE email transport (Phase 16E-A; contract §9: providers are
  * provider-independent behind interfaces, per the Phase 13 email precedent). Deliberately a
  * SEPARATE interface from {@link InvoiceEmailSender} — the locked "duplicate, don't extract"
- * decision for the quote feature: a quote email carries the issued quote PDF plus the public
- * signing link, and its recorded sends must never be conflated with invoice sends in tests or in
- * the later Phase 17 provider wiring.
+ * decision for the quote feature: a quote email carries the public quote link only (link-only since
+ * 16F PR1 — no PDF attachment; {@link QuoteEmailRequest} has no attachment field), and its recorded
+ * sends must never be conflated with invoice sends in tests or in the later Phase 17 provider wiring.
  *
  * <p>On a quote send the delivery IS the operation (contract §7.1): the caller translates a
  * {@link QuoteEmailException} into 502 {@code EMAIL_SEND_FAILED}, while the already-persisted

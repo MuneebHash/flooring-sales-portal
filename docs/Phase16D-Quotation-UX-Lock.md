@@ -2,7 +2,7 @@
 
 Status: **locked product + UX contract for Phase 16D onward.** Docs-only. No code is implemented by this document.
 
-Implementation status (post-16E reconciliation, `main` @ `33c4e22`): the 16D and 16E behaviour described here is **built** — Quote Draft (16D), Send by Email + Customer Quote (16E-B), and the public read-only quote page with viewed tracking (16E-C). Remote acceptance, the Accepted Quote view, the signed quote PDF and Create Invoice from an accepted quote are **planned 16F** and not built. Delivery is **email only**; SMS is dormant (§12).
+Implementation status (16F PR1 — backend acceptance; base `main` @ `39fc7d4`): the 16D and 16E behaviour described here is **built** — Quote Draft (16D), Send by Email + Customer Quote (16E-B), and the public read-only quote page with viewed tracking (16E-C). 16F PR1 adds the **backend only** of remote acceptance: the public accept endpoint (signature-only; accepted name from the `V17` issue snapshot), the stored signed quote PDF (§15), the post-commit store notification, the protected accepted reads (§14), the acceptance price write (decision D6b — an explicit amendment to the 16D-A separation, §1.1), and the cancellation of an active quote link when an invoice is accepted in-app (decision D5(c), §16). The quote email is now **link-only** (§12). Still **planned 16F**: Create Invoice from an accepted quote (Path A — PR2) and **all** 16F frontend (PR3) — the public signing UI, the Accepted Quote view, the issued/accepted refresh guards and the send-after-acceptance warning. The frontend is unchanged by PR1. Delivery is **email only**; SMS is dormant (§12).
 
 This document **extends and clarifies** `docs/API-Contracts-Phase16B-Quotation.md`. It does **not** replace it. Phase 16B remains the authoritative contract for the broader quotation lifecycle (quote draft, issued/customer quote, accepted quote, send by email (SMS dormant), public token link, viewed/opened state, customer acceptance/signature, signed quote PDF, create-invoice-from-accepted-quote).
 
@@ -18,18 +18,19 @@ These three points exist because earlier drafts described behavior that does not
 
 ### 1.1 Quote modularity — described accurately
 
-Current backend reality on `main` (Phase 16C–16E):
+Current backend reality (Phase 16C–16E, amended by 16F PR1 — see the D6b amendment below):
 
 - Quote lines do **not** mutate the order's product/charge lines. That separation is real and must be preserved.
 - `PUT /api/v1/{slug}/orders/{orderId}/quote/draft` saves the quote draft **only**. It does **not** change the order sale-price override or any `sales_order` header financials (decoupled in Phase 16D-A).
-- Issuing/sending a quote (16E) does not change the order price or header financials either.
-- Therefore quote autosave never changes the order/header price or the next invoice — the quote draft is fully independent of order pricing.
+- Issuing/sending a quote (16E) does not change the order price or header financials either — and neither do Preview PDF or Cancel quote.
+- Therefore quote autosave (and sending) never changes the order/header price or the next invoice — the quote draft is fully independent of order pricing.
+- **Amendment — 16F decision D6b (backend built in 16F PR1):** customer **acceptance** is the one deliberate exception to the 16D-A separation — a signed quote is the final price. When the customer signs on the public link, the signed inc-GST total is applied as the order's **standard sale-price override**: `price_adjustment_inc_gst` (the same stored adjustment the Details of Sale override uses) = accepted total inc GST − the calculated line total at acceptance, replacing any earlier override, and the header sale price ex GST, total cost, GP and GP% are recomputed. At that moment Details of Sale's final sale price equals the accepted total and GP recalculates from it. Like any override the adjustment is then fixed, so later Products & Charges edits (only possible while the order is not LAID) shift the working price relative to the signed total; the manual override and reset in Details of Sale remain the correction tools. The accepted quote snapshot itself never changes, and Path A (planned 16F PR2) bills that frozen snapshot, never the working order price. The write happens even on a LAID order (acceptance is allowed when LAID — D4); the protected sale-price endpoints keep their LAID gate. Draft saves, Preview PDF, send/resend and cancel still never touch the order price, and quote lines still never touch Products & Charges.
 
 What 16D states:
 
 - The quote draft is **price-independent**. Quote lines are customer-facing and separate from operational product/charge lines; editing/saving a quote never edits Products & Charges and never changes the order sale price.
-- The header "Sale total" is driven only by Products & Charges plus the manual sale-price override — a quote save does **not** move it.
-- The quote total **may differ** from the order's working price by design; they reconcile later only via the 16F accepted-snapshot invoice path (Path A).
+- The header "Sale total" is driven only by Products & Charges plus the sale-price override — set manually in Details of Sale or, on acceptance, to the accepted quote total (D6b). A quote save or send does **not** move it.
+- The quote total **may differ** from the order's working price by design while the quote is a draft or sent. Acceptance aligns them at that moment (D6b), and Path A (planned 16F PR2) bills the accepted snapshot, never the live order price.
 
 ### 1.2 Quote PDF wording — implemented in Phase 16D-C
 
@@ -40,13 +41,15 @@ Current known state of the quote PDF template (`quote.html`) after Phase 16D-C:
 
 These were backend template/PDF wording changes completed under the separately scoped Phase 16D-C backend task with its own verify gate and Codex review.
 
+Since 16F PR1 the same template also renders the stored **signed** quote PDF: both declaration squares ticked, the signature image and `Accepted by {name} on {dd/MM/yyyy HH:mm}` (§15). The draft preview and the issued PDF keep the blank acceptance area.
+
 ### 1.3 Send Quote — email sending is built (16E)
 
 History: 16D shipped the Send Quote button and its confirmation modal with delivery disabled (no backend send endpoint called). 16E wired email delivery.
 
 Current behaviour (16E-A backend, 16E-B UI):
 
-- `Send by Email` calls `send-email`, which issues a new quote version (or resends the unchanged one), stores the immutable issued PDF, mints the public link, and makes the Customer Quote sub-tab functional (§12, §13).
+- `Send by Email` calls `send-email`, which issues a new quote version (or resends the unchanged one), stores the immutable issued PDF, mints the public link, and makes the Customer Quote sub-tab functional (§12, §13). Since 16F PR1 the email carries the public link only — no PDF attachment (§12).
 - `Send by Phone/SMS` is shown **disabled** and no SMS call is ever made. SMS is dormant backend support only, outside the approved delivery scope (email only) — see §12.
 - In the current build email delivery is **recording-only** (in-memory sender): no real email reaches the customer until the Phase 17 email provider.
 
@@ -58,8 +61,8 @@ A quote is a **customer-facing commercial document**. Products & Charges / Detai
 
 - Quote Draft is a customer-facing, editable presentation, initially seeded from the order, that then becomes its own working quote canvas.
 - Quote lines **never** mutate order product/charge lines.
-- A quote **may** differ from the internal/current order working price by design; saving a quote does not change the order price (see §1.1).
-- The accepted quote snapshot becomes the source for quote-led invoice creation later (16F).
+- A quote **may** differ from the internal/current order working price by design; saving or sending a quote does not change the order price. Acceptance does: the accepted total becomes the order's sale-price override (decision D6b, backend built in 16F PR1 — see §1.1).
+- The accepted quote snapshot (created by the public accept, 16F PR1) is the source for quote-led invoice creation (Path A — planned 16F PR2).
 
 Illustrative:
 
@@ -122,11 +125,11 @@ The Quote tab has three internal sub-tabs:
 2. **Customer Quote** — latest sent/issued quote snapshot, read-only.
 3. **Accepted Quote** — latest accepted/signed quote snapshot, read-only.
 
-Current state (post-16E):
+Current state (16F PR1 — backend only; the frontend is unchanged):
 
 - **Quote Draft** is functional (16D).
-- **Customer Quote** is functional (16E-B) — it renders the active issued quote from `current_issued` (§13), and shows the clean empty state `No quote has been sent yet.` when there is no active issued quote (never sent, cancelled, or already lazily expired by a public visit after its link lapsed).
-- **Accepted Quote** shows the clean empty state `No quote has been accepted yet.` — `accepted` is always null until 16F.
+- **Customer Quote** is functional (16E-B) — it renders the active issued quote from `current_issued` (§13), and shows the clean empty state `No quote has been sent yet.` when there is no active issued quote (never sent; cancelled, including by an in-app invoice acceptance (D5(c), §16); accepted; or already lazily expired by a public visit after its link lapsed). Known gap until 16F PR3: after an acceptance `current_issued` is null, so this sub-tab shows that empty state although the quote was sent and signed.
+- **Accepted Quote** still shows only the clean empty state `No quote has been accepted yet.` Since 16F PR1 the backend returns a non-null `accepted` summary after a remote acceptance (§14); the frontend ignores it until 16F PR3 builds the sub-tab (planned).
 
 These are real lifecycle tabs, not throwaway placeholders.
 
@@ -208,11 +211,11 @@ After seeding:
 - editing quote lines does **not** mutate operational product/charge rows
 - if a saved quote draft already has lines, **the saved quote draft lines are the source of truth** — do not silently overwrite them from Products & Charges just because the order changed. Re-seeding only happens on an explicit user rebuild. This includes retained dormant rows on a non-itemised draft: toggling itemised back ON restores them and must not re-seed (§9 — active until Batch A #108 changes it).
 
-### 8.2 Quote pricing is independent of the order (locked)
+### 8.2 Quote draft pricing is independent of the order (locked; acceptance exception D6b)
 
-The quote draft save is decoupled from order pricing (Phase 16D-A, see §1.1): saving a quote never writes `sales_order.price_adjustment_inc_gst` or any header financial. There is therefore **no** override to reconcile or preserve on carry-over — turning itemised ON and saving the seeded lines does not change the order price in any way.
+The quote draft save is decoupled from order pricing (Phase 16D-A, see §1.1): saving a quote never writes `sales_order.price_adjustment_inc_gst` or any header financial. There is therefore **no** override to reconcile or preserve on carry-over — turning itemised ON and saving the seeded lines does not change the order price in any way. The one exception is customer **acceptance** (16F decision D6b, backend built in PR1), which writes the accepted total inc GST as the order's sale-price override (§1.1). It is not a draft save and has no effect on seeding or carry-over.
 
-Seed the quote from the order's current sale-side line data as a **starting point only**. The salesperson then edits the quote freely; the quote total may differ from the order Sale total with no effect on the order or the next invoice.
+Seed the quote from the order's current sale-side line data as a **starting point only**. The salesperson then edits the quote freely; the quote total may differ from the order Sale total, and editing, saving or sending it has no effect on the order or the next invoice — of all quote actions, only the customer's acceptance changes the order price (D6b, §1.1).
 
 ### 8.3 Itemised math / adjustment helper
 
@@ -275,6 +278,8 @@ Requirements:
 
 **Important documented behavior:** the quote draft save is decoupled from order pricing (§1.1), so autosave does **not** change the order/header "Sale total" and does **not** require refreshing the order financial summary. Debounce should still be generous (e.g. ~800ms–1s) to avoid excessive PUTs. The frontend must not assume a quote save updates order financials.
 
+The D6b amendment (§1.1) does not change this: autosave stays price-independent. Only a remote **acceptance** writes the order price, and it happens outside the editing session (on the customer's device). PR1 adds no frontend refresh, so an already-open workspace shows the accepted price only after it next reads the order; the issued/accepted refresh for the Quote tab is planned 16F PR3.
+
 ---
 
 ## 11. Preview PDF
@@ -313,6 +318,8 @@ Current behavior (built in 16E-B; 16D shipped the same modal with delivery disab
 - on success the modal closes, the confirmation `Quote sent by email.` shows, and Customer Quote renders the returned issued summary.
 - errors show inside the modal: a missing/invalid customer email adds a pointer and a `Go to Customer tab` button; a delivery failure (502) says nothing was sent and it is safe to try again (the issued version/PDF/link were kept); other backend messages show verbatim.
 - delivery is **recording-only** in the current build — the send is recorded in memory and no real email reaches the customer (Phase 17 adds the provider).
+- the quote email is **link-only** (16F PR1): a short body with the public quote link and **no PDF attachment** (16E-A attached the issued PDF). The immutable issued PDF is still generated and stored on issue; the customer opens it from the public page (its `PDF` button) and the salesperson from Customer Quote `Preview PDF`.
+- **sending after an acceptance (decision D9):** the backend allows it — with no active issued version a send always issues a **new** quote version (with a new link) that needs a new signature, and the accepted version is never changed. **Planned (16F PR3):** when an accepted quote exists, the modal first shows the accepted state and warns that sending again creates a new version needing a new signature. Until PR3 the modal shows no such warning.
 - `Send by Phone/SMS` is disabled and never calls the backend. SMS is dormant backend support, **not** approved customer delivery (email only), and no activation is planned. The button's current "Available soon" wording overstates this — a known follow-up listed in `docs/Phases.md` §8 (no issue filed yet); this document does not change the UI.
 
 Hard rule: **no accidental one-click sending** — sending always passes through this confirmation modal.
@@ -321,37 +328,42 @@ Hard rule: **no accidental one-click sending** — sending always passes through
 
 ## 13. Customer Quote — built (16E-B)
 
-Read-only. Shows the active issued quote from the workspace `current_issued` summary (seeded by the probe, replaced by send responses, cleared by a successful cancel) — **never** from the live draft rows, totals, details or terms, which may have drifted since the issue was frozen. Never shows raw cost, GP, token or internal file data.
+Read-only. Shows the active issued quote from the workspace `current_issued` summary (seeded by the probe, replaced by send responses, cleared by a successful cancel) — **never** from the live draft rows, totals, details or terms, which may have drifted since the issue was frozen. Never shows raw cost, GP, token or internal file data. Since 16F PR1 the backend also returns `current_issued` as null once the quote is accepted, or once an in-app invoice acceptance cancels it (D5(c)); until the PR3 refresh lands, an open Quote tab learns of either only when the order is reloaded.
 
 - **Status badge:** `Sent`; `Opened` once the customer has opened the public link (`viewed_at` set — 16E-C, shown from the next workspace load); `Not delivered` when the latest email attempt failed (with "The email could not be delivered. Resend to try again."). Keep the status model simple — no further states for MVP.
 - **Details:** channel, sent time, link expiry.
-- **Actions:** `Preview PDF` (opens the **stored** issued PDF, never regenerated), `Resend` (through the §12 confirmation modal; disabled when LAID), `Cancel quote` (its own confirmation — "Cancel this quote?" / "The customer's quote link will stop working. You can send a new quote at any time."; allowed when LAID because it only kills the public link).
+- **Actions:** `Preview PDF` (opens the **stored** issued PDF, never regenerated), `Resend` (through the §12 confirmation modal; disabled when LAID), `Cancel quote` (its own confirmation — "Cancel this quote?" / "The customer's quote link will stop working. You can send a new quote at any time."; allowed when LAID because it only kills the public link). Cancel on an order whose quote was already accepted (no active issued version) is rejected with 409 `QUOTE_ALREADY_ACCEPTED`, shown verbatim (reachable since 16F PR1).
+- **PDF action (settled 16F decision):** `Preview PDF` only — **no separate download button**; the browser downloads from the preview. This is the built behaviour, and the Accepted Quote view follows the same rule (§14).
 - **Document:** a read-only "Issued quote" view of the frozen version (version number, details of sale, the snapshot lines for an itemised issue, and the ex-GST / inc-GST totals). The full document, including terms, is the stored issued PDF.
 
-The customer-facing side is the public read-only quote page `/q/{token}` (16E-C): it renders the issued snapshot (customer identity from the `V17` snapshot; business presentation fields read live), records the first view, offers the stored issued PDF, and shows a per-state message for expired/replaced/cancelled/inactive links. Its customer-acceptance area is static document content — signing is 16F.
+The customer-facing side is the public read-only quote page `/q/{token}` (16E-C): it renders the issued snapshot (customer identity from the `V17` snapshot; business presentation fields read live), records the first view, offers the stored issued PDF, and shows a per-state message for expired/replaced/cancelled/inactive links. Its customer-acceptance area is still static document content. The backend accept (`POST /api/v1/public/quotes/{token}/accept` — the signature image only; the accepted name comes from the `V17` issue snapshot, never typed) exists since 16F PR1, but the **signing UI is planned 16F PR3**: a signature pad (mouse or finger), the two declarations (a frontend gate only — D8; the signed PDF renders them ticked) and `Accept`, placed after the terms. The page keeps its `PDF` button (the stored issued PDF) — the customer's way to get the PDF now that the email is link-only. Once signed the link is dead: the page shows the inactive message (token `CONSUMED`) and the signed PDF is never served publicly.
 
 ---
 
-## 14. Accepted Quote — future visual (planned 16F)
+## 14. Accepted Quote — backend data built (16F PR1); visual planned (16F PR3)
 
-Not built: today the sub-tab shows only its empty state (§5). Planned for 16F — same quotation canvas style, read-only and signed. Shows:
+**Backend (built, 16F PR1):** the quote workspace returns the order's **latest** accepted version as `accepted` (null when none), selected independently of the draft and of `current_issued`: the frozen ex/inc-GST totals, itemised flag, flooring type, details of sale, the snapshot lines (always empty for a non-itemised quote), the accepted customer name (`V17` issue snapshot — D1) and time, signature presence plus `signature_download_path`, `signed_pdf_available`, and `invoice_eligible` (false once the order's current invoice is accepted — D5(b)). No cost, GP, token, storage path or file id. The stored signed PDF streams from `GET …/quote/pdf?type=accepted` and the signature image from `GET …/quote/accepted/signature` (both protected, LAID allowed). The stored signature is the server-normalised re-encoding of the customer's PNG (same dimensions and pixels; ancillary chunks and trailing bytes dropped — contract §7.2), so that download returns the normalised image, not the original upload bytes.
+
+**Frontend (planned 16F PR3):** today the sub-tab still shows only its empty state (§5). It will use the same quotation canvas style, read-only and signed, rendered only from `accepted` (never the live draft or order). Shows:
 
 - the same customer-facing quote content
-- signature section
-- accepted customer name
+- signature section (image from `accepted.signature_download_path`, consumed verbatim)
+- accepted customer name (the issue-time `V17` snapshot; never typed)
 - accepted date/time
-- `Create Invoice` button (from the accepted quote)
-- download signed PDF if available
+- `Create Invoice` button (from the accepted quote — backend Path A planned 16F PR2); disabled with `Invoice already accepted` when `invoice_eligible` is false (D5(b))
+- `Preview signed PDF` when `signed_pdf_available` — opens the stored signed PDF in a new tab; **no separate download button** (the browser downloads from the preview). Same rule as Customer Quote (§13).
 
-Create Invoice from the accepted quote uses the **accepted quote snapshot**. After an invoice is created from an accepted quote, the normal Details of Sale button becomes `Rewrite Invoice` (an invoice now exists), and the salesperson can still use the direct Details-of-Sale invoice/rewrite flow as normal.
+Create Invoice from the accepted quote uses the **accepted quote snapshot** (planned 16F PR2/PR3). After an invoice is created from an accepted quote, the normal Details of Sale button becomes `Rewrite Invoice` (an invoice now exists), and the salesperson can still use the direct Details-of-Sale invoice/rewrite flow as normal.
 
 Accepted Quote shows the **latest** accepted quote only for MVP; older accepted-quote history stays out of the UI unless explicitly scoped later.
 
+`Rewrite Quote` is **out of scope** for 16F (decision D10): cancel + new quote is the model. After an acceptance the salesperson edits the draft and sends again, which issues a new version that needs a new signature (D9, §12); the accepted version is never changed.
+
 ---
 
-## 15. Quote PDF — Phase 16D-C implemented visual direction
+## 15. Quote PDF — Phase 16D-C implemented visual direction (+ 16F PR1 signed PDF)
 
-The quote PDF is backend (`quote.html`). Phase 16D-C completed the separately scoped backend quote PDF update.
+The quote PDF is backend (`quote.html`). Phase 16D-C completed the separately scoped backend quote PDF update; 16F PR1 added the signed variant (below).
 
 Implemented:
 
@@ -365,11 +377,12 @@ Implemented:
 - adjustment/discount lines shown visibly if present; total matches the visible lines
 - never show raw cost
 
-Still future 16F scope:
+Built in 16F PR1 (backend):
 
-- remote customer quote signing
-- accepted quote lifecycle
-- signed quote PDF with accepted timestamp and stored signature
+- the **signed quote PDF**, generated and stored immutably at acceptance from the accepted version's frozen snapshot — the itemised flag, snapshot lines (line table only when itemised), totals, details of sale, frozen terms (no terms page when none were frozen) and the `V17` "Quotation To" identity; never the live draft, live customer/address or live terms. Business presentation (name, logo, ABN, bank, store contact, salesperson) is read live at acceptance, as for the issued PDF. Same `QUOTATION` template and 40% deposit line, with the acceptance area filled: both declaration squares **ticked**, the stored **signature image** (the server-normalised PNG — contract §7.2), and the caption `Accepted by {name} on {dd/MM/yyyy HH:mm}` (the accepted name and time). It is portal-only (`GET …/quote/pdf?type=accepted`, file `quote-{order}-v{n}-signed.pdf`) and never served on the public link. The draft preview and the issued PDF are unchanged (blank acceptance area).
+- the accepted lifecycle: version `ACCEPTED` (its snapshot total is the legal billing number), token `CONSUMED` (the public link dies).
+
+Still planned 16F: the public signing UI and the Accepted Quote `Preview signed PDF` (PR3).
 
 ---
 
@@ -378,9 +391,18 @@ Still future 16F scope:
 Quote and invoice are separate lifecycle objects.
 
 - Direct invoice path: Details of Sale → `Create Invoice` / `Rewrite Invoice`.
-- Quote path: Details of Sale → `Create Quote` → Quote Draft → Send Quote → Customer Quote → Accepted Quote → Create Invoice from Accepted Quote (the last two steps are planned 16F).
+- Quote path: Details of Sale → `Create Quote` → Quote Draft → Send Quote → Customer Quote → customer acceptance → Accepted Quote → Create Invoice from Accepted Quote (customer acceptance: backend built in 16F PR1, signing UI planned PR3; Accepted Quote view planned PR3; Create Invoice from Accepted Quote planned PR2 backend / PR3 UI).
 
 A quote is not mandatory for invoicing — an invoice can still be created directly from Details of Sale. A quote can be created before or after an invoice, as long as the Quote tab has not already been opened for that order. Once a quote is accepted and an invoice is created from it, the Details of Sale button reads `Rewrite Invoice`.
+
+Since 16F PR1:
+
+- Accepting the current invoice in-app (signing on the iPad) cancels any active issued quote and its link in the same transaction (decision D5(c)), so that quote can no longer be signed remotely (its link shows the cancelled message). With no active issued quote it does nothing.
+- An accepted quote never blocks in-app invoice signing and is never revoked by it (D5(d)) — one direction only. If the invoice is signed in-app, the accepted quote simply is not converted.
+- A remote acceptance sets the order's sale-price override to the accepted total (D6b, §1.1). A direct Create/Rewrite Invoice from Details of Sale still uses the order's working price, which therefore equals the accepted total unless Products & Charges or the override changed after the acceptance.
+- **Known open item (no guard, by decision):** D5(c) cancels only the quote link that is active when the invoice is signed in-app. A quote sent after that can still be signed remotely, and its D6b write then changes the working order price while the accepted invoice stays frozen. Recorded for reviewer/user decision (contract §13); not a behaviour PR1 changes.
+
+Planned 16F PR2 (Path A): Create Invoice from the accepted quote appends a new invoice version when an unsigned invoice exists (rewrite mechanics, payments carried — D5(a)); it is unavailable (`Invoice already accepted`) when the current invoice is already accepted (D5(b)). Create Invoice from the accepted quote follows the existing invoice-create LAID rule (D4).
 
 ---
 
@@ -403,11 +425,12 @@ A quote is not mandatory for invoicing — an invoice can still be created direc
 - 16E-B: Send by Email wired through the confirmation modal; Customer Quote tab functional (Sent / Opened / Not delivered, stored issued PDF preview, Resend, Cancel quote)
 - 16E-C: public read-only quote page `/q/{token}`; public viewed tracking (drives `Opened`); issue-time customer snapshots (`V17`); reserved slug `q` (`V18`)
 
-**16F — remote acceptance + invoice conversion (PLANNED, not built):**
+**16F — remote acceptance + invoice conversion (IN PROGRESS — three PRs):**
 
-- customer signature on the public link; accepted quote; signed PDF; store notification email
-- Accepted Quote tab functional
-- Create Invoice from Accepted Quote (inherits the signature; no re-sign)
+- **PR1 — backend acceptance (BUILT):** public `POST /public/quotes/{token}/accept` (signature-only multipart; accepted name from the `V17` snapshot — D1; allowed when LAID — D4; public-safe 422 wording — D11); signed quote PDF stored; version `ACCEPTED`, token `CONSUMED`; post-commit store notification email (the order's store email, skipped if blank, no attachment, recording-only); accepted total → order sale-price override (D6b); in-app invoice acceptance cancels the active issued quote (D5(c)); protected reads (`workspace.accepted`, `pdf?type=accepted`, `GET …/quote/accepted/signature`); quote email link-only; migration `V19`.
+- **PR2 — backend Create Invoice from Accepted Quote, Path A (PLANNED):** inherits the signature (no re-sign); invoice fields from the accepted snapshot only; frozen quote terms on the invoice (D6/D7).
+- **PR3 — frontend (PLANNED):** public signing UI; Accepted Quote tab functional (`Preview signed PDF` only); Create Invoice button; issued/accepted refresh with stale-response guards; send-after-acceptance warning (D9).
+- Out of scope: `Rewrite Quote` (D10).
 
 ---
 
@@ -419,8 +442,10 @@ Forbidden (display, bind, or send): `cost`, `cost_snapshot`, `costSnapshot`, `un
 
 Allowed in the protected salesperson portal only: `gp_percent`, the below-cost warning, and quote totals. The public/customer quote surface is entirely cost-free.
 
+The public accept (16F PR1) never shows cost or GP figures: a below-cost quote, a missing name snapshot and a price that cannot be stored all return the same customer-facing message `This quote can no longer be accepted online. Please contact the store.` (decision D11). The raw 422 `error.code` (`QUOTE_BELOW_COST` / `ACCEPTED_CUSTOMER_NAME_REQUIRED` / `BUSINESS_RULE_VIOLATION`) still names the cause in the response body — accepted under D11 ("code stays QUOTE_BELOW_COST"); the PR3 page should show only the message. The store notification carries no cost or GP either.
+
 ---
 
 ## 19. Purpose of this document
 
-This is the visual/workflow source of truth for Phase 16D onward. It exists so implementation agents do not guess: where the Quote tab appears and when it persists, what `Create Quote` means, how Quote Draft looks, how itemised carry-over and adjustment math work, how autosave behaves (quote-only; it does not change order pricing), what Customer Quote and Accepted Quote mean, how the quote PDF looks, and what belongs to 16D vs 16E vs 16F.
+This is the visual/workflow source of truth for Phase 16D onward. It exists so implementation agents do not guess: where the Quote tab appears and when it persists, what `Create Quote` means, how Quote Draft looks, how itemised carry-over and adjustment math work, how autosave behaves (quote-only; it does not change order pricing — only the customer's acceptance does, D6b), what Customer Quote and Accepted Quote mean, how the quote PDF looks, and what belongs to 16D vs 16E vs 16F.

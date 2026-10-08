@@ -787,23 +787,46 @@ class PublicQuoteControllerTest {
     void publicPdf_activeToken_streamsStoredIssuedPdfVerbatim() throws Exception {
         long orderId = sendReadyOrder();
         String token = issueAndExtractToken(orderId);
-        QuoteEmailRequest email = quoteEmailSender.sentEmails().get(0);
 
         MvcResult result = mockMvc.perform(get(publicPdfUrl(token)))
                 .andExpect(status().isOk())
                 .andExpect(header().string("Content-Type", "application/pdf"))
                 .andReturn();
 
-        // Byte-identical to the attachment persisted+delivered at issue: the endpoint serves the
-        // STORED bytes verbatim (a regenerated PDF could never be byte-identical — metadata
-        // timestamps alone would differ).
-        Assertions.assertArrayEquals(email.pdfBytes(),
+        // 16F PR1: the quote email is LINK-ONLY (no attachment), so the comparison basis is the
+        // STORED issued artifact itself: quote_version.issued_pdf_file_id -> stored_file -> the
+        // bytes on disk (read through the same FileStorageService the endpoint uses). The endpoint
+        // serves those STORED bytes verbatim (a regenerated PDF could never be byte-identical —
+        // metadata timestamps alone would differ).
+        Map<String, Object> storedFile = jdbcTemplate.queryForMap(
+                "SELECT sf.file_name, sf.storage_path, sf.mime_type, sf.file_size FROM quote_version v "
+                        + "JOIN stored_file sf ON sf.stored_file_id = v.issued_pdf_file_id "
+                        + "WHERE v.order_id = ? AND v.status = 'ISSUED'", orderId);
+        Assertions.assertEquals("application/pdf", storedFile.get("mime_type"));
+        byte[] storedBytes = context.getBean(com.flooring.salesportal.common.storage.FileStorageService.class)
+                .read((String) storedFile.get("storage_path"));
+        Assertions.assertEquals(((Number) storedFile.get("file_size")).longValue(), (long) storedBytes.length,
+                "stored_file.file_size must equal the stored bytes on disk");
+        Assertions.assertTrue(storedBytes.length > 5, "stored issued PDF bytes present");
+        Assertions.assertEquals("%PDF-", new String(storedBytes, 0, 5, StandardCharsets.US_ASCII),
+                "the stored issued artifact is a real PDF");
+        Assertions.assertArrayEquals(storedBytes,
                 result.getResponse().getContentAsByteArray(),
                 "public PDF must be the stored issued artifact, never a regeneration");
+
+        // The protected salesperson read streams the very same stored artifact.
+        byte[] protectedBytes = mockMvc.perform(get("/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId
+                                + "/quote/pdf?type=issued").session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andReturn().getResponse().getContentAsByteArray();
+        Assertions.assertArrayEquals(storedBytes, protectedBytes,
+                "protected and public reads must serve the identical stored issued PDF");
+
         String disposition = result.getResponse().getHeader("Content-Disposition");
         Assertions.assertNotNull(disposition);
         Assertions.assertTrue(disposition.contains("inline"), disposition);
         Assertions.assertTrue(disposition.contains("quote-"), disposition);
+        Assertions.assertTrue(disposition.contains((String) storedFile.get("file_name")), disposition);
     }
 
     @Test

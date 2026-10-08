@@ -2,13 +2,15 @@
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:th="http://www.thymeleaf.org">
 <head>
     <title>Quotation</title>
-    <!-- Phase 16D-C: quote PREVIEW document, an acceptance-ready printable QUOTATION. Reuses the
+    <!-- Phase 16D-C: the acceptance-ready printable QUOTATION (draft preview + stored issued PDF;
+         since Phase 16F PR1 also the stored SIGNED PDF). Reuses the
          invoice "Aire Compact" style but is a SEPARATE template (title QUOTATION, never TAX INVOICE;
          no payment made / balance due). Carries a display-only deposit line (40% of the inc-GST
-         total) and a BLANK print-and-sign "Customer Acceptance" area mirroring the invoice's
-         two-column acceptance idiom, adapted invoice-to-quotation (two CSS-border declaration
-         squares + one blank signature line; never interactive form fields, no accepted state, no
-         signature image). Rendered by Thymeleaf + openhtmltopdf (XML parser, no JS, no external
+         total) and a "Customer Acceptance" area mirroring the invoice's two-column acceptance idiom,
+         adapted invoice-to-quotation (two CSS-border declaration squares + one signature line; never
+         interactive form fields): BLANK on the preview / issued PDF; on the signed PDF the squares
+         are ticked and the stored signature image + accepted name + time fill the signature line.
+         Rendered by Thymeleaf + openhtmltopdf (XML parser, no JS, no external
          fonts/images). Tables + conservative CSS only (no flexbox/grid/CSS-multi-column). All ${...}
          values are server-supplied; user text is escaped via th:text; sanitized terms HTML is
          injected via th:utext. The logo is a real data-URI image (logoDataUri); there is no
@@ -110,9 +112,20 @@
         .agree-chk td { vertical-align: top; padding: 2pt 0; }
         .agree-chk .chk-cell { width: 14pt; }
         .agree-chk .chk { width: 7pt; height: 7pt; border: 1pt solid #5d716d; margin-top: 1pt; }
+        /* Phase 16F PR1 — SIGNED quote only: the declaration square renders ticked as a solid inner
+           mark (pure CSS geometry — no glyph, no font dependency, nothing interactive). The unsigned
+           preview / issued PDF never renders this element (th:if="${accepted}"). */
+        .agree-chk .chk-tick { width: 5pt; height: 5pt; margin: 1pt; background-color: #0f3d36; }
         .agree-chk .chk-text { font-size: 8.5pt; line-height: 1.5; font-weight: bold; color: #0f3d36; }
         .agree-accept { font-size: 8.5pt; line-height: 1; color: #0f3d36; font-weight: bold; }
         .sig-cap { font-size: 7.5pt; color: #5d716d; margin-top: 4pt; }
+        /* Phase 16F PR1 — SIGNED quote only: the signature cell grows to the invoice's 44pt
+           signature slot; the stored signature image sits on the rule (the inner div's bottom border
+           is the signature line, exactly like the blank .sig-rule), bottom-aligned with the accept
+           sentence. Mirrors invoice.html .sig-area / .sig-img. */
+        .accept .sig-signed { height: 44pt; }
+        .accept .sig-ink { border-bottom: 1pt solid #aebab3; padding-bottom: 2pt; }
+        .accept .sig-img { display: block; max-width: 200pt; max-height: 40pt; margin: 0; }
 
         /* footer */
         .footer { text-align: center; font-size: 7.5pt; color: #5d716d; margin-top: 16pt; letter-spacing: 0.3pt; }
@@ -243,9 +256,11 @@
          invoice-to-quotation ("of this quotation" / "on this quotation") — hair rules above and below
          close the section like invoice.html. Rows: full-width intro, full-width agreement sentence,
          the two checkbox lines (left column), then a final two-column row where the accept sentence
-         sits level with the blank signature line. Blank print-and-sign area only: no accepted state,
-         no signature image, no timestamps — remote signing is a later phase. The two empty squares are
-         CSS-border boxes; this PDF is NOT interactive (no form fields, no unicode checkbox glyphs).
+         sits level with the signature line. UNSIGNED (draft preview / issued PDF; accepted = false):
+         a blank print-and-sign area — empty CSS-border squares and a blank signature line. SIGNED
+         (Phase 16F PR1 remote acceptance; accepted = true): the squares render ticked (solid inner
+         CSS mark) and the stored signature image + "Accepted by {name} on {time}" fill the signature
+         line. This PDF is NOT interactive either way (no form fields, no unicode checkbox glyphs).
          All sentences stay sentence-case and are never CSS-uppercased, so "terms and conditions"
          cannot surface as "TERMS" on page 1 (the terms heading belongs to the dedicated terms page). -->
     <div class="accept-block">
@@ -254,23 +269,36 @@
         <div class="agree-lead">This agreement is for the sale and installation of the goods described above at the value shown on this quotation and upon the terms and conditions stated herein.</div>
         <table class="agree-chk">
             <tr>
-                <td class="chk-cell"><div class="chk"></div></td>
+                <td class="chk-cell"><div class="chk"><div class="chk-tick" th:if="${accepted}"></div></div></td>
                 <td class="chk-text">I agree to pay the balance before the installation date.</td>
             </tr>
             <tr>
-                <td class="chk-cell"><div class="chk"></div></td>
+                <td class="chk-cell"><div class="chk"><div class="chk-tick" th:if="${accepted}"></div></div></td>
                 <td class="chk-text">I agree that no floor preparation costs are included unless otherwise stated above.</td>
             </tr>
         </table>
         <table class="accept">
             <tr>
                 <td class="agree"><div class="agree-accept">I accept the terms and conditions of this quotation.</div></td>
-                <!-- The inner div's bottom border IS the blank signature line. -->
-                <td class="sign sig-line"><div class="sig-rule"></div></td>
+                <!-- UNSIGNED: the inner div's bottom border IS the blank signature line. -->
+                <td class="sign sig-line" th:unless="${accepted}"><div class="sig-rule"></div></td>
+                <!-- SIGNED: the stored signature image sits on the same rule (inner div border). The img
+                     MUST stay self-closed (openhtmltopdf XML parser). -->
+                <td class="sign sig-signed" th:if="${accepted}">
+                    <div class="sig-ink">
+                        <img class="sig-img" alt="Customer signature"
+                             th:if="${signatureDataUri != null}" th:src="${signatureDataUri}" />
+                    </div>
+                </td>
             </tr>
             <tr class="cap-row">
                 <td class="agree"></td>
-                <td class="sign"><div class="sig-cap">Customer signature</div></td>
+                <td class="sign">
+                    <div class="sig-cap" th:unless="${accepted}">Customer signature</div>
+                    <!-- One server-built text node ("Accepted by {name} on {dd/MM/yyyy HH:mm}") so the
+                         frozen name and time can never be split / reordered by text extraction. -->
+                    <div class="sig-cap" th:if="${accepted}" th:text="${acceptedCaption}">Accepted by Customer Name on 01/01/2026 00:00</div>
+                </td>
             </tr>
         </table>
         <!-- Subtle separator below the entire Customer Acceptance block (matches the rule above it),

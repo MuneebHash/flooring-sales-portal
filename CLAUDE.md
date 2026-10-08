@@ -233,7 +233,7 @@ Blocked when LAID:  customer/address/details protected saves · product/charge m
 Allowed when LAID:  reads · notes (append-only) · photo upload/list/preview ·
                     status change from dashboard · Lead Enquiry read ·
                     invoice/signature/payment flows where explicitly supported
-                    (accept / resend / signature-download) · payment VOID (inverse of recording)
+                    (accept / resend / signature-download) · payment VOID (inverse of recording) · public quote accept + its D6b order-price write (16F)
 ```
 
 ### Lead Enquiry (Phase 15F — shipped)
@@ -295,7 +295,7 @@ Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-
 
 ```text
 - Quote ≠ invoice. Quote draft saves AND issue/send never write the order sale-price override or
-  sales_order header financials; quote lines never mutate Products & Charges. Path B (existing
+  sales_order header financials (16F D6b exception: a signed quote's inc-GST total becomes the order sale-price override on public accept); quote lines never mutate Products & Charges. Path B (existing
   Details of Sale -> Create Invoice) uses the order's working price and ignores the quote; Path A
   (planned 16F) will bill the ACCEPTED quote snapshot, never the live order price.
 - Draft (one per order): itemised total = sum of lines (a direct reduction auto-adds a negative

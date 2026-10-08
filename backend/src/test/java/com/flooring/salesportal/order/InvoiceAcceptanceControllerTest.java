@@ -1,7 +1,10 @@
 package com.flooring.salesportal.order;
 
 import com.flooring.salesportal.common.email.InvoiceEmailRequest;
+import com.flooring.salesportal.common.email.QuoteEmailRequest;
 import com.flooring.salesportal.common.email.RecordingInvoiceEmailSender;
+import com.flooring.salesportal.common.email.RecordingQuoteAcceptanceNotificationSender;
+import com.flooring.salesportal.common.email.RecordingQuoteEmailSender;
 import jakarta.persistence.EntityManager;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.text.PDFTextStripper;
@@ -25,6 +28,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.request.MockMultipartHttpServletRequestBuilder;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.context.WebApplicationContext;
 
@@ -32,15 +36,25 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.sql.Timestamp;
 import java.util.Base64;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -66,6 +80,16 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * order 5 = cross-store; order 9 = cross-business; order 99999 = nonexistent. New invoice versions are
  * asserted STATE-DERIVED ({@code maxInvoiceVersion() + 1}, count-before/after) — never hardcoded
  * against the shared dirty local DB.
+ *
+ * <p>Phase 16F PR1 (decision D5(c)) — the section at the end proves that a successful D.8 cancels the
+ * order's ISSUED quote version + its ACTIVE quote token inside D.8's own persist transaction, and
+ * nothing else. Those tests SELF-SEED (Phase 14D go-forward rule; V4 business 1 / store 1 / user 1
+ * only — never ORDER_FULL): their own invoice-ready order, invoice v1 through D.1, and — where needed —
+ * a quote draft saved and ISSUED through the protected quote endpoints. They also drive the singleton
+ * {@link RecordingQuoteEmailSender} (the token's only carrier) and
+ * {@link RecordingQuoteAcceptanceNotificationSender} (public accept), reset like the invoice sender.
+ * Two of them COMMIT their fixture (the rollback proof and the durable post-commit proof) and delete it
+ * in {@code finally}.
  */
 @ExtendWith(SpringExtension.class)
 @SpringBootTest
@@ -116,6 +140,14 @@ class InvoiceAcceptanceControllerTest {
     @Autowired
     private RecordingInvoiceEmailSender recordingInvoiceEmailSender;
 
+    // Phase 16F PR1 (D5(c) section): the quote send records the link-only email (the plaintext token's
+    // only carrier) and the public accept records the store notification.
+    @Autowired
+    private RecordingQuoteEmailSender recordingQuoteEmailSender;
+
+    @Autowired
+    private RecordingQuoteAcceptanceNotificationSender recordingQuoteAcceptanceNotificationSender;
+
     @Autowired
     private EntityManager entityManager;
 
@@ -125,12 +157,16 @@ class InvoiceAcceptanceControllerTest {
     void setUp() {
         mockMvc = MockMvcBuilders.webAppContextSetup(context).build();
         recordingInvoiceEmailSender.reset();
+        recordingQuoteEmailSender.reset();
+        recordingQuoteAcceptanceNotificationSender.reset();
     }
 
     @AfterEach
     void tearDown() {
-        // The sender is a singleton — never leak recorded sends or an armed failNextSend.
+        // The senders are singletons — never leak recorded sends or an armed failNextSend.
         recordingInvoiceEmailSender.reset();
+        recordingQuoteEmailSender.reset();
+        recordingQuoteAcceptanceNotificationSender.reset();
     }
 
     // ----------------------------------------------------------------
@@ -1248,5 +1284,909 @@ class InvoiceAcceptanceControllerTest {
         Assertions.assertEquals(1, sent.size());
         Assertions.assertEquals("invoice-" + ORDER_FULL_NUMBER + "-v" + currentVersion + ".pdf",
                 sent.get(0).pdfFileName(), "resend must email the void-created current version's PDF");
+    }
+
+    // ================================================================
+    // Phase 16F PR1 — decision D5(c): an in-app invoice acceptance (D.8) kills an ACTIVE quote link
+    // ================================================================
+    //
+    // A successful D.8 moves the order's ISSUED quote_version to CANCELLED and its ACTIVE quote_token to
+    // CANCELLED (dead_at = the appended invoice version's accepted_at) inside D.8's own persist
+    // transaction, under the order row lock. No ISSUED version -> silent no-op. ACCEPTED / SUPERSEDED /
+    // EXPIRED / CANCELLED versions and their (already dead) tokens are never touched, and an accepted
+    // quote never blocks D.8 (D5(d), one direction only).
+    //
+    // Self-seeded (Phase 14D go-forward rule) — the V4 ORDER_FULL fixture is NOT used here: each test
+    // INSERTs its own invoice-ready SOFT LEAD order (V4 business 1 / store 1 / user 1 only), creates
+    // invoice v1 through D.1 and, where the scenario needs a quote, saves a draft through the protected
+    // PUT and ISSUES it through POST .../quote/send-email; the plaintext token is read from the recorded
+    // link-only quote email (the only place it ever appears).
+
+    private static final String D5C_ORDER_NUMBER_PREFIX = "IACQT.ZZ9.";
+    // Rolled-back tests allocate from this class's own fixed range (their rows never outlive the test);
+    // the two tests that COMMIT their fixture take the next FREE business sequence instead (see
+    // insertCommittedD5cOrder), so a leftover from a crashed run can never block a re-run.
+    private static final int D5C_SEQ_BASE = 31_000;
+    private static final String D5C_FIRST_NAME = "Dana";
+    private static final String D5C_LAST_NAME = "Quoteholder";
+    private static final String D5C_CUSTOMER_NAME = D5C_FIRST_NAME + " " + D5C_LAST_NAME;
+    private static final String D5C_CUSTOMER_EMAIL = "dana.quoteholder@example.com";
+    private static final String D5C_DETAILS_OF_SALE = "Supply and lay carpet throughout";
+    // The public link inside the recorded link-only quote email: <app-base>/q/{token}.
+    private static final Pattern QUOTE_LINK_TOKEN_PATTERN = Pattern.compile("/q/([A-Za-z0-9_-]{43,128})");
+
+    private int d5cSeq = D5C_SEQ_BASE;
+
+    /** A self-seeded order with an unaccepted invoice v1 + an ISSUED quote v1 and its ACTIVE link's token. */
+    private record IssuedQuoteOrder(long orderId, String token) {
+    }
+
+    // ---- URLs ----
+
+    private static String invoicesUrl(Object orderId) {
+        return "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/invoices";
+    }
+
+    private static String quoteUrl(Object orderId, String action) {
+        return "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/quote/" + action;
+    }
+
+    private static String publicQuoteUrl(String token) {
+        return "/api/v1/public/quotes/" + token;
+    }
+
+    // ---- fixtures ----
+
+    /**
+     * Detach every hydrated entity: the MockMvc calls of one test share the test transaction's
+     * persistence context, so after a raw JDBC write a later JPA read could return a stale entity.
+     * clear() only — every write in these flows is native JDBC (no dirty managed entity to lose), and
+     * clear() is also safe outside a transaction, where flush() would throw.
+     */
+    private void clearJpaCache() {
+        entityManager.clear();
+    }
+
+    /** Rolled-back tests: the next number of this class's fixed sequence range. */
+    private long insertD5cOrder() {
+        return insertD5cOrder(++d5cSeq);
+    }
+
+    /**
+     * COMMITTED fixtures: the next FREE business sequence (MAX + 1, as order creation allocates it), so
+     * a row left behind by a crashed run (finally never ran) can never collide with a re-run.
+     */
+    private long insertCommittedD5cOrder() {
+        Integer next = jdbcTemplate.queryForObject(
+                "SELECT COALESCE(MAX(order_sequence_number), 0) + 1 FROM sales_order WHERE business_id = ?",
+                Integer.class, BUSINESS_AUSSIE);
+        Assertions.assertNotNull(next, "setup: no next order_sequence_number");
+        return insertD5cOrder(next);
+    }
+
+    /**
+     * INSERT a SOFT LEAD order header that already carries D.1's order-level preconditions (details of
+     * sale, proposed lay date + lay date status). V4 business 1 / store 1 / user 1 only.
+     */
+    private long insertD5cOrder(int seq) {
+        return jdbcTemplate.queryForObject(
+                "INSERT INTO sales_order "
+                        + "(business_id, store_id, user_id, order_sequence_number, order_number, "
+                        + " flooring_type, order_status, week_number, week_year, "
+                        + " details_of_sale, proposed_lay_date, lay_date_status) "
+                        + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, 'LEAD'::order_status, 1, 2026, "
+                        + " ?, DATE '2026-12-01', 'CONFIRMED'::lay_date_status) "
+                        + "RETURNING order_id",
+                Long.class,
+                BUSINESS_AUSSIE, STORE_SYD_CBD, USER_LIAM, seq,
+                D5C_ORDER_NUMBER_PREFIX + String.format("%05d", seq % 100_000),
+                D5C_DETAILS_OF_SALE);
+    }
+
+    private int orderSequenceNumber(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT order_sequence_number FROM sales_order WHERE order_id = ?", Integer.class, orderId);
+    }
+
+    private static String d5cChargeCode(int orderSequenceNumber) {
+        return "IAQ" + orderSequenceNumber;
+    }
+
+    /**
+     * Make the order pass D.1's email gate + 9 preconditions: customer (first/last name, valid email),
+     * INSTALLATION + BILLING addresses and ONE priced charge line on a self-seeded store_charge
+     * (500.00 ex -> invoice 550.00 inc; cost 200.00, so the 250.00-ex quote below is not below cost).
+     */
+    private void seedD5cInvoiceReadiness(long orderId) {
+        jdbcTemplate.update(
+                "INSERT INTO order_customer (order_id, first_name, last_name, email, mobile) "
+                        + "VALUES (?, ?, ?, ?, '0412345678')",
+                orderId, D5C_FIRST_NAME, D5C_LAST_NAME, D5C_CUSTOMER_EMAIL);
+        jdbcTemplate.update(
+                "INSERT INTO order_address "
+                        + "(order_id, address_type, street_number, street, suburb, state_code, postcode) "
+                        + "VALUES (?, 'INSTALLATION'::address_type, '7', 'Install Street', 'Sydney', 'NSW', '2000')",
+                orderId);
+        jdbcTemplate.update(
+                "INSERT INTO order_address "
+                        + "(order_id, address_type, street_number, street, suburb, state_code, postcode) "
+                        + "VALUES (?, 'BILLING'::address_type, '12', 'Billing Street', 'Sydney', 'NSW', '2000')",
+                orderId);
+        String code = d5cChargeCode(orderSequenceNumber(orderId));
+        BigDecimal lineTotal = new BigDecimal("500.00");
+        BigDecimal lineCost = new BigDecimal("200.00");
+        long chargeId = jdbcTemplate.queryForObject(
+                "INSERT INTO store_charge (store_id, flooring_type, code, name, price, cost) "
+                        + "VALUES (?, 'SOFT'::flooring_type, ?, 'D5c test charge', ?, ?) RETURNING charge_id",
+                Long.class, STORE_SYD_CBD, code, lineTotal, lineCost);
+        jdbcTemplate.update(
+                "INSERT INTO order_charge_line "
+                        + "(order_id, charge_id, charge_code_snapshot, charge_name_snapshot, "
+                        + " price_snapshot, cost_snapshot, quantity, unit_price, line_total, line_cost) "
+                        + "VALUES (?, ?, ?, 'D5c test charge', ?, ?, 1, ?, ?, ?)",
+                orderId, chargeId, code, lineTotal, lineCost, lineTotal, lineTotal, lineCost);
+    }
+
+    /** D.1 POST .../invoices — create the unaccepted invoice v1 from the live order (empty body). */
+    private void createInvoice(long orderId) throws Exception {
+        mockMvc.perform(post(invoicesUrl(orderId)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.version_number").value(1));
+        clearJpaCache();
+    }
+
+    /** A self-seeded order with invoice v1 created through D.1 and NO quote rows at all. */
+    private long seedInvoicedOrder() throws Exception {
+        long orderId = insertD5cOrder();
+        seedD5cInvoiceReadiness(orderId);
+        createInvoice(orderId);
+        return orderId;
+    }
+
+    /** PUT .../quote/draft — itemised Carpet 2x100 + Underlay 1x50 = 250.00 ex / 275.00 inc. */
+    private void saveItemisedQuoteDraft(long orderId) throws Exception {
+        mockMvc.perform(put(quoteUrl(orderId, "draft")).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Carpet","quantity":2,"unit_price_ex_gst":100,"line_total_ex_gst":200,"sort_order":0},
+                                  {"line_type":"ITEM","description":"Underlay","quantity":1,"unit_price_ex_gst":50,"line_total_ex_gst":50,"sort_order":1}
+                                ]}"""))
+                .andExpect(status().isOk());
+        clearJpaCache();
+    }
+
+    /** PUT .../quote/draft — non-itemised, the given final inc-GST total (header-only save). */
+    private void saveNonItemisedQuoteDraft(long orderId, String finalIncTotal) throws Exception {
+        mockMvc.perform(put(quoteUrl(orderId, "draft")).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON)
+                        .content("{\"itemised\": false, \"final_total_inc_gst\": " + finalIncTotal
+                                + ", \"lines\": []}"))
+                .andExpect(status().isOk());
+        clearJpaCache();
+    }
+
+    /**
+     * POST .../quote/send-email (issue a new version, or resend the unchanged one) -> 201, then return
+     * the plaintext token from the LATEST recorded link-only quote email.
+     */
+    private String sendQuoteEmail(long orderId) throws Exception {
+        clearJpaCache();
+        mockMvc.perform(post(quoteUrl(orderId, "send-email")).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated());
+        clearJpaCache();
+        List<QuoteEmailRequest> sent = recordingQuoteEmailSender.sentEmails();
+        Assertions.assertFalse(sent.isEmpty(), "a quote email must have been recorded");
+        String body = sent.get(sent.size() - 1).bodyText();
+        Matcher matcher = QUOTE_LINK_TOKEN_PATTERN.matcher(body);
+        Assertions.assertTrue(matcher.find(), () -> "the quote email must carry the /q/{token} link: " + body);
+        return matcher.group(1);
+    }
+
+    /** {@link #seedInvoicedOrder()} + the itemised draft ISSUED by email: quote v1 ISSUED + its ACTIVE token. */
+    private IssuedQuoteOrder seedInvoicedOrderWithIssuedQuote() throws Exception {
+        long orderId = seedInvoicedOrder();
+        saveItemisedQuoteDraft(orderId);
+        return new IssuedQuoteOrder(orderId, sendQuoteEmail(orderId));
+    }
+
+    /** A valid D.8 request for a self-seeded order: the signature PNG + the saved customer's name. */
+    private MockMultipartHttpServletRequestBuilder signInvoice(long orderId) {
+        return (MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
+                .file(signaturePart(ONE_PIXEL_PNG))
+                .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME);
+    }
+
+    /**
+     * Sign the ISSUED quote through the REAL token-only public endpoint (no session; exactly one
+     * signature PNG part) -> 201 INACTIVE. Inside the test transaction the acceptance joins it, so its
+     * rows roll back with the test and its files are removed by the rollback hooks.
+     */
+    private void acceptQuoteViaPublicLink(String token) throws Exception {
+        clearJpaCache();
+        mockMvc.perform(multipart(publicQuoteUrl(token) + "/accept").file(signaturePart(ONE_PIXEL_PNG)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.state").value("INACTIVE"));
+        clearJpaCache();
+    }
+
+    /** Public GET (no session): 200 with the link's customer-facing state. */
+    private void assertPublicQuoteState(String token, String expectedState) throws Exception {
+        mockMvc.perform(get(publicQuoteUrl(token)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.state").value(expectedState));
+    }
+
+    /** Public accept of a dead link: the token gate answers 410 before the (valid) signature is read. */
+    private void assertPublicAcceptGone(String token, String expectedCode) throws Exception {
+        mockMvc.perform(multipart(publicQuoteUrl(token) + "/accept").file(signaturePart(ONE_PIXEL_PNG)))
+                .andExpect(status().isGone())
+                .andExpect(jsonPath("$.error.code").value(expectedCode));
+    }
+
+    // ---- DB probes ----
+
+    private Map<String, Object> quoteVersionRow(long orderId, int versionNumber) {
+        return jdbcTemplate.queryForMap(
+                "SELECT * FROM quote_version WHERE order_id = ? AND version_number = ?", orderId, versionNumber);
+    }
+
+    private List<Map<String, Object>> quoteVersionRows(long orderId) {
+        return jdbcTemplate.queryForList(
+                "SELECT * FROM quote_version WHERE order_id = ? ORDER BY version_number", orderId);
+    }
+
+    private List<String> quoteVersionStatuses(long orderId) {
+        return jdbcTemplate.queryForList(
+                "SELECT status FROM quote_version WHERE order_id = ? ORDER BY version_number", String.class, orderId);
+    }
+
+    private int quoteVersionCount(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM quote_version WHERE order_id = ?", Integer.class, orderId);
+    }
+
+    /** The token row behind a plaintext token (only its SHA-256 hash is stored). */
+    private Map<String, Object> quoteTokenRow(String plainToken) {
+        return jdbcTemplate.queryForMap("SELECT * FROM quote_token WHERE token_hash = ?", sha256Hex(plainToken));
+    }
+
+    private List<Map<String, Object>> quoteTokenRows(long orderId) {
+        return jdbcTemplate.queryForList(
+                "SELECT t.* FROM quote_token t JOIN quote_version v ON v.quote_version_id = t.quote_version_id "
+                        + "WHERE v.order_id = ? ORDER BY t.quote_token_id", orderId);
+    }
+
+    private List<String> quoteTokenStatuses(long orderId) {
+        return jdbcTemplate.queryForList(
+                "SELECT t.status FROM quote_token t JOIN quote_version v ON v.quote_version_id = t.quote_version_id "
+                        + "WHERE v.order_id = ? ORDER BY t.quote_token_id", String.class, orderId);
+    }
+
+    private int quoteTokenCount(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM quote_token t JOIN quote_version v ON v.quote_version_id = t.quote_version_id "
+                        + "WHERE v.order_id = ?", Integer.class, orderId);
+    }
+
+    private Map<String, Object> quoteDraftRow(long orderId) {
+        return jdbcTemplate.queryForMap("SELECT * FROM quote_draft WHERE order_id = ?", orderId);
+    }
+
+    private List<Map<String, Object>> quoteDraftLineRows(long orderId) {
+        return jdbcTemplate.queryForList(
+                "SELECT l.* FROM quote_draft_line l JOIN quote_draft d ON d.quote_draft_id = l.quote_draft_id "
+                        + "WHERE d.order_id = ? ORDER BY l.quote_draft_line_id", orderId);
+    }
+
+    private int quoteDraftCount(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM quote_draft WHERE order_id = ?", Integer.class, orderId);
+    }
+
+    /** FileStorageService virtual-path prefix of everything stored for this order. */
+    private static String orderStoragePrefix(long orderId) {
+        return "/uploads/" + BUSINESS_AUSSIE + "/orders/" + orderId + "/";
+    }
+
+    private int storedFileCountForOrder(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM stored_file WHERE storage_path LIKE ?", Integer.class,
+                orderStoragePrefix(orderId) + "%");
+    }
+
+    private long invoicePdfFileId(long invoiceId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT stored_file_id FROM invoice WHERE invoice_id = ?", Long.class, invoiceId);
+    }
+
+    /** The order's working-price header (what the D6b quote acceptance writes; D.8 must never move it). */
+    private Map<String, Object> orderWorkingPrice(long orderId) {
+        return jdbcTemplate.queryForMap(
+                "SELECT price_adjustment_inc_gst, sale_price_ex_gst, total_cost, gp, gp_percent, updated_at "
+                        + "FROM sales_order WHERE order_id = ?", orderId);
+    }
+
+    private String orderStatus(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT order_status::text FROM sales_order WHERE order_id = ?", String.class, orderId);
+    }
+
+    private void backdateQuoteTokenExpiry(String plainToken) {
+        int updated = jdbcTemplate.update(
+                "UPDATE quote_token SET expires_at = now() - interval '1 day' WHERE token_hash = ?",
+                sha256Hex(plainToken));
+        Assertions.assertEquals(1, updated, "expected to backdate exactly one quote token");
+        clearJpaCache();
+    }
+
+    private static String sha256Hex(String value) {
+        try {
+            return HexFormat.of().formatHex(
+                    MessageDigest.getInstance("SHA-256").digest(value.getBytes(StandardCharsets.UTF_8)));
+        } catch (NoSuchAlgorithmException e) {
+            throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
+    /** A copy of {@code row} with the given (column, value) pairs overridden. */
+    private static Map<String, Object> withColumns(Map<String, Object> row, Object... columnValuePairs) {
+        Map<String, Object> copy = new LinkedHashMap<>(row);
+        for (int i = 0; i < columnValuePairs.length; i += 2) {
+            copy.put((String) columnValuePairs[i], columnValuePairs[i + 1]);
+        }
+        return copy;
+    }
+
+    /**
+     * D5(c) outcome for one link: the version moved ISSUED -> CANCELLED and NOTHING else on it changed
+     * (no acceptance fields, no snapshot edit, no marker); its token moved ACTIVE -> CANCELLED with
+     * {@code dead_at} == the appended invoice version's {@code accepted_at} (same instant, same
+     * transaction) and nothing else on it changed.
+     */
+    private void assertLinkCancelledByInvoiceAcceptance(long orderId, int versionNumber, String token,
+                                                        Map<String, Object> versionBefore,
+                                                        Map<String, Object> tokenBefore) {
+        Assertions.assertEquals("ISSUED", versionBefore.get("status"), "precondition: the version was ISSUED");
+        Assertions.assertEquals("ACTIVE", tokenBefore.get("status"), "precondition: the token was ACTIVE");
+        Timestamp invoiceAcceptedAt = invoiceAcceptedAt(latestInvoiceId(orderId));
+        Assertions.assertNotNull(invoiceAcceptedAt, "D.8 must have appended an ACCEPTED invoice version");
+        Assertions.assertEquals(withColumns(versionBefore, "status", "CANCELLED"),
+                quoteVersionRow(orderId, versionNumber),
+                "D.8 may change ONLY the quote version's status (ISSUED -> CANCELLED)");
+        Assertions.assertEquals(withColumns(tokenBefore, "status", "CANCELLED", "dead_at", invoiceAcceptedAt),
+                quoteTokenRow(token),
+                "D.8 may change ONLY the token's status + dead_at (ACTIVE -> CANCELLED at the acceptance time)");
+    }
+
+    /** The link is exactly as it was: version row + token row unchanged. */
+    private void assertQuoteLinkUntouched(String step, long orderId, int versionNumber, String token,
+                                          Map<String, Object> versionBefore, Map<String, Object> tokenBefore) {
+        Assertions.assertEquals(versionBefore, quoteVersionRow(orderId, versionNumber),
+                step + ": the quote version must be untouched");
+        Assertions.assertEquals(tokenBefore, quoteTokenRow(token), step + ": the quote token must be untouched");
+    }
+
+    /**
+     * Delete everything a COMMITTED fixture order owns — autocommit, children first (FK order). The
+     * order's stored_file rows (invoice PDFs, signature PNGs, issued quote PDFs) are matched by the
+     * FileStorageService virtual-path prefix; their bytes live in the class TempDir, which JUnit
+     * removes. Must run outside any test-managed transaction (or the deletes would roll back too).
+     */
+    private void deleteCommittedD5cOrder(long orderId) {
+        List<Integer> seqs = jdbcTemplate.queryForList(
+                "SELECT order_sequence_number FROM sales_order WHERE order_id = ?", Integer.class, orderId);
+        jdbcTemplate.update("DELETE FROM quote_token WHERE quote_version_id IN "
+                + "(SELECT quote_version_id FROM quote_version WHERE order_id = ?)", orderId);
+        jdbcTemplate.update("DELETE FROM invoice WHERE order_id = ?", orderId);
+        jdbcTemplate.update("DELETE FROM quote_version WHERE order_id = ?", orderId); // version lines cascade
+        jdbcTemplate.update("DELETE FROM quote_draft WHERE order_id = ?", orderId);   // draft lines cascade
+        for (String table : List.of("payment_transaction", "order_attachment", "order_note", "order_enquiry",
+                "order_charge_line", "order_product_line", "order_address", "order_customer")) {
+            jdbcTemplate.update("DELETE FROM " + table + " WHERE order_id = ?", orderId);
+        }
+        jdbcTemplate.update("DELETE FROM stored_file WHERE storage_path LIKE ?", orderStoragePrefix(orderId) + "%");
+        jdbcTemplate.update("DELETE FROM sales_order WHERE order_id = ?", orderId);
+        for (Integer seq : seqs) {
+            jdbcTemplate.update("DELETE FROM store_charge WHERE store_id = ? AND code = ?",
+                    STORE_SYD_CBD, d5cChargeCode(seq));
+        }
+    }
+
+    // ---- 1. success: the ISSUED version + ACTIVE token die with the invoice signature ----
+
+    @Test
+    void accept_withIssuedQuote_cancelsIssuedVersionAndActiveToken_linkIsDead() throws Exception {
+        IssuedQuoteOrder fx = seedInvoicedOrderWithIssuedQuote();
+        long orderId = fx.orderId();
+        Map<String, Object> versionBefore = quoteVersionRow(orderId, 1);
+        Map<String, Object> tokenBefore = quoteTokenRow(fx.token());
+        Map<String, Object> draftBefore = quoteDraftRow(orderId);
+        List<Map<String, Object>> draftLinesBefore = quoteDraftLineRows(orderId);
+        int storedFilesBefore = storedFileCountForOrder(orderId);
+        int quoteEmailsBefore = recordingQuoteEmailSender.sentEmails().size();
+        mockMvc.perform(get(quoteUrl(orderId, "workspace")).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.current_issued.version_number").value(1))
+                .andExpect(jsonPath("$.data.current_issued.status").value("ISSUED"));
+
+        MvcResult result = mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2))
+                .andExpect(jsonPath("$.data.invoice.accepted_customer_name").value(D5C_CUSTOMER_NAME))
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(true))
+                .andReturn();
+
+        // The link is dead: ONLY version.status (ISSUED -> CANCELLED) and token.status + dead_at (ACTIVE ->
+        // CANCELLED at the invoice's accepted_at) moved; no quote row was added.
+        assertLinkCancelledByInvoiceAcceptance(orderId, 1, fx.token(), versionBefore, tokenBefore);
+        Assertions.assertEquals(1, quoteVersionCount(orderId), "no quote version may be added");
+        Assertions.assertEquals(1, quoteTokenCount(orderId), "no quote token may be added");
+
+        // Nothing else quote-related moved: draft + its lines unchanged, no quote email, no stored_file
+        // beyond D.8's own two (signature PNG + signed invoice PDF), no acceptance notification.
+        Assertions.assertEquals(draftBefore, quoteDraftRow(orderId), "the quote draft must be untouched");
+        Assertions.assertEquals(draftLinesBefore, quoteDraftLineRows(orderId), "draft lines must be untouched");
+        Assertions.assertEquals(quoteEmailsBefore, recordingQuoteEmailSender.sentEmails().size());
+        Assertions.assertEquals(storedFilesBefore + 2, storedFileCountForOrder(orderId));
+        Assertions.assertTrue(recordingQuoteAcceptanceNotificationSender.sentNotifications().isEmpty());
+        // D.8's own contract is unchanged: exactly one auto-email; no quote token material in the response.
+        Assertions.assertEquals(1, recordingInvoiceEmailSender.sentEmails().size());
+        String json = result.getResponse().getContentAsString();
+        Assertions.assertFalse(json.contains(fx.token()), "the quote token must never appear in D.8's response");
+        Assertions.assertFalse(json.contains("/q/"), "no public quote link in D.8's response");
+
+        // Protected workspace: no active issued quote any more, nothing accepted, the draft is still there.
+        mockMvc.perform(get(quoteUrl(orderId, "workspace")).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.current_issued").value(nullValue()))
+                .andExpect(jsonPath("$.data.accepted").value(nullValue()))
+                .andExpect(jsonPath("$.data.draft").value(notNullValue()));
+
+        // Public surface: GET reports CANCELLED (200); the accept is 410 QUOTE_LINK_CANCELLED and writes nothing.
+        Map<String, Object> versionCancelled = quoteVersionRow(orderId, 1);
+        Map<String, Object> tokenCancelled = quoteTokenRow(fx.token());
+        assertPublicQuoteState(fx.token(), "CANCELLED");
+        assertPublicAcceptGone(fx.token(), "QUOTE_LINK_CANCELLED");
+        Assertions.assertEquals(versionCancelled, quoteVersionRow(orderId, 1));
+        Assertions.assertEquals(tokenCancelled, quoteTokenRow(fx.token()));
+        Assertions.assertEquals(storedFilesBefore + 2, storedFileCountForOrder(orderId));
+        Assertions.assertTrue(recordingQuoteAcceptanceNotificationSender.sentNotifications().isEmpty());
+    }
+
+    // ---- 2. rejected D.8 requests never touch the link (the kill happens only in the persist) ----
+
+    @Test
+    void accept_rejectedRequests_neverTouchTheQuoteLink_thenAValidAcceptCancelsIt() throws Exception {
+        IssuedQuoteOrder fx = seedInvoicedOrderWithIssuedQuote();
+        long orderId = fx.orderId();
+        String token = fx.token();
+        Map<String, Object> versionBefore = quoteVersionRow(orderId, 1);
+        Map<String, Object> tokenBefore = quoteTokenRow(token);
+        int invoicesBefore = countInvoices(orderId);
+        int storedFilesBefore = storedFileCountForOrder(orderId);
+
+        // 401 / 403: the session guard, before the order is even read.
+        mockMvc.perform(signInvoice(orderId))
+                .andExpect(status().isUnauthorized());
+        assertQuoteLinkUntouched("401 no session", orderId, 1, token, versionBefore, tokenBefore);
+        mockMvc.perform(signInvoice(orderId).session(liamSessionNoStore()))
+                .andExpect(status().isForbidden());
+        assertQuoteLinkUntouched("403 no store", orderId, 1, token, versionBefore, tokenBefore);
+
+        // 400: an unexpected form field — even a quote-shaped one — is refused before any write.
+        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
+                        .file(signaturePart(ONE_PIXEL_PNG))
+                        .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME)
+                        .param("quote_version_id", "1"))
+                        .session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quote_version_id"));
+        assertQuoteLinkUntouched("400 extra form field", orderId, 1, token, versionBefore, tokenBefore);
+
+        // 400: an unexpected extra FILE part.
+        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
+                        .file(signaturePart(ONE_PIXEL_PNG))
+                        .file(new MockMultipartFile("quote_signature", "x.png", "image/png", ONE_PIXEL_PNG))
+                        .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME))
+                        .session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("quote_signature"));
+        assertQuoteLinkUntouched("400 extra file part", orderId, 1, token, versionBefore, tokenBefore);
+
+        // 422: blank accepted name.
+        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
+                        .file(signaturePart(ONE_PIXEL_PNG))
+                        .param(ACCEPTED_NAME_FIELD, "   "))
+                        .session(liamStore1Session()))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("ACCEPTED_CUSTOMER_NAME_REQUIRED"));
+        assertQuoteLinkUntouched("422 blank name", orderId, 1, token, versionBefore, tokenBefore);
+
+        // 422: missing signature part.
+        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
+                        .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME))
+                        .session(liamStore1Session()))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("SIGNATURE_REQUIRED"));
+        assertQuoteLinkUntouched("422 missing signature", orderId, 1, token, versionBefore, tokenBefore);
+
+        // 400: a signature declared as a non-PNG type.
+        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
+                        .file(new MockMultipartFile(SIGNATURE_PART, "signature.jpg", "image/jpeg", ONE_PIXEL_PNG))
+                        .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME))
+                        .session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("SIGNATURE_INVALID"));
+        assertQuoteLinkUntouched("400 non-PNG signature", orderId, 1, token, versionBefore, tokenBefore);
+
+        // 422: the customer-email gate — D.8's LAST validation before the persist (and therefore before
+        // the link kill): a fully valid request against a malformed saved email must leave the link live.
+        setCustomerEmail(orderId, "dana@");
+        clearJpaCache();
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isUnprocessableEntity())
+                .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_INVALID"));
+        assertQuoteLinkUntouched("422 customer email gate", orderId, 1, token, versionBefore, tokenBefore);
+
+        // No rejection appended an invoice version, wrote a file or attempted an email; the customer's link
+        // still opens as ACTIVE.
+        Assertions.assertEquals(invoicesBefore, countInvoices(orderId));
+        Assertions.assertEquals(storedFilesBefore, storedFileCountForOrder(orderId));
+        Assertions.assertTrue(recordingInvoiceEmailSender.sentEmails().isEmpty());
+        Assertions.assertTrue(recordingInvoiceEmailSender.failedEmails().isEmpty());
+        assertPublicQuoteState(token, "ACTIVE");
+
+        // The link survived every rejection; a valid acceptance now kills exactly that link.
+        setCustomerEmail(orderId, D5C_CUSTOMER_EMAIL);
+        clearJpaCache();
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated());
+        assertLinkCancelledByInvoiceAcceptance(orderId, 1, token, versionBefore, tokenBefore);
+    }
+
+    @Test
+    void accept_alreadyAcceptedInvoice409_neverTouchesTheQuoteLink() throws Exception {
+        // An accepted current invoice + a live ISSUED quote is reachable (e.g. a quote issued after the
+        // in-app signature — D5(d) is one direction only — or a double-submit losing the race). The 409
+        // fires before the persist, so it must never kill the link.
+        IssuedQuoteOrder fx = seedInvoicedOrderWithIssuedQuote();
+        long orderId = fx.orderId();
+        Map<String, Object> versionBefore = quoteVersionRow(orderId, 1);
+        Map<String, Object> tokenBefore = quoteTokenRow(fx.token());
+        seedAcceptance(orderId);
+        int invoicesBefore = countInvoices(orderId);
+
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_ALREADY_ACCEPTED"));
+
+        assertQuoteLinkUntouched("409 already accepted", orderId, 1, fx.token(), versionBefore, tokenBefore);
+        Assertions.assertEquals(invoicesBefore, countInvoices(orderId));
+        assertPublicQuoteState(fx.token(), "ACTIVE");
+    }
+
+    // ---- 3. a rolled-back D.8 rolls the link kill back with it ----
+
+    /**
+     * Observable approach: the fixture (order, invoice v1, ISSUED quote v1 + its ACTIVE token) is
+     * COMMITTED first, so it is real state that survives a later rollback. D.8 then runs in a fresh
+     * test-managed transaction (its programmatic TransactionTemplate joins it, exactly like the existing
+     * {@code accept_transactionRollback_...} test), the in-flight cancel is asserted, and that
+     * transaction is rolled back. Afterwards only COMMITTED state is visible (autocommit reads): the
+     * committed version is ISSUED again and the committed token ACTIVE with no {@code dead_at} — the link
+     * kill was part of the SAME unit of work as the invoice acceptance. Had it committed on its own (e.g.
+     * a REQUIRES_NEW / separately committed write) the committed rows would still read CANCELLED here. (A
+     * quote seeded INSIDE the rolled-back transaction would simply vanish, which proves nothing.) The
+     * auto-email recorded during D.8 is a test artifact: in production it is only attempted after a real
+     * commit. The committed fixture is deleted in {@code finally}.
+     */
+    @Test
+    void accept_rolledBack_committedQuoteLinkIsStillIssuedAndActive() throws Exception {
+        // Phase 1 — seed + invoice + issue inside the test-managed transaction, then COMMIT it.
+        long orderId = insertCommittedD5cOrder();
+        seedD5cInvoiceReadiness(orderId);
+        createInvoice(orderId);
+        saveItemisedQuoteDraft(orderId);
+        String token = sendQuoteEmail(orderId);
+        Map<String, Object> committedVersion = quoteVersionRow(orderId, 1);
+        Map<String, Object> committedToken = quoteTokenRow(token);
+        TestTransaction.flagForCommit();
+        TestTransaction.end();
+        try {
+            // Phase 2 — D.8 in a fresh test-managed transaction, then roll it back.
+            TestTransaction.start();
+            mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                    .andExpect(status().isCreated());
+            long acceptedInvoiceId = latestInvoiceId(orderId);
+            String signaturePath = storagePathOf(acceptedSignatureFileId(acceptedInvoiceId));
+            String signedPdfPath = storagePathOf(invoicePdfFileId(acceptedInvoiceId));
+            Assertions.assertTrue(diskFileExists(signaturePath));
+            Assertions.assertTrue(diskFileExists(signedPdfPath));
+            // In flight (same transaction): the link IS cancelled, together with the acceptance.
+            assertLinkCancelledByInvoiceAcceptance(orderId, 1, token, committedVersion, committedToken);
+
+            TestTransaction.flagForRollback();
+            TestTransaction.end();
+
+            // Phase 3 — no transaction: only COMMITTED state is visible. The link kill rolled back WITH
+            // the acceptance.
+            Assertions.assertEquals(committedVersion, quoteVersionRow(orderId, 1),
+                    "the rolled-back D.8 must leave the committed quote version ISSUED, unchanged");
+            Assertions.assertEquals(committedToken, quoteTokenRow(token),
+                    "the rolled-back D.8 must leave the committed token ACTIVE with no dead_at");
+            Assertions.assertEquals(1, countInvoices(orderId), "the accepted invoice version must be rolled back");
+            Assertions.assertNull(invoiceAcceptedAt(latestInvoiceId(orderId)), "v1 stays the unsigned current invoice");
+            Assertions.assertFalse(diskFileExists(signaturePath), "rolled-back signature file must be deleted");
+            Assertions.assertFalse(diskFileExists(signedPdfPath), "rolled-back signed PDF must be deleted");
+            // ...and the customer's link still works on the real public surface.
+            assertPublicQuoteState(token, "ACTIVE");
+        } finally {
+            if (TestTransaction.isActive()) {
+                TestTransaction.flagForRollback();
+                TestTransaction.end();
+            }
+            deleteCommittedD5cOrder(orderId);
+        }
+    }
+
+    // ---- 4. the post-commit auto-email failure never resurrects the link (durable, real commits) ----
+
+    /**
+     * Runs OUTSIDE the test transaction, so every MockMvc call commits for real (production semantics):
+     * D.8 commits the acceptance + the link kill, and only THEN attempts the auto-email, which is forced
+     * to fail. The committed state proves the email failure undid nothing and the link stays CANCELLED.
+     * Self-cleaning: everything committed is deleted in {@code finally}.
+     */
+    @Test
+    @Transactional(propagation = Propagation.NOT_SUPPORTED)
+    void accept_postCommitEmailFailure_quoteLinkStaysCancelled_outsideTestTransaction() throws Exception {
+        long orderId = insertCommittedD5cOrder(); // autocommit — from here on everything is committed state
+        try {
+            seedD5cInvoiceReadiness(orderId);
+            createInvoice(orderId);
+            saveItemisedQuoteDraft(orderId);
+            String token = sendQuoteEmail(orderId);
+            Map<String, Object> versionBefore = quoteVersionRow(orderId, 1);
+            Map<String, Object> tokenBefore = quoteTokenRow(token);
+
+            recordingInvoiceEmailSender.failNextSend();
+            mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.message").value(ACCEPT_EMAIL_FAILED_MESSAGE))
+                    .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(true));
+
+            long acceptedInvoiceId = latestInvoiceId(orderId);
+            Assertions.assertNotNull(invoiceAcceptedAt(acceptedInvoiceId), "acceptance is committed");
+            Assertions.assertNull(invoiceLastEmailedAt(acceptedInvoiceId));
+            Assertions.assertNull(orderLastEmailedAt(orderId));
+            Assertions.assertEquals(0, recordingInvoiceEmailSender.sentEmails().size());
+            Assertions.assertEquals(1, recordingInvoiceEmailSender.failedEmails().size());
+            assertLinkCancelledByInvoiceAcceptance(orderId, 1, token, versionBefore, tokenBefore);
+
+            // Real public requests (each in its own transaction) see the durable dead link.
+            Map<String, Object> versionCancelled = quoteVersionRow(orderId, 1);
+            Map<String, Object> tokenCancelled = quoteTokenRow(token);
+            assertPublicQuoteState(token, "CANCELLED");
+            assertPublicAcceptGone(token, "QUOTE_LINK_CANCELLED");
+            Assertions.assertEquals(versionCancelled, quoteVersionRow(orderId, 1));
+            Assertions.assertEquals(tokenCancelled, quoteTokenRow(token));
+            Assertions.assertTrue(recordingQuoteAcceptanceNotificationSender.sentNotifications().isEmpty());
+        } finally {
+            deleteCommittedD5cOrder(orderId);
+        }
+    }
+
+    // ---- 5 / 6. an ACCEPTED quote never blocks D.8 and is never touched by it ----
+
+    @Test
+    void accept_withAcceptedQuote_isNeverBlocked_andLeavesTheAcceptedQuoteUntouched() throws Exception {
+        IssuedQuoteOrder fx = seedInvoicedOrderWithIssuedQuote();
+        long orderId = fx.orderId();
+        acceptQuoteViaPublicLink(fx.token());
+        Map<String, Object> acceptedVersion = quoteVersionRow(orderId, 1);
+        Map<String, Object> consumedToken = quoteTokenRow(fx.token());
+        Assertions.assertEquals("ACCEPTED", acceptedVersion.get("status"));
+        Assertions.assertEquals("CONSUMED", consumedToken.get("status"));
+        Map<String, Object> signedWorkingPrice = orderWorkingPrice(orderId);
+        mockMvc.perform(get(quoteUrl(orderId, "workspace")).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.current_issued").value(nullValue()))
+                .andExpect(jsonPath("$.data.accepted.version_number").value(1))
+                .andExpect(jsonPath("$.data.accepted.invoice_eligible").value(true));
+
+        // D5(d): the accepted quote never blocks the in-app signature — D.8 behaves exactly as usual...
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2))
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(true));
+
+        // ...and never revokes it: the ACCEPTED version (acceptance fields, signature + signed-PDF refs) and
+        // its CONSUMED token are unchanged; nothing was cancelled or added.
+        Assertions.assertEquals(acceptedVersion, quoteVersionRow(orderId, 1));
+        Assertions.assertEquals(consumedToken, quoteTokenRow(fx.token()));
+        Assertions.assertEquals(List.of("ACCEPTED"), quoteVersionStatuses(orderId));
+        Assertions.assertEquals(List.of("CONSUMED"), quoteTokenStatuses(orderId));
+        // D.8 carries the invoice snapshot forward and never rewrites the price the signed quote set (D6b).
+        Assertions.assertEquals(signedWorkingPrice, orderWorkingPrice(orderId));
+
+        // The accepted quote stays visible; conversion is now unavailable because the CURRENT invoice is
+        // signed (D5(b): invoice_eligible = false). The consumed link stays INACTIVE (never re-labelled).
+        mockMvc.perform(get(quoteUrl(orderId, "workspace")).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.current_issued").value(nullValue()))
+                .andExpect(jsonPath("$.data.accepted.version_number").value(1))
+                .andExpect(jsonPath("$.data.accepted.invoice_eligible").value(false));
+        assertPublicQuoteState(fx.token(), "INACTIVE");
+    }
+
+    @Test
+    void accept_withAcceptedV1AndIssuedV2_cancelsOnlyV2AndItsToken() throws Exception {
+        IssuedQuoteOrder fx = seedInvoicedOrderWithIssuedQuote();
+        long orderId = fx.orderId();
+        acceptQuoteViaPublicLink(fx.token());
+        // D9: a changed quote sent after the acceptance is a NEW version (v2) with a fresh ACTIVE link.
+        saveNonItemisedQuoteDraft(orderId, "440.00");
+        String v2Token = sendQuoteEmail(orderId);
+        Map<String, Object> v1 = quoteVersionRow(orderId, 1);
+        Map<String, Object> v1Token = quoteTokenRow(fx.token());
+        Map<String, Object> v2 = quoteVersionRow(orderId, 2);
+        Map<String, Object> v2TokenBefore = quoteTokenRow(v2Token);
+        Assertions.assertEquals("ACCEPTED", v1.get("status"));
+        Assertions.assertEquals("CONSUMED", v1Token.get("status"));
+        Assertions.assertEquals(v2.get("quote_version_id"), v2TokenBefore.get("quote_version_id"),
+                "the ACTIVE link belongs to v2");
+
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated());
+
+        assertLinkCancelledByInvoiceAcceptance(orderId, 2, v2Token, v2, v2TokenBefore);
+        Assertions.assertEquals(v1, quoteVersionRow(orderId, 1), "the ACCEPTED v1 is never touched");
+        Assertions.assertEquals(v1Token, quoteTokenRow(fx.token()), "v1's CONSUMED token is never touched");
+        Assertions.assertEquals(List.of("ACCEPTED", "CANCELLED"), quoteVersionStatuses(orderId));
+        Assertions.assertEquals(List.of("CONSUMED", "CANCELLED"), quoteTokenStatuses(orderId));
+
+        assertPublicQuoteState(v2Token, "CANCELLED");
+        assertPublicAcceptGone(v2Token, "QUOTE_LINK_CANCELLED");
+        assertPublicQuoteState(fx.token(), "INACTIVE");
+        assertPublicAcceptGone(fx.token(), "QUOTE_LINK_INACTIVE");
+        mockMvc.perform(get(quoteUrl(orderId, "workspace")).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.current_issued").value(nullValue()))
+                .andExpect(jsonPath("$.data.accepted.version_number").value(1));
+    }
+
+    @Test
+    void accept_afterQuoteResend_cancelsOnlyTheActiveToken_replacedTokenKeepsItsReason() throws Exception {
+        IssuedQuoteOrder fx = seedInvoicedOrderWithIssuedQuote();
+        long orderId = fx.orderId();
+        // Unchanged resend: the SAME ISSUED v1, its first token -> REPLACED, a fresh ACTIVE token.
+        String liveToken = sendQuoteEmail(orderId);
+        Assertions.assertNotEquals(fx.token(), liveToken);
+        Assertions.assertEquals(1, quoteVersionCount(orderId));
+        Map<String, Object> versionBefore = quoteVersionRow(orderId, 1);
+        Map<String, Object> replacedToken = quoteTokenRow(fx.token());
+        Map<String, Object> liveTokenBefore = quoteTokenRow(liveToken);
+        Assertions.assertEquals("REPLACED", replacedToken.get("status"));
+        Assertions.assertNotNull(replacedToken.get("dead_at"));
+
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated());
+
+        assertLinkCancelledByInvoiceAcceptance(orderId, 1, liveToken, versionBefore, liveTokenBefore);
+        Assertions.assertEquals(replacedToken, quoteTokenRow(fx.token()),
+                "an already-dead token keeps its REPLACED reason and its original dead_at");
+        assertPublicQuoteState(fx.token(), "SUPERSEDED");
+        assertPublicQuoteState(liveToken, "CANCELLED");
+    }
+
+    // ---- 7. no ISSUED version -> D.8 is unchanged and touches no quote row ----
+
+    @Test
+    void accept_withNoQuoteAtAll_isUnchanged_andCreatesNoQuoteRows() throws Exception {
+        long orderId = seedInvoicedOrder();
+
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2))
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(true));
+
+        Assertions.assertNotNull(invoiceAcceptedAt(latestInvoiceId(orderId)));
+        Assertions.assertEquals(0, quoteDraftCount(orderId));
+        Assertions.assertEquals(0, quoteVersionCount(orderId));
+        Assertions.assertEquals(0, quoteTokenCount(orderId));
+        Assertions.assertEquals(1, recordingInvoiceEmailSender.sentEmails().size());
+        Assertions.assertTrue(recordingQuoteEmailSender.sentEmails().isEmpty());
+        mockMvc.perform(get(quoteUrl(orderId, "workspace")).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.draft").value(nullValue()))
+                .andExpect(jsonPath("$.data.current_issued").value(nullValue()))
+                .andExpect(jsonPath("$.data.accepted").value(nullValue()));
+    }
+
+    @Test
+    void accept_withDraftOnlyQuote_isUnchanged_andLeavesTheDraftUntouched() throws Exception {
+        long orderId = seedInvoicedOrder();
+        saveItemisedQuoteDraft(orderId);
+        Map<String, Object> draftBefore = quoteDraftRow(orderId);
+        List<Map<String, Object>> draftLinesBefore = quoteDraftLineRows(orderId);
+        Assertions.assertEquals(2, draftLinesBefore.size());
+
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2));
+
+        Assertions.assertEquals(draftBefore, quoteDraftRow(orderId), "the draft header must be untouched");
+        Assertions.assertEquals(draftLinesBefore, quoteDraftLineRows(orderId), "the draft lines must be untouched");
+        Assertions.assertEquals(0, quoteVersionCount(orderId));
+        Assertions.assertEquals(0, quoteTokenCount(orderId));
+        Assertions.assertTrue(recordingQuoteEmailSender.sentEmails().isEmpty());
+        mockMvc.perform(get(quoteUrl(orderId, "workspace")).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.draft.itemised").value(true))
+                .andExpect(jsonPath("$.data.current_issued").value(nullValue()))
+                .andExpect(jsonPath("$.data.accepted").value(nullValue()));
+    }
+
+    @Test
+    void accept_withOnlyDeadQuoteHistory_touchesNothing() throws Exception {
+        IssuedQuoteOrder fx = seedInvoicedOrderWithIssuedQuote();      // v1 ISSUED (token A)
+        long orderId = fx.orderId();
+        sendQuoteEmail(orderId);                                      // unchanged resend: A REPLACED, B ACTIVE
+        saveNonItemisedQuoteDraft(orderId, "330.00");
+        sendQuoteEmail(orderId);                                      // changed: v1 SUPERSEDED (B too), v2 ISSUED (C)
+        mockMvc.perform(post(quoteUrl(orderId, "cancel")).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk());                          // protected cancel: v2 + C CANCELLED
+        clearJpaCache();
+        String expiringToken = sendQuoteEmail(orderId);               // nothing ISSUED: v3 ISSUED (D)
+        backdateQuoteTokenExpiry(expiringToken);
+        assertPublicQuoteState(expiringToken, "EXPIRED");             // lazy expiry: v3 + D EXPIRED
+        Assertions.assertEquals(List.of("SUPERSEDED", "CANCELLED", "EXPIRED"), quoteVersionStatuses(orderId));
+        Assertions.assertEquals(List.of("REPLACED", "SUPERSEDED", "CANCELLED", "EXPIRED"),
+                quoteTokenStatuses(orderId));
+        List<Map<String, Object>> versionsBefore = quoteVersionRows(orderId);
+        List<Map<String, Object>> tokensBefore = quoteTokenRows(orderId);
+
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE));
+
+        // No ISSUED version -> no-op: every dead version and token keeps its own status, reason and dead_at.
+        Assertions.assertEquals(versionsBefore, quoteVersionRows(orderId),
+                "SUPERSEDED / CANCELLED / EXPIRED versions must never be touched");
+        Assertions.assertEquals(tokensBefore, quoteTokenRows(orderId),
+                "already-dead tokens must never be touched (no re-labelling, no new dead_at)");
+    }
+
+    // ---- 8. LAID: D.8 stays allowed and still kills the link ----
+
+    @Test
+    void accept_laidOrderWithIssuedQuote_isAllowed_andCancelsTheQuoteLink() throws Exception {
+        // Issued while the order was editable (a quote send is LAID-blocked), then the order is laid.
+        IssuedQuoteOrder fx = seedInvoicedOrderWithIssuedQuote();
+        long orderId = fx.orderId();
+        laidOrder(orderId);
+        clearJpaCache();
+        Map<String, Object> versionBefore = quoteVersionRow(orderId, 1);
+        Map<String, Object> tokenBefore = quoteTokenRow(fx.token());
+
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(true));
+
+        assertLinkCancelledByInvoiceAcceptance(orderId, 1, fx.token(), versionBefore, tokenBefore);
+        Assertions.assertEquals("LAID", orderStatus(orderId), "neither D.8 nor the link kill changes the order status");
+        // The public accept is LAID-allowed (D4), but the link is dead: 410, never a resurrected acceptance.
+        assertPublicQuoteState(fx.token(), "CANCELLED");
+        assertPublicAcceptGone(fx.token(), "QUOTE_LINK_CANCELLED");
     }
 }

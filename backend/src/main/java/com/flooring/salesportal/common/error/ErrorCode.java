@@ -62,14 +62,18 @@ public enum ErrorCode {
     QUOTE_BELOW_COST(HttpStatus.UNPROCESSABLE_ENTITY, "This quote is below cost and cannot be saved, sent, or accepted."),
     QUOTE_TOTAL_EXCEEDS_LINES(HttpStatus.UNPROCESSABLE_ENTITY, "The quote total cannot exceed the sum of its lines. Add or raise a line instead."),
     // Phase 16E-A quote delivery codes (contract §12): cancel (QUOTE_NOT_ISSUED 422 /
-    // QUOTE_ALREADY_ACCEPTED 409 — the accepted branch is defensive here: no 16E-A endpoint can
-    // create an ACCEPTED version, but it is valid data once 16F lands), stored-PDF download
+    // QUOTE_ALREADY_ACCEPTED 409 — reachable since 16F PR1, when the public accept endpoint creates
+    // ACCEPTED versions), stored-PDF download
     // (QUOTE_PDF_NOT_FOUND 404), the send-sms recipient gate (422s, mirroring the Phase 13
     // CUSTOMER_EMAIL_* pair), and the send-sms provider failure (502, mirroring EMAIL_SEND_FAILED).
     // The 16F create-invoice code (QUOTE_NOT_ACCEPTED) is added by its owning endpoint, not here.
     QUOTE_NOT_ISSUED(HttpStatus.UNPROCESSABLE_ENTITY, "There is no active quote to cancel."),
     QUOTE_ALREADY_ACCEPTED(HttpStatus.CONFLICT, "This quote has already been accepted."),
     QUOTE_PDF_NOT_FOUND(HttpStatus.NOT_FOUND, "The requested quote PDF is not available."),
+    // Phase 16F PR1: the protected accepted-quote signature download (GET .../quote/accepted/signature)
+    // when the order has no ACCEPTED quote version, or its latest accepted version has no signature
+    // reference. Endpoint-specific (the quote analogue of the invoice signature's INVOICE_* codes).
+    QUOTE_SIGNATURE_NOT_FOUND(HttpStatus.NOT_FOUND, "No accepted quote signature is available for this order."),
     CUSTOMER_MOBILE_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "A valid customer mobile number is required to send by SMS."),
     CUSTOMER_MOBILE_INVALID(HttpStatus.UNPROCESSABLE_ENTITY, "Customer mobile number is not valid."),
     SMS_SEND_FAILED(HttpStatus.BAD_GATEWAY, "The quote could not be sent by SMS. Please try again."),
