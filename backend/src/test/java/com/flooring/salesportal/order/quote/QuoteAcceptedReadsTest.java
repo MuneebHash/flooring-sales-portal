@@ -1141,7 +1141,7 @@ class QuoteAcceptedReadsTest {
 
         JsonNode accepted = workspaceData(orderId).get("accepted");
         Assertions.assertFalse(accepted.get("invoice_eligible").booleanValue(),
-                "an ACCEPTED current invoice makes the accepted quote ineligible");
+                "a current invoice signed AFTER the quote was accepted makes the accepted quote ineligible");
         // D.8 never touches the accepted quote itself.
         Assertions.assertEquals(1, accepted.get("version_number").asInt());
         Assertions.assertEquals(SNAPSHOT_NAME, accepted.get("accepted_customer_name").asText());
@@ -1149,11 +1149,14 @@ class QuoteAcceptedReadsTest {
     }
 
     /**
-     * invoice_eligible follows the CURRENT invoice (max version_number) only. On an invoice-ready order:
-     * no invoice → true; D.1 Create (unsigned v1) → true; D.8 in-app acceptance (signed v2) → false;
-     * (a) a payment appends v3 with the acceptance CARRIED FORWARD → still false; (b) a manual Rewrite
-     * appends an UNSIGNED v4 (rewrite clears acceptance) → true again, although the signed v2/v3 remain
-     * in the invoice history. None of it touches the accepted quote.
+     * invoice_eligible (amended D5(b)) compares the accepted quote's signature time with the CURRENT
+     * invoice (max version_number) only: true with no invoice, with an unsigned current invoice, or when the
+     * quote was signed STRICTLY later than the current invoice; false when the current invoice was signed
+     * at the same time or later. On an invoice-ready order whose quote is accepted FIRST: no invoice -> true;
+     * D.1 Create (unsigned v1) -> true; D.8 in-app acceptance (v2, signed after the quote) -> false; (a) a
+     * payment appends v3 carrying that same later signature time forward -> still false; (b) a manual
+     * Rewrite appends an UNSIGNED v4 (rewrite clears acceptance) -> true again, although the signed v2/v3
+     * remain in the invoice history. None of it touches the accepted quote.
      */
     @Test
     void workspace_invoiceEligible_followsCurrentInvoiceOnly_paymentKeepsFalse_rewriteMakesTrueAgain()
@@ -1171,12 +1174,13 @@ class QuoteAcceptedReadsTest {
         Assertions.assertNull(currentInvoiceAcceptedAt(orderId), "precondition: v1 is unsigned");
         Assertions.assertTrue(invoiceEligible(orderId), "an UNSIGNED current invoice → eligible");
 
-        // D.8: the in-app signature appends the signed current v2 → ineligible.
+        // D.8: the in-app signature appends the current v2, signed after the quote -> ineligible.
         acceptInvoiceInApp(orderId);
         Map<String, Object> signed = currentInvoiceRow(orderId);
         Assertions.assertEquals(2, ((Number) signed.get("version_number")).intValue());
         Assertions.assertNotNull(signed.get("accepted_at"), "precondition: the current v2 is signed");
-        Assertions.assertFalse(invoiceEligible(orderId), "an ACCEPTED current invoice → ineligible");
+        Assertions.assertFalse(invoiceEligible(orderId),
+                "a current invoice signed after the quote was accepted -> ineligible");
 
         // (a) A payment appends v3 carrying the acceptance forward (the customer does not re-sign).
         recordCashPayment(orderId, "50.00");
@@ -1187,7 +1191,7 @@ class QuoteAcceptedReadsTest {
         Assertions.assertEquals(signed.get("accepted_signature_file_id"), paid.get("accepted_signature_file_id"));
         Assertions.assertEquals(0, new BigDecimal("50.00").compareTo((BigDecimal) paid.get("total_paid")));
         Assertions.assertFalse(invoiceEligible(orderId),
-                "the payment version still carries the acceptance → still ineligible");
+                "the payment version carries the same later signature time forward -> still ineligible");
 
         // (b) A manual Rewrite appends an UNSIGNED v4 from the live order → eligible again.
         rewriteInvoice(orderId, 4);

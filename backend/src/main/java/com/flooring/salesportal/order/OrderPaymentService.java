@@ -289,6 +289,14 @@ public class OrderPaymentService {
      * {@code latest} is unaccepted, all acceptance fields stay null. {@code last_emailed_at} starts
      * null on EVERY payment- and void-created version and stays null (Phase 15D: these flows never
      * email; manual Re-send is the only email path).
+     *
+     * <p>Phase 16F PR2: the two {@code V19} columns ({@code source_quote_version_id},
+     * {@code terms_snapshot}) are carried forward VERBATIM from {@code latest}, and the regenerated PDF
+     * takes its terms from that same source rule ({@link InvoiceTermsSelection#forInvoice}): a Path A
+     * invoice keeps its frozen quote terms, or its frozen absence of terms, across every payment and
+     * void, even after the business edits its live terms. Path B invoices (no source) keep rendering
+     * the live terms, unchanged. The carried source is re-verified as this order's quote version at the
+     * insert boundary ({@link InvoiceRepository#insertInvoice}).
      */
     private InvoiceRow regenerateInvoiceVersion(RequestContext ctx,
                                                 SalesOrder order,
@@ -302,6 +310,8 @@ public class OrderPaymentService {
         String detailsSnapshot = latest.detailsOfSaleSnapshot();    // carried forward
         BigDecimal salePriceExGst = latest.salePriceExGst();        // carried forward
         BigDecimal salePriceIncGst = latest.salePriceIncGst();      // carried forward
+        Long sourceQuoteVersionId = latest.sourceQuoteVersionId();  // carried forward (V19)
+        String termsSnapshot = latest.termsSnapshot();              // carried forward (V19)
 
         // Acceptance metadata carried forward UNCHANGED from the paid version (§6) — the customer does
         // not re-sign, and the same signature stored_file is referenced (never duplicated).
@@ -337,7 +347,8 @@ public class OrderPaymentService {
                 salePriceIncGst,
                 totalPaidAfter,
                 newBalance,
-                acceptedAt, acceptedCustomerName, signaturePng)));
+                acceptedAt, acceptedCustomerName, signaturePng,
+                InvoiceTermsSelection.forInvoice(sourceQuoteVersionId, termsSnapshot))));
 
         String storagePath = fileStorageService.store(pdfBytes, ctx.businessId(), orderId, PDF_EXTENSION);
         deleteFileOnRollback(storagePath);
@@ -347,7 +358,8 @@ public class OrderPaymentService {
                     orderId, versionNumber, invoiceDate, dueDate, detailsSnapshot,
                     salePriceExGst, salePriceIncGst, totalPaidAfter, newBalance,
                     storedFileId, ctx.userId(),
-                    acceptedAt, acceptedCustomerName, acceptedSignatureFileId, null);
+                    acceptedAt, acceptedCustomerName, acceptedSignatureFileId, null,
+                    sourceQuoteVersionId, termsSnapshot);
 
             // Dashboard mirror invariant (Phase 13 §11.1): whenever a new current invoice version is
             // created, sales_order.last_emailed_at is set to that version's last_emailed_at — null here

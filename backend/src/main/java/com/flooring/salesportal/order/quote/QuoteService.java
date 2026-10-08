@@ -11,6 +11,7 @@ import com.flooring.salesportal.common.error.NotFoundException;
 import com.flooring.salesportal.common.error.ValidationException;
 import com.flooring.salesportal.common.session.RequestContext;
 import com.flooring.salesportal.common.session.RequestContextGuard;
+import com.flooring.salesportal.order.AcceptedQuoteInvoiceEligibility;
 import com.flooring.salesportal.order.InvoiceRepository;
 import com.flooring.salesportal.order.OrderChargeLineReadRepository;
 import com.flooring.salesportal.order.OrderProductLineRepository;
@@ -171,14 +172,18 @@ public class QuoteService {
         // Phase 16F PR1: the LATEST accepted version summary (or null) — selected independently of
         // the draft and of current_issued (contract §4.3 / §7.1). Frozen body + acceptance fields
         // only; the stored_file ids stay server-internal (derived booleans + the backend-built
-        // protected signature path). invoice_eligible is false once the CURRENT invoice is accepted.
+        // protected signature path). Phase 16F PR2: invoice_eligible is the SAME signature-precedence
+        // rule the create-invoice endpoint enforces (AcceptedQuoteInvoiceEligibility, decision D5(b) as
+        // amended): true with no invoice, an unsigned current invoice, or a quote signature strictly
+        // newer than the current invoice's; read inside this one REPEATABLE_READ snapshot.
         QuoteAcceptedSummaryDto accepted = quoteVersionRepository.findLatestAcceptedByOrderId(orderId)
                 .map(row -> QuoteAcceptedSummaryDto.from(row,
                         quoteVersionRepository.findVersionLines(row.version().quoteVersionId()),
                         acceptedSignatureDownloadPath(slug, orderId),
-                        invoiceRepository.findCurrentByOrderId(orderId)
-                                .map(invoice -> invoice.acceptedAt() == null)
-                                .orElse(true)))
+                        AcceptedQuoteInvoiceEligibility.allows(row.acceptedAt(),
+                                invoiceRepository.findCurrentByOrderId(orderId)
+                                        .map(InvoiceRepository.InvoiceRow::acceptedAt)
+                                        .orElse(null))))
                 .orElse(null);
 
         Optional<QuoteDraft> draftOpt = quoteDraftRepository.findByOrderId(orderId);

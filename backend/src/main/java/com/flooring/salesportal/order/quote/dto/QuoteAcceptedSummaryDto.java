@@ -26,11 +26,14 @@ import java.util.List;
  * clients consume it verbatim) and the signed PDF through {@code GET .../quote/pdf?type=accepted}.
  * No storage path, stored_file id, token, hash, cost or GP field ever rides on this DTO.
  *
- * <p>{@code invoiceEligible} is false when the order's CURRENT invoice is already accepted (16F
- * decision D5(b): conversion is unavailable — "Invoice already accepted"); an unsigned invoice, an
- * unsigned draft or a newer issued quote does not by itself make it false. It is a read-only
- * eligibility flag; the conversion itself (Path A) is PR2. Every field is always serialized (nullable
- * ones as JSON null), matching {@link QuoteIssuedSummaryDto}.
+ * <p>{@code invoiceEligible} (Phase 16F PR2, decision D5(b) as amended on 8 October 2026) is the
+ * signature-precedence rule the create-invoice endpoint (Path A) enforces, shared through
+ * {@code AcceptedQuoteInvoiceEligibility}: true when the order has no invoice, when its CURRENT invoice
+ * is unsigned, or when this quote's {@code accepted_at} is STRICTLY later than the current invoice's
+ * {@code accepted_at}; false when the current invoice was signed at the same time or later. It reflects
+ * that rule only: LAID, a draft or newer issued quote, missing invoice preconditions, a blank details
+ * of sale, a zero total or overpayment never make it false (the endpoint validates those itself).
+ * Every field is always serialized (nullable ones as JSON null), matching {@link QuoteIssuedSummaryDto}.
  */
 public record QuoteAcceptedSummaryDto(
         long quoteVersionId,

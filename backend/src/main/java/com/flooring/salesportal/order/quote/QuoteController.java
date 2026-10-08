@@ -1,6 +1,8 @@
 package com.flooring.salesportal.order.quote;
 
 import com.flooring.salesportal.common.api.ApiResponse;
+import com.flooring.salesportal.order.OrderInvoiceService;
+import com.flooring.salesportal.order.dto.InvoiceResponse;
 import com.flooring.salesportal.order.quote.QuoteSendService.QuoteSignatureImage;
 import com.flooring.salesportal.order.quote.QuoteSendService.QuoteStoredPdf;
 import com.flooring.salesportal.order.quote.QuoteService.QuotePreviewResult;
@@ -39,7 +41,10 @@ import java.nio.charset.StandardCharsets;
  * <p>PR1 added the workspace GET and the draft PUT; PR2 added the on-demand preview PDF
  * ({@code POST .../quote/preview-pdf}); Phase 16E-A adds send-email / send-sms / cancel / the
  * stored issued-PDF download (all delivery/lifecycle logic lives in {@link QuoteSendService}).
- * Create-invoice and the public token surface are Phase 16F / 16E-C.
+ * The public token surface is Phase 16E-C ({@code PublicQuoteController}). Phase 16F PR2 adds
+ * {@code POST .../quote/create-invoice} (Path A), which delegates to
+ * {@link OrderInvoiceService#createInvoiceFromAcceptedQuote} so the invoice is persisted by the
+ * invoice service's own established pattern.
  *
  * <p>The preview returns a raw {@code ResponseEntity<byte[]>} (the file-binary exception, mirroring the
  * invoice file download D.4) rather than the {@code ApiResponse} envelope; its error paths still flow
@@ -53,10 +58,14 @@ public class QuoteController {
 
     private final QuoteService quoteService;
     private final QuoteSendService quoteSendService;
+    private final OrderInvoiceService orderInvoiceService;
 
-    public QuoteController(QuoteService quoteService, QuoteSendService quoteSendService) {
+    public QuoteController(QuoteService quoteService,
+                           QuoteSendService quoteSendService,
+                           OrderInvoiceService orderInvoiceService) {
         this.quoteService = quoteService;
         this.quoteSendService = quoteSendService;
+        this.orderInvoiceService = orderInvoiceService;
     }
 
     /** GET .../quote/workspace — draft + current_issued + accepted (latest ACCEPTED, 16F PR1). LAID read allowed. */
@@ -147,6 +156,24 @@ public class QuoteController {
             @RequestBody(required = false) String body,
             HttpServletRequest httpRequest) {
         return quoteSendService.cancel(slug, orderId, body, httpRequest);
+    }
+
+    /**
+     * POST .../quote/create-invoice (Phase 16F PR2, Path A): create an invoice version from the order's
+     * latest ACCEPTED quote, inheriting its signature. Empty body only (the server selects the quote
+     * version). Allowed when LAID; no email. 201 with the InvoiceDetail envelope and the message
+     * "Invoice created from accepted quote."; 422 QUOTE_NOT_ACCEPTED / INVOICE_PRECONDITIONS_NOT_MET /
+     * BUSINESS_RULE_VIOLATION; 409 INVOICE_ALREADY_ACCEPTED when the current invoice was signed at the
+     * same time or later than the quote. All logic lives in {@link OrderInvoiceService}.
+     */
+    @PostMapping("/create-invoice")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ApiResponse<InvoiceResponse> createInvoiceFromQuote(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestBody(required = false) String body,
+            HttpServletRequest httpRequest) {
+        return orderInvoiceService.createInvoiceFromAcceptedQuote(slug, orderId, body, httpRequest);
     }
 
     /**

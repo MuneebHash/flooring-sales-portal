@@ -2016,8 +2016,10 @@ class InvoiceAcceptanceControllerTest {
         // D.8 carries the invoice snapshot forward and never rewrites the price the signed quote set (D6b).
         Assertions.assertEquals(signedWorkingPrice, orderWorkingPrice(orderId));
 
-        // The accepted quote stays visible; conversion is now unavailable because the CURRENT invoice is
-        // signed (D5(b): invoice_eligible = false). The consumed link stays INACTIVE (never re-labelled).
+        // The accepted quote stays visible; conversion is now unavailable because the CURRENT invoice was
+        // signed AFTER the quote was accepted (amended D5(b): only a quote signature strictly later than
+        // the current invoice's signature may be invoiced, so invoice_eligible = false). The consumed link
+        // stays INACTIVE (never re-labelled).
         mockMvc.perform(get(quoteUrl(orderId, "workspace")).session(liamStore1Session()))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.current_issued").value(nullValue()))
@@ -2188,5 +2190,127 @@ class InvoiceAcceptanceControllerTest {
         // The public accept is LAID-allowed (D4), but the link is dead: 410, never a resurrected acceptance.
         assertPublicQuoteState(fx.token(), "CANCELLED");
         assertPublicAcceptGone(fx.token(), "QUOTE_LINK_CANCELLED");
+    }
+
+    // ================================================================
+    // Phase 16F PR2 - D.8 / D.9 InvoiceDetail terms on a Path B invoice
+    // ================================================================
+    //
+    // A Path B invoice (no source quote version) reports terms_source LIVE and terms_html = the business's
+    // CURRENT per-flooring-type terms through the InvoiceTermsSanitizer (JSON null, key present, when there
+    // are none) on both the D.8 201 and the D.9 200 response. D.8 carries the current row's two V19
+    // columns verbatim, so the signed version of a Path B invoice keeps both NULL. Self-seeded with the
+    // D5(c) fixtures above (own SOFT order + invoice v1 through D.1); business 1's terms are set here.
+
+    private static final String PR2_SOFT_TERMS_TEXT = "Live soft acceptance terms apply.";
+    private static final String PR2_UPDATED_SOFT_TERMS_TEXT = "Updated soft acceptance terms apply.";
+    private static final String PR2_HARD_TERMS_TEXT = "Live hard acceptance terms apply.";
+    // Markup the sanitizer strips, so an equal-to-sanitized terms_html proves the sanitizer ran.
+    private static final String PR2_LIVE_SOFT_TERMS_RAW =
+            "<p style=\"color:red\" onclick=\"steal()\">" + PR2_SOFT_TERMS_TEXT + "</p>";
+    private static final String PR2_UPDATED_SOFT_TERMS_RAW = "<p id=\"updated\">" + PR2_UPDATED_SOFT_TERMS_TEXT + "</p>";
+    private static final String PR2_LIVE_HARD_TERMS_RAW = "<p>" + PR2_HARD_TERMS_TEXT + "</p>";
+
+    /** Business 1's live per-flooring-type terms (V13 columns); rolled back with the test. */
+    private void setTenantTerms(String termsSoft, String termsHard) {
+        jdbcTemplate.update("UPDATE business SET terms_soft = ?, terms_hard = ? WHERE business_id = ?",
+                termsSoft, termsHard, BUSINESS_AUSSIE);
+        clearJpaCache();
+    }
+
+    private static int pdfPageCount(byte[] pdf) throws Exception {
+        try (PDDocument document = PDDocument.load(pdf)) {
+            return document.getNumberOfPages();
+        }
+    }
+
+    /** Whitespace-flattened text of one page (1-based). */
+    private static String pdfPageText(byte[] pdf, int page) throws Exception {
+        try (PDDocument document = PDDocument.load(pdf)) {
+            PDFTextStripper stripper = new PDFTextStripper();
+            stripper.setStartPage(page);
+            stripper.setEndPage(page);
+            return stripper.getText(document).replaceAll("\\s+", " ");
+        }
+    }
+
+    @Test
+    void acceptAndResend_pathBInvoice_reportLiveTermsSource_withTheBusinessCurrentSanitizedTerms() throws Exception {
+        setTenantTerms(PR2_LIVE_SOFT_TERMS_RAW, PR2_LIVE_HARD_TERMS_RAW);
+        long orderId = seedInvoicedOrder();
+        Assertions.assertNull(jdbcTemplate.queryForObject(
+                        "SELECT source_quote_version_id FROM invoice WHERE invoice_id = ?", Long.class,
+                        latestInvoiceId(orderId)),
+                "precondition: v1 (D.1) is a Path B invoice");
+        InvoiceTermsSanitizer sanitizer = new InvoiceTermsSanitizer();
+        String softTerms = sanitizer.sanitize(PR2_LIVE_SOFT_TERMS_RAW);
+        Assertions.assertNotNull(softTerms);
+        Assertions.assertNotEquals(PR2_LIVE_SOFT_TERMS_RAW, softTerms,
+                "fixture: the raw terms carry markup the sanitizer strips");
+
+        // D.8 (201): the appended signed version reports LIVE + the sanitized SOFT terms.
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(2))
+                .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(true))
+                .andExpect(jsonPath("$.data.invoice.terms_source").value("LIVE"))
+                .andExpect(jsonPath("$.data.invoice.terms_html").value(softTerms));
+        clearJpaCache();
+
+        // D.8 carries the current row's V19 columns verbatim: the signed Path B version keeps both NULL...
+        long signedInvoiceId = latestInvoiceId(orderId);
+        Map<String, Object> v19 = jdbcTemplate.queryForMap(
+                "SELECT source_quote_version_id, terms_snapshot FROM invoice WHERE invoice_id = ?", signedInvoiceId);
+        Assertions.assertNull(v19.get("source_quote_version_id"), "D.8 v2: source_quote_version_id must be NULL");
+        Assertions.assertNull(v19.get("terms_snapshot"), "D.8 v2: terms_snapshot must be NULL");
+        // ...and its signed PDF (the stored file, which is also the auto-emailed attachment) renders those
+        // live SOFT terms on a dedicated page 2, never the HARD ones.
+        String signedPdfPath = storagePathOf(invoicePdfFileId(signedInvoiceId));
+        Assertions.assertTrue(diskFileExists(signedPdfPath), "the signed PDF must exist on disk");
+        byte[] signedPdf = Files.readAllBytes(tempStorageDir.resolve(signedPdfPath.substring(1)));
+        List<InvoiceEmailRequest> sent = recordingInvoiceEmailSender.sentEmails();
+        Assertions.assertEquals(1, sent.size(), "D.8 auto-emails once");
+        Assertions.assertArrayEquals(signedPdf, sent.get(0).pdfBytes(), "the auto-email attaches the stored signed PDF");
+        Assertions.assertEquals(2, pdfPageCount(signedPdf), "live terms -> a dedicated terms page 2");
+        String page1 = pdfPageText(signedPdf, 1);
+        String page2 = pdfPageText(signedPdf, 2);
+        Assertions.assertFalse(page1.contains("TERMS"), () -> "page 1 never carries the terms: " + page1);
+        Assertions.assertTrue(page2.contains("TERMS") && page2.contains(PR2_SOFT_TERMS_TEXT),
+                () -> "page 2 must carry the live soft terms: " + page2);
+        String signedText = extractPdfText(signedPdf);
+        Assertions.assertFalse(signedText.contains(PR2_HARD_TERMS_TEXT), () -> "no hard terms on SOFT: " + signedText);
+        Assertions.assertTrue(signedText.contains("Accepted by") && signedText.contains(D5C_CUSTOMER_NAME),
+                () -> "the signed PDF carries the acceptance caption: " + signedText);
+
+        // D.9 (200) after the business edits its SOFT terms: LIVE reports the CURRENT terms.
+        setTenantTerms(PR2_UPDATED_SOFT_TERMS_RAW, PR2_LIVE_HARD_TERMS_RAW);
+        mockMvc.perform(post(resendUrl(orderId)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.message").value(RESEND_MESSAGE))
+                .andExpect(jsonPath("$.data.invoice.invoice_id").value(signedInvoiceId))
+                .andExpect(jsonPath("$.data.invoice.terms_source").value("LIVE"))
+                .andExpect(jsonPath("$.data.invoice.terms_html").value(sanitizer.sanitize(PR2_UPDATED_SOFT_TERMS_RAW)));
+        clearJpaCache();
+
+        // D.9 (200) with no SOFT terms: terms_html stays PRESENT as JSON null (no fallback to the HARD terms).
+        setTenantTerms(null, PR2_LIVE_HARD_TERMS_RAW);
+        MvcResult cleared = mockMvc.perform(post(resendUrl(orderId)).session(liamStore1Session())
+                        .contentType(APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.invoice.terms_source").value("LIVE"))
+                .andReturn();
+        clearJpaCache();
+        String json = cleared.getResponse().getContentAsString();
+        Assertions.assertTrue(json.contains("\"terms_html\":null"), () -> "terms_html must be present as null: " + json);
+        for (String internal : List.of("source_quote_version_id", "terms_snapshot")) {
+            Assertions.assertFalse(json.contains(internal), () -> "must not leak " + internal + ": " + json);
+        }
+
+        // Neither resend appended a version; each one emailed the stored PDF.
+        Assertions.assertEquals(2, countInvoices(orderId));
+        Assertions.assertEquals(signedInvoiceId, latestInvoiceId(orderId));
+        Assertions.assertEquals(3, recordingInvoiceEmailSender.sentEmails().size());
     }
 }

@@ -4,6 +4,7 @@ import com.flooring.salesportal.common.api.ErrorDetail;
 import com.flooring.salesportal.order.dto.OrderFinancialSummaryDto;
 import org.springframework.stereotype.Component;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -19,6 +20,12 @@ import java.util.List;
  * from the live summary subtotals (every line has a {@code line_total > 0} DB CHECK, so a non-zero
  * subtotal means ≥1 line). Precondition 9 uses the live computed {@code final_sale_price_inc_gst}
  * (there is no persisted {@code order_financial_summary} table — it is recomputed each time).
+ *
+ * <p>Phase 16F PR2 adds a SEPARATE entry point for Path A ({@link #collectAcceptedQuoteFailures}):
+ * the six identity / address / lay-date checks are retained unchanged (same sections, fields and
+ * messages, shared helpers below), while the live priced-line, live details-of-sale and live
+ * sale-price checks are REPLACED by checks on the signed quote snapshot. The Path B entry point
+ * ({@link #collectFailures}) and its nine checks are unchanged.
  */
 @Component
 public class InvoicePreconditionValidator {
@@ -41,20 +48,10 @@ public class InvoicePreconditionValidator {
         List<ErrorDetail> errors = new ArrayList<>();
 
         // 1 + 2. Customer first / last name present and non-blank.
-        if (customer == null || isBlank(customer.getFirstName())) {
-            errors.add(new ErrorDetail("customer", "first_name", "Customer first name is required."));
-        }
-        if (customer == null || isBlank(customer.getLastName())) {
-            errors.add(new ErrorDetail("customer", "last_name", "Customer last name is required."));
-        }
+        addCustomerNameFailures(customer, errors);
 
         // 3 + 4. Installation / billing address rows exist (required fields enforced by the schema).
-        if (!hasAddress(addresses, ADDRESS_INSTALLATION)) {
-            errors.add(new ErrorDetail("address", "installation_address", "Installation address is required."));
-        }
-        if (!hasAddress(addresses, ADDRESS_BILLING)) {
-            errors.add(new ErrorDetail("address", "billing_address", "Billing address is required."));
-        }
+        addAddressFailures(addresses, errors);
 
         // 5. At least one priced product or charge line (subtotal > 0 implies ≥1 line).
         boolean hasPricedLine = summary.productSubtotal().signum() > 0 || summary.chargeSubtotal().signum() > 0;
@@ -67,15 +64,8 @@ public class InvoicePreconditionValidator {
             errors.add(new ErrorDetail("details", "details_of_sale", "Details of sale is required."));
         }
 
-        // 7. Proposed lay date present.
-        if (order.getProposedLayDate() == null) {
-            errors.add(new ErrorDetail("details", "proposed_lay_date", "Proposed lay date is required."));
-        }
-
-        // 8. Lay date status present.
-        if (isBlank(order.getLayDateStatus())) {
-            errors.add(new ErrorDetail("details", "lay_date_status", "Lay date status is required."));
-        }
+        // 7 + 8. Proposed lay date present; lay date status present.
+        addLayDateFailures(order, errors);
 
         // 9. Live final sale price (inc GST) > 0.
         if (summary.finalSalePriceIncGst() == null || summary.finalSalePriceIncGst().signum() <= 0) {
@@ -84,6 +74,85 @@ public class InvoicePreconditionValidator {
         }
 
         return errors;
+    }
+
+    /**
+     * Phase 16F PR2 - the Path A ("create invoice from the accepted quote") preconditions. Empty list =
+     * all pass. Retained from Path B (same detail sections, fields and messages): customer first / last
+     * name, installation / billing address rows, proposed lay date, lay date status. Replaced by the
+     * signed snapshot: the frozen details of sale must be present and non-blank (it is NEVER filled from
+     * the live order), and each signed quote total (ex and inc GST, checked independently) must be
+     * greater than zero. There is deliberately NO live priced-line, live details-of-sale or live
+     * sale-price check, and no customer-email gate.
+     *
+     * @param order               the scoped, locked sales order (proposed_lay_date / lay_date_status)
+     * @param customer            the order's live customer row, or {@code null} if none saved
+     * @param addresses           the order's live address rows (INSTALLATION / BILLING)
+     * @param quoteDetailsOfSale  the accepted quote version's frozen {@code details_of_sale_snapshot}
+     * @param quoteTotalExGst     the accepted quote version's frozen {@code quote_total_ex_gst}
+     * @param quoteTotalIncGst    the accepted quote version's frozen {@code quote_total_inc_gst}
+     */
+    public List<ErrorDetail> collectAcceptedQuoteFailures(SalesOrder order,
+                                                          OrderCustomer customer,
+                                                          List<OrderAddress> addresses,
+                                                          String quoteDetailsOfSale,
+                                                          BigDecimal quoteTotalExGst,
+                                                          BigDecimal quoteTotalIncGst) {
+        List<ErrorDetail> errors = new ArrayList<>();
+
+        addCustomerNameFailures(customer, errors);
+        addAddressFailures(addresses, errors);
+
+        // The signed quote's frozen details of sale (replaces the live details-of-sale check).
+        if (isBlank(quoteDetailsOfSale)) {
+            errors.add(new ErrorDetail("details", "details_of_sale",
+                    "Details of sale on the accepted quote is required."));
+        }
+
+        addLayDateFailures(order, errors);
+
+        // The signed quote totals (replace the live priced-line and live sale-price checks). Each is
+        // checked on its own: ex is never derived from inc, nor inc from ex.
+        if (quoteTotalExGst == null || quoteTotalExGst.signum() <= 0) {
+            errors.add(new ErrorDetail("financial", "sale_price_ex_gst",
+                    "The accepted quote total (ex GST) must be greater than zero."));
+        }
+        if (quoteTotalIncGst == null || quoteTotalIncGst.signum() <= 0) {
+            errors.add(new ErrorDetail("financial", "sale_price_inc_gst",
+                    "The accepted quote total (inc GST) must be greater than zero."));
+        }
+
+        return errors;
+    }
+
+    // Preconditions 1 + 2 (shared by Path B and Path A).
+    private static void addCustomerNameFailures(OrderCustomer customer, List<ErrorDetail> errors) {
+        if (customer == null || isBlank(customer.getFirstName())) {
+            errors.add(new ErrorDetail("customer", "first_name", "Customer first name is required."));
+        }
+        if (customer == null || isBlank(customer.getLastName())) {
+            errors.add(new ErrorDetail("customer", "last_name", "Customer last name is required."));
+        }
+    }
+
+    // Preconditions 3 + 4 (shared by Path B and Path A).
+    private static void addAddressFailures(List<OrderAddress> addresses, List<ErrorDetail> errors) {
+        if (!hasAddress(addresses, ADDRESS_INSTALLATION)) {
+            errors.add(new ErrorDetail("address", "installation_address", "Installation address is required."));
+        }
+        if (!hasAddress(addresses, ADDRESS_BILLING)) {
+            errors.add(new ErrorDetail("address", "billing_address", "Billing address is required."));
+        }
+    }
+
+    // Preconditions 7 + 8 (shared by Path B and Path A).
+    private static void addLayDateFailures(SalesOrder order, List<ErrorDetail> errors) {
+        if (order.getProposedLayDate() == null) {
+            errors.add(new ErrorDetail("details", "proposed_lay_date", "Proposed lay date is required."));
+        }
+        if (isBlank(order.getLayDateStatus())) {
+            errors.add(new ErrorDetail("details", "lay_date_status", "Lay date status is required."));
+        }
     }
 
     private static boolean hasAddress(List<OrderAddress> addresses, String addressType) {
