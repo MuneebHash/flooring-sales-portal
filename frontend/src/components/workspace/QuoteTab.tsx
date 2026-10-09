@@ -2398,8 +2398,22 @@ export function QuoteTab({
         )
         return
       }
-      // A snapshot refresh can land during the flush, and the effect that closes
-      // a stale confirmation is paused while converting: re-check the target.
+      // Codex P1 (second): re-read the accepted quote state right before the
+      // POST, so a change made elsewhere since the last read is caught by the
+      // re-check below. Issued before the floor is raised so it can apply; a
+      // 'superseded' read means a newer read applied, which is just as fresh.
+      // A failed read blocks the conversion (nothing is posted, no lock).
+      const outcome = await refreshSnapshots({ reportError: false })
+      if (!mountedRef.current || orderIdRef.current !== requestOrderId) return
+      if (outcome === 'failed') {
+        closeConvertModal()
+        setConvertError(
+          'The latest quote status could not be loaded, so the invoice was not created. Try again.',
+        )
+        return
+      }
+      // Re-check the target against that fresh state (the effect that closes a
+      // stale confirmation is paused while converting).
       const latest = acceptedRef.current
       if (
         latest === null ||
