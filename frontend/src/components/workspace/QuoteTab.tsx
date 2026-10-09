@@ -2383,10 +2383,37 @@ export function QuoteTab({
     setConvertError(null)
     setConvertErrorDetails([])
     setConvertNotice(null)
-    // The conversion starts: older snapshot reads may not land after it.
-    raiseSnapshotFloor()
     const requestOrderId = target.orderId
     try {
+      // Codex P1: the backend reads the PERSISTED proposed lay date and lay date
+      // status (due date and preconditions), so pending Details of Sale edits are
+      // flushed first, as Send and Preview PDF do; a failed save blocks the
+      // conversion. No quote draft flush: Path A never reads the draft.
+      const detailsSaved = await flushDetailsAutosave()
+      if (!mountedRef.current || orderIdRef.current !== requestOrderId) return
+      if (!detailsSaved) {
+        closeConvertModal()
+        setConvertError(
+          'Could not save the latest Details of Sale. Fix the details and try again.',
+        )
+        return
+      }
+      // A snapshot refresh can land during the flush, and the effect that closes
+      // a stale confirmation is paused while converting: re-check the target.
+      const latest = acceptedRef.current
+      if (
+        latest === null ||
+        latest.quote_version_id !== target.quoteVersionId ||
+        !latest.invoice_eligible ||
+        target.orderId !== orderIdRef.current ||
+        convertTargetRef.current?.key !== target.key
+      ) {
+        closeConvertModal()
+        setConvertNotice(ACCEPTED_CHANGED_MESSAGE)
+        return
+      }
+      // The conversion starts: older snapshot reads may not land after it.
+      raiseSnapshotFloor()
       let message = 'Invoice created from accepted quote.'
       try {
         const res = await createInvoiceFromQuote(requestOrderId)
