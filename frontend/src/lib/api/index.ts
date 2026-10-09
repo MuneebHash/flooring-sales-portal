@@ -81,6 +81,7 @@ export type {
   InvoiceDetail,
   InvoicePdfDownload,
   InvoiceResponse,
+  InvoiceTermsSource,
 } from './orderInvoicesApi'
 export { fetchQuickDescriptions } from './quickDescriptionsApi'
 export { fetchTenantInvoiceConfig } from './tenantInvoiceConfigApi'
@@ -104,6 +105,8 @@ export {
   fetchQuoteWorkspace,
   saveQuoteDraft,
   fetchQuotePreviewPdf,
+  fetchAcceptedQuoteSignature,
+  createInvoiceFromQuote,
   QUOTE_TOTAL_MAX,
 } from './orderQuoteApi'
 export type {
@@ -113,6 +116,8 @@ export type {
   QuoteDraftAdjustmentLineInput,
   QuoteDraftLineInput,
   QuoteDraftRead,
+  QuoteIssuedLine,
+  QuoteAcceptedSummary,
   QuoteWorkspace,
   QuoteDraftSaveRequest,
   QuotePreviewPdfDownload,

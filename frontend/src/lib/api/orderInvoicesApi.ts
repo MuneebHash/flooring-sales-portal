@@ -35,6 +35,17 @@ import type { ApiSuccess } from './types'
 // signature stream, consumed verbatim by fetchCurrentInvoiceSignature. last_emailed_at is a
 // delivery marker: null = this invoice version has never been emailed (including when an
 // Accept's auto-email failed — Re-send retries it).
+//
+// Phase 16F PR2 (decision D7) terms fields, ALWAYS present on every InvoiceDetail response:
+// terms_source is QUOTE for an invoice created from an accepted quote (Path A, and the payment,
+// void and in-app accept versions carried from it) and LIVE otherwise (Create / Rewrite).
+// terms_html is selected by the same rule the invoice PDF renderer uses: with QUOTE it is the
+// frozen quote terms snapshot verbatim, and null means frozen "no terms" (never a fall-back to
+// live terms); with LIVE it is the business's CURRENT per-flooring-type terms at read time (null
+// when none are set), which may differ from the terms inside an already-stored PDF. The Invoice
+// tab renders terms from these fields only.
+export type InvoiceTermsSource = 'QUOTE' | 'LIVE'
+
 export type InvoiceDetail = {
   invoice_id: number
   order_id: number
@@ -54,12 +65,16 @@ export type InvoiceDetail = {
   accepted_signature_present: boolean
   accepted_signature_download_path: string | null
   last_emailed_at: string | null
+  terms_html: string | null
+  terms_source: InvoiceTermsSource
 }
 
 // Create (201) / Rewrite (201) / Read current (200) / Accept (201) / Resend (200) all wrap the
 // invoice under an `invoice` key inside the standard ApiSuccess `data` envelope. Create/Rewrite
 // include a top-level message ("Invoice created." / "Invoice rewritten."); Accept/Resend include
 // the Phase 13 messages (see acceptCurrentInvoice / resendCurrentInvoice); Read current does not.
+// The Phase 16F Path A conversion (orderQuoteApi.createInvoiceFromQuote) returns the same shape
+// with the message "Invoice created from accepted quote.".
 export type InvoiceResponse = {
   invoice: InvoiceDetail
 }
@@ -101,8 +116,10 @@ export function rewriteInvoice(
   )
 }
 
-// Matches invoice.accepted_customer_name VARCHAR(150) / the backend trim+length check
-// (a trimmed name longer than this is a 400 VALIDATION_FAILED, not a 422).
+// Matches the backend D.8 accept request check (trim + length; a trimmed name longer than this
+// is a 400 VALIDATION_FAILED, not a 422). Since V19 the stored column is TEXT, so a name an
+// invoice INHERITS from an accepted quote (Path A) can be longer: that name is display-only
+// and never passes through this request gate.
 export const ACCEPTED_NAME_MAX_LENGTH = 150
 
 // POST /api/v1/{slug}/orders/{orderId}/invoices/current/accept — Phase 13 D.8. Accept/sign the

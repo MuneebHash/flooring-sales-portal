@@ -17,20 +17,15 @@ import type {
   OrderAddress,
   OrderCustomer,
 } from '../../lib/api/orderWorkspaceApi'
-import {
-  fetchTenantInvoiceConfig,
-  type TenantInvoiceConfig,
-} from '../../lib/api/tenantInvoiceConfigApi'
 import { fetchPublicBusiness } from '../../lib/api/tenantApi'
 import { getActiveSlug } from '../../lib/tenant'
-import type { FlooringType } from '../../lib/flooring'
 
 type Props = {
   orderId: number
-  // The order's flooring type (SOFT or HARD). An order has exactly one type, which
-  // selects WHICH per-tenant terms block (terms_soft vs terms_hard) renders on the
-  // invoice — see termsText below.
-  flooringType: FlooringType
+  // Phase 16F PR3 - a one-shot success notice handed over when the workspace opens this
+  // tab right after an action elsewhere (the Path A "Invoice created from accepted quote."
+  // message from the Quote tab). Shown above the invoice until the next invoice action.
+  notice?: string | null
   // View/download + Phase 13 acceptance (sign / accept / re-send). Create + Rewrite
   // live in the Details of Sale tab now. NOTE: LAID/`locked` is deliberately NOT a
   // prop here — Accept, Re-send and the signature download are all allowed when
@@ -129,7 +124,7 @@ function pdfFileName(
 }
 
 // Trim a nullable/optional string and return it only when it has visible content;
-// otherwise null. Lets the invoice hide tenant-config rows that are null/blank rather
+// otherwise null. Lets the invoice hide values (e.g. terms_html) that are null/blank rather
 // than render an empty label, a sample fallback, or a "—" placeholder.
 function nonBlank(value: string | null | undefined): string | null {
   const trimmed = value?.trim()
@@ -141,9 +136,26 @@ const ACCEPTANCE_LINES: string[] = [
   'I agree that no floor preparation costs are included unless otherwise stated above.',
 ]
 
+// Phase 16F PR3 - the plain terms-source label. It reports the API's own terms_source
+// (QUOTE = the terms frozen on the signed quote; LIVE = the business's current terms). It
+// makes no claim about any stored PDF.
+function termsSourceLabel(
+  source: InvoiceDetail['terms_source'],
+  hasTerms: boolean,
+): string {
+  if (source === 'QUOTE') {
+    return hasTerms
+      ? 'Terms source: frozen from the signed quote.'
+      : 'Terms source: frozen from the signed quote, which has no terms.'
+  }
+  return hasTerms
+    ? 'Terms source: the business’s current terms.'
+    : 'Terms source: the business’s current terms (none are set).'
+}
+
 export function InvoiceTab({
   orderId,
-  flooringType,
+  notice,
   orderNumber,
   customer,
   billingAddress,
@@ -157,6 +169,12 @@ export function InvoiceTab({
   const [actionError, setActionError] = useState<string | null>(null)
   // Backend success messages (accept / resend) surfaced VERBATIM.
   const [actionMessage, setActionMessage] = useState<string | null>(null)
+  // Phase 16F PR3 - the handed-over success notice (see Props.notice), captured once at
+  // mount (the workspace remounts this tab on every open and on every handover). Cleared
+  // by the next action.
+  const [handoverNotice, setHandoverNotice] = useState<string | null>(
+    notice ?? null,
+  )
   // True when the last accept/resend failed on the customer-email gate, so the
   // error banner can point the salesperson at the Customer tab.
   const [emailFixNeeded, setEmailFixNeeded] = useState(false)
@@ -165,29 +183,19 @@ export function InvoiceTab({
   const [resending, setResending] = useState(false)
   const [reloadToken, setReloadToken] = useState(0)
 
-  // Phase 15B — per-tenant invoice metadata for the document terms. The business name +
-  // private invoice-config are fetched in a SEPARATE, order-independent effect below and FAIL
-  // SOFT: a failure hides the affected rows, never blocks the invoice document, and never
-  // routes through loadError. (Phase 16A PR1: store details are no longer shown on this screen,
-  // so the auth store context is no longer read here.)
-  const [tenantConfig, setTenantConfig] = useState<TenantInvoiceConfig | null>(
-    null,
-  )
+  // Business name + logo for the document header, from the fail-soft public-business lookup
+  // in a SEPARATE, order-independent effect below: a failure hides the brand, never blocks
+  // the invoice document or acceptance, and never routes through loadError. (Phase 16A PR1:
+  // store details are no longer shown on this screen, so the auth store context is not read.)
+  // Phase 16F PR3: the terms no longer come from the private tenant invoice config - they
+  // ride on the InvoiceDetail itself (terms_html / terms_source), so that config is not
+  // fetched here at all.
   const [businessName, setBusinessName] = useState<string | null>(null)
-  // Phase 16A PR1 — demo/tenant logo for the document header. Sourced from the fail-soft
-  // public-business lookup (NOT the acceptance-gating tenant config), rendered as a browser
+  // Phase 16A PR1 - demo/tenant logo for the document header, rendered as a browser
   // <img> that fails soft to the business-name text. logoFailed flips on an <img> load error
   // and resets whenever the path changes (effect below).
   const [logoPath, setLogoPath] = useState<string | null>(null)
   const [logoFailed, setLogoFailed] = useState(false)
-  // Legal-risk gate (Codex P1): Accept must be unavailable until the tenant invoice
-  // config is SAFELY known. Configured per-type terms (terms_soft/terms_hard) may exist
-  // but not yet have rendered, so the customer must not sign/accept while the config is
-  // still loading or failed to load. `tenantConfigLoading` is true until the config request resolves;
-  // `tenantConfigError` is true when it failed. (The public business / name request
-  // stays soft — see the effect below — and never gates Accept.)
-  const [tenantConfigLoading, setTenantConfigLoading] = useState(true)
-  const [tenantConfigError, setTenantConfigError] = useState(false)
 
   // Acceptance draft (unaccepted invoice only): whether the pad has at least one
   // drawn stroke. The accepted customer name is NOT typed — it is derived from the
@@ -260,45 +268,12 @@ export function InvoiceTab({
     }
   }, [orderId, reloadToken])
 
-  // Phase 15B — load tenant invoice metadata. SEPARATE from the invoice fetch:
-  // tenant-scoped and order-independent (never keyed on orderId), refreshed on
-  // reloadToken so "Try again" refreshes it too. The two requests run as FULLY
-  // INDEPENDENT chains (no Promise.all/allSettled, no awaiting one before the other),
-  // so a slow/hung optional lookup can never hold up the legal gate (Codex P2):
-  //   - fetchTenantInvoiceConfig is the legal-risk gate (Codex P1) and is the SOLE
-  //     driver of tenantConfig / tenantConfigLoading / tenantConfigError. Its loading
-  //     flag clears on its OWN settlement, so once the config has safely loaded Accept
-  //     is no longer blocked even if the public business lookup is still pending.
-  //   - fetchPublicBusiness is optional branding: it only ever sets businessName and
-  //     NEVER touches the config gate, so its failure/hang fails soft (the store name
-  //     still comes from auth). Neither chain ever touches invoice/loadError.
+  // Optional branding - tenant-scoped and order-independent (never keyed on orderId),
+  // refreshed on reloadToken so "Try again" refreshes it too. It only ever sets
+  // businessName / logoPath: its failure or hang fails soft, never gates acceptance and
+  // never touches invoice / loadError.
   useEffect(() => {
     let cancelled = false
-
-    // Legal-risk gate chain: re-enter the gated state on every (re)load, then let ONLY
-    // this chain's settlement clear the loading flag — on BOTH success and failure.
-    setTenantConfigLoading(true)
-    setTenantConfigError(false)
-    fetchTenantInvoiceConfig()
-      .then((config) => {
-        if (cancelled) return
-        setTenantConfig(config)
-        setTenantConfigError(false)
-      })
-      .catch(() => {
-        if (cancelled) return
-        // Config failed → null it and raise the error so Accept stays disabled
-        // (configured terms may exist but failed to load).
-        setTenantConfig(null)
-        setTenantConfigError(true)
-      })
-      .finally(() => {
-        if (cancelled) return
-        setTenantConfigLoading(false)
-      })
-
-    // Optional branding chain — independent; only ever sets businessName and NEVER
-    // touches tenantConfig / tenantConfigLoading / tenantConfigError under any outcome.
     fetchPublicBusiness(getActiveSlug())
       .then((business) => {
         if (cancelled) return
@@ -310,26 +285,27 @@ export function InvoiceTab({
         setBusinessName(null)
         setLogoPath(null)
       })
-
     return () => {
       cancelled = true
     }
   }, [reloadToken])
 
-  // Codex (signature-before-terms) — keep the signature gate and the ink in sync: while
-  // the tenant invoice config is loading or failed (i.e. NOT ready for acceptance), the
-  // pad is disabled AND any already-drawn ink is dropped, so a signature drawn before the
-  // terms rendered can never become submittable once the config later loads. Keyed on the
-  // RAW flags (tenantConfigLoading || tenantConfigError, exactly
-  // !tenantConfigReadyForAcceptance) so this hook groups with the other effects above the
-  // JSX return rather than depending on a const declared just before render — and stays
-  // hook-order-safe if an early return is ever added later.
+  // Legal-risk gate (Codex P1; source moved in Phase 16F PR3) - the customer must not sign
+  // before the terms this invoice is accepted under have rendered. Those terms now ride on
+  // the CURRENT InvoiceDetail itself (terms_html / terms_source), so the gate is that
+  // response: while the invoice is loading, failed or missing, the pad is disabled AND any
+  // already-drawn ink is dropped, so a signature drawn before the terms rendered can never
+  // become submittable. A loaded terms_html of null is valid (no terms), not an error, and
+  // branding never gates acceptance. Keyed on the RAW flags (exactly
+  // !invoiceReadyForAcceptance) so this hook groups with the other effects above the JSX
+  // return and stays hook-order-safe if an early return is ever added later.
+  const invoiceMissing = invoice === null
   useEffect(() => {
-    if (tenantConfigLoading || tenantConfigError) {
+    if (loading || loadError !== null || invoiceMissing) {
       padRef.current?.clear()
       setHasInk(false)
     }
-  }, [tenantConfigLoading, tenantConfigError])
+  }, [loading, loadError, invoiceMissing])
 
   // Phase 16A PR1 — reset the acceptance checkboxes whenever the invoice IDENTITY or VERSION
   // changes (initial load, accept, drift resync, rewrite, payment/void regeneration). A keyed
@@ -470,13 +446,13 @@ export function InvoiceTab({
   }
 
   async function handleAccept() {
-    // Stray-call guard: never accept while the tenant invoice config is not safely
-    // loaded (Codex P1) — configured terms may exist but not yet have rendered.
+    // Stray-call guard: never accept while the current invoice (and with it the terms it
+    // is accepted under) is not safely loaded (Codex P1).
     if (
       accepting ||
       resending ||
       invoice === null ||
-      !tenantConfigReadyForAcceptance ||
+      !invoiceReadyForAcceptance ||
       !acceptanceChecked.every(Boolean)
     )
       return
@@ -496,6 +472,7 @@ export function InvoiceTab({
     setAccepting(true)
     setActionError(null)
     setActionMessage(null)
+    setHandoverNotice(null)
     setEmailFixNeeded(false)
     try {
       // BEST-EFFORT STALE-TAB GUARD: the accept endpoint targets /current, but
@@ -577,6 +554,7 @@ export function InvoiceTab({
     setResending(true)
     setActionError(null)
     setActionMessage(null)
+    setHandoverNotice(null)
     setEmailFixNeeded(false)
     try {
       const res = await resendCurrentInvoice(orderId)
@@ -611,6 +589,7 @@ export function InvoiceTab({
     setDownloading(true)
     setActionError(null)
     setActionMessage(null)
+    setHandoverNotice(null)
     setEmailFixNeeded(false)
     try {
       const { blob, fileName } = await fetchCurrentInvoicePdf(orderId)
@@ -668,23 +647,20 @@ export function InvoiceTab({
   // TAX INVOICE + number on the right. Store name/address/phone/email, ABN, bank/payment
   // details, Flooring Type and Salesperson are deliberately NOT rendered on this screen. All of
   // that data is unchanged in auth/workspace/tenant-config and still appears on the PDF.
-  // Per-flooring-type terms (Phase 15B-2): a SOFT order shows terms_soft, a HARD order
-  // shows terms_hard. Exactly one block renders. NO fallback to the legacy single-block
-  // terms_and_conditions — an unset per-type terms block hides like any other null/blank
-  // tenant-config row.
-  const termsText = nonBlank(
-    flooringType === 'SOFT'
-      ? tenantConfig?.terms_soft
-      : tenantConfig?.terms_hard,
-  )
-  // Tenant per-type terms are stored as HTML (sanitized server-side for the PDF). Render them
-  // as HTML on screen too, but ALWAYS sanitize client-side first (defense in depth) with an
-  // EXPLICIT restricted allowlist — NOT DOMPurify defaults. Everything outside the list (script,
-  // style, iframe/object/embed, form controls, img, a, event handlers, javascript: URLs, remote
-  // images) is stripped. Memoised on termsText so a large block isn't re-sanitized every render.
-  // The terms section hides when termsText is blank, sanitization yields a blank string, OR
-  // the sanitized HTML has no visible text (textless markup). The dangerouslySetInnerHTML
-  // below receives ONLY this sanitized value, never raw termsText.
+  // Terms (Phase 16F PR3, decision D7): rendered ONLY from the invoice's own terms_html -
+  // the same selection the invoice PDF uses (terms_source QUOTE: the frozen quote terms,
+  // where null means frozen "no terms" and never falls back to the tenant's terms; LIVE: the
+  // business's current per-flooring-type terms). There is no tenant-config lookup and no
+  // fallback of any kind here.
+  const termsText = nonBlank(invoice?.terms_html)
+  // Terms are stored as HTML (sanitized server-side). Render them as HTML on screen too, but
+  // ALWAYS sanitize client-side first (defense in depth) with an EXPLICIT restricted allowlist
+  // - NOT DOMPurify defaults. Everything outside the list (script, style, iframe/object/embed,
+  // form controls, img, a, event handlers, javascript: URLs, remote images) is stripped.
+  // Memoised on termsText so a large block isn't re-sanitized every render. The terms section
+  // hides when termsText is blank, sanitization yields a blank string, OR the sanitized HTML
+  // has no visible text (textless markup). The dangerouslySetInnerHTML below receives ONLY
+  // this sanitized value, never raw termsText.
   const sanitizedTermsHtml = useMemo(() => {
     if (!termsText) return null
     const sanitized = nonBlank(
@@ -732,12 +708,18 @@ export function InvoiceTab({
     return sanitized
   }, [termsText])
 
-  // Accept is gated on the tenant invoice config being SAFELY loaded (Codex P1): not
-  // loading and not errored. Configured terms may exist but not yet have rendered, so
-  // signing/accepting before this is true is a legal risk. (Business-name failure is
-  // soft and never affects this flag.)
-  const tenantConfigReadyForAcceptance =
-    !tenantConfigLoading && !tenantConfigError
+  // Accept is gated on the current invoice - and so the terms it is accepted under - being
+  // SAFELY loaded (Codex P1): not loading, not failed, present. A null terms_html on a
+  // loaded invoice is a valid "no terms" state, not a failure. (Branding failure is soft and
+  // never affects this flag.)
+  const invoiceReadyForAcceptance =
+    !loading && loadError === null && invoice !== null
+  // Phase 16F PR3 - the plain terms-source label (shown even when no terms render, so a
+  // frozen "no terms" invoice still says where its terms come from).
+  const termsSource =
+    invoice !== null
+      ? termsSourceLabel(invoice.terms_source, sanitizedTermsHtml !== null)
+      : null
   // Phase 16A PR1 — all acceptance checkboxes ticked (frontend-only gate for Accept).
   const allAcceptanceChecked = acceptanceChecked.every(Boolean)
   // Phase 16A PR1 — drives the bottom composition (checkbox read-only state + Accept vs
@@ -772,6 +754,12 @@ export function InvoiceTab({
           </div>
         )}
       </div>
+
+      {handoverNotice !== null && (
+        <div className="mb-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3">
+          <p className="text-sm font-medium text-teal-700">{handoverNotice}</p>
+        </div>
+      )}
 
       {actionMessage !== null && (
         <div className="mb-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3">
@@ -954,6 +942,17 @@ export function InvoiceTab({
               />
             </div>
           )}
+          {/* Phase 16F PR3 - where these terms come from (InvoiceDetail.terms_source). Shown
+              on its own line, so a frozen "no terms" invoice (terms hidden) still says so. */}
+          {termsSource !== null && (
+            <p
+              className={`text-center text-[11px] text-slate-500 ${
+                sanitizedTermsHtml ? 'mt-3' : ''
+              }`}
+            >
+              {termsSource}
+            </p>
+          )}
 
           {/* Phase 16A PR1 — CarpetCall-style bottom composition: acceptance checkboxes +
               bold agreement on the left, the customer signature (centered) on the right, and a
@@ -1036,7 +1035,9 @@ export function InvoiceTab({
                       </p>
                     )}
                   </div>
-                  <div className="mt-1.5 text-sm font-medium text-slate-800">
+                  {/* Display-only and never truncated: an inherited (Path A) name can be
+                      longer than the D.8 request limit, so it must wrap, not overflow. */}
+                  <div className="mt-1.5 w-full break-words text-sm font-medium text-slate-800">
                     {invoice.accepted_customer_name || '—'}
                   </div>
                   {/* Email state derives from last_emailed_at, never from message text. */}
@@ -1062,7 +1063,7 @@ export function InvoiceTab({
                   <div className="invoice-signature-pad rounded-md border border-slate-200 bg-white px-1.5 pt-1.5 pb-1">
                     <SignaturePad
                       ref={padRef}
-                      disabled={accepting || !tenantConfigReadyForAcceptance}
+                      disabled={accepting || !invoiceReadyForAcceptance}
                       onInkChange={setHasInk}
                     />
                   </div>
@@ -1116,28 +1117,10 @@ export function InvoiceTab({
                       )}
                     </div>
                   ) : null}
-                  {/* Codex P1 legal-risk gate — exactly one state: loading XOR error, never
-                      both. Accept stays disabled until tenant config is safely loaded. */}
-                  {tenantConfigLoading ? (
-                    <p className="mt-2 text-center text-[11px] text-slate-500">
-                      Loading invoice terms and business details…
-                    </p>
-                  ) : tenantConfigError ? (
-                    <div className="mt-2 flex flex-col items-center gap-2 text-center">
-                      <p className="text-[11px] font-medium text-amber-700">
-                        Invoice terms and business details could not be loaded.
-                        Try again before accepting.
-                      </p>
-                      <Button
-                        type="button"
-                        variant="secondary"
-                        size="sm"
-                        onClick={refetch}
-                      >
-                        Try again
-                      </Button>
-                    </div>
-                  ) : null}
+                  {/* Codex P1 legal-risk gate: this pad only renders inside the loaded
+                      invoice document, whose own terms_html has already rendered above, so
+                      there is no separate terms loading/error state here any more (Phase 16F
+                      PR3). invoiceReadyForAcceptance still guards the pad and Accept. */}
                 </div>
               )}
             </div>
@@ -1175,7 +1158,7 @@ export function InvoiceTab({
                   !allAcceptanceChecked ||
                   derivedAcceptedName.length === 0 ||
                   derivedNameTooLong ||
-                  !tenantConfigReadyForAcceptance
+                  !invoiceReadyForAcceptance
                 }
                 className="flex w-full items-center justify-center rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"
               >

@@ -42,6 +42,7 @@ import { fetchOrderLines } from '../lib/api/orderLinesApi'
 import type { OrderFinancialSummary } from '../lib/api/orderLinesApi'
 import { fetchQuoteWorkspace } from '../lib/api/orderQuoteApi'
 import type {
+  QuoteAcceptedSummary,
   QuoteDraftRead,
   QuoteIssuedSummary,
 } from '../lib/api/orderQuoteApi'
@@ -184,8 +185,9 @@ function WorkspaceShell({
   // --- Phase 16D-B: Quote tab visibility + quote-workspace probe. ---
   // LOCKED visibility rules (docs/Phase16D-Quotation-UX-Lock.md §4): the Quote
   // tab is hidden by default; on order load it is shown IFF the backend quote
-  // workspace returns a non-null draft (the durable signal); within a session,
-  // Create Quote shows it before the first save persists a draft. All of this
+  // workspace returns a non-null draft, active issued quote or (Phase 16F)
+  // accepted quote (the durable signal); within a session, Create Quote shows
+  // it before the first save persists a draft. All of this
   // state lives HERE in the per-order shell (keyed by orderId), so visibility is
   // order-scoped and resets naturally on an order switch — no localStorage, no
   // global flag.
@@ -206,6 +208,11 @@ function WorkspaceShell({
   // owns the issued state (send/cancel responses update it locally).
   const [quoteInitialIssued, setQuoteInitialIssued] =
     useState<QuoteIssuedSummary | null>(null)
+  // Phase 16F: the probe's accepted summary (the latest ACCEPTED version, or
+  // null) seeds QuoteTab's Accepted Quote sub-tab alongside current_issued.
+  // After that seed the tab owns both snapshots and refreshes them itself.
+  const [quoteInitialAccepted, setQuoteInitialAccepted] =
+    useState<QuoteAcceptedSummary | null>(null)
   const [quoteProbeToken, setQuoteProbeToken] = useState(0)
 
   useEffect(() => {
@@ -216,12 +223,18 @@ function WorkspaceShell({
         if (cancelled) return
         setQuoteInitialDraft(res.data.draft)
         setQuoteInitialIssued(res.data.current_issued)
+        setQuoteInitialAccepted(res.data.accepted)
         setQuoteProbeStatus('loaded')
-        // A saved draft OR an active issued quote is the durable visibility
-        // source of truth (issued-only is unreachable via the API today —
-        // sending requires a persisted draft and drafts are never deleted —
-        // but the backend workspace deliberately supports the shape).
-        if (res.data.draft !== null || res.data.current_issued !== null)
+        // A saved draft, an active issued quote OR an accepted quote is the
+        // durable visibility source of truth (issued-only and accepted-only
+        // are unreachable via the API today - sending requires a persisted
+        // draft and drafts are never deleted - but the backend workspace
+        // deliberately supports the shapes, so the tab is revealed for them).
+        if (
+          res.data.draft !== null ||
+          res.data.current_issued !== null ||
+          res.data.accepted !== null
+        )
           setQuoteTabVisible(true)
       })
       .catch(() => {
@@ -260,6 +273,26 @@ function WorkspaceShell({
   function handleCreateQuote() {
     setQuoteTabVisible(true)
     setActiveTab('quote')
+  }
+
+  // Phase 16F PR3 - Create Invoice from the accepted quote (Path A) succeeded in
+  // the Quote tab: switch to the Invoice tab and hand it the backend success
+  // message as a one-shot notice. The handover also bumps the Invoice tab's key,
+  // so the tab remounts and reads the new current invoice itself even when it
+  // was already the active tab (keyboard focus can reach the tab bar behind the
+  // Create Invoice modal while the request is in flight). Only that tab
+  // remounts: no workspace remount or reseed. The notice is dropped as soon as
+  // the Invoice tab is no longer active, so a later visit never shows it.
+  const [invoiceTabNotice, setInvoiceTabNotice] = useState<string | null>(null)
+  const [invoiceTabKey, setInvoiceTabKey] = useState(0)
+  useEffect(() => {
+    if (activeTab !== 'invoice') setInvoiceTabNotice(null)
+  }, [activeTab])
+
+  function handleQuoteInvoiceReady(message: string) {
+    setInvoiceTabNotice(message)
+    setInvoiceTabKey((key) => key + 1)
+    setActiveTab('invoice')
   }
 
   // --- Details-of-sale autosave single-flight (Codex P1). ---
@@ -582,13 +615,18 @@ function WorkspaceShell({
                 (visibility implies a loaded probe), so initialDraft is always
                 the confirmed server state and autosave can never fire against
                 an unknown draft. locked gates edits/autosave inside the tab;
-                reads + preview of a persisted draft stay available when LAID. */}
+                reads + preview of a persisted draft stay available when LAID.
+                Phase 16F PR3: `active` lets the tab re-read its issued/accepted
+                snapshots each time it becomes the visible tab (never the draft),
+                and onInvoiceReady switches to the Invoice tab after a Create
+                Invoice from the accepted quote. */}
             {quoteTabVisible && (
               <div className={activeTab === 'quote' ? '' : 'hidden'}>
                 <QuoteTab
                   key={orderId}
                   orderId={orderId}
                   locked={locked}
+                  active={activeTab === 'quote'}
                   flooringType={flooringType}
                   orderNumber={orderNumber}
                   customer={customer}
@@ -596,6 +634,8 @@ function WorkspaceShell({
                   saleDetails={saleDetails}
                   initialDraft={quoteInitialDraft}
                   initialIssued={quoteInitialIssued}
+                  initialAccepted={quoteInitialAccepted}
+                  onInvoiceReady={handleQuoteInvoiceReady}
                   // Codex P2: the quote preview PDF renders the PERSISTED
                   // sales_order.details_of_sale, so Preview must flush pending
                   // Details of Sale autosaves first — the same shell-owned
@@ -609,8 +649,9 @@ function WorkspaceShell({
             )}
             {activeTab === 'invoice' && (
               <InvoiceTab
+                key={invoiceTabKey}
                 orderId={orderId}
-                flooringType={flooringType}
+                notice={invoiceTabNotice}
                 orderNumber={orderNumber}
                 customer={customer}
                 billingAddress={billingAddress}

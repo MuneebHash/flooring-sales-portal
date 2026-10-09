@@ -1,21 +1,24 @@
 import { API_BASE_URL } from './config'
 import { ApiError } from './ApiError'
+import type { ApiSuccess } from './types'
 
 // Phase 16E-C — PUBLIC, token-only quote API (GET /api/v1/public/quotes/{token},
-// POST .../viewed, GET .../pdf). These endpoints are UNAUTHENTICATED: the secret
-// token in the URL is the only credential.
+// POST .../viewed, GET .../pdf); Phase 16F PR3 adds POST .../accept (remote
+// signing). These endpoints are UNAUTHENTICATED: the secret token in the URL is
+// the only credential.
 //
 // They must NOT go through apiPath(slug, …) (they are slugless, like
 // tenantApi.ts) and must NOT go through the shared client.ts request() — that
 // helper hardcodes credentials: 'include', and the public surface is fetched
 // WITHOUT credentials (credentials: 'omit'; no session, no cookies — the
-// browser must never attach SP_SESSION to a public quote request).
+// browser must never attach SP_SESSION to a public quote request). That
+// applies to EVERY request here, the accept POST included.
 //
 // Field names are snake_case to mirror the backend JSON verbatim. The payload
 // is cost-free and internal-ID-free by contract: no token hash, no storage
 // path, no stored_file id, no cost/GP field is ever returned — and none may be
-// typed here. There is deliberately NO signing/acceptance helper (Phase 16F)
-// and NO SMS helper.
+// typed here. There is deliberately NO SMS helper and NO public signed-PDF
+// helper (the signed quote is portal-only).
 
 export type PublicQuoteState =
   | 'ACTIVE'
@@ -243,4 +246,94 @@ export async function fetchPublicQuotePdf(
   )
   const blob = await response.blob()
   return { blob, fileName }
+}
+
+// The data of a successful public accept (openapi PublicQuoteAcceptResult):
+// always state INACTIVE (the quote is signed and the link is now dead). No id,
+// amount, name, timestamp, file reference or token is ever returned.
+export type PublicQuoteAcceptResult = {
+  state: PublicQuoteState
+}
+
+// POST /api/v1/public/quotes/{token}/accept - Phase 16F: the customer signs the
+// issued quote remotely. multipart/form-data with EXACTLY ONE part: the FILE
+// part `signature` (image/png, filename signature.png). Nothing else is ever
+// appended - no name (the accepted name is the issue-time V17 snapshot, taken
+// server-side; decision D1), no declaration flags (a frontend-only gate;
+// decision D8), no ids, totals, terms or query parameters: any extra part is a
+// 400 VALIDATION_FAILED. The browser sets the multipart Content-Type and
+// boundary (no Content-Type header is set here). Sent WITHOUT credentials.
+//
+// The caller must pass a PNG inside the backend's safe-decode bounds (at most
+// 8192 px per side, 4,000,000 px in total and 2,097,152 bytes; see
+// lib/signaturePng.ts).
+//
+// 201 { data: { state: "INACTIVE" }, message: "Quote accepted." }. Errors keep
+// the backend code/message (standard envelope): 404 QUOTE_TOKEN_NOT_FOUND;
+// 410 QUOTE_LINK_EXPIRED / _SUPERSEDED / _CANCELLED / _INACTIVE; 400
+// VALIDATION_FAILED / SIGNATURE_INVALID; 422 SIGNATURE_REQUIRED and the
+// public-safe QUOTE_BELOW_COST / ACCEPTED_CUSTOMER_NAME_REQUIRED /
+// BUSINESS_RULE_VIOLATION. A network failure is an ApiError with status 0. A 2xx
+// whose body cannot be read as the documented result is an ApiError carrying
+// that 2xx status: the caller must treat it as an UNKNOWN outcome (the
+// acceptance may have gone through) and re-read the link state, never as
+// success and never as a definite failure.
+export async function acceptPublicQuote(
+  token: string,
+  signatureBlob: Blob,
+): Promise<ApiSuccess<PublicQuoteAcceptResult>> {
+  const formData = new FormData()
+  // The explicit filename marks this as a FILE part; its Content-Type comes from
+  // the Blob's own type, which must be exactly image/png.
+  formData.append('signature', signatureBlob, 'signature.png')
+  let response: Response
+  try {
+    response = await fetch(publicQuoteUrl(token, '/accept'), {
+      method: 'POST',
+      credentials: 'omit',
+      body: formData,
+    })
+  } catch (err) {
+    throw new ApiError({
+      status: 0,
+      code: null,
+      message: 'Network request failed.',
+      details: err,
+    })
+  }
+  if (!response.ok) {
+    throw await toPublicApiError(response, 'Could not accept the quote.')
+  }
+  let body: unknown
+  try {
+    body = await response.json()
+  } catch (err) {
+    throw new ApiError({
+      status: response.status,
+      code: null,
+      message: 'The quote acceptance response could not be read.',
+      details: err,
+    })
+  }
+  const data =
+    body && typeof body === 'object' && 'data' in body
+      ? (body as { data?: unknown }).data
+      : null
+  const state =
+    data && typeof data === 'object' && 'state' in data
+      ? (data as { state?: unknown }).state
+      : null
+  if (state !== 'INACTIVE') {
+    throw new ApiError({
+      status: response.status,
+      code: null,
+      message: 'The quote acceptance response could not be read.',
+    })
+  }
+  const message = (body as { message?: unknown }).message
+  return {
+    data: { state: 'INACTIVE' },
+    message:
+      typeof message === 'string' && message.length > 0 ? message : undefined,
+  }
 }

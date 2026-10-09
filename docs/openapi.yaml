@@ -1718,7 +1718,7 @@ paths:
         public page (GET /public/quotes/{token}/pdf) and the salesperson via
         GET /orders/{orderId}/quote/pdf?type=issued. The link's token is the credential for the
         public view, viewed, PDF and accept endpoints (acceptPublicQuote implemented 16F PR1; the
-        public signing UI is planned 16F PR3). A draft or customer name/billing change since the
+        public signing UI implemented 16F PR3). A draft or customer name/billing change since the
         last issue (compared with the V17 issue-time snapshot), or no active ISSUED version at all
         (never sent, cancelled, expired or accepted), creates a new ISSUED version (next
         version_number) that supersedes any previous ISSUED one; otherwise the same version is
@@ -1859,7 +1859,7 @@ paths:
       summary: Create invoice from accepted quote (Path A)
       operationId: createInvoiceFromQuote
       description: >
-        IMPLEMENTED 16F PR2 (backend; the Accepted Quote Create Invoice button is planned 16F PR3).
+        IMPLEMENTED 16F PR2 (backend; the Accepted Quote Create Invoice button implemented 16F PR3).
         Creates an invoice version from the order's LATEST ACCEPTED quote version (highest
         version_number with status ACCEPTED; a newer draft or ISSUED, SUPERSEDED, CANCELLED or
         EXPIRED version never replaces it), inheriting its signature so the customer does not
@@ -2045,7 +2045,7 @@ paths:
         credential and the endpoint exposes only the single quote behind it (cost-free, no
         internal IDs). Never stamps viewed_at. Returns a state derived from the token: ACTIVE
         (viewable, and signable via acceptPublicQuote - implemented 16F PR1; the page's signing UI
-        is planned 16F PR3), EXPIRED, SUPERSEDED, CANCELLED (including a quote cancelled by an
+        implemented 16F PR3), EXPIRED, SUPERSEDED, CANCELLED (including a quote cancelled by an
         in-app invoice acceptance, 16F decision D5(c)), or INACTIVE (signed; link dead, not a
         viewable signed copy). An unknown token returns 404 (QUOTE_TOKEN_NOT_FOUND). Only an ACTIVE token on an
         ISSUED quote can lazily expire on access. Rate limiting against rapid repeated access by
