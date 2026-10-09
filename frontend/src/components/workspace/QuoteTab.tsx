@@ -9,11 +9,14 @@ import { ApiError } from '../../lib/api/ApiError'
 import {
   QUOTE_TOTAL_MAX,
   cancelQuote,
+  createInvoiceFromQuote,
+  fetchAcceptedQuoteSignature,
   fetchQuotePreviewPdf,
   fetchQuoteStoredPdf,
   fetchQuoteWorkspace,
   saveQuoteDraft,
   sendQuoteEmail,
+  type QuoteAcceptedSummary,
   type QuoteChannel,
   type QuoteDraftLineInput,
   type QuoteDraftLineRead,
@@ -22,6 +25,10 @@ import {
   type QuoteIssuedSummary,
   type QuoteLineType,
 } from '../../lib/api/orderQuoteApi'
+import {
+  fetchCurrentInvoice,
+  type InvoiceDetail,
+} from '../../lib/api/orderInvoicesApi'
 import {
   fetchOrderLines,
   type OrderLinesResponse,
@@ -39,13 +46,31 @@ import { fetchPublicBusiness } from '../../lib/api/tenantApi'
 import { getActiveSlug } from '../../lib/tenant'
 import type { FlooringType } from '../../lib/flooring'
 
-// Phase 16D-B PR1 + PR2B + 16E-B — the salesperson Quote tab
+// Phase 16D-B PR1 + PR2B + 16E-B + 16F PR3 - the salesperson Quote tab
 // (docs/Phase16D-Quotation-UX-Lock.md).
 //
 // Three internal sub-tabs: Quote Draft (functional), Customer Quote (functional
-// since 16E-B — the ISSUED quote surface) and Accepted Quote (16F — clean empty
-// state until then). The Quote Draft is an invoice-style QUOTATION canvas
-// mirroring InvoiceTab's document layout, NOT a generic form.
+// since 16E-B - the ISSUED quote surface) and Accepted Quote (functional since
+// 16F PR3 - the latest ACCEPTED quote). The Quote Draft is an invoice-style
+// QUOTATION canvas mirroring InvoiceTab's document layout, NOT a generic form.
+//
+// 16F PR3 rules (locked):
+//   - Accepted Quote renders from the workspace `accepted` summary ONLY (the
+//     frozen accepted snapshot): never the live draft, order customer/address or
+//     tenant terms. Signature image via accepted.signature_download_path
+//     (verbatim, credentialed blob); Preview signed PDF streams the STORED signed
+//     PDF (no flush, no regeneration); Create Invoice (Path A) is enabled by the
+//     server's invoice_eligible only (never LAID, a draft, a newer issued quote or
+//     any client-side date comparison), confirms first, posts exactly {} and then
+//     re-reads the snapshots and switches to the Invoice tab.
+//   - Issued/accepted refresh: the tab re-reads the workspace snapshots when the
+//     top-level tab becomes active, on a sub-tab change and before the Send
+//     confirmation opens (the D9 warning needs the current accepted state). ONE
+//     recency mechanism covers every snapshot read and every send / cancel /
+//     conversion result (see refreshSnapshots), and a refresh only ever replaces
+//     `issued` + `accepted` together. It NEVER touches the draft rows, mode, total
+//     input, server-draft baseline, save queue or autosave status: the response's
+//     draft is ignored (#101 stays out of scope), so a refresh never causes a PUT.
 //
 // 16E-B delivery rules (locked):
 //   - Send by Email goes through the confirmation modal ONLY (no one-click
@@ -55,10 +80,11 @@ import type { FlooringType } from '../../lib/flooring'
 //   - SMS stays DISABLED ("Available soon") — no sendQuoteSms wrapper exists;
 //     frontend SMS enablement is 16E-C.
 //   - The Customer Quote sub-tab renders from the `issued` summary state
-//     (seeded from the probe's current_issued, replaced by send responses,
-//     nulled by a successful cancel) and from it ONLY — never from the live
-//     draft rows / totals / details / terms, which may have drifted since the
-//     issue was frozen.
+//     (seeded from the probe's current_issued, replaced by send responses and
+//     snapshot refreshes, nulled by a successful cancel) and from it ONLY - never
+//     from the live draft rows / totals / details / terms, which may have drifted
+//     since the issue was frozen. With no active issued quote but an accepted
+//     one, it shows the accepted state instead of the never-sent empty state.
 //   - LAID: Send/Resend disabled; Cancel quote and issued Preview PDF stay
 //     enabled (cancel only kills a public link; the stored PDF is a read).
 //
@@ -121,8 +147,11 @@ const SUB_TABS: Array<{ id: QuoteSubTabId; label: string }> = [
 type Props = {
   orderId: number
   // LAID lock — reads/preview stay available; edits + toggle + autosave are
-  // disabled.
+  // disabled. Create Invoice from the accepted quote is NOT gated by it.
   locked: boolean
+  // Phase 16F PR3: true while the top-level Quote tab is the visible tab. Each
+  // false -> true transition re-reads the issued/accepted snapshots.
+  active: boolean
   flooringType: FlooringType
   orderNumber?: string
   customer?: OrderCustomer | null
@@ -134,8 +163,15 @@ type Props = {
   initialDraft: QuoteDraftRead | null
   // The active issued quote summary from the same probe (null = nothing issued).
   // Seeds the Customer Quote sub-tab ONCE; after mount the tab owns the issued
-  // state (send responses replace it; a successful cancel nulls it).
+  // state (send responses and snapshot refreshes replace it; a successful cancel
+  // nulls it).
   initialIssued: QuoteIssuedSummary | null
+  // Phase 16F: the latest accepted quote from the same probe (null = none
+  // accepted). Seeds the Accepted Quote sub-tab ONCE, alongside initialIssued.
+  initialAccepted: QuoteAcceptedSummary | null
+  // Phase 16F PR3: called with the backend success message after Create Invoice
+  // from the accepted quote succeeds; the workspace switches to the Invoice tab.
+  onInvoiceReady: (message: string) => void
   // Switches the workspace to the Customer tab when a send fails with
   // CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID so the salesperson can fix
   // the email where it lives (the InvoiceTab accept/resend precedent).
@@ -614,9 +650,107 @@ function previewFileName(orderNumber: string | undefined): string {
   return `quote-preview-${safeOrder}.pdf`
 }
 
+// --- Phase 16F PR3: Accepted Quote helpers. ---
+
+// Explanation under a disabled Create Invoice (invoice_eligible false). The
+// second sentence is the backend's own Path A refusal wording.
+const ALREADY_CONVERTED_MESSAGE =
+  'An invoice has already been created from this quote.'
+const NEWER_SIGNATURE_REQUIRED_MESSAGE =
+  'The current invoice was signed at the same time or later than this quote. A newer signed quote is required to create an invoice from a quote.'
+const ACCEPTED_CHANGED_MESSAGE =
+  'The accepted quote changed while the confirmation was open. Review the accepted quote before creating an invoice.'
+const CONVERSION_UNKNOWN_MESSAGE =
+  'The Create Invoice request did not complete, so its result is unknown. Check the Invoice tab before trying again.'
+
+// Same instant? The two backend timestamp strings are compared as STRINGS (no
+// Date arithmetic) at the precision both APIs share. accepted.accepted_at is
+// serialized with fractional seconds (no @JsonFormat on the accepted summary)
+// while InvoiceDetail.accepted_at is formatted to whole seconds, and a Path A
+// invoice copies the quote's accepted_at exactly - so the first 19 characters
+// (YYYY-MM-DDTHH:mm:ss) are the comparable form of both.
+function sameSecondTimestamp(a: string, b: string): boolean {
+  const left = a.slice(0, 19)
+  return left.length === 19 && left === b.slice(0, 19)
+}
+
+// INVOICE_PRECONDITIONS_NOT_MET details[] ({ section?, field?, message } or
+// plain strings) in the existing Details of Sale convention: "field: message",
+// falling back to the section when there is no field.
+type PreconditionFailure = {
+  label: string | null
+  message: string
+}
+
+function parsePreconditionFailures(details: unknown): PreconditionFailure[] {
+  if (!Array.isArray(details)) return []
+  const out: PreconditionFailure[] = []
+  for (const item of details) {
+    if (typeof item === 'string') {
+      if (item.length > 0) out.push({ label: null, message: item })
+      continue
+    }
+    if (item && typeof item === 'object') {
+      const rec = item as {
+        section?: unknown
+        field?: unknown
+        message?: unknown
+      }
+      const message = typeof rec.message === 'string' ? rec.message : ''
+      const field = typeof rec.field === 'string' ? rec.field : null
+      const section = typeof rec.section === 'string' ? rec.section : null
+      if (message.length > 0) out.push({ label: field ?? section, message })
+    }
+  }
+  return out
+}
+
+// Statuses that mean "no readable answer from the service" (network failure, or
+// a gateway / timeout in front of it): the request MAY have taken effect.
+function isAmbiguousFailure(err: unknown): boolean {
+  if (!(err instanceof ApiError)) return true
+  return (
+    err.status === 0 ||
+    err.status === 502 ||
+    err.status === 503 ||
+    err.status === 504
+  )
+}
+
+// The current-invoice read that supports the conversion wording: the
+// confirmation text (no invoice / unsigned / signed) and the explanation under
+// a disabled Create Invoice. INVOICE_NOT_FOUND is the genuine no-invoice state
+// (invoice: null); any other failure is 'error' and never "no invoice".
+type CurrentInvoiceLookup =
+  | { status: 'idle' }
+  | { status: 'loading'; key: number }
+  | { status: 'ready'; key: number; invoice: InvoiceDetail | null }
+  | { status: 'error'; key: number }
+
+// The accepted version a Create Invoice confirmation was opened for. The POST
+// itself carries no selector (the server converts the latest accepted quote);
+// this binding only lets the frontend invalidate a confirmation that no longer
+// matches what is on screen.
+type ConvertTarget = {
+  key: number
+  orderId: number
+  quoteVersionId: number
+  versionNumber: number
+  totalIncGst: number
+}
+
+// Outcome of one issued/accepted snapshot read (see refreshSnapshots).
+type SnapshotRefreshOutcome = 'applied' | 'superseded' | 'failed' | 'gone'
+
+// The pre-Send check re-issues a superseded read at most this many times in
+// total before it reports a failure with a retry (a superseded read carries no
+// confirmed state for the D9 warning).
+const PRE_SEND_READ_ATTEMPTS = 3
+
 export function QuoteTab({
   orderId,
   locked,
+  active,
   flooringType,
   orderNumber,
   customer,
@@ -624,6 +758,8 @@ export function QuoteTab({
   saleDetails,
   initialDraft,
   initialIssued,
+  initialAccepted,
+  onInvoiceReady,
   flushDetailsAutosave,
   onGoToCustomer,
 }: Props) {
@@ -710,11 +846,75 @@ export function QuoteTab({
     null,
   )
 
-  // Branding + per-type quote terms — same two INDEPENDENT fail-soft fetch
-  // chains as InvoiceTab (business name/logo is optional branding; the tenant
-  // invoice config is the TERMS source). The invoice acceptance-gating semantics
-  // are deliberately NOT copied — a quote draft has nothing to gate; the config
-  // status here only drives the terms section + a small retry notice.
+  // --- Phase 16F PR3: accepted quote + snapshot refresh state. ---
+  // The latest accepted quote driving the Accepted Quote sub-tab (and the D9
+  // warning / Customer Quote accepted state). Seeded ONCE from the shell probe;
+  // afterwards replaced only by snapshot refreshes, which always apply it
+  // TOGETHER with `issued` from one workspace response.
+  const [accepted, setAccepted] = useState<QuoteAcceptedSummary | null>(
+    initialAccepted,
+  )
+  // Snapshot refresh status: a retryable failure keeps the last confirmed
+  // issued/accepted state on screen (never a fabricated empty state).
+  const [snapshotRefreshing, setSnapshotRefreshing] = useState(false)
+  const [snapshotRefreshError, setSnapshotRefreshError] = useState<
+    string | null
+  >(null)
+  // Bumped on every APPLIED snapshot read, so reads that depend on the latest
+  // server state (the ineligibility explanation) re-run after each refresh.
+  const [snapshotApplyCount, setSnapshotApplyCount] = useState(0)
+  // Pre-Send refresh (D9): the Send confirmation opens only after a successful
+  // re-read of the snapshots; a failed read shows a retry instead.
+  const [sendCheck, setSendCheck] = useState<'idle' | 'checking' | 'error'>(
+    'idle',
+  )
+  // Accepted Quote sub-tab: the signature image (object URL owned by its
+  // effect) loads only once the sub-tab has been opened.
+  const [acceptedSubTabSeen, setAcceptedSubTabSeen] = useState(false)
+  const [acceptedSignatureUrl, setAcceptedSignatureUrl] = useState<
+    string | null
+  >(null)
+  const [acceptedSignatureFailed, setAcceptedSignatureFailed] = useState(false)
+  const [acceptedSignatureReload, setAcceptedSignatureReload] = useState(0)
+  const [acceptedPreviewing, setAcceptedPreviewing] = useState(false)
+  const [acceptedPreviewError, setAcceptedPreviewError] = useState<
+    string | null
+  >(null)
+  // Create Invoice (Path A) lifecycle: the confirmation bound to one accepted
+  // version, its current-invoice read, the in-flight flag and the errors that
+  // must outlive the modal (a drift refresh may invalidate it).
+  const [convertModalOpen, setConvertModalOpen] = useState(false)
+  const [convertTarget, setConvertTarget] = useState<ConvertTarget | null>(
+    null,
+  )
+  const [convertLookup, setConvertLookup] = useState<CurrentInvoiceLookup>({
+    status: 'idle',
+  })
+  const [converting, setConverting] = useState(false)
+  const [convertError, setConvertError] = useState<string | null>(null)
+  const [convertErrorDetails, setConvertErrorDetails] = useState<
+    PreconditionFailure[]
+  >([])
+  const [convertNotice, setConvertNotice] = useState<string | null>(null)
+  // After a conversion succeeded (or its outcome is unknown) Create Invoice stays
+  // disabled until a snapshot read issued AFTER it applies - so a stale
+  // invoice_eligible can never invite a duplicate conversion.
+  const [conversionLock, setConversionLock] = useState<
+    null | 'created' | 'unknown'
+  >(null)
+  // The explanation under a disabled Create Invoice needs the current invoice.
+  const [eligibilityLookup, setEligibilityLookup] = useState<
+    | { status: 'ready'; quoteVersionId: number; invoice: InvoiceDetail | null }
+    | { status: 'error'; quoteVersionId: number }
+    | null
+  >(null)
+
+  // Branding + per-type quote terms: two INDEPENDENT fail-soft fetch chains
+  // (business name/logo is optional branding; the tenant invoice config is the
+  // live TERMS source for the quote draft). Since 16F PR3 only this tab reads the
+  // tenant config: InvoiceTab renders the server-selected InvoiceDetail
+  // terms_html / terms_source instead. A quote draft has nothing to gate; the
+  // config status here only drives the terms section + a small retry notice.
   const [tenantConfig, setTenantConfig] = useState<TenantInvoiceConfig | null>(
     null,
   )
@@ -741,6 +941,44 @@ export function QuoteTab({
   lockedRef.current = locked
   const orderIdRef = useRef(orderId)
   orderIdRef.current = orderId
+  // Phase 16F PR3 mirrors read by async continuations.
+  const activeRef = useRef(active)
+  activeRef.current = active
+  const issuedRef = useRef(issued)
+  issuedRef.current = issued
+  const acceptedRef = useRef(accepted)
+  acceptedRef.current = accepted
+  const conversionLockRef = useRef(conversionLock)
+  conversionLockRef.current = conversionLock
+  const cancelModalOpenRef = useRef(cancelModalOpen)
+  cancelModalOpenRef.current = cancelModalOpen
+  const convertModalOpenRef = useRef(convertModalOpen)
+  convertModalOpenRef.current = convertModalOpen
+
+  // --- Phase 16F PR3: ONE recency mechanism for the issued/accepted snapshots.
+  // snapshotSeqRef numbers every snapshot read when it is ISSUED, and every
+  // mutation barrier/result (send, cancel, conversion). snapshotFloorRef is the
+  // newest number whose data (or barrier) has been applied: a read applies only
+  // when its number is ABOVE the floor, and then raises the floor to it. So an
+  // older read can never overwrite a newer read, a read issued before a mutation
+  // started can never land after it (the mutation raises the floor when it starts
+  // and again when its own result applies), and a mutation's own result always
+  // applies. All of it is per instance: an order change or unmount remounts the
+  // tab (key={orderId}) and every continuation also checks mountedRef and the
+  // captured order id.
+  const snapshotSeqRef = useRef(0)
+  const snapshotFloorRef = useRef(0)
+  const snapshotReadsInFlightRef = useRef(0)
+  // Snapshot sequence at which the conversion lock was taken; reads issued
+  // after it release the lock when they apply.
+  const conversionLockSeqRef = useRef(0)
+  // Single-flight guards (refs, so a double click in one tick never runs twice).
+  const sendCheckRef = useRef(false)
+  const convertingRef = useRef(false)
+  // The confirmation currently open (mirror of convertTarget) and its key
+  // sequence: a lookup result is applied only for the key it was issued for.
+  const convertTargetRef = useRef<ConvertTarget | null>(null)
+  const convertKeySeqRef = useRef(0)
 
   const mountedRef = useRef(true)
   // JSON of the last body the backend confirmed persisted — the dirty baseline.
@@ -1281,9 +1519,9 @@ export function QuoteTab({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Branding + terms — two independent fail-soft chains (see InvoiceTab). The
-  // config chain drives ONLY the terms section here (no acceptance gate); the
-  // public-business chain only ever sets name/logo.
+  // Branding + terms: two independent fail-soft chains. The config chain drives
+  // ONLY the terms section here (no acceptance gate); the public-business chain
+  // only ever sets name/logo (the same branding lookup InvoiceTab uses).
   useEffect(() => {
     let cancelled = false
 
@@ -1418,16 +1656,171 @@ export function QuoteTab({
     }
   }
 
+  // --- Phase 16F PR3: issued/accepted snapshot refresh (see snapshotSeqRef). ---
+
+  // Install a new issued snapshot. A preview failure recorded against a
+  // DIFFERENT issued artifact must not resurface against this one.
+  function installIssued(next: QuoteIssuedSummary | null) {
+    if (
+      (issuedRef.current?.quote_version_id ?? null) !==
+      (next?.quote_version_id ?? null)
+    ) {
+      setIssuedPreviewError(null)
+    }
+    issuedRef.current = next
+    setIssued(next)
+  }
+
+  function installAccepted(next: QuoteAcceptedSummary | null) {
+    if (
+      (acceptedRef.current?.quote_version_id ?? null) !==
+      (next?.quote_version_id ?? null)
+    ) {
+      setAcceptedPreviewError(null)
+    }
+    acceptedRef.current = next
+    setAccepted(next)
+  }
+
+  // A mutation (send / cancel / conversion) is starting or has applied its own
+  // result: no snapshot read issued before this point may apply afterwards.
+  function raiseSnapshotFloor() {
+    snapshotSeqRef.current += 1
+    snapshotFloorRef.current = snapshotSeqRef.current
+  }
+
+  // A send / cancel result is the newest issued state: it always applies, and
+  // older in-flight reads are discarded. (Mutations never change `accepted`.)
+  function applyMutationIssued(next: QuoteIssuedSummary | null) {
+    raiseSnapshotFloor()
+    installIssued(next)
+  }
+
+  // Re-read the workspace and apply ONLY its server snapshots - current_issued
+  // and accepted together, from this one response - when no newer read or
+  // mutation has applied since this read was issued. The response's draft is
+  // deliberately IGNORED: the live draft rows, mode, total input, server-draft
+  // baseline, save queue and autosave status are never replaced by a refresh,
+  // so a refresh can never trigger a draft PUT. A failure keeps the last
+  // confirmed state; with reportError it shows the retryable notice (only when
+  // nothing newer has applied meanwhile).
+  async function refreshSnapshots(
+    options: { reportError?: boolean } = {},
+  ): Promise<SnapshotRefreshOutcome> {
+    const reportError = options.reportError ?? true
+    snapshotSeqRef.current += 1
+    const seq = snapshotSeqRef.current
+    const requestOrderId = orderIdRef.current
+    snapshotReadsInFlightRef.current += 1
+    setSnapshotRefreshing(true)
+    try {
+      const res = await fetchQuoteWorkspace(requestOrderId)
+      if (!mountedRef.current || orderIdRef.current !== requestOrderId) {
+        return 'gone'
+      }
+      if (seq <= snapshotFloorRef.current) return 'superseded'
+      snapshotFloorRef.current = seq
+      installIssued(res.data.current_issued)
+      installAccepted(res.data.accepted)
+      setSnapshotApplyCount((count) => count + 1)
+      setSnapshotRefreshError(null)
+      // A read issued after the conversion lock was taken reports the
+      // post-conversion invoice_eligible: the server state takes over again.
+      if (conversionLockRef.current !== null && seq > conversionLockSeqRef.current) {
+        conversionLockRef.current = null
+        setConversionLock(null)
+      }
+      return 'applied'
+    } catch {
+      if (!mountedRef.current || orderIdRef.current !== requestOrderId) {
+        return 'gone'
+      }
+      if (reportError && seq > snapshotFloorRef.current) {
+        setSnapshotRefreshError(
+          'The latest quote status could not be loaded, so the last known status is shown.',
+        )
+      }
+      return 'failed'
+    } finally {
+      snapshotReadsInFlightRef.current -= 1
+      if (mountedRef.current && snapshotReadsInFlightRef.current === 0) {
+        setSnapshotRefreshing(false)
+      }
+    }
+  }
+
+  // Refresh trigger 1: the top-level Quote tab became the visible tab (also on
+  // mount when it mounts visible, e.g. straight after Create Quote).
+  useEffect(() => {
+    if (!active) return
+    void refreshSnapshots()
+    // refreshSnapshots reads everything through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active])
+
+  // Refresh trigger 2: a quote sub-tab change.
+  function handleSubTabChange(next: QuoteSubTabId) {
+    if (next === subTab) return
+    setSubTab(next)
+    if (next === 'accepted') setAcceptedSubTabSeen(true)
+    void refreshSnapshots()
+  }
+
   // --- Phase 16E-B: Send by Email / Cancel quote / stored issued-PDF preview. ---
 
   // Open the Send Quote confirmation modal with a clean slate (used by the
   // draft action bar's Send Quote and the Customer Quote Resend — both go
   // through the SAME confirmation; there is no one-click send).
-  function handleOpenSendModal() {
+  // Refresh trigger 3 (Phase 16F PR3, decision D9): re-read the issued/accepted
+  // snapshots FIRST and open the confirmation only after that read succeeded,
+  // so the accepted-state warning reflects the current server state. A failed
+  // read explains itself and offers a retry; it never opens an uninformed modal
+  // and never sends anything.
+  async function handleOpenSendModal() {
+    if (sendCheckRef.current) return
+    if (sendingRef.current || cancellingRef.current || convertingRef.current) {
+      return
+    }
+    sendCheckRef.current = true
+    setSendCheck('checking')
     setSendError(null)
     setSendEmailFixNeeded(false)
     setActionNotice(null)
-    setSendModalOpen(true)
+    try {
+      // Only a read that APPLIED informs the warning. 'superseded' means a newer
+      // read OR a mutation barrier moved the floor while this read was pending, and
+      // the latter carries no data, so re-issue the read (bounded) instead of
+      // opening on state this check did not confirm.
+      let outcome: SnapshotRefreshOutcome = 'superseded'
+      for (
+        let attempt = 0;
+        attempt < PRE_SEND_READ_ATTEMPTS && outcome === 'superseded';
+        attempt += 1
+      ) {
+        outcome = await refreshSnapshots({ reportError: false })
+      }
+      if (outcome === 'gone') return
+      if (outcome !== 'applied') {
+        setSendCheck('error')
+        return
+      }
+      setSendCheck('idle')
+      // Never open over another action: the tab must still be visible, no
+      // mutation may be running and no other confirmation may be open.
+      if (
+        !activeRef.current ||
+        sendingRef.current ||
+        cancellingRef.current ||
+        convertingRef.current ||
+        cancelModalOpenRef.current ||
+        convertModalOpenRef.current
+      ) {
+        return
+      }
+      setSendModalOpen(true)
+    } finally {
+      sendCheckRef.current = false
+    }
   }
 
   // Map a failed send to its in-modal message. Backend messages surface
@@ -1468,10 +1861,16 @@ export function QuoteTab({
   // — and blocks the send when either flush fails. The ref guard makes the send
   // single-flight (no duplicate issue from a double-tap). Disabled when LAID.
   async function handleSendEmail() {
-    // Cross in-flight guard: never send while a cancel is running (and vice
-    // versa) — the two mutations race server-side and the loser's response
-    // could reinstall dead state.
-    if (sendingRef.current || cancellingRef.current || lockedRef.current) return
+    // Cross in-flight guard: never send while a cancel or a Create Invoice is
+    // running (and vice versa) - the mutations race server-side and the loser's
+    // response could reinstall dead state.
+    if (
+      sendingRef.current ||
+      cancellingRef.current ||
+      convertingRef.current ||
+      lockedRef.current
+    )
+      return
     sendingRef.current = true
     setSending(true)
     setSendError(null)
@@ -1501,6 +1900,9 @@ export function QuoteTab({
         }
         return
       }
+      // The send mutation starts: no snapshot read issued before this point may
+      // land after it (16F PR3 recency mechanism).
+      raiseSnapshotFloor()
       const res = await sendQuoteEmail(orderIdRef.current)
       if (!mountedRef.current) return
       // The 201 summary is the new issued state — the Customer Quote sub-tab
@@ -1509,8 +1911,9 @@ export function QuoteTab({
       // ISSUED summary is installed as the ACTIVE quote — if another session
       // cancelled between the send's issue and its success stamp, the re-read
       // summary can be CANCELLED, and rendering that as active would show a
-      // live-looking quote whose link is dead (a reload would show null).
-      setIssued(res.data.status === 'ISSUED' ? res.data : null)
+      // live-looking quote whose link is dead (a reload would show null). A
+      // send never changes the accepted version, so `accepted` is untouched.
+      applyMutationIssued(res.data.status === 'ISSUED' ? res.data : null)
       // A preview failure recorded against the PREVIOUS issued artifact must
       // not resurface against this fresh one.
       setIssuedPreviewError(null)
@@ -1530,15 +1933,13 @@ export function QuoteTab({
       // carries no last_emailed_at, so the Not-delivered badge renders
       // naturally. The modal stays open with the error either way, and the
       // in-flight guard (reset in finally, after this await) keeps a retry
-      // from racing the resync.
+      // from racing the resync. 16F PR3: the resync is a guarded snapshot read
+      // (issued + accepted together; older reads can never land after it); it
+      // stays best-effort and silent on failure (the in-modal error already
+      // covers the user and the last state is kept).
       if (err instanceof ApiError && err.code === 'EMAIL_SEND_FAILED') {
-        try {
-          const ws = await fetchQuoteWorkspace(orderIdRef.current)
-          if (mountedRef.current) setIssued(ws.data.current_issued)
-        } catch {
-          // Best-effort resync: the in-modal error already covers the user;
-          // leave the local state as-is until the next action or reload.
-        }
+        raiseSnapshotFloor()
+        await refreshSnapshots({ reportError: false })
       }
     } finally {
       sendingRef.current = false
@@ -1554,16 +1955,25 @@ export function QuoteTab({
   // QUOTE_ALREADY_ACCEPTED / 404) surface verbatim inside the modal.
   async function handleCancelQuote() {
     // Cross in-flight guard (mirrors handleSendEmail): a cancel racing an
-    // in-flight send could let the later send response reinstall a summary the
-    // backend built AFTER the cancel committed.
-    if (cancellingRef.current || sendingRef.current) return
+    // in-flight send (or Create Invoice) could let the later response reinstall
+    // a summary the backend built AFTER the cancel committed.
+    if (
+      cancellingRef.current ||
+      sendingRef.current ||
+      convertingRef.current ||
+      sendCheckRef.current
+    ) {
+      return
+    }
     cancellingRef.current = true
     setCancelling(true)
     setCancelError(null)
     try {
+      // The cancel mutation starts: older snapshot reads may not land after it.
+      raiseSnapshotFloor()
       const res = await cancelQuote(orderIdRef.current)
       if (!mountedRef.current) return
-      setIssued(null)
+      applyMutationIssued(null)
       // The stale-status rule: an old preview failure must not render against
       // whatever is issued next.
       setIssuedPreviewError(null)
@@ -1581,13 +1991,24 @@ export function QuoteTab({
           : 'Could not cancel the quote. Please try again.',
       )
       // Drift resync: 422 QUOTE_NOT_ISSUED means the backend has NO active
-      // issued quote (it was cancelled/superseded elsewhere) — the local
-      // summary is stale. Null it so the Customer Quote sub-tab returns to
-      // its empty state, matching what a reload shows. QUOTE_ALREADY_ACCEPTED
-      // (409) and all other errors deliberately leave the state untouched
-      // (acceptance is 16F state this surface cannot represent yet).
+      // issued quote and no accepted one (cancelled/superseded elsewhere) - the
+      // local summary is stale. Null it at once, then (16F PR3) follow with a
+      // guarded snapshot read so the coherent issued + accepted state shows.
+      // 409 QUOTE_ALREADY_ACCEPTED (no issued version, an accepted one exists)
+      // gets the same guarded read: the accepted state is representable now.
+      // The issued summary is NOT nulled first: with no accepted summary to show
+      // yet, that would fabricate the "No quote has been sent yet." empty state.
+      // A failure of that read therefore shows the retryable notice over the
+      // last known state. Other errors leave the state untouched. The error
+      // stays in the modal.
       if (err instanceof ApiError && err.code === 'QUOTE_NOT_ISSUED') {
-        setIssued(null)
+        applyMutationIssued(null)
+        void refreshSnapshots({ reportError: false })
+      } else if (
+        err instanceof ApiError &&
+        err.code === 'QUOTE_ALREADY_ACCEPTED'
+      ) {
+        void refreshSnapshots()
       }
     } finally {
       cancellingRef.current = false
@@ -1656,12 +2077,359 @@ export function QuoteTab({
     }
   }
 
+  // --- Phase 16F PR3: Accepted Quote (signature, signed PDF, Create Invoice). ---
+
+  // The stored accepted signature (credentialed blob of the VERBATIM backend
+  // path -> object URL). Keyed on the accepted VERSION as well as the path: the
+  // path is the same stable /quote/accepted/signature URL for every accepted
+  // version, so a newer accepted version must refetch even though the path did
+  // not change. The old image is cleared at once on any identity change; a late
+  // result after a change or unmount is discarded and its URL revoked (the
+  // InvoiceTab ownership pattern). A failure shows a small retry notice only.
+  // Loaded once the Accepted Quote sub-tab has been opened.
+  const acceptedSignaturePath =
+    acceptedSubTabSeen && accepted !== null
+      ? accepted.signature_download_path
+      : null
+  const acceptedSignatureVersionId =
+    accepted !== null ? accepted.quote_version_id : null
+  useEffect(() => {
+    if (acceptedSignaturePath === null) {
+      setAcceptedSignatureUrl(null)
+      setAcceptedSignatureFailed(false)
+      return
+    }
+    let cancelled = false
+    let objectUrl: string | null = null // closure-tracked - authoritative for revoke
+    setAcceptedSignatureUrl(null)
+    setAcceptedSignatureFailed(false)
+    fetchAcceptedQuoteSignature(acceptedSignaturePath)
+      .then((blob) => {
+        objectUrl = URL.createObjectURL(blob)
+        if (cancelled) {
+          URL.revokeObjectURL(objectUrl)
+          objectUrl = null
+          return
+        }
+        setAcceptedSignatureUrl(objectUrl)
+      })
+      .catch(() => {
+        if (!cancelled) setAcceptedSignatureFailed(true)
+      })
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [acceptedSignaturePath, acceptedSignatureVersionId, acceptedSignatureReload])
+
+  // The current invoice behind a DISABLED Create Invoice (invoice_eligible
+  // false), to choose its explanation. Re-read after every applied snapshot
+  // refresh while the Accepted Quote sub-tab is in use; a result is used only for
+  // the accepted version it was read for, and a late result after a change or
+  // unmount is discarded.
+  const eligibilityLookupKey =
+    acceptedSubTabSeen && accepted !== null && !accepted.invoice_eligible
+      ? `${accepted.quote_version_id}:${snapshotApplyCount}`
+      : null
+  const eligibilityLookupVersionId =
+    accepted !== null ? accepted.quote_version_id : null
+  useEffect(() => {
+    if (eligibilityLookupKey === null || eligibilityLookupVersionId === null) {
+      setEligibilityLookup(null)
+      return
+    }
+    let cancelled = false
+    const quoteVersionId = eligibilityLookupVersionId
+    fetchCurrentInvoice(orderIdRef.current)
+      .then((res) => {
+        if (!cancelled) {
+          setEligibilityLookup({
+            status: 'ready',
+            quoteVersionId,
+            invoice: res.data.invoice,
+          })
+        }
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
+          setEligibilityLookup({ status: 'ready', quoteVersionId, invoice: null })
+          return
+        }
+        setEligibilityLookup({ status: 'error', quoteVersionId })
+      })
+    return () => {
+      cancelled = true
+    }
+    // eligibilityLookupVersionId is part of eligibilityLookupKey.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [eligibilityLookupKey])
+
+  // Preview the STORED signed PDF (GET quote/pdf?type=accepted) in a new tab -
+  // never the draft preview, never a regeneration, never an autosave flush. Same
+  // popup-safe order as the other previews: blank tab opened synchronously in
+  // the click handler, then the blob; download fallback only when blocked. No
+  // separate download button. Allowed when LAID (read).
+  async function handleAcceptedPreviewPdf() {
+    if (acceptedPreviewing) return
+    setAcceptedPreviewError(null)
+    const tab = window.open('', '_blank')
+    setAcceptedPreviewing(true)
+    const versionNumber = acceptedRef.current?.version_number
+    try {
+      const { blob, fileName } = await fetchQuoteStoredPdf(
+        orderIdRef.current,
+        'accepted',
+      )
+      if (!mountedRef.current) {
+        tab?.close()
+        return
+      }
+      const url = URL.createObjectURL(blob)
+      if (tab && !tab.closed) {
+        // Revoked on unmount only - revoking now could blank the loading tab.
+        previewUrlsRef.current.push(url)
+        tab.location.href = url
+      } else if (tab === null) {
+        // Popup blocked - fall back to a normal download. One-shot URL.
+        const anchor = document.createElement('a')
+        anchor.href = url
+        anchor.download =
+          fileName ??
+          `quote-${orderNumber && orderNumber.length > 0 ? orderNumber : 'order'}${
+            versionNumber !== undefined ? `-v${versionNumber}` : ''
+          }-signed.pdf`
+        document.body.appendChild(anchor)
+        anchor.click()
+        anchor.remove()
+        URL.revokeObjectURL(url)
+        setAcceptedPreviewError(
+          'The preview tab was blocked by the browser, so the PDF was downloaded instead.',
+        )
+      } else {
+        // The user closed the blank tab while the PDF was being fetched.
+        URL.revokeObjectURL(url)
+      }
+    } catch (err) {
+      tab?.close()
+      if (!mountedRef.current) return
+      setAcceptedPreviewError(
+        err instanceof ApiError && err.message.length > 0
+          ? err.message
+          : 'Could not open the signed quote PDF. Please try again.',
+      )
+    } finally {
+      if (mountedRef.current) setAcceptedPreviewing(false)
+    }
+  }
+
+  function closeConvertModal() {
+    convertTargetRef.current = null
+    setConvertTarget(null)
+    setConvertLookup({ status: 'idle' })
+    setConvertModalOpen(false)
+  }
+
+  // The current-invoice read for an open confirmation, bound to its key (order +
+  // accepted version + attempt). Its only job is accurate confirmation wording:
+  // it never replaces invoice_eligible or the server's own checks.
+  async function lookupInvoiceForConvert(target: ConvertTarget) {
+    setConvertLookup({ status: 'loading', key: target.key })
+    try {
+      const res = await fetchCurrentInvoice(target.orderId)
+      if (!mountedRef.current || convertTargetRef.current?.key !== target.key) {
+        return
+      }
+      setConvertLookup({
+        status: 'ready',
+        key: target.key,
+        invoice: res.data.invoice,
+      })
+    } catch (err) {
+      if (!mountedRef.current || convertTargetRef.current?.key !== target.key) {
+        return
+      }
+      if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
+        setConvertLookup({ status: 'ready', key: target.key, invoice: null })
+        return
+      }
+      setConvertLookup({ status: 'error', key: target.key })
+    }
+  }
+
+  function openConvertTarget(current: QuoteAcceptedSummary) {
+    convertKeySeqRef.current += 1
+    const target: ConvertTarget = {
+      key: convertKeySeqRef.current,
+      orderId: orderIdRef.current,
+      quoteVersionId: current.quote_version_id,
+      versionNumber: current.version_number,
+      totalIncGst: current.quote_total_inc_gst,
+    }
+    convertTargetRef.current = target
+    setConvertTarget(target)
+    void lookupInvoiceForConvert(target)
+  }
+
+  // Create Invoice: open the confirmation (never a one-click POST).
+  function handleOpenConvertModal() {
+    const current = acceptedRef.current
+    if (current === null || !current.invoice_eligible) return
+    if (
+      convertingRef.current ||
+      sendingRef.current ||
+      cancellingRef.current ||
+      sendCheckRef.current ||
+      conversionLockRef.current !== null
+    ) {
+      return
+    }
+    setConvertError(null)
+    setConvertErrorDetails([])
+    setConvertNotice(null)
+    setActionNotice(null)
+    openConvertTarget(current)
+    setConvertModalOpen(true)
+  }
+
+  function handleRetryConvertLookup() {
+    const target = convertTargetRef.current
+    const current = acceptedRef.current
+    if (target === null || current === null) return
+    if (current.quote_version_id !== target.quoteVersionId) return
+    openConvertTarget(current)
+  }
+
+  // A snapshot refresh changed the accepted quote (or made it ineligible) while
+  // its confirmation was open: invalidate the confirmation and require a review
+  // of the new accepted state. Never while the POST is in flight (its outcome
+  // must not be lost).
+  useEffect(() => {
+    if (!convertModalOpen || converting) return
+    const target = convertTargetRef.current
+    if (target === null) return
+    if (
+      accepted === null ||
+      accepted.quote_version_id !== target.quoteVersionId ||
+      !accepted.invoice_eligible
+    ) {
+      closeConvertModal()
+      setConvertNotice(ACCEPTED_CHANGED_MESSAGE)
+    }
+    // closeConvertModal only uses refs and state setters.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [accepted, convertModalOpen, converting])
+
+  // Keep Create Invoice disabled until a snapshot read issued from NOW applies.
+  function takeConversionLock(reason: 'created' | 'unknown') {
+    conversionLockSeqRef.current = snapshotSeqRef.current
+    conversionLockRef.current = reason
+    setConversionLock(reason)
+  }
+
+  function applyConvertError(err: unknown) {
+    const fallback =
+      'Could not create the invoice from the accepted quote. Please try again.'
+    if (isAmbiguousFailure(err)) {
+      // No readable answer: the invoice MAY have been created. Never invite a
+      // blind retry - lock the button and re-read the real eligibility.
+      setConvertError(CONVERSION_UNKNOWN_MESSAGE)
+      takeConversionLock('unknown')
+      void refreshSnapshots()
+      return
+    }
+    if (err instanceof ApiError) {
+      // Backend messages VERBATIM (409 signature precedence, 422 preconditions /
+      // overpayment / not accepted, 404 ...).
+      setConvertError(err.message.length > 0 ? err.message : fallback)
+      if (err.code === 'INVOICE_PRECONDITIONS_NOT_MET') {
+        setConvertErrorDetails(parsePreconditionFailures(err.details))
+      }
+      // Drift (the signature precedence or the accepted version changed since
+      // this tab last read them): refresh eligibility, keeping the error shown.
+      if (err.status === 409 || err.code === 'QUOTE_NOT_ACCEPTED') {
+        void refreshSnapshots()
+      }
+      return
+    }
+    setConvertError(fallback)
+  }
+
+  // Confirmed Create Invoice (Path A). POSTs exactly {} - the server converts the
+  // LATEST accepted quote (no version selector, price, terms or signature
+  // reference is ever sent). Single-flight; never overlaps a send or a cancel.
+  async function handleConfirmCreateInvoice() {
+    if (convertingRef.current || sendingRef.current || cancellingRef.current) {
+      return
+    }
+    const target = convertTargetRef.current
+    if (target === null) return
+    const current = acceptedRef.current
+    if (
+      current === null ||
+      current.quote_version_id !== target.quoteVersionId ||
+      !current.invoice_eligible ||
+      target.orderId !== orderIdRef.current
+    ) {
+      closeConvertModal()
+      setConvertNotice(ACCEPTED_CHANGED_MESSAGE)
+      return
+    }
+    if (convertLookup.status !== 'ready' || convertLookup.key !== target.key) {
+      return
+    }
+    convertingRef.current = true
+    setConverting(true)
+    setConvertError(null)
+    setConvertErrorDetails([])
+    setConvertNotice(null)
+    // The conversion starts: older snapshot reads may not land after it.
+    raiseSnapshotFloor()
+    const requestOrderId = target.orderId
+    try {
+      let message = 'Invoice created from accepted quote.'
+      try {
+        const res = await createInvoiceFromQuote(requestOrderId)
+        if (res && typeof res.message === 'string' && res.message.length > 0) {
+          message = res.message
+        }
+      } catch (err) {
+        // A 2xx whose body could not be read (the shared client reports it as an
+        // ApiError carrying the 2xx status) still CREATED the invoice: take the
+        // success path with the default message rather than inviting a retry.
+        if (!(err instanceof ApiError && err.status >= 200 && err.status < 300)) {
+          throw err
+        }
+      }
+      if (!mountedRef.current || orderIdRef.current !== requestOrderId) return
+      takeConversionLock('created')
+      closeConvertModal()
+      setActionNotice(message)
+      // Re-read the issued/accepted snapshots (the new eligibility) in the
+      // background: a failed read never undoes or relabels the creation - it
+      // shows the retryable refresh notice and the lock keeps a duplicate
+      // conversion from being offered meanwhile.
+      void refreshSnapshots()
+      // Land on the Invoice tab, which reads the new current invoice itself.
+      onInvoiceReady(message)
+    } catch (err) {
+      if (!mountedRef.current || orderIdRef.current !== requestOrderId) return
+      // Errors live OUTSIDE the modal so a drift refresh cannot erase them.
+      closeConvertModal()
+      applyConvertError(err)
+    } finally {
+      convertingRef.current = false
+      if (mountedRef.current) setConverting(false)
+    }
+  }
+
   const customerName = composeFullName(customer)
   const billingAddressLines = composeAddressLines(billingAddress)
   const detailsOfSaleText = saleDetails?.details_of_sale || ''
 
-  // Per-flooring-type quote terms — same selection + blank-hides-section rule as
-  // the invoice (SOFT -> terms_soft, HARD -> terms_hard, no legacy fallback).
+  // Per-flooring-type LIVE quote terms (SOFT -> terms_soft, HARD -> terms_hard, no
+  // legacy fallback; blank hides the section). The invoice no longer selects terms
+  // client-side: InvoiceTab shows the server-selected InvoiceDetail.terms_html.
   const termsText = nonBlank(
     flooringType === 'SOFT'
       ? tenantConfig?.terms_soft
@@ -1791,6 +2559,60 @@ export function QuoteTab({
   // Locked itemised drafts render the persisted lines as a read-only table.
   const lockedItemised = locked && serverDraft !== null && serverDraft.itemised
 
+  // --- Phase 16F PR3: Accepted Quote derivations. ---
+  // Create Invoice: the server's invoice_eligible alone, plus the in-flight
+  // gates and the post-conversion lock. Deliberately NOT gated by `locked`
+  // (LAID), the draft, a newer issued quote or any client-side date comparison.
+  const createInvoiceDisabled =
+    accepted === null ||
+    !accepted.invoice_eligible ||
+    conversionLock !== null ||
+    converting ||
+    sending ||
+    cancelling ||
+    sendCheck === 'checking'
+  // The note under Create Invoice. A just-created invoice says so (the lock
+  // holds until a fresh read confirms the new eligibility); an unknown outcome
+  // defers to the error above; an ineligible quote explains why, from the
+  // current invoice read for THIS accepted version (string comparison of the
+  // two backend timestamps, never Date arithmetic; a failed read gives the
+  // general sentence).
+  let createInvoiceNote: string | null = null
+  if (accepted !== null) {
+    if (conversionLock === 'created') {
+      createInvoiceNote = ALREADY_CONVERTED_MESSAGE
+    } else if (conversionLock === 'unknown') {
+      createInvoiceNote = snapshotRefreshing
+        ? 'Checking the latest quote status…'
+        : 'Load the latest quote status (Try again above) before creating an invoice.'
+    } else if (!accepted.invoice_eligible) {
+      const lookup =
+        eligibilityLookup !== null &&
+        eligibilityLookup.quoteVersionId === accepted.quote_version_id
+          ? eligibilityLookup
+          : null
+      if (lookup === null) {
+        createInvoiceNote = 'Checking the current invoice…'
+      } else if (
+        lookup.status === 'ready' &&
+        lookup.invoice !== null &&
+        lookup.invoice.accepted_at !== null &&
+        sameSecondTimestamp(lookup.invoice.accepted_at, accepted.accepted_at)
+      ) {
+        createInvoiceNote = ALREADY_CONVERTED_MESSAGE
+      } else {
+        createInvoiceNote = NEWER_SIGNATURE_REQUIRED_MESSAGE
+      }
+    }
+  }
+  // The open confirmation's current-invoice read, only for its own key.
+  const convertInvoiceLookup =
+    convertTarget !== null &&
+    convertLookup.status !== 'idle' &&
+    convertLookup.key === convertTarget.key
+      ? convertLookup
+      : null
+
   return (
     <div>
       <div className="mb-4 flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3">
@@ -1831,7 +2653,7 @@ export function QuoteTab({
       )}
 
       <div className="mb-5 -mx-3">
-        <Tabs tabs={SUB_TABS} active={subTab} onChange={setSubTab} />
+        <Tabs tabs={SUB_TABS} active={subTab} onChange={handleSubTabChange} />
       </div>
 
       {/* 16E-B success notice ("Quote sent by email." / "Quote cancelled.") —
@@ -1839,6 +2661,45 @@ export function QuoteTab({
       {actionNotice && (
         <div className="mb-4 rounded-lg border border-teal-200 bg-teal-50 px-4 py-3">
           <p className="text-sm font-medium text-teal-700">{actionNotice}</p>
+        </div>
+      )}
+
+      {/* 16F PR3: a failed issued/accepted refresh keeps the last confirmed
+          state on screen and offers a retry (visible from any sub-tab). */}
+      {snapshotRefreshError && (
+        <div className="mb-4 flex flex-col gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-sm font-medium text-amber-800">
+            {snapshotRefreshError}
+          </p>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            disabled={snapshotRefreshing}
+            onClick={() => void refreshSnapshots()}
+          >
+            {snapshotRefreshing ? 'Checking…' : 'Try again'}
+          </Button>
+        </div>
+      )}
+
+      {/* 16F PR3 (D9): the pre-Send status read failed, so the confirmation
+          was not opened without the current accepted state. */}
+      {sendCheck === 'error' && (
+        <div className="mb-4 flex flex-col gap-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+          <p className="text-sm font-medium text-amber-800">
+            The latest quote status could not be checked, so the send
+            confirmation was not opened. Check your connection and try again.
+          </p>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            disabled={locked}
+            onClick={() => void handleOpenSendModal()}
+          >
+            Try again
+          </Button>
         </div>
       )}
 
@@ -2489,8 +3350,8 @@ export function QuoteTab({
               </button>
               <button
                 type="button"
-                onClick={handleOpenSendModal}
-                disabled={locked}
+                onClick={() => void handleOpenSendModal()}
+                disabled={locked || sendCheck === 'checking' || converting}
                 title={
                   locked
                     ? 'This order is laid and locked, so the quote cannot be sent.'
@@ -2498,7 +3359,7 @@ export function QuoteTab({
                 }
                 className="flex w-full items-center justify-center rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                Send Quote
+                {sendCheck === 'checking' ? 'Checking…' : 'Send Quote'}
               </button>
             </div>
           </article>
@@ -2512,11 +3373,40 @@ export function QuoteTab({
           cost, GP, token, hash, storage path or file id is ever rendered. */}
       {subTab === 'customer' &&
         (issued === null ? (
-          <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-10 text-center">
-            <p className="text-base font-medium text-slate-700">
-              No quote has been sent yet.
-            </p>
-          </div>
+          accepted !== null ? (
+            // 16F PR3: no active issued quote, but one was accepted (its link
+            // is consumed) - say so and point to Accepted Quote; never the
+            // never-sent empty state.
+            <div className="rounded-xl border border-slate-200 bg-white px-6 py-8 text-center">
+              <span className="inline-flex items-center rounded-md border border-teal-200 bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700">
+                Accepted
+              </span>
+              <p className="mt-3 break-words text-base font-medium text-slate-700">
+                Version {accepted.version_number} was accepted by{' '}
+                {accepted.accepted_customer_name} on{' '}
+                {formatTimestamp(accepted.accepted_at)}.
+              </p>
+              <p className="mt-1 text-sm text-slate-500">
+                There is no quote waiting for a signature.
+              </p>
+              <div className="mt-4 flex justify-center">
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="md"
+                  onClick={() => handleSubTabChange('accepted')}
+                >
+                  View accepted quote
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-10 text-center">
+              <p className="text-base font-medium text-slate-700">
+                No quote has been sent yet.
+              </p>
+            </div>
+          )
         ) : (
           <div className="space-y-5">
             {issuedPreviewError && (
@@ -2617,21 +3507,25 @@ export function QuoteTab({
                   type="button"
                   variant="success"
                   size="md"
-                  onClick={handleOpenSendModal}
-                  disabled={locked}
+                  onClick={() => void handleOpenSendModal()}
+                  disabled={locked || sendCheck === 'checking' || converting}
                   title={
                     locked
                       ? 'This order is laid and locked, so the quote cannot be resent.'
                       : undefined
                   }
                 >
-                  Resend
+                  {sendCheck === 'checking' ? 'Checking…' : 'Resend'}
                 </Button>
                 <Button
                   type="button"
                   variant="secondary"
                   size="md"
+                  // Not while the pre-Send status read is running: that read may
+                  // open the Send confirmation, which must never stack on this one.
+                  disabled={sendCheck === 'checking'}
                   onClick={() => {
+                    if (sendCheckRef.current) return
                     setCancelError(null)
                     setActionNotice(null)
                     setCancelModalOpen(true)
@@ -2740,11 +3634,246 @@ export function QuoteTab({
           </div>
         ))}
 
+      {/* Accepted Quote (16F PR3) - the latest ACCEPTED version, rendered from
+          the `accepted` summary ONLY (the frozen accepted snapshot): never the
+          live draft, the live order customer/address or live tenant terms (the
+          full frozen document, terms included, is the signed PDF). No cost, GP,
+          token, storage path or file id is rendered. */}
       {subTab === 'accepted' && (
-        <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-10 text-center">
-          <p className="text-base font-medium text-slate-700">
-            No quote has been accepted yet.
-          </p>
+        <div className="space-y-5">
+          {/* The Create Invoice outcome banners render ABOVE both the canvas and
+              the empty state: a drift refresh that finds no accepted quote any
+              more must not erase the error it was triggered by. */}
+          {convertNotice && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+              <p className="text-sm font-medium text-amber-800">
+                {convertNotice}
+              </p>
+            </div>
+          )}
+          {/* Create Invoice errors live here (outside the confirmation) so a
+              drift refresh can update eligibility without erasing them.
+              Backend messages verbatim; precondition details in the Details
+              of Sale "field: message" convention. */}
+          {convertError && (
+            <div
+              role="alert"
+              className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3"
+            >
+              <p className="text-sm font-medium text-rose-700">
+                {convertError}
+              </p>
+              {convertErrorDetails.length > 0 && (
+                <ul className="mt-1 space-y-0.5">
+                  {convertErrorDetails.map((failure, idx) => (
+                    <li
+                      key={`${failure.label ?? ''}-${idx}`}
+                      className="text-xs text-rose-700 leading-relaxed"
+                    >
+                      {failure.label ? (
+                        <span className="font-medium">{failure.label}: </span>
+                      ) : null}
+                      {failure.message}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
+          {acceptedPreviewError && (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
+              <p className="text-sm font-medium text-rose-700">
+                {acceptedPreviewError}
+              </p>
+            </div>
+          )}
+
+          {accepted === null ? (
+            <div className="rounded-xl border border-dashed border-slate-300 bg-white px-6 py-10 text-center">
+              <p className="text-base font-medium text-slate-700">
+                No quote has been accepted yet.
+              </p>
+            </div>
+          ) : (
+            <article className="rounded-lg border border-slate-200 bg-white shadow-sm px-6 py-6 sm:px-8 sm:py-8 lg:px-10 lg:py-8">
+              <header className="flex flex-wrap items-start justify-between gap-4">
+                <div className="text-xl font-bold text-slate-900 tracking-tight">
+                  Accepted quote
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="inline-flex items-center rounded-md border border-teal-200 bg-teal-50 px-2 py-0.5 text-xs font-medium text-teal-700">
+                    Accepted
+                  </span>
+                  <span className="text-sm text-slate-500">
+                    Version {accepted.version_number}
+                  </span>
+                </div>
+              </header>
+
+              <div className="my-6 border-t border-slate-200" />
+
+              <div>
+                <div className="text-base font-semibold text-slate-900">
+                  Details Of Sale
+                </div>
+                <p className="mt-2 text-sm text-slate-700 leading-relaxed whitespace-pre-wrap break-words">
+                  {accepted.details_of_sale || '—'}
+                </p>
+              </div>
+
+              {/* Frozen lines ONLY for an itemised accepted quote - the itemised
+                  flag drives this branch, so a non-itemised quote never renders
+                  a line table (whatever `lines` holds). */}
+              {accepted.itemised && (
+                <div className="mt-8 overflow-x-auto">
+                  <table className="w-full text-sm">
+                    <thead>
+                      <tr className="border-b border-slate-200 text-[11px] uppercase tracking-wider text-slate-500">
+                        <th className="py-2 pr-3 text-left font-semibold">
+                          Description
+                        </th>
+                        <th className="py-2 px-3 text-right font-semibold">
+                          Quantity
+                        </th>
+                        <th className="py-2 px-3 text-right font-semibold">
+                          Unit price
+                        </th>
+                        <th className="py-2 pl-3 text-right font-semibold">
+                          Amount
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {accepted.lines.map((line, idx) => (
+                        <tr
+                          key={`accepted-line-${idx}`}
+                          className="border-b border-slate-100"
+                        >
+                          <td className="py-2 pr-3 text-slate-800">
+                            {line.description}
+                          </td>
+                          <td className="py-2 px-3 text-right tabular-nums text-slate-700">
+                            {line.quantity !== null
+                              ? toFixed2(line.quantity)
+                              : '—'}
+                          </td>
+                          <td className="py-2 px-3 text-right tabular-nums text-slate-700">
+                            {line.unit_price_ex_gst !== null
+                              ? formatMoney(line.unit_price_ex_gst)
+                              : '—'}
+                          </td>
+                          <td className="py-2 pl-3 text-right tabular-nums text-slate-900">
+                            {formatMoney(line.line_total_ex_gst)}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+
+              {/* Frozen totals, shown as returned (never recalculated). */}
+              <div className="mt-8 sm:ml-auto sm:w-[360px] rounded-md border border-slate-200">
+                <div className="flex items-center justify-between px-4 py-2.5">
+                  <span className="text-sm text-slate-700">Total Ex. GST</span>
+                  <span className="text-sm font-medium tabular-nums text-slate-900">
+                    {formatMoney(accepted.quote_total_ex_gst)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between px-4 py-2.5 border-t border-slate-200">
+                  <span className="text-sm text-slate-700">
+                    Quote Total Inc. GST
+                  </span>
+                  <span className="text-sm font-semibold tabular-nums text-slate-900">
+                    {formatMoney(accepted.quote_total_inc_gst)}
+                  </span>
+                </div>
+              </div>
+
+              <div className="my-8 border-t border-slate-200" />
+
+              {/* The customer's signature (the stored image, consumed through the
+                  verbatim backend path), the accepted name exactly as frozen
+                  (never truncated) and the accepted time - the Invoice tab's
+                  accepted-signature composition. */}
+              <div className="flex flex-col items-center">
+                <div className="text-sm font-semibold text-slate-700">
+                  Customer Signature
+                </div>
+                <div className="mt-2 flex w-full max-w-[340px] flex-col items-center text-center">
+                  <div className="flex h-16 w-full items-end justify-center border-b border-slate-300">
+                    {acceptedSignatureUrl !== null ? (
+                      <img
+                        src={acceptedSignatureUrl}
+                        alt={`Signature of ${accepted.accepted_customer_name}`}
+                        className="max-h-14 w-auto pb-0.5"
+                      />
+                    ) : accepted.signature_download_path === null ? (
+                      <p className="pb-2 text-[11px] text-slate-500">
+                        No signature image stored.
+                      </p>
+                    ) : acceptedSignatureFailed ? (
+                      <div className="flex items-center gap-2 pb-1">
+                        <p className="text-[11px] text-slate-500">
+                          The signature image could not be loaded.
+                        </p>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            setAcceptedSignatureReload((count) => count + 1)
+                          }
+                        >
+                          Retry
+                        </Button>
+                      </div>
+                    ) : (
+                      <p className="pb-2 text-[11px] text-slate-500">
+                        Loading signature…
+                      </p>
+                    )}
+                  </div>
+                  <div className="mt-1.5 w-full break-words text-sm font-medium text-slate-800">
+                    {accepted.accepted_customer_name}
+                  </div>
+                  <div className="mt-0.5 text-[11px] text-slate-500 tabular-nums">
+                    Accepted on {formatTimestamp(accepted.accepted_at)}
+                  </div>
+                </div>
+              </div>
+
+              {/* Actions: Preview signed PDF (the STORED signed PDF; no separate
+                  download button) + Create Invoice (Path A). Create Invoice is
+                  enabled by invoice_eligible alone (plus in-flight gates): never
+                  disabled by LAID, a draft or a newer issued quote. */}
+              <div className="mt-8 flex flex-col sm:flex-row gap-3">
+                {accepted.signed_pdf_available && (
+                  <button
+                    type="button"
+                    onClick={() => void handleAcceptedPreviewPdf()}
+                    disabled={acceptedPreviewing}
+                    className="flex w-full items-center justify-center rounded-md border border-teal-600 bg-white px-6 py-3.5 text-sm font-semibold text-teal-700 shadow-sm transition-colors hover:bg-teal-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {acceptedPreviewing ? 'Preparing…' : 'Preview signed PDF'}
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleOpenConvertModal}
+                  disabled={createInvoiceDisabled}
+                  className="flex w-full items-center justify-center rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {converting ? 'Creating invoice…' : 'Create Invoice'}
+                </button>
+              </div>
+              {createInvoiceNote !== null && (
+                <p className="mt-2 text-xs text-slate-600 sm:text-right">
+                  {createInvoiceNote}
+                </p>
+              )}
+            </article>
+          )}
         </div>
       )}
 
@@ -2763,6 +3892,28 @@ export function QuoteTab({
         labelledBy="send-quote-title"
       >
         <div className="p-6">
+          {/* 16F PR3 (decision D9): with an accepted quote, the modal FIRST shows
+              that accepted state (from the pre-Send refresh) and warns that
+              sending issues a new version needing a new signature. The server
+              still decides new version vs unchanged resend. */}
+          {accepted !== null && (
+            <div className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+              <div className="text-[11px] font-semibold uppercase tracking-wider text-amber-800">
+                Accepted quote
+              </div>
+              <p className="mt-1 break-words text-sm text-amber-900">
+                Version {accepted.version_number} was accepted by{' '}
+                <span className="font-semibold">
+                  {accepted.accepted_customer_name}
+                </span>{' '}
+                on {formatTimestamp(accepted.accepted_at)}.
+              </p>
+              <p className="mt-2 text-sm font-semibold text-amber-900">
+                Sending again creates a new quote version that needs a new
+                signature.
+              </p>
+            </div>
+          )}
           <h3
             id="send-quote-title"
             className="text-lg font-semibold text-slate-900 tracking-tight"
@@ -2803,7 +3954,7 @@ export function QuoteTab({
               type="button"
               variant="success"
               size="md"
-              disabled={locked || sending || cancelling}
+              disabled={locked || sending || cancelling || converting}
               title={
                 locked
                   ? 'This order is laid and locked, so the quote cannot be sent.'
@@ -2883,10 +4034,109 @@ export function QuoteTab({
               type="button"
               variant="primary"
               size="md"
-              disabled={cancelling || sending}
+              disabled={cancelling || sending || converting}
               onClick={handleCancelQuote}
             >
               {cancelling ? 'Cancelling…' : 'Cancel quote'}
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Create Invoice confirmation (16F PR3, Path A) - bound to the accepted
+          version it was opened for (a refresh that changes it closes this). The
+          wording comes from a current-invoice read: no invoice / unsigned /
+          signed. A failed read never counts as "no invoice", so confirming waits
+          for a successful read. The POST body is exactly {}. */}
+      <Modal
+        open={convertModalOpen}
+        onClose={() => {
+          // Keep the modal up while the POST is in flight so its outcome is
+          // never lost behind a dismiss.
+          if (!converting) closeConvertModal()
+        }}
+        labelledBy="create-invoice-title"
+      >
+        <div className="p-6">
+          <h3
+            id="create-invoice-title"
+            className="text-lg font-semibold text-slate-900 tracking-tight"
+          >
+            Create the invoice from the signed quote?
+          </h3>
+          {convertTarget !== null && (
+            <p className="mt-2 text-sm text-slate-600 leading-relaxed">
+              The invoice is created from the signed quote (version{' '}
+              {convertTarget.versionNumber},{' '}
+              {formatMoney(convertTarget.totalIncGst)} inc GST).
+            </p>
+          )}
+          <ul className="mt-3 list-disc space-y-1.5 pl-5 text-sm text-slate-600 leading-relaxed">
+            <li>
+              It inherits the customer&apos;s signature from the quote, so the
+              customer does not sign again.
+            </li>
+            <li>Any recorded payments are carried onto the invoice.</li>
+          </ul>
+          {convertInvoiceLookup === null ||
+          convertInvoiceLookup.status === 'loading' ? (
+            <p className="mt-3 text-sm text-slate-500">
+              Checking the current invoice…
+            </p>
+          ) : convertInvoiceLookup.status === 'error' ? (
+            <div className="mt-3 flex flex-col gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+              <p className="text-sm text-amber-800">
+                The current invoice could not be checked, so this cannot be
+                confirmed yet.
+              </p>
+              <Button
+                type="button"
+                variant="secondary"
+                size="sm"
+                disabled={converting}
+                onClick={handleRetryConvertLookup}
+              >
+                Try again
+              </Button>
+            </div>
+          ) : convertInvoiceLookup.invoice === null ? (
+            <p className="mt-3 text-sm text-slate-700">
+              This order has no invoice yet, so this creates its first invoice.
+            </p>
+          ) : convertInvoiceLookup.invoice.accepted_at === null ? (
+            <p className="mt-3 text-sm font-semibold text-slate-900">
+              This replaces the current unsigned invoice.
+            </p>
+          ) : (
+            <p className="mt-3 text-sm font-semibold text-slate-900">
+              A new invoice version replaces the current signed invoice. The
+              earlier signed version remains in history.
+            </p>
+          )}
+          <div className="mt-5 flex justify-end gap-2">
+            <Button
+              type="button"
+              variant="secondary"
+              size="md"
+              disabled={converting}
+              onClick={closeConvertModal}
+            >
+              Cancel
+            </Button>
+            <Button
+              type="button"
+              variant="success"
+              size="md"
+              disabled={
+                converting ||
+                sending ||
+                cancelling ||
+                convertInvoiceLookup === null ||
+                convertInvoiceLookup.status !== 'ready'
+              }
+              onClick={() => void handleConfirmCreateInvoice()}
+            >
+              {converting ? 'Creating invoice…' : 'Create Invoice'}
             </Button>
           </div>
         </div>
