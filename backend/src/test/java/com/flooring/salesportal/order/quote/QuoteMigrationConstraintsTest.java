@@ -318,7 +318,7 @@ class QuoteMigrationConstraintsTest {
         Assertions.assertEquals("bigint", source.get("data_type"));
         Assertions.assertEquals("YES", source.get("is_nullable"), "source_quote_version_id must be nullable");
         Assertions.assertNull(source.get("column_default"),
-                "no default: existing rows and every PR1 invoice write leave source_quote_version_id NULL");
+                "no default: nullable column, null means not quote-sourced");
 
         Map<String, Object> terms = columnShape("invoice", "terms_snapshot");
         Assertions.assertEquals("text", terms.get("data_type"));
@@ -326,7 +326,7 @@ class QuoteMigrationConstraintsTest {
         Assertions.assertEquals("YES", terms.get("is_nullable"),
                 "terms_snapshot must be nullable (NULL = frozen 'no terms' on a Path A invoice)");
         Assertions.assertNull(terms.get("column_default"),
-                "no default: existing rows and every PR1 invoice write leave terms_snapshot NULL");
+                "no default: nullable column, null means frozen 'no terms' or not quote-sourced");
     }
 
     @Test

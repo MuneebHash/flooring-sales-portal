@@ -36,7 +36,7 @@ makes a failing statement stop the run instead of carrying on.
    ```
    docker compose -f infra/docker-compose.yml up -d
    ```
-2. Start the backend so Flyway applies all migrations (V1–V18), then leave it running:
+2. Start the backend so Flyway applies all migrations (V1 to V19), then leave it running:
    ```
    cd backend && ./mvnw spring-boot:run
    ```
@@ -120,7 +120,7 @@ makes a failing statement stop the run instead of carrying on.
 
 ## Phase 17 deferral
 
-Current migrations are V1–V18. The legacy V4–V7 demo data (Aussie Floors Group / Premier
+Current migrations are V1 to V19. The legacy V4–V7 demo data (Aussie Floors Group / Premier
 Flooring, users LC1…EL1, the seeded orders/invoice, and the `password123` hashes) **stays in
 the migration path for now** — committed migrations are never edited, the CI "Locked migration
 protection" guard covers V1–V13, and the backend test suite depends on the legacy data. The

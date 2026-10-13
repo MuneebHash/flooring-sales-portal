@@ -27,6 +27,10 @@ Examples:
 - `/api/v1/{slug}/auth/login` — public (no session required)
 - Everything else under `/api/v1/{slug}/...` — protected (valid session required)
 
+Two public surfaces sit outside the `/api/v1/{slug}/...` structure:
+- `/api/v1/public/businesses/{slug}`: public business discovery (no session); returns only the business name, logo and accent colour.
+- `/api/v1/public/quotes/{token}…`: the slugless, token-only public quote surface (read and viewed tracking since 16E-C; accept since 16F). The secret token is the only credential; it never uses, populates or weakens the session model. See `docs/API-Contracts-Phase16B-Quotation.md` section 7.2.
+
 ---
 
 ## 2. Naming Conventions
@@ -135,6 +139,7 @@ File upload and file download endpoints are the only allowed exception to the JS
 | 403  | Forbidden | User does not have access to this business/store/resource |
 | 404  | Not Found | Resource does not exist or does not belong to this tenant |
 | 409  | Conflict | Duplicate resource (e.g., duplicate salesperson_code) |
+| 410  | Gone | An action (viewed, PDF, accept) on a found but dead public quote link: expired, replaced or superseded, cancelled, or already signed (codes `QUOTE_LINK_*`, Phase 16). The public GET of a found dead token is 200 with a `state`; an unknown or malformed token is 404. |
 | 422  | Unprocessable Entity | Business rule violation (e.g., invoice preconditions not met) |
 | 500  | Internal Server Error | Unexpected server failure |
 | 502  | Bad Gateway | Upstream/provider dependency failed to complete a request (e.g., the email provider could not send an invoice — `EMAIL_SEND_FAILED`, Phase 13). Used only for failures of an external dependency the backend calls on the caller's behalf; an internal bug is still 500. |
@@ -657,6 +662,7 @@ When an order is LAID, the backend must reject any attempt to:
 - add / edit / delete charge lines
 - edit details of sale
 - manually Rewrite Invoice
+- save the quote draft or send a quote (`PUT .../quote/draft`, `POST .../quote/send-email` and the dormant `send-sms`; 422 `ORDER_LOCKED`)
 
 ### What is still allowed when LAID
 These actions are allowed even when the order is LAID:
@@ -666,6 +672,10 @@ These actions are allowed even when the order is LAID:
 - add attachment
 - accept the current invoice (Phase 13: `POST .../invoices/current/accept`)
 - re-send the current accepted invoice (Phase 13: `POST .../invoices/current/resend`)
+- accept a quote on its public link (16F: `POST /api/v1/public/quotes/{token}/accept`), including the decision D6b order sale-price write
+- create an invoice from the accepted quote (16F Path A: `POST .../quote/create-invoice`)
+- cancel the active issued quote (`POST .../quote/cancel`)
+- read the quote workspace, render the draft preview PDF, and download the stored quote PDFs and the accepted quote signature
 
 Reason: LAID does not require full payment. Final payments may still be collected after job completion. **Payment void is a financial / payment-history correction, not a protected order edit** — it changes only `total_paid` / `balance_due` (and the carried-forward invoice version), never the live order's customer / address / lines / sale price — so, like adding a payment, it is allowed when LAID. Notes and attachments may still need to be added for record-keeping after the job is done.
 
