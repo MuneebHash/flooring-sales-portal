@@ -63,19 +63,46 @@ Phase 16B–16E (quotation foundation + email delivery + public read-only link) 
   - 16E-A (#102) issue/resend/cancel + stored issued PDFs · 16E-B (#103) Send by Email + Customer Quote
   - 16E-C (#106) public read-only /q/{token} page + viewed tracking, V17 issue-time customer
     snapshots (identity-aware resend), V18 reserved slug 'q'
-  NOT built: remote quote acceptance/signing, signed quote PDF, Accepted Quote, Create Invoice
-  from an accepted quote — all planned 16F.
 
-Next development step: the 16F READ-ONLY verify gate, after the post-16E docs reconciliation PR
-  merges. That gate must assess #101's impact on 16F and the accepted-customer-name source (live
-  saved customer vs the V17 issued snapshot) — neither outcome is pre-decided.
+Phase 16F (remote quote acceptance + invoice conversion, Path A) is COMPLETE on main:
+  - PR1 (#117, backend, merged 8 October 2026): public POST /api/v1/public/quotes/{token}/accept
+    (signature-only multipart; accepted name = the issued V17 customer_name_snapshot, D1; allowed
+    when LAID, D4; public-safe 422 wording, D11); stored signed quote PDF; version ISSUED ->
+    ACCEPTED, token -> CONSUMED; post-commit store notification to store.email (non-fatal,
+    recording-only, D12); accepted inc-GST total written as the order sale-price override (D6b);
+    in-app invoice accept (D.8) cancels the ISSUED quote and its ACTIVE token in the same
+    transaction (D5(c)); protected reads workspace.accepted, quote/pdf?type=accepted and
+    quote/accepted/signature; quote email link-only; migration V19
+  - PR2 (#118, backend, merged 8 October 2026): POST .../quote/create-invoice (Path A): an invoice
+    version from the latest ACCEPTED quote, inheriting its signature, accepted name and time, and
+    copying its frozen details of sale, ex/inc totals and terms_snapshot (source_quote_version_id
+    set); strict newer-signature rule D5(b) as amended 8 October 2026 (allowed with no invoice, an
+    unsigned current invoice, or a quote signed strictly later; else 409 INVOICE_ALREADY_ACCEPTED);
+    allowed when LAID; no email; InvoiceDetail terms_html (nullable) + terms_source (QUOTE / LIVE),
+    D7; no migration
+  - PR3 (#119, frontend, merged 9 October 2026): public signing UI on /q/{token} (two declarations
+    as a frontend gate, D8; signature pad; Accept Quote; local "Quote accepted." confirmation;
+    410/422 messages verbatim; re-read before any retry); Accepted Quote sub-tab (frozen content,
+    signature, Preview signed PDF, Create Invoice with confirmation, disabled with an explanation
+    when invoice_eligible is false); Customer Quote accepted state; issued/accepted re-read on tab
+    activation, sub-tab change and before Send, with stale-response guards; send-after-acceptance
+    warning (D9); Invoice tab terms from InvoiceDetail terms_html with a terms_source line
+  - Smoke test on the real stack passed on 9 October 2026 (run by Muneeb, as reported): send, open,
+    sign, dead link on reload, Accepted Quote, Preview signed PDF, Create Invoice with the inherited
+    signature and frozen terms, invoice PDF terms on page 2, D9 warning, version 2 signed, Create
+    Invoice replacing the signed invoice, Rewrite clears the signature.
+  16F added one migration, V19.
+
+Next development step: the 16G READ-ONLY verify gate, after this post-16F docs reconciliation
+  merges; then Muneeb's 16G decisions, the contract and UX lock amendments, then the 16G PRs.
 
 Approved sequence (details: docs/Phases.md §7/§9):
-  GitHub cleanup (done) -> post-16E docs reconciliation -> 16F read-only verify gate -> 16F
-  -> 16G -> Batch A -> Batch B -> 17 Deploy & Hardening -> 18 Revamp/app chrome -> 19 Final audit
+  GitHub cleanup (done) -> post-16E docs reconciliation (done) -> 16F verify gate (done) -> 16F (done)
+  -> post-16F docs reconciliation (this PR) -> 16G read-only verify gate -> 16G -> Batch A -> Batch B
+  -> 17 -> 18 -> 19
 ```
 
-The app is wired to the Spring Boot backend across the full MVP sales workflow: auth/login/logout/store-selection; dashboard order list + status update; create order shell; order workspace; customer + address save; details-of-sale autosave; product search + product lines; charge/labour lines; financial summary, GP, sale-price override/reset, target-GP price control; notes; photo upload/list/preview/delete; invoice create/rewrite/view/download; payment list/record/**void**; invoice acceptance with customer signature; resend/email state; per-tenant invoice on screen + PDF; per-flooring-type terms; PaymentsTab Stripe-link + bank-transfer helpers; **Lead Enquiry form (one-per-order order_enquiry) in the Customer tab**; dynamic business-slug routing; reserved-slug blocking; slug validation + Business-Not-Found; per-tenant quick-adds; go-forward db/dev-seed workflow + MS1 multi-store demo user; **quotation (16B–16E)**: conditional Quote tab with autosaved non-itemised/itemised quote draft editor and draft Preview PDF, Send by Email (issue/resend with a stored immutable issued PDF) and Cancel quote, Customer Quote sub-tab (Sent / Opened / Not delivered, stored issued PDF preview), and the public read-only quote page `/q/{token}` with viewed tracking. Quote acceptance/remote signing and invoice conversion are **future (16F)**; quote email is recording-only in this build (see Quotation rules).
+The app is wired to the Spring Boot backend across the full MVP sales workflow: auth/login/logout/store-selection; dashboard order list + status update; create order shell; order workspace; customer + address save; details-of-sale autosave; product search + product lines; charge/labour lines; financial summary, GP, sale-price override/reset, target-GP price control; notes; photo upload/list/preview/delete; invoice create/rewrite/view/download; payment list/record/**void**; invoice acceptance with customer signature; resend/email state; per-tenant invoice on screen + PDF; per-flooring-type terms; PaymentsTab Stripe-link + bank-transfer helpers; **Lead Enquiry form (one-per-order order_enquiry) in the Customer tab**; dynamic business-slug routing; reserved-slug blocking; slug validation + Business-Not-Found; per-tenant quick-adds; go-forward db/dev-seed workflow + MS1 multi-store demo user; **quotation (16B–16E)**: conditional Quote tab with autosaved non-itemised/itemised quote draft editor and draft Preview PDF, Send by Email (issue/resend with a stored immutable issued PDF) and Cancel quote, Customer Quote sub-tab (Sent / Opened / Not delivered, stored issued PDF preview), and the public read-only quote page `/q/{token}` with viewed tracking; **quote acceptance and invoice conversion (16F)**: public signing on `/q/{token}`, the stored signed quote PDF, the store notification on acceptance (recording-only), the Accepted Quote sub-tab with Preview signed PDF, Create Invoice from the accepted quote (Path A) inheriting the customer's signature, and Invoice tab terms from InvoiceDetail. Quote email is recording-only in this build (see Quotation rules).
 
 ---
 
@@ -96,7 +123,7 @@ Local DB:  Docker Postgres 17 (infra/docker-compose.yml) —
 ```bash
 # local DB
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal && docker compose -f infra/docker-compose.yml up -d
-# backend (Flyway applies V1–V18 on boot)
+# backend (Flyway applies V1 to V19 on boot)
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal/backend && ./mvnw spring-boot:run
 # frontend
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal/frontend && npm run dev
@@ -150,22 +177,25 @@ The frontend guard (`RESERVED_BUSINESS_SLUGS` in `frontend/src/lib/tenant.ts`, v
 ## Migration rules
 
 ```text
-Current migrations are V1–V18:
+Current migrations are V1 to V19:
   V1–V7 base · V8 LM/SQM factor · V9 negative-price constraint · V10 invoice accept/signature/email
   V11 reserved slug words · V12 per-tenant branding/invoice-legal/quick-add · V13 per-type terms
   V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
   V16 quote tables (quote_draft/_line, quote_version/_line, quote_token)
   V17 quote_version customer name + billing-line snapshots (frozen at issue)
   V18 reserved slug 'q' (replaces the V11 chk_business_slug_reserved constraint)
+  V19 (16F PR1) quote_version.accepted_customer_name + invoice.accepted_customer_name widened to TEXT ·
+      invoice.source_quote_version_id BIGINT NULL (non-unique FK fk_invoice_source_quote_version,
+      index idx_invoice_source_quote_version) · invoice.terms_snapshot TEXT NULL
 
 Never edit any committed migration. Any schema change is a NEW migration.
 Phase 16A added NO migration (invoice tab + PDF logo path + Aire Compact PDF were app/template only).
-CI "Locked migration protection" guards V1–V13 only (.github/workflows/ci.yml). V14–V18 are on main
+CI "Locked migration protection" guards V1–V13 only (.github/workflows/ci.yml). V14 to V19 are on main
   but OUTSIDE the guard — they are still never edited; the rule applies regardless of guard coverage.
-  Any migration/CI work before the Phase 17 squash must explicitly account for V14–V18. Do not
+  Any migration/CI work before the Phase 17 squash must explicitly account for V14 to V19. Do not
   casually expand or rewrite the guard if the Phase 17 squash/baseline will supersede it.
 The Phase 17 schema-only squash/baseline must collapse ALL committed pre-production migrations —
-  V1–V18 plus any later pre-production migrations — into one clean baseline before any real store
+  V1 to V19 plus any later pre-production migrations — into one clean baseline before any real store
   data exists, and re-lock it in CI.
 Do NOT create a Flyway migration per customer/tenant — onboarding seeds are not product migrations.
 ```
@@ -182,7 +212,7 @@ Dev-seed scripts live in `backend/src/main/resources/db/dev-seed/` (sibling of `
 
 ```text
 1. start Postgres
-2. start backend (Flyway applies V1–V18)
+2. start backend (Flyway applies V1 to V19)
 3. psql -f db/dev-seed/quick_descriptions_demo.sql
 4. psql -f db/dev-seed/multi_store_user_demo.sql
 5. psql -f db/dev-seed/payment_helpers_demo.sql      # bank + Stripe-link demo data (Phase 15E)
@@ -234,6 +264,7 @@ Allowed when LAID:  reads · notes (append-only) · photo upload/list/preview ·
                     status change from dashboard · Lead Enquiry read ·
                     invoice/signature/payment flows where explicitly supported
                     (accept / resend / signature-download) · payment VOID (inverse of recording) · public quote accept + its D6b order-price write (16F)
+                    · Create Invoice from the accepted quote (Path A, 16F)
 ```
 
 ### Lead Enquiry (Phase 15F — shipped)
@@ -286,18 +317,24 @@ Target-GP price control uses a backend-rounding-aware candidate cent-search so t
   boundaries (the exact bug Codex caught).
 Negative sale_price_ex_gst persists through line CRUD (never clamped); only invoice creation blocks a
   negative FINAL sale price (DB CHECK). Money is BigDecimal 2dp; >2dp rounded HALF_UP across sibling endpoints.
-Costs are NEVER exposed in the salesperson frontend; catalog search is cost-free.
+Cost (9 October 2026): staff order views may show cost: Details of Sale shows total cost + GP (Chunk 3
+  F.2) and order lines return a read-only cost_snapshot (never line_cost per line); catalog search is
+  cost-free; the client never sends any cost field. Quote tab, quote requests and PDFs, the public page,
+  emails, invoice PDFs and notifications stay cost-free (Quote tab: only gp_percent + below-cost flag).
 ```
 
-### Quotation (Phase 16B–16E — shipped; 16F/16G planned)
+### Quotation (Phase 16B to 16F shipped; 16G planned)
 
 Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-Quotation-UX-Lock.md`. Quote state is separate from order status.
 
 ```text
 - Quote ≠ invoice. Quote draft saves AND issue/send never write the order sale-price override or
-  sales_order header financials (16F D6b exception: a signed quote's inc-GST total becomes the order sale-price override on public accept); quote lines never mutate Products & Charges. Path B (existing
-  Details of Sale -> Create Invoice) uses the order's working price and ignores the quote; Path A
-  (planned 16F) will bill the ACCEPTED quote snapshot, never the live order price.
+  sales_order header financials; quote lines never mutate Products & Charges. The one quote-to-order
+  price write is D6b: at public acceptance the signed quote's inc-GST total becomes the order's
+  sale-price override. Path A (16F, shipped: Accepted Quote -> Create Invoice) bills the ACCEPTED
+  quote snapshot (details of sale, totals, frozen terms) and inherits its signature, never the live
+  order price. Path B (existing Details of Sale -> Create Invoice) is unchanged: it uses the order's
+  working price and ignores the quote.
 - Draft (one per order): itemised total = sum of lines (a direct reduction auto-adds a negative
   ADJUSTMENT; above the line sum -> 422 QUOTE_TOTAL_EXCEEDS_LINES); non-itemised = final total only.
   Below cost is blocked at save and send (QUOTE_BELOW_COST). Itemised rows are RETAINED as dormant
@@ -308,10 +345,11 @@ Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-
   token. A changed draft OR changed customer name/billing -> NEW version (prior SUPERSEDED);
   otherwise resend = same version, stored PDF re-delivered verbatim, new token (old REPLACED).
 - LAID: draft save and send blocked (ORDER_LOCKED); workspace read, previews, stored PDF, cancel allowed.
-- Public /q/{token}: slugless, token-only, read-only + write-once viewed_at; cost-free, no internal
-  IDs; never reuses or weakens the HttpSession model. Customer identity comes from the V17 issue
-  snapshot; the approved business presentation fields (name, logo, accent, ABN, direct-deposit
-  bank details, Stripe link) are read LIVE.
+- Public /q/{token}: slugless, token-only; read, write-once viewed_at, and signing (accept, 16F);
+  cost-free, no internal IDs; never reuses or weakens the HttpSession model. The link dies when the
+  quote is signed (token CONSUMED) and the signed quote is portal-only. Customer identity comes from
+  the V17 issue snapshot; the approved business presentation fields (name, logo, accent, ABN,
+  direct-deposit bank details, Stripe link) are read LIVE.
 - Delivery is EMAIL ONLY. Quote email uses the in-memory RecordingQuoteEmailSender — NO real email
   is sent. The recorded message (with the bearer link) is logged only when DEBUG is explicitly
   enabled for that class; application.properties does not enable it. Real email = Phase 17.
@@ -320,8 +358,9 @@ Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-
   button is disabled. Do not activate or extend it.
 - The display-only 40% deposit is hardcoded (QuotePdfGenerator + PublicQuoteService). Configurable
   deposit is #112 (Batch B) — not implemented.
-- The quote accept-name source (live saved customer vs the V17 issued snapshot) is an OPEN
-  16F-gate question — do not decide it in code or docs.
+- Accepted name for a remotely signed quote (D1): the issued version's V17 customer_name_snapshot,
+  never the live saved customer, never typed, never truncated (TEXT since V19); a null or blank
+  snapshot -> 422 with the public-safe message.
 ```
 
 ---
@@ -337,7 +376,13 @@ Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-
   download paths VERBATIM — do NOT rewrite them to build their own slug path.
 - Invoice table is APPEND-ONLY: Create / Rewrite / Payment / Void each INSERT a new version;
   current invoice = max(version_number). last_emailed_at is the only in-place update.
-- Terms are FROZEN at acceptance; changing business terms needs a NEW invoice + re-sign (do not re-raise).
+- Terms product rule (do not re-raise): changing business terms needs a NEW invoice + re-sign.
+  Implementation (16F, D7): a Path A invoice (terms_source QUOTE) renders the frozen quote
+  terms_snapshot verbatim (null = no terms page, even when live terms exist). A Path B invoice
+  (Create / Rewrite, terms_source LIVE) renders the business's current per-flooring-type terms,
+  sanitised, on every render: its payment and void versions re-render live terms, also after
+  acceptance, and its InvoiceDetail terms_html is live. Payment, void and D.8 carry the current
+  invoice's source + snapshot forward. Freezing Path B terms and Invoice To is #125 (16G candidate).
 - Rewrite-after-accept CLEARS acceptance/signature by design (new customer-facing invoice; re-accept).
 - Blank per-type terms display is CORRECT (terms_hard/terms_soft nullable; no backfill).
 - Logo is fail-soft to business-name TEXT on BOTH surfaces (screen <img> and backend PDF data URI).
@@ -352,7 +397,9 @@ Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-
   auto-update on template change — rewrite/regenerate to see changes.
 - Quick-adds: DetailsOfSaleTab reads the tenant list; EMPTY if none — no hardcoded fallback.
 - Accepted customer name (invoice acceptance) comes from the SAVED customer record — not typed at
-  accept time. The quote equivalent is an open 16F-gate question (see Quotation above).
+  accept time; the Invoice tab sends it as the D.8 accepted_customer_name part (150-character
+  request limit, unchanged). Remote quote acceptance takes the issued V17 customer_name_snapshot
+  (D1), never typed, never truncated (see Quotation above). Both columns are TEXT since V19.
 - Never leave follow-ups untracked — file a GitHub issue (the PR #71 lesson).
 - business_quick_description column is `description`, NOT `text` (Postgres type-name footgun);
   its FK to business has no ON DELETE — wipe child rows before the business row.
@@ -395,7 +442,7 @@ Order Workspace tab order:
 6. Quote (conditional)  7. Invoice
 ```
 
-The Quote tab is hidden by default. It appears when the user clicks Create Quote in the Details of Sale action modal (for the rest of that workspace session), or on load when the quote-workspace probe succeeds and returns a saved draft or an active issued quote. A failed probe is never treated as "no quote" — the tab stays hidden and Create Quote stays unavailable (with a retry) until a probe succeeds.
+The Quote tab is hidden by default. It appears when the user clicks Create Quote in the Details of Sale action modal (for the rest of that workspace session), or on load when the quote-workspace probe succeeds and returns a saved draft, an active issued quote or an accepted quote. A failed probe is never treated as "no quote" — the tab stays hidden and Create Quote stays unavailable (with a retry) until a probe succeeds.
 
 ---
 
@@ -424,8 +471,14 @@ Issue base: https://github.com/MuneebHash/flooring-sales-portal/issues/
 - [#34](https://github.com/MuneebHash/flooring-sales-portal/issues/34) app/database timezone before production → Phase 17
 - [#69](https://github.com/MuneebHash/flooring-sales-portal/issues/69) backend version precondition on invoice accept → **required for 16G**: must cover both the current in-app acceptance and the new remote invoice signing
 - [#55](https://github.com/MuneebHash/flooring-sales-portal/issues/55) financial summary versioning (concurrent mutations) → deferred-hardening (post-pilot)
-- Batch A (own PR after 16G): [#107](https://github.com/MuneebHash/flooring-sales-portal/issues/107) · [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108) · [#104](https://github.com/MuneebHash/flooring-sales-portal/issues/104) · [#109](https://github.com/MuneebHash/flooring-sales-portal/issues/109) · [#110](https://github.com/MuneebHash/flooring-sales-portal/issues/110) · [#96](https://github.com/MuneebHash/flooring-sales-portal/issues/96) · [#101](https://github.com/MuneebHash/flooring-sales-portal/issues/101) — details in `docs/Phases.md` §7
+- 16G: [#120](https://github.com/MuneebHash/flooring-sales-portal/issues/120) Quote tab: poll issued/accepted state while an active link waits for a signature · [#121](https://github.com/MuneebHash/flooring-sales-portal/issues/121) Refresh order financials after a remote quote acceptance · [#122](https://github.com/MuneebHash/flooring-sales-portal/issues/122) Bind Accepted Quote reads to the displayed version (signed PDF, signature) · [#123](https://github.com/MuneebHash/flooring-sales-portal/issues/123) Server-side quote-version precondition on POST quote/create-invoice (with #69) · [#124](https://github.com/MuneebHash/flooring-sales-portal/issues/124) Replace the 19-character accepted_at comparison with a server provenance field
+- 16G candidates (in or out undecided): [#125](https://github.com/MuneebHash/flooring-sales-portal/issues/125) Freeze Path B terms and Invoice To across payment and void · [#126](https://github.com/MuneebHash/flooring-sales-portal/issues/126) Public accept 410 message: align with the generic dead-link rule or confirm verbatim
+- Phase 17: [#127](https://github.com/MuneebHash/flooring-sales-portal/issues/127) Restore the login session on page reload · [#128](https://github.com/MuneebHash/flooring-sales-portal/issues/128) Rate limiting on public quote endpoints and a decode concurrency cap · [#129](https://github.com/MuneebHash/flooring-sales-portal/issues/129) Tenant-independent test fixtures · [#130](https://github.com/MuneebHash/flooring-sales-portal/issues/130) Terms per store
+- Phase 18: [#131](https://github.com/MuneebHash/flooring-sales-portal/issues/131) Shared Modal: focus trap and inert background · [#132](https://github.com/MuneebHash/flooring-sales-portal/issues/132) AppHeader overflow on narrow screens · [#133](https://github.com/MuneebHash/flooring-sales-portal/issues/133) Disabled Send by Phone/SMS button wording
+- Phase 19: [#136](https://github.com/MuneebHash/flooring-sales-portal/issues/136) End-of-project cosmetic cleanups from the 16F reviews
+- Batch A (own PR after 16G): [#107](https://github.com/MuneebHash/flooring-sales-portal/issues/107) · [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108) · [#104](https://github.com/MuneebHash/flooring-sales-portal/issues/104) · [#109](https://github.com/MuneebHash/flooring-sales-portal/issues/109) · [#110](https://github.com/MuneebHash/flooring-sales-portal/issues/110) · [#96](https://github.com/MuneebHash/flooring-sales-portal/issues/96) · [#101](https://github.com/MuneebHash/flooring-sales-portal/issues/101) · [#134](https://github.com/MuneebHash/flooring-sales-portal/issues/134) — details in `docs/Phases.md` §7
 - Batch B (own PR after Batch A): [#111](https://github.com/MuneebHash/flooring-sales-portal/issues/111) · [#112](https://github.com/MuneebHash/flooring-sales-portal/issues/112) · [#113](https://github.com/MuneebHash/flooring-sales-portal/issues/113) · [#114](https://github.com/MuneebHash/flooring-sales-portal/issues/114) — details in `docs/Phases.md` §7
+- Batch A or Batch B (placement undecided): [#135](https://github.com/MuneebHash/flooring-sales-portal/issues/135) Rewrite Invoice with active payments above the new price returns 500 instead of 422
 
 Docs are authoritative for phase numbering.
 

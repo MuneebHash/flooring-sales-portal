@@ -646,7 +646,9 @@ Used in D.1 / D.2 / D.3 responses (the current invoice snapshot).
   "balance_due": 424.00,
   "created_by_user_id": 1,
   "created_at": "2026-04-22T14:30:00",
-  "pdf_download_path": "/api/v1/aussiefloors/orders/1/invoices/current/file"
+  "pdf_download_path": "/api/v1/aussiefloors/orders/1/invoices/current/file",
+  "terms_html": "<p>…</p>",
+  "terms_source": "LIVE"
 }
 ```
 
@@ -654,6 +656,7 @@ Used in D.1 / D.2 / D.3 responses (the current invoice snapshot).
 - All fields from the locked `invoice` table except `stored_file_id` (replaced by `pdf_download_path`).
 - `due_date` semantics: for manual versions (D.1, D.2) it is `proposed_lay_date − 2 calendar days`. For payment-driven versions (D.7) it is carried forward from the latest official invoice. It may be earlier than `invoice_date` — see G.2.
 - Money fields with two decimal places.
+- Phase 13 adds the five acceptance/email fields (`docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` section 5, with the full example). Since 16F PR2, `terms_html` (string or null) and `terms_source` (`QUOTE` or `LIVE`) are always present: `QUOTE` for an invoice created from an accepted quote (and its payment, void and D.8 versions), whose `terms_html` is the frozen quote terms verbatim (null means no terms); `LIVE` for Create and Rewrite (Path B), whose `terms_html` is the business's current per-flooring-type terms, sanitised. The rule is in `docs/API-Contracts-Phase16B-Quotation.md` section 4.6. E.1 `current_invoice_summary` is unchanged (no terms fields).
 
 ### E.3 `payment_transaction_read`
 
@@ -743,7 +746,7 @@ In all paths:
 - All side effects in a single DB transaction. Any failure → full rollback. The salesperson must retry; partial state is never persisted.
 - D.7 response includes the created payment, the updated `payment_summary`, and the updated `current_invoice` metadata (E.1 shape).
 
-> **Phase 13 delta.** When the current invoice has already been **accepted**, the payment-regenerated version additionally **carries the acceptance/signature metadata forward** (`accepted_at`, `accepted_customer_name`, `accepted_signature_file_id`) — the customer does **not** re-accept — and the updated signed PDF is **automatically re-emailed**, updating `last_emailed_at`. That email is **best-effort and non-fatal**: if the email provider fails, the **payment and the new invoice version still succeed**, the acceptance metadata still carries forward, `last_emailed_at` stays **null**, `D.7` **still returns `201` (never `502`)**, and the success message tells the user to Re-send (`D.9`); the backend **must not** roll back the payment because the email failed. (This mirrors Accept, where acceptance persists even if the email fails; `502`/`EMAIL_SEND_FAILED` is reserved for an explicit Re-send.) When the current invoice has **not** been accepted, the payment is still allowed, the new version stays unaccepted, and **no** email is sent. In all of these cases the dashboard mirror `sales_order.last_emailed_at` is kept equal to the **current** invoice's `last_emailed_at` (including `null` when the new version is unemailed), so the dashboard never shows a stale emailed time from a previous version — see the Phase 13 contract §11.1 mirror invariant. See `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` §Payment interaction rules. (E.1 / E.2 also gain the acceptance/email fields in Phase 13.)
+> **Phase 13 delta (as changed by Phase 15D).** A payment (D.7) or a payment void (D.10) creates a new current invoice version and PDF that carries the sale snapshot forward and, when the current invoice was **accepted**, the acceptance/signature metadata (`accepted_at`, `accepted_customer_name`, `accepted_signature_file_id`): the customer does **not** re-accept or re-sign. The new version starts with `last_emailed_at = null`, the dashboard mirror `sales_order.last_emailed_at` is reset to `null`, and **no email is sent** (D.7 and D.10 never auto-email and never return `502`). Manual Re-send (`D.9`) is the only email action after a payment change. The mirror always equals the **current** invoice's `last_emailed_at` (including `null`), so the dashboard never shows a stale emailed time from a previous version; see the Phase 13 contract section 11.1 mirror invariant and its section 6 payment interaction rules. (E.1 / E.2 also gain the acceptance/email fields in Phase 13.)
 
 **F.5 Invoice due_date rule.**
 - Manual invoice versions (D.1 Create, D.2 Manual Rewrite) derive `due_date = sales_order.proposed_lay_date − 2 calendar days`. The frontend never sends `due_date`.

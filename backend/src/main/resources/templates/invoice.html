@@ -86,8 +86,8 @@
         /* footer */
         .footer { text-align: center; font-size: 7.5pt; color: #5d716d; margin-top: 16pt; letter-spacing: 0.3pt; }
 
-        /* terms (single column). SOFT terms are separated from acceptance by the hair below the
-           acceptance block (no own top border, to avoid a double rule). */
+        /* terms (single column). Terms render on the dedicated terms page below (.tpage) for SOFT
+           and HARD alike; page 1 never carries a terms section. */
         .terms { margin-top: 14pt; }
         .terms-h { font-size: 7pt; font-weight: bold; text-transform: uppercase; letter-spacing: 0.4pt; color: #5d716d; text-align: center; }
         .terms-body { font-size: 7.5pt; line-height: 1.5; color: #3c4a44; margin-top: 8pt; }
@@ -97,9 +97,10 @@
         .terms-body table { width: 100%; border-collapse: collapse; }
         .terms-body th, .terms-body td { border: 1pt solid #d1d5db; padding: 3pt; text-align: left; vertical-align: top; }
 
-        /* HARD terms page (page 2): a near-full-height table so the terms sit at the top and the footer
-           is pinned to the bottom of the page (not floating mid-page). Height is kept just under the A4
-           content area (297mm - 2*12mm = 273mm) so it never spills to a third page. No fixed positioning. */
+        /* Terms page (page 2, SOFT and HARD alike): a near-full-height table so the terms sit at the
+           top and the footer is pinned to the bottom of the page (not floating mid-page). Height is kept
+           just under the A4 content area (297mm - 2*12mm = 273mm) so it never spills to a third page.
+           No fixed positioning. */
         .tpage { width: 100%; height: 264mm; border-collapse: collapse; page-break-before: always; }
         .tpage .tp-body { vertical-align: top; height: 100%; }
         .tpage .tp-foot { vertical-align: bottom; }

@@ -69,7 +69,7 @@ Phase 13 adds four nullable columns to the existing `invoice` table. **No migrat
 | Column | Type | Null | Notes |
 |--------|------|------|-------|
 | `accepted_at` | `TIMESTAMP` | NULL | Set when the current invoice is accepted; null = unaccepted. |
-| `accepted_customer_name` | `VARCHAR(150)` | NULL | Name captured with the signature. |
+| `accepted_customer_name` | `VARCHAR(150)`; widened to `TEXT` by `V19` (16F PR1); the D.8 request limit of 150 characters (section 5.1) is unchanged | NULL | Name captured with the signature. |
 | `accepted_signature_file_id` | `BIGINT` | NULL | FK → `stored_file(stored_file_id)`. **Not unique** (a carried-forward version references the same signature file). |
 | `last_emailed_at` | `TIMESTAMP` | NULL | Last time **this invoice version** was emailed; null = never. Mutable delivery marker (see below). |
 
@@ -101,6 +101,8 @@ The invoice DTOs `current_invoice_summary` (E.1) and `invoice_detail` (E.2) from
 | `accepted_signature_download_path` | string \| null | relative URL to the signature GET (§5.3); null when no signature |
 | `last_emailed_at` | timestamp \| null | null = never emailed |
 
+Since 16F PR2, `invoice_detail` (E.2) also always carries `terms_html` (string or null) and `terms_source` (`QUOTE` or `LIVE`); the rule is in `docs/API-Contracts-Phase16B-Quotation.md` section 4.6. `current_invoice_summary` (E.1) does not carry them.
+
 Updated **`invoice_detail` (E.2)** example (returned by Phase 12 `D.1`/`D.2`/`D.3` and Phase 13 Accept/Resend):
 
 ```json
@@ -122,7 +124,9 @@ Updated **`invoice_detail` (E.2)** example (returned by Phase 12 `D.1`/`D.2`/`D.
   "accepted_customer_name": "Jordan Wilson",
   "accepted_signature_present": true,
   "accepted_signature_download_path": "/api/v1/aussiefloors/orders/1/invoices/current/signature",
-  "last_emailed_at": "2026-04-22T14:31:12"
+  "last_emailed_at": "2026-04-22T14:31:12",
+  "terms_html": "<p>…</p>",
+  "terms_source": "LIVE"
 }
 ```
 
@@ -179,7 +183,7 @@ The acceptance (signature + `accepted_at`) is **durably persisted even if the em
 5. `signature` part present and non-empty, else 422 `SIGNATURE_REQUIRED`.
 6. `signature` is `image/png` and ≤ 2 MB, else 400 `SIGNATURE_INVALID`.
 7. Customer email present and valid (§12), else 422 `CUSTOMER_EMAIL_REQUIRED` / `CUSTOMER_EMAIL_INVALID`.
-8. **Persist (one transaction):** store the signature as a `stored_file`; **append** a new current invoice version (`version_number = max + 1`) that **carries forward** the sale snapshot (`details_of_sale_snapshot`, `sale_price_ex_gst`, `sale_price_inc_gst`, `due_date`) and `total_paid`/`balance_due` **unchanged**, sets `accepted_at = now`, `accepted_customer_name`, `accepted_signature_file_id`, and `last_emailed_at = null`; generate the **signed** PDF (`stored_file`, linked via `invoice.stored_file_id`). Set the dashboard mirror `sales_order.last_emailed_at` to this new current version's value (`null`) — see §11.1. PDF/file/insert failure → full rollback.
+8. **Persist (one transaction):** store the signature as a `stored_file`; **append** a new current invoice version (`version_number = max + 1`) that **carries forward** the sale snapshot (`details_of_sale_snapshot`, `sale_price_ex_gst`, `sale_price_inc_gst`, `due_date`) and `total_paid`/`balance_due` **unchanged**, sets `accepted_at = now`, `accepted_customer_name`, `accepted_signature_file_id`, and `last_emailed_at = null`; generate the **signed** PDF (`stored_file`, linked via `invoice.stored_file_id`). Set the dashboard mirror `sales_order.last_emailed_at` to this new current version's value (`null`) — see §11.1. PDF/file/insert failure → full rollback. Since 16F PR1 (D5(c)) the same transaction cancels the order's ISSUED quote version and its ACTIVE token (both `CANCELLED`); no ISSUED quote is a no-op; an ACCEPTED quote is never touched and never blocks D.8.
 9. **Post-commit:** email the signed PDF to the customer. On success set `last_emailed_at` to the send timestamp on **both** `invoice` and the `sales_order` mirror. On failure leave **both** `invoice.last_emailed_at` and `sales_order.last_emailed_at` = `null` (non-fatal; see message above).
 10. Return the updated current invoice (E.2).
 

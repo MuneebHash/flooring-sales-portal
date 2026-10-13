@@ -98,7 +98,8 @@ public class InvoicePdfModelAssembler {
         // verbatim, and frozen null terms render NO terms even when live terms exist; a Path B invoice
         // renders the live per-flooring-type terms, sanitised.
         String termsHtml = in.terms().resolve(() -> liveTermsHtml(config, flooringType));
-        // HARD terms render on a dedicated second page; SOFT terms render inline on page 1.
+        // Terms render on a dedicated page for SOFT and HARD alike. termsOnSeparatePage is still passed
+        // to the generator, but the current invoice template does not read it.
         boolean termsOnSeparatePage = FLOORING_HARD.equals(flooringType);
 
         return new InvoicePdfModel(

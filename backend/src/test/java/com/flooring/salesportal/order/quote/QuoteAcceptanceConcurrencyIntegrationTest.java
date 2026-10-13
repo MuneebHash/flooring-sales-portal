@@ -611,7 +611,8 @@ class QuoteAcceptanceConcurrencyIntegrationTest {
         Assertions.assertEquals(INVOICE_ACCEPT_EMAILED_MESSAGE, json(invoiceResult).path("message").asText());
         assertErrorResponse(acceptResult, 410, ErrorCode.QUOTE_LINK_CANCELLED, "public quote accept (queued behind D.8)");
 
-        // D.8 appended the accepted invoice v2 (carry-forward; PR1 never writes the quote-source columns).
+        // D.8 appended the accepted invoice v2. D.8 carries the current invoice's quote-source columns
+        // forward; this fixture's Path B invoice has none, so both stay null.
         Assertions.assertEquals(2, invoiceCount(quote.orderId()));
         Assertions.assertNull(invoiceRow(quote.orderId(), 1).get("accepted_at"), "v1 stays the unsigned version");
         Map<String, Object> invoiceV2 = invoiceRow(quote.orderId(), 2);
@@ -619,8 +620,10 @@ class QuoteAcceptanceConcurrencyIntegrationTest {
         Assertions.assertNotNull(invoiceAcceptedAt, "D.8 accepted the invoice");
         Assertions.assertEquals(CUSTOMER_NAME, invoiceV2.get("accepted_customer_name"));
         Assertions.assertNotNull(invoiceV2.get("accepted_signature_file_id"));
-        Assertions.assertNull(invoiceV2.get("source_quote_version_id"), "PR1 never writes invoice.source_quote_version_id");
-        Assertions.assertNull(invoiceV2.get("terms_snapshot"), "PR1 never writes invoice.terms_snapshot");
+        Assertions.assertNull(invoiceV2.get("source_quote_version_id"),
+                "D.8 carries the current invoice's source_quote_version_id forward; this fixture's Path B invoice has none");
+        Assertions.assertNull(invoiceV2.get("terms_snapshot"),
+                "D.8 carries the current invoice's terms_snapshot forward; this fixture's Path B invoice has none");
 
         // D5(c): the ISSUED quote and its ACTIVE link were cancelled INSIDE the committed D.8 transaction,
         // at the invoice acceptance instant — which is exactly what the queued accept then re-read.
@@ -684,8 +687,10 @@ class QuoteAcceptanceConcurrencyIntegrationTest {
         Assertions.assertEquals(CUSTOMER_NAME, invoiceV2.get("accepted_customer_name"));
         assertMoney("220.00", invoiceV1.get("sale_price_inc_gst"), "invoice v1 inc (created before the race)");
         assertMoney("220.00", invoiceV2.get("sale_price_inc_gst"), "invoice v2 carries v1's snapshot forward");
-        Assertions.assertNull(invoiceV2.get("source_quote_version_id"), "PR1 never writes invoice.source_quote_version_id");
-        Assertions.assertNull(invoiceV2.get("terms_snapshot"), "PR1 never writes invoice.terms_snapshot");
+        Assertions.assertNull(invoiceV2.get("source_quote_version_id"),
+                "D.8 carries the current invoice's source_quote_version_id forward; this fixture's Path B invoice has none");
+        Assertions.assertNull(invoiceV2.get("terms_snapshot"),
+                "D.8 carries the current invoice's terms_snapshot forward; this fixture's Path B invoice has none");
 
         // D.8 only writes the last_emailed_at mirror on sales_order — the quote's D6b price stands and
         // updated_at is still the quote acceptance instant.

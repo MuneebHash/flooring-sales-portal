@@ -106,9 +106,10 @@ public class InvoicePdfGenerator {
                 ? null
                 : "data:image/png;base64," + Base64.getEncoder().encodeToString(model.signaturePng()));
 
-        // Phase 15C terms: pre-sanitized, XML-well-formed HTML (null -> no terms block/page). SOFT renders
-        // inline on page 1; HARD renders on a dedicated second page (termsOnSeparatePage = true). Rendered
-        // with th:utext (unescaped) in the template; everything else stays th:text-escaped.
+        // Phase 15C terms: pre-sanitized, XML-well-formed HTML. Non-null terms render on a dedicated page
+        // for SOFT and HARD alike; null means no terms page. termsOnSeparatePage is still set, but the
+        // current template does not read it. Rendered with th:utext (unescaped) in the template;
+        // everything else stays th:text-escaped.
         context.setVariable("termsHtml", model.termsHtml());
         context.setVariable("termsOnSeparatePage", model.termsOnSeparatePage());
 
@@ -182,7 +183,8 @@ public class InvoicePdfGenerator {
             LocalDateTime acceptedAt,
             String acceptedCustomerName,
             byte[] signaturePng,
-            // Terms (sanitized HTML; null -> hide. SOFT inline page 1; HARD dedicated page 2)
+            // Terms (sanitized HTML; null -> no terms page; otherwise a dedicated page, SOFT and HARD
+            // alike). termsOnSeparatePage is still carried but not read by the current template.
             String termsHtml,
             boolean termsOnSeparatePage) {
     }

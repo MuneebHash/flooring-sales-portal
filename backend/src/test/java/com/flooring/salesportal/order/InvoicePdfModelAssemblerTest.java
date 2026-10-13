@@ -159,7 +159,8 @@ class InvoicePdfModelAssemblerTest {
         Assertions.assertNotNull(m.termsHtml());
         Assertions.assertTrue(m.termsHtml().contains("Soft flooring terms."), m.termsHtml());
         Assertions.assertFalse(m.termsHtml().contains("Hard flooring terms."), "must not include hard terms");
-        Assertions.assertFalse(m.termsOnSeparatePage(), "SOFT terms render inline (page 1)");
+        Assertions.assertFalse(m.termsOnSeparatePage(),
+                "SOFT keeps termsOnSeparatePage false (unread by the template; terms still get a dedicated page)");
 
         // Lookups are tenant-scoped to the session business; salesperson resolution is delegated
         // to the shared resolver, called with the order's user id + the session business id.
