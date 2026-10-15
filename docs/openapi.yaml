@@ -5411,9 +5411,11 @@ components:
             16G PR 6 (planned; not returned until PR 6 merges). Always present once implemented,
             never null. Derived by the server from the stored markers at full precision, before
             whole-second formatting: true when last_emailed_at is non-null and is not before
-            last_sent_at, otherwise false. The markers keep their meaning (last_sent_at is the
-            latest send attempt, stamped before delivery; last_emailed_at is the last successful
-            email); no column and no migration. Customer Quote shows Not delivered when
+            last_sent_at, otherwise false. The markers keep their roles (last_sent_at is the
+            latest send attempt, stamped before delivery; last_emailed_at is the success marker,
+            which from PR 6 a successful delivery stamps only while its own attempt is still the
+            latest (last_sent_at unchanged), so a superseded attempt's late success writes nothing
+            and never makes this true); no column and no migration. Customer Quote shows Not delivered when
             sent_channel is EMAIL and this is false; the dormant SMS channel never shows it. The
             client stops comparing the returned whole-second timestamp strings, which can be
             identical for a delivered history and an undelivered one (a successful send followed,
