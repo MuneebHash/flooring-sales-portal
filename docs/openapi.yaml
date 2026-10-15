@@ -1431,8 +1431,11 @@ paths:
         response is 201 with the emailed message, and last_emailed_at and the mirror stay null,
         so Re-send Invoice stays available. Today only the transport failure is caught: another
         sender failure or a stamp failure returns 500 after commit. The version is appended with
-        the copied frozen words (16G PR 2) and, from 16G PR 4, the same transaction marks an
-        ACTIVE invoice link SIGNED.
+        the copied frozen words (16G PR 2) and, from 16G PR 3, the current version's
+        invoice_date, so the signed PDF shows the date of the invoice the customer was shown;
+        accepted_at records the signing time. Today the appended version is dated the signing day
+        (LocalDate.now(), as every invoice writer dates its version). From 16G PR 4 the same
+        transaction marks an ACTIVE invoice link SIGNED.
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -2709,9 +2712,11 @@ paths:
         business-rule refusal; there is no customer-email gate). Then persist, file-write-first:
         the normalised signature PNG (signature-{order_number}-v{N}.png) and the signed invoice
         PDF (invoice-{order_number}-v{N}.pdf) with their stored_file rows; version N = current + 1
-        appended as in-store acceptance does (invoice_date today; due date, details, totals, paid,
-        balance, source quote version, terms_snapshot and the three frozen identity columns
-        copied; accepted_at now; accepted_customer_name = the frozen name, verbatim, full length;
+        appended (16G PR 4, with the in-store persistence from 16G PR 3: invoice_date, due date,
+        details, totals, paid, balance, source quote version, terms_snapshot and the three frozen
+        identity columns copied from the current version, so the stored and emailed signed PDF
+        shows the invoice date of the version the customer reviewed; accepted_at now, the signing
+        time; accepted_customer_name = the frozen name, verbatim, full length;
         created_by_user_id = the staff user who sent the link; last_emailed_at null); the
         sales_order.last_emailed_at mirror reset to null; the token ACTIVE -> SIGNED (dead_at =
         accepted_at); an ISSUED quote version and its ACTIVE quote token CANCELLED (16F D5(c),
@@ -3745,7 +3750,14 @@ components:
             the Invoice tab sends the version_number of the invoice on screen as
             expected_version_number on acceptCurrentInvoice (#69).
         invoice_date:
-          $ref: '#/components/schemas/Date'
+          allOf:
+            - $ref: '#/components/schemas/Date'
+          description: >-
+            Today every invoice writer dates its new version with the server's current date
+            (LocalDate.now()), in-store acceptance included; from 16G PR 3 (acceptCurrentInvoice)
+            and 16G PR 4 (acceptPublicInvoice) a signing version instead copies invoice_date from
+            the version it signs, while createInvoice, rewriteInvoice, createInvoiceFromQuote,
+            recordPayment and voidPayment keep dating their version the day it is written.
         due_date:
           nullable: true
           allOf:
