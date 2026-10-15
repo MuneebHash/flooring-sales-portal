@@ -27,9 +27,10 @@ Examples:
 - `/api/v1/{slug}/auth/login` — public (no session required)
 - Everything else under `/api/v1/{slug}/...` — protected (valid session required)
 
-Two public surfaces sit outside the `/api/v1/{slug}/...` structure:
+Three public surfaces sit outside the `/api/v1/{slug}/...` structure:
 - `/api/v1/public/businesses/{slug}`: public business discovery (no session); returns only the business name, logo and accent colour.
 - `/api/v1/public/quotes/{token}…`: the slugless, token-only public quote surface (read and viewed tracking since 16E-C; accept since 16F). The secret token is the only credential; it never uses, populates or weakens the session model. See `docs/API-Contracts-Phase16B-Quotation.md` section 7.2.
+- `/api/v1/public/invoices/{token}…`: the slugless, token-only public invoice surface (16G PR 4: read, accept and the stored PDF of the version shown; no viewed tracking). Its invoice token is the only credential, on the same rules as the quote surface. A quote token is unknown on this surface and an invoice token is unknown on the quote surface. See [`docs/API-Contracts-Phase16G-Invoice-Link.md`](API-Contracts-Phase16G-Invoice-Link.md) section 9.
 
 ---
 
@@ -138,8 +139,8 @@ File upload and file download endpoints are the only allowed exception to the JS
 | 401  | Unauthorized | No session or session expired |
 | 403  | Forbidden | User does not have access to this business/store/resource |
 | 404  | Not Found | Resource does not exist or does not belong to this tenant |
-| 409  | Conflict | Duplicate resource (e.g., duplicate salesperson_code) |
-| 410  | Gone | An action (viewed, PDF, accept) on a found but dead public quote link: expired, replaced or superseded, cancelled, or already signed (codes `QUOTE_LINK_*`, Phase 16). The public GET of a found dead token is 200 with a `state`; an unknown or malformed token is 404. |
+| 409  | Conflict | Duplicate resource (e.g., duplicate salesperson_code), or a request that conflicts with the resource's current state (e.g., `INVOICE_ALREADY_ACCEPTED`, `PAYMENT_ALREADY_VOIDED`). The 16G version preconditions use it for a stale request: `INVOICE_VERSION_STALE` (in-store and remote invoice accept, the public invoice PDF read) and `QUOTE_VERSION_STALE` (Create Invoice from the accepted quote) |
+| 410  | Gone | An action on a found but dead public link. Quote links (viewed, PDF, accept): expired, replaced or superseded, cancelled, or already signed (codes `QUOTE_LINK_*`, Phase 16). Invoice links (16G PR 4; accept, PDF): replaced, rewritten, signed or expired (codes `INVOICE_LINK_*`). The public GET of a found dead token is 200 with a `state` and its message, never 410; an unknown or malformed token is 404 on every public token endpoint. |
 | 422  | Unprocessable Entity | Business rule violation (e.g., invoice preconditions not met) |
 | 500  | Internal Server Error | Unexpected server failure |
 | 502  | Bad Gateway | Upstream/provider dependency failed to complete a request (e.g., the email provider could not send an invoice — `EMAIL_SEND_FAILED`, Phase 13). Used only for failures of an external dependency the backend calls on the caller's behalf; an internal bug is still 500. |
@@ -162,6 +163,7 @@ Do not confirm the existence of another tenant's data.
 - all timestamps are stored and returned in server local time (Australia)
 - example: `"2026-04-22T14:30:00"`
 - used for: `created_at`, `updated_at`, `last_emailed_at`
+- known drift: the quote DTO timestamps apply no whole-second format today, so they can carry fractional seconds; 16G PR 6 formats every quote timestamp to whole seconds (16G contract §13.5). Whole-second strings never decide quote email delivery: from the same PR the derived `QuoteIssuedSummary.last_email_delivered` does
 
 ### Money
 - all monetary values are `DECIMAL(10,2)`
@@ -513,6 +515,8 @@ An invoice can be created or rewritten only if all of these are true:
 
 **Phase 13 — customer email gate (Create, Rewrite, Accept, Resend).** In addition to the 9 preconditions above, a **valid customer email** must be present before Create Invoice, Rewrite Invoice, Accept Invoice, and Resend Invoice (so the accepted invoice can be emailed). This is a backend contract rule, not frontend-only. It is a **separate gate** evaluated before the 9 preconditions and returns its own codes (not bundled into `INVOICE_PRECONDITIONS_NOT_MET`): a missing/blank email → 422 `CUSTOMER_EMAIL_REQUIRED`; a malformed email → 422 `CUSTOMER_EMAIL_INVALID`. Create and Rewrite validate the email as a precondition but still **send no email**. Full Phase 13 contract: `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`.
 
+**16G (target contract, [`docs/API-Contracts-Phase16G-Invoice-Link.md`](API-Contracts-Phase16G-Invoice-Link.md)).** The same gate also applies to the invoice link send (PR 4: `POST …/invoices/current/send-link`). Two signing routes deliberately have **no** email gate: Create Invoice from the accepted quote (Path A) and remote invoice signing (PR 4). Each emails the signed PDF after commit and skips the send with a WARN log when the saved email is missing or invalid (16G contract §6).
+
 ### Address requirement
 Both installation address and billing address must exist as separate rows in `order_address`.
 "Billing same as install" is a UI convenience only — when the user selects it, the backend copies the installation address into a billing address row.
@@ -554,10 +558,14 @@ If preconditions are not met, return 422 with a structured body:
 ### Invoice versioning
 - first invoice = version 1, created by Create Invoice
 - manual Rewrite Invoice = new version number, created from current live order state
-- Add Payment = also creates a new payment-driven invoice version automatically
+- Add Payment and Void Payment = each also creates a new payment-driven invoice version automatically
+- Accept Invoice (Phase 13 D.8) = a new signed version carrying the current version forward
+- Create Invoice from the accepted quote (16F Path A) = version 1 or a new version, from the accepted quote's frozen snapshot, inheriting its signature
+- remote invoice signing (16G PR 4) = a new signed version carrying the current version forward, as Accept Invoice
 - manual invoice versions make the current live order state official
-- payment-driven invoice versions carry forward the latest official sale snapshot and only update payment fields: `total_paid` and `balance_due`
+- payment-driven and signing versions carry forward the latest official sale snapshot; payment-driven versions only update payment fields: `total_paid` and `balance_due`
 - payment-driven invoice versions must not silently include unsent live order edits
+- **frozen words (16G PR 2):** every version stores its own Invoice To name, billing address lines and terms. Create and Rewrite freeze them from the saved customer, billing address and the business's per-flooring-type terms; payment, void and signing versions copy them from the previous version verbatim; Path A copies the accepted quote's frozen identity and terms. Every version renders its stored words (null terms = no terms page). See `docs/API-Contracts-Phase16G-Invoice-Link.md` §4.
 - old versions are never modified
 - old versions remain in invoice history (retained internally)
 
@@ -590,12 +598,13 @@ Each invoice snapshot stores internally:
 - `total_paid` (at the moment of snapshot)
 - `balance_due` (at the moment of snapshot)
 - linked PDF via `stored_file_id`
+- (16G PR 2) the frozen words: `customer_name_snapshot`, `customer_address_line1_snapshot`, `customer_address_line2_snapshot` and `terms_snapshot` (the terms column exists since `V19`)
 
 ### What is shown on the customer-facing invoice PDF
 The customer-facing invoice PDF shows:
 - invoice number and date
 - due date
-- customer name and billing address
+- customer name and billing address (from 16G PR 2, the version's stored words; today read live at render)
 - details of sale
 - total amount inc GST (`sale_price_inc_gst`)
 - payment made (`total_paid`)
@@ -676,13 +685,17 @@ These actions are allowed even when the order is LAID:
 - create an invoice from the accepted quote (16F Path A: `POST .../quote/create-invoice`)
 - cancel the active issued quote (`POST .../quote/cancel`)
 - read the quote workspace, render the draft preview PDF, and download the stored quote PDFs and the accepted quote signature
+- send the customer an invoice link (16G PR 4: `POST .../invoices/current/send-link`)
+- use the public invoice link (16G PR 4). While the link is `ACTIVE`, the customer can read the current invoice (`GET /api/v1/public/invoices/{token}`), download the stored PDF of the version shown (`…/pdf`) and accept it remotely (`…/accept`), which appends a signed invoice version. Signing marks the link `SIGNED` and ends public document and PDF access: the signed version is never shown or served on the public link (the customer is emailed its PDF). A found dead link still gets 200 from the GET, with its `state` and per-state message, and 410 from accept and PDF; an unknown or malformed token gets 404 "Invoice not found." (`docs/API-Contracts-Phase16G-Invoice-Link.md` §7.2, §9)
+
+16G adds no `CANCELLED` rule: no invoice or link action reads the CANCELLED status, and a status change never kills an invoice link (`docs/API-Contracts-Phase16G-Invoice-Link.md` §12).
 
 Reason: LAID does not require full payment. Final payments may still be collected after job completion. **Payment void is a financial / payment-history correction, not a protected order edit** — it changes only `total_paid` / `balance_due` (and the carried-forward invoice version), never the live order's customer / address / lines / sale price — so, like adding a payment, it is allowed when LAID. Notes and attachments may still need to be added for record-keeping after the job is done.
 
 ### What "editable" means
 When an order is not LAID, all order data can be modified freely.
 An order that has an invoice can still be edited — the existing invoice snapshot is not affected.
-A new invoice version is created only when the user clicks Rewrite Invoice.
+Order edits never create an invoice version: only Rewrite Invoice makes them official. (Invoice versions are also created by payment, payment void, acceptance, Create Invoice from the accepted quote and, from 16G PR 4, remote signing; see §14. Of all the version writers, only Create and Rewrite take the sale content from the live order.)
 
 ---
 

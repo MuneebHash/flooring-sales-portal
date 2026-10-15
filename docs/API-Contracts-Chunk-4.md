@@ -59,8 +59,8 @@ Out of MVP scope or deferred:
 - **Signed / accepted invoice revision *history* (deferred post-MVP):** the invoice-page revision dropdown and viewing/downloading **old** signed PDFs. (The invoice **acceptance + signature + email** workflow itself is **MVP in Phase 13** — see `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` — which *does* add the signed-invoice fields `accepted_at`, `accepted_customer_name`, `accepted_signature_file_id`, and `last_emailed_at` via a documented `V10` migration. Phase 13 does **not** introduce a separate invoice-status enum.)
 - Refunds, surcharges, finance products, cheque, partial reversals.
 - Stripe / gateway-driven flows (`gateway_transaction_id`, `response_status`, `response_message` remain nullable backend fields for manual MVP payments). Stripe is **Phase 14**.
-- Invoice email / send-to-customer **before signature/acceptance** (not allowed). Automatic emailing of the **accepted** invoice PDF, and Re-send of the current accepted invoice, are **MVP in Phase 13** (Accept / Resend endpoints — see the Phase 13 contract). Advanced email audit history stays post-MVP.
-- Standalone invoice PDF (re)generation endpoints — PDFs are produced only as a side effect of Create Invoice, manual Rewrite Invoice, POST Payment, and (Phase 13) Accept Invoice. **Re-send (D.9) does NOT (re)generate a PDF** — it only re-emails the already-current accepted PDF (no new invoice version).
+- Emailing the invoice **PDF** to the customer **before signature/acceptance** (not allowed). Automatic emailing of the **accepted** invoice PDF, and Re-send of the current accepted invoice, are **MVP in Phase 13** (Accept / Resend endpoints — see the Phase 13 contract); 16G extends the automatic signed-PDF email to Create Invoice from the accepted quote (PR 3) and remote signing (PR 4). From **16G PR 4** an **unsigned** current invoice can be emailed to the customer as a **link** to review and sign remotely, with no PDF attached ([16G contract §8](API-Contracts-Phase16G-Invoice-Link.md#8-protected-send-link)). Advanced email audit history stays post-MVP.
+- Standalone invoice PDF (re)generation endpoints — PDFs are produced only as a side effect of Create Invoice, manual Rewrite Invoice, POST Payment, payment void (D.10), (Phase 13) Accept Invoice, (16F) Create Invoice from the accepted quote and (16G PR 4) remote invoice signing. **Re-send (D.9) does NOT (re)generate a PDF** — it only re-emails the already-current accepted PDF (no new invoice version). The 16G link send generates no PDF either.
 - `SIGNATURE` attachment kind in the **general Notes & Photos attachments list** (Chunk 3 still rejects `attachment_kind=SIGNATURE` on the attachment upload endpoint). Phase 13 captures the signature through a **dedicated invoice-acceptance endpoint** that stores it via `stored_file` (reusing the existing storage mechanism) without surfacing it as a general order attachment. A full legal e-sign platform is post-MVP.
 
 ---
@@ -90,6 +90,14 @@ All endpoints are **Standard protected** (all 7 checks from conventions §9). Ev
 | GET  | `/api/v1/{slug}/orders/{orderId}/invoices/current/signature` | Stream the accepted signature image | Phase 13 |
 
 Phase 13 also adds a customer-email precondition to D.1 / D.2 (and to Accept / Resend), and makes D.7 carry acceptance/signature metadata forward when the current invoice was already accepted. See the Phase 13 contract for the deltas. **Phase 15D update:** recording a payment (D.7) and voiding a payment (D.10) **never auto-email** — manual Resend is the only email action after a payment change. (The old "re-email on payment after acceptance" behaviour was removed.)
+
+**Added in 16G (target contract; [16G contract](API-Contracts-Phase16G-Invoice-Link.md)):**
+
+| Method | Path | Purpose | Contract |
+|--------|------|---------|----------|
+| POST | `/api/v1/{slug}/orders/{orderId}/invoices/current/send-link` | Email the customer a link to review and sign the unsigned current invoice (Accept Remotely). Standard protected. | 16G §8 (PR 4) |
+
+16G also adds a token-only public surface outside `/api/v1/{slug}`: `GET /api/v1/public/invoices/{token}`, `POST …/{token}/accept` and `GET …/{token}/pdf` (16G §9, PR 4). They are not Standard protected and are not Chunk 4 endpoints.
 
 **Deferred to post-MVP (NOT implemented in MVP — see D.5):** `GET .../invoices` (history
 list), `GET .../invoices/{invoiceId}` (detail by id), `GET .../invoices/{invoiceId}/file`
@@ -138,6 +146,7 @@ list), `GET .../invoices/{invoiceId}` (detail by id), `GET .../invoices/{invoice
    - `total_paid = round(sum(payment_transaction.amount for this order), 2)` — typically `0.00` at first invoice
    - `balance_due = round(sale_price_inc_gst − total_paid, 2)` — must be ≥ 0 (DB CHECK)
    - `created_by_user_id = session.user_id`
+   - *(16G PR 2, [16G contract §4](API-Contracts-Phase16G-Invoice-Link.md#4-every-invoice-version-freezes-its-words-125))* the frozen words: `customer_name_snapshot`, `customer_address_line1_snapshot` and `customer_address_line2_snapshot` from the current saved customer and BILLING address; `terms_snapshot` = the business's per-flooring-type terms for the order's flooring type, sanitised (null when none are set). Until PR 2 none of these is stored, and the PDF reads Invoice To and terms live.
 5. Generate the PDF, write a `stored_file` row, link via `invoice.stored_file_id`.
 6. Persist the `invoice` row.
 7. Steps 4–6 happen in one DB transaction. PDF / file-write failure → full rollback (no `invoice` row, no `stored_file` row).
@@ -228,9 +237,10 @@ list), `GET .../invoices/{invoiceId}` (detail by id), `GET .../invoices/{invoice
    - `total_paid = round(sum(payment_transaction.amount for this order), 2)` (current at this moment)
    - `balance_due = round(sale_price_inc_gst − total_paid, 2)` — must be ≥ 0
    - `created_by_user_id = session.user_id`
+   - *(16G PR 2)* the frozen words, freshly frozen from the current saved customer, BILLING address and business terms, as D.1 (never copied from the previous version)
 6. Generate a **new** PDF, write a new `stored_file` row, link via `invoice.stored_file_id`.
 7. Persist the new `invoice` row. Old versions are not modified.
-8. Steps 5–7 happen in one DB transaction. PDF / file-write failure → full rollback.
+8. Steps 5–7 happen in one DB transaction. PDF / file-write failure → full rollback. *(16G PR 4)* The same transaction marks an `ACTIVE` invoice link `REWRITTEN` (16G contract §7.5).
 
 **Validation**
 - `orderId` is a positive integer.
@@ -286,8 +296,13 @@ only the current invoice; there is no history list and no per-version detail (de
 ```
 
 The current invoice is the `invoice` row with the highest `version_number` for the order.
-`version_number` is an internal field returned in the snapshot; the MVP frontend does not
-surface it (no revision dropdown).
+`version_number` is returned in the snapshot; the MVP frontend shows no version label and no
+revision dropdown. From 16G PR 3 the Invoice tab sends it back as `expected_version_number`
+when accepting (a comparison precondition, F.9), and from 16G PR 4 the public invoice view
+carries it as the document identity (16G contract §5, §9). From 16G PR 4 the snapshot also
+carries the derived `invoice_link_expires_at` (E.2; the read writes nothing), and from PR 6
+the Invoice tab re-reads D.3 every 15 seconds while that field is non-null and the invoice
+unsigned (16G contract §13.2).
 
 **Business rules / scoping**
 - Resolve the current invoice = `max(version_number)` row in `invoice` for this order.
@@ -507,7 +522,8 @@ current-invoice acceptance endpoints. No older-version invoice or signature endp
    - `total_paid = total_paid_after`
    - `balance_due = round(sale_price_inc_gst − total_paid, 2)` — must be ≥ 0 (DB CHECK; guaranteed by step 3)
    - `created_by_user_id = session.user_id`
-7. Generate a new PDF, write `stored_file`, link via `invoice.stored_file_id`.
+   - *(16G PR 2)* the frozen words (`customer_name_snapshot`, the two billing lines and `terms_snapshot`) copied from `latest_invoice` verbatim, including null; never the current customer record or the business's current terms (16G contract §4.2)
+7. Generate a new PDF, write `stored_file`, link via `invoice.stored_file_id`. *(16G PR 4)* An `ACTIVE` invoice link stays `ACTIVE`; the public page then shows this new version (16G contract §7.5).
 8. Persist the new `invoice` row.
 9. **Atomicity:** steps 4–8 happen in a single DB transaction. If PDF generation, file write, or the new invoice insert fails, the payment insert is rolled back. The salesperson must retry; partial state is never persisted.
 
@@ -580,7 +596,7 @@ current-invoice acceptance endpoints. No older-version invoice or signature endp
 3. If the payment is already voided → **409 `PAYMENT_ALREADY_VOIDED`** (idempotent; a concurrent double-void is caught by the `WHERE voided_at IS NULL` update guard and also returns 409 — no second invoice version is created).
 4. Require an existing current invoice, else **422 `INVOICE_REQUIRED`** (defensive).
 5. Stamp `voided_at = now`, `voided_by_user_id = session.user_id` (the **session actor**, NOT the order-bound salesperson).
-6. Recompute `total_paid_after = round(sum(active payment_transaction.amount), 2)` (excludes the just-voided row) and regenerate the current invoice (new `version_number = max + 1`) carrying forward the sale snapshot fields and — when the current invoice was accepted — the acceptance/signature metadata (the customer does **NOT** re-sign; the same signature `stored_file` is referenced).
+6. Recompute `total_paid_after = round(sum(active payment_transaction.amount), 2)` (excludes the just-voided row) and regenerate the current invoice (new `version_number = max + 1`) carrying forward the sale snapshot fields, *(16G PR 2)* the frozen words verbatim, and — when the current invoice was accepted — the acceptance/signature metadata (the customer does **NOT** re-sign; the same signature `stored_file` is referenced). *(16G PR 4)* An `ACTIVE` invoice link stays `ACTIVE`.
 7. The new version starts `last_emailed_at = null` and the dashboard mirror (`sales_order.last_emailed_at`) is reset to null. **No email is sent.** Manual Resend remains available.
 8. **Atomicity:** the void stamp + new invoice version + PDF write are one DB transaction with a rollback-cleanup hook (no orphan PDF).
 
@@ -647,16 +663,24 @@ Used in D.1 / D.2 / D.3 responses (the current invoice snapshot).
   "created_by_user_id": 1,
   "created_at": "2026-04-22T14:30:00",
   "pdf_download_path": "/api/v1/aussiefloors/orders/1/invoices/current/file",
+  "customer_name_snapshot": "Jordan Wilson",
+  "customer_address_line1_snapshot": "4/12 Oxford Street",
+  "customer_address_line2_snapshot": "Paddington NSW 2021",
   "terms_html": "<p>…</p>",
-  "terms_source": "LIVE"
+  "terms_source": "BUSINESS",
+  "invoice_link_expires_at": "2026-04-29T14:40:00"
 }
 ```
 
+(The 16G target shape: the three `customer_*_snapshot` fields arrive in PR 2 and `invoice_link_expires_at` in PR 4. Until PR 2 the three snapshot fields are absent and a Path B invoice reports `"terms_source": "LIVE"`; until PR 4 `invoice_link_expires_at` is absent.)
+
 **Field rules**
-- All fields from the locked `invoice` table except `stored_file_id` (replaced by `pdf_download_path`).
+- All fields from the locked `invoice` table except `stored_file_id` (replaced by `pdf_download_path`), `source_quote_version_id` (never exposed) and the Phase 13 signature file id (replaced by its download path).
 - `due_date` semantics: for manual versions (D.1, D.2) it is `proposed_lay_date − 2 calendar days`. For payment-driven versions (D.7) it is carried forward from the latest official invoice. It may be earlier than `invoice_date` — see G.2.
 - Money fields with two decimal places.
-- Phase 13 adds the five acceptance/email fields (`docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` section 5, with the full example). Since 16F PR2, `terms_html` (string or null) and `terms_source` (`QUOTE` or `LIVE`) are always present: `QUOTE` for an invoice created from an accepted quote (and its payment, void and D.8 versions), whose `terms_html` is the frozen quote terms verbatim (null means no terms); `LIVE` for Create and Rewrite (Path B), whose `terms_html` is the business's current per-flooring-type terms, sanitised. The rule is in `docs/API-Contracts-Phase16B-Quotation.md` section 4.6. E.1 `current_invoice_summary` is unchanged (no terms fields).
+- Phase 13 adds the five acceptance/email fields (`docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` section 5, with the full example). Since 16F PR2, `terms_html` (string or null) and `terms_source` are always present.
+- **Frozen words (16G PR 2, [16G contract §4](API-Contracts-Phase16G-Invoice-Link.md#4-every-invoice-version-freezes-its-words-125)).** `customer_name_snapshot`, `customer_address_line1_snapshot` and `customer_address_line2_snapshot` are always present and nullable: the Invoice To name and billing lines stored on this version (frozen at Create or Rewrite from the saved customer and BILLING address, copied from the accepted quote's `V17` snapshot by Path A, carried verbatim by payment, void and signing versions). `terms_html` is this version's stored `terms_snapshot`, verbatim; null means no terms, with no live fallback. `terms_source` reports where the stored terms came from: `QUOTE` (the frozen terms of the signed quote: Path A and the payment, void and signing versions carried from it) or `BUSINESS` (the business's per-flooring-type terms frozen at Create or Rewrite, and carried). Neither value triggers a live lookup. Until PR 2 the value `LIVE` is returned instead of `BUSINESS`, meaning the business's current terms read at every render (`docs/API-Contracts-Phase16B-Quotation.md` section 4.6). E.1 `current_invoice_summary` carries none of these fields.
+- **Derived link field (16G PR 4, [16G contract §4.5](API-Contracts-Phase16G-Invoice-Link.md#45-invoicedetail-e2-changes-pr-2-pr-4)).** `invoice_link_expires_at` (timestamp, nullable, always present from PR 4) is response metadata, not a frozen word and not one of the three snapshot fields: the `expires_at` of the order's `ACTIVE`, unexpired invoice link, otherwise null, computed in the read from server state. It is not an `invoice` column, no writer copies it, and reading it writes nothing and never expires a token. It is never displayed; from PR 6 the Invoice tab polls D.3 while it is non-null and the invoice unsigned. Neither E.1 `current_invoice_summary` nor any public invoice payload carries it.
 
 ### E.3 `payment_transaction_read`
 
@@ -713,7 +737,7 @@ The 9 preconditions:
 
 Failure response: 422 with `error.code = "INVOICE_PRECONDITIONS_NOT_MET"` and `error.details[]` listing every failing item with `section`, `field`, and `message`.
 
-> **Phase 13 delta.** Phase 13 adds a **customer-email gate** to D.1 (Create) and D.2 (Rewrite), evaluated before these 9 preconditions: a missing/blank email → 422 `CUSTOMER_EMAIL_REQUIRED`, an invalid email → 422 `CUSTOMER_EMAIL_INVALID`. The same email gate also guards the Phase 13 Accept / Resend endpoints. See `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` §Error contract.
+> **Phase 13 delta.** Phase 13 adds a **customer-email gate** to D.1 (Create) and D.2 (Rewrite), evaluated before these 9 preconditions: a missing/blank email → 422 `CUSTOMER_EMAIL_REQUIRED`, an invalid email → 422 `CUSTOMER_EMAIL_INVALID`. The same email gate also guards the Phase 13 Accept / Resend endpoints and (16G PR 4) the invoice link send. Create Invoice from the accepted quote (Path A) and the 16G remote signing have no email gate. See `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` §Error contract.
 
 **F.2 Invoice creation — current invoice (MVP).**
 
@@ -721,9 +745,13 @@ MVP exposes only the current/latest invoice. Internally the backend still writes
 rows with an incrementing `version_number` (schema unchanged), but clients only ever see the
 current invoice (D.3 / D.4). History listing and old-version access are deferred (see D.5).
 
-- **D.1 Create Invoice** = first invoice, `version_number = 1`. Snapshots current live order state. Allowed when LAID (if no prior invoice).
-- **D.2 Rewrite Invoice** = regenerates the current invoice (internally next `version_number`). Snapshots current live order state — this is what makes new live edits official. Blocked when LAID.
-- **D.7 payment** = regenerates the current invoice (internally next `version_number`). **Carries forward sale snapshot fields from the current invoice**, updates only `total_paid` / `balance_due`. Allowed when LAID.
+- **D.1 Create Invoice** = first invoice, `version_number = 1`. Snapshots current live order state (from 16G PR 2 including the frozen Invoice To name, billing lines and terms). Allowed when LAID (if no prior invoice).
+- **D.2 Rewrite Invoice** = regenerates the current invoice (internally next `version_number`). Snapshots current live order state — this is what makes new live edits official (from 16G PR 2 it freezes fresh words). Blocked when LAID.
+- **D.7 payment** = regenerates the current invoice (internally next `version_number`). **Carries forward sale snapshot fields from the current invoice** (and, from 16G PR 2, its words verbatim), updates only `total_paid` / `balance_due`. Allowed when LAID.
+- **D.10 payment void** = as D.7, with the voided payment excluded from `total_paid`. Allowed when LAID.
+- **Phase 13 D.8 accept** = appends a signed version carrying the current version's snapshot and words forward. Allowed when LAID.
+- **16F Path A** (`POST …/quote/create-invoice`, 16B §7.1) = version 1, or the next version, from the latest accepted quote's frozen snapshot, inheriting its signature (from 16G PR 2 also its `V17` name and billing lines). Allowed when LAID.
+- **16G PR 4 remote signing** (`POST /api/v1/public/invoices/{token}/accept`, 16G contract §9.4) = appends a signed version carrying the current version's snapshot and words forward, as D.8. Allowed when LAID.
 
 In all paths:
 - Older internal invoice rows are never modified (and are simply not exposed in MVP).
@@ -782,12 +810,17 @@ In all paths:
 | Phase 13 POST invoices/current/accept | **Yes** (acceptance parallels payment, not rewrite — a laid job's invoice may still need signing/emailing; carries the snapshot forward, never makes live edits official). See Phase 13 contract. |
 | Phase 13 POST invoices/current/resend | **Yes** (re-emails the existing accepted PDF) |
 | Phase 13 GET invoices/current/signature | **Yes** (read) |
+| 16F POST quote/create-invoice (Path A) | **Yes** (16B §7.1) |
+| 16G POST invoices/current/send-link (PR 4) | **Yes** (16G contract §12) |
+| 16G public invoice GET / accept / pdf (PR 4) | **Yes** (16G contract §12; not Standard protected) |
 
 **F.9 Backend-controlled fields.** Client never sends or controls:
 - `business_id`, `store_id`, `user_id`, `order_id`, `invoice_id`, `payment_transaction_id` in any body.
-- `version_number`, `invoice_date`, `details_of_sale_snapshot`, `sale_price_ex_gst`, `sale_price_inc_gst`, `total_paid`, `balance_due`, `stored_file_id`, `created_by_user_id` on invoices.
+- `version_number`, `invoice_date`, `details_of_sale_snapshot`, `sale_price_ex_gst`, `sale_price_inc_gst`, `total_paid`, `balance_due`, `stored_file_id`, `created_by_user_id` on invoices, nor (16G PR 2) the frozen `customer_*_snapshot` fields or `terms_snapshot`.
 - `gateway_transaction_id`, `response_status`, `response_message` on payments.
 - `created_at` everywhere.
+
+**16G comparison preconditions (not client-controlled values).** From 16G PR 3 the in-store accept (D.8) sends `expected_version_number` and Path A sends `{"quote_version_id": N}`; from PR 4 the public accept sends `expected_version_number` and the public PDF read sends the shown `version_number`. These are **comparison preconditions only**. D.8, the public invoice accept and Path A compare the value with the row they read under the order lock (the current invoice version, or the latest accepted quote version). The public invoice PDF read takes no order lock: it compares the requested `version_number` with the current version inside its one read-only snapshot ([16G contract §9.5](API-Contracts-Phase16G-Invoice-Link.md#95-get-pdf)). Every mismatch is refused with 409. The values never select, load or write a row and never become a stored value ([16G contract §5](API-Contracts-Phase16G-Invoice-Link.md#5-version-preconditions-69-123)).
 
 ---
 

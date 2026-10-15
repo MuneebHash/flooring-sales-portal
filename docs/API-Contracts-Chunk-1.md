@@ -298,7 +298,8 @@
       "last_emailed_at": null,
       "week_year": 2026,
       "week_number": 15,
-      "gp": 408.00
+      "gp": 408.00,
+      "invoice_accepted": false
     }
   ],
   "pagination": {
@@ -319,7 +320,8 @@
 - `order_status` — `sales_order.order_status` enum value. NOT NULL.
 - `customer` — nested object with `first_name`, `last_name`, and `email` from the order's `order_customer` row. **Nullable: when no `order_customer` row exists for the order, the entire `customer` object is `null`** (locked). When the row exists, all three fields are NOT NULL per the DB schema (`order_customer.first_name`, `last_name`, and `email` are all NOT NULL with non-blank CHECK constraints). The `email` field is included on dashboard rows because the dashboard surfaces customer email next to last-emailed timing.
 - `install_address` — nested object built from the `order_address` row where `address_type = 'INSTALLATION'`. Fields exposed are the raw DB columns: `unit_number, street_number, street, suburb, state_code, postcode`. **Nullable: when no installation address row exists for the order, the entire `install_address` object is `null`** (locked). When the row exists, `unit_number` may be `null`; all other fields are NOT NULL (DB constraints).
-- `last_emailed_at` — `sales_order.last_emailed_at`. May be `null`. Returned as ISO 8601 timestamp per conventions §5. The field is exposed as-stored; this contract does not introduce update behavior or a display format for it.
+- `last_emailed_at` — `sales_order.last_emailed_at`. May be `null`. Returned as ISO 8601 timestamp per conventions §5. Chunk 1 defined no update behaviour; Phase 13 later defined it (`docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` §11.1): it mirrors the **current** invoice's `last_emailed_at`, including `null`. Every new invoice version resets it to `null` (Create, Rewrite, Accept, payment, payment void, Create Invoice from the accepted quote and, from 16G PR 4, remote signing); a successful signed-PDF email to the customer sets it (Accept and Re-send; from 16G PR 3 Create Invoice from the accepted quote; from 16G PR 4 remote signing). Payment and void never email, and a 16G invoice link email never sets it ([16G contract §11](API-Contracts-Phase16G-Invoice-Link.md#11-email-markers-and-the-dashboard-mirror)).
+- `invoice_accepted` — Phase 13 (`docs/API-Contracts-Phase13-Acceptance-Signature-Email.md` §11). Boolean, always present: `true` when the order's current invoice has `accepted_at` set; `false` when it is unaccepted or no invoice exists. No invoice-status enum.
 - `week_year`, `week_number` — `sales_order.week_year` and `sales_order.week_number`. NOT NULL (DB constraints).
 - `gp` — `sales_order.gp`. Two decimal places. May be `null`.
 
@@ -519,7 +521,7 @@ These apply across every Chunk 1 endpoint and are the single source of enforceme
    - This avoids inventing punctuation/concatenation rules; the frontend builds the display string from the grounded fields.
 6. **`order_number` uses the locked conventions §18 format.** It is returned exactly as stored on `sales_order.order_number`, and the frontend displays it verbatim. `order_sequence_number` is exposed alongside it for completeness.
 7. **`flooring_type` retained on dashboard rows.** Strict definition: `sales_order.flooring_type`, NOT NULL, value `SOFT` or `HARD`, locked at order creation per conventions §17. No conditional language.
-8. **`last_emailed_at` retained as a grounded, nullable timestamp field.** No display formatting, no update semantics defined here — that is out of scope for Chunk 1.
+8. **`last_emailed_at` retained as a grounded, nullable timestamp field.** No display formatting, no update semantics defined here — that is out of scope for Chunk 1. (Phase 13 §11.1 later defined the update semantics, and Phase 13 added `invoice_accepted`; see the field rules above.)
 9. **`status` filter locked to single value.** Comma-separated multi-status (allowed by conventions §7 in general) is not used in Chunk 1; the dashboard filter UI is a single-select dropdown. Only the 6 currently locked statuses are accepted.
 10. **`week_year` and `week_number` filters retained.** Grounded in conventions §7 (example) and §19, and in the DB.
 11. **`sort` query parameter removed.** Not grounded in conventions. Default ordering is locked backend-side (`created_at` descending).
