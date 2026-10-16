@@ -52,7 +52,6 @@ import java.util.Enumeration;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Optional;
-import java.util.function.Supplier;
 
 /**
  * Phase 12 Chunk 4 invoice endpoints — D.1 Create, D.2 Rewrite, D.3 read current, D.4 stream the
@@ -83,9 +82,19 @@ import java.util.function.Supplier;
  * {@code POST /orders/{orderId}/quote/create-invoice}): an invoice version built from the order's
  * latest ACCEPTED quote snapshot, inheriting the quote's signature, using the same file-write-first /
  * rollback-cleanup persistence pattern as the flows above. It also adds the {@code V19} columns
- * ({@code source_quote_version_id}, {@code terms_snapshot}) to every invoice write here (Path A writes
- * them, D.1 / D.2 write nulls, D.8 carries them) and the InvoiceDetail {@code terms_html} /
- * {@code terms_source} fields, both through {@link InvoiceTermsSelection}.
+ * ({@code source_quote_version_id}, {@code terms_snapshot}) to every invoice write here and the
+ * InvoiceDetail {@code terms_html} / {@code terms_source} fields, both through
+ * {@link InvoiceTermsSelection}.
+ *
+ * <p>Phase 16G PR 2 (#125): every invoice version stores and renders its own words - the Invoice To
+ * name, both billing lines and the terms ({@code customer_name_snapshot},
+ * {@code customer_address_line1_snapshot}, {@code customer_address_line2_snapshot},
+ * {@code terms_snapshot}). Each writer resolves them ONCE and passes the same values to the PDF and to
+ * the insert: D.1 / D.2 freeze the saved customer, BILLING address and sanitised business terms; Path A
+ * copies the accepted quote version's {@code V17} identity and frozen terms; D.8 copies the current
+ * version's words verbatim (payment / void do the same in {@code OrderPaymentService}). InvoiceDetail
+ * maps the stored values straight from the row; nothing customer-facing is read live at render or read
+ * time.
  */
 @Service
 public class OrderInvoiceService {
@@ -297,6 +306,12 @@ public class OrderInvoiceService {
      * any DB row exists; a DB failure removes the just-written file (rollback hook + in-method catch), so
      * a rollback never orphans the file. {@code invoice.stored_file_id} is NOT NULL + UNIQUE, so the file
      * row must exist before the invoice row.
+     *
+     * <p>Phase 16G PR 2 (#125): the version's words are frozen here, once, from the current saved
+     * state - the Invoice To name and both BILLING lines (the {@code V17} derivation, a missing or
+     * blank value stored as null, never {@code ""}) and the business's per-flooring-type terms,
+     * sanitised once (null when none are set). Those same values are rendered into the PDF and
+     * inserted, and the response maps them back from the inserted row.
      */
     private ApiResponse<InvoiceResponse> snapshotAndPersistInvoice(String slug,
                                                                    long orderId,
@@ -347,30 +362,37 @@ public class OrderInvoiceService {
                     "Computed balance_due is negative (payments exceed the invoice amount) for order " + orderId);
         }
 
+        // Phase 16G PR 2 (#125): freeze this version's words ONCE (see the method javadoc). The customer
+        // row exists (the email gate above requires it); a missing BILLING row gives null lines.
+        String customerNameSnapshot = blankToNull(customerName(customer));
+        String billingLine1Snapshot = blankToNull(billingLine1(addresses));
+        String billingLine2Snapshot = blankToNull(billingLine2(addresses));
+        String termsSnapshot = invoicePdfModelAssembler.businessTermsHtml(ctx.businessId(), order.getFlooringType());
+
         // Render the PDF and write the file FIRST, then register rollback cleanup, then insert the
         // stored_file + invoice rows (mirrors OrderAttachmentService).
         String fileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
         // Acceptance fields are null on Create AND Rewrite: a new manual snapshot is always unaccepted
         // (Phase 13 §7 — Rewrite CLEARS acceptance; the customer must sign the new version again). The
-        // assembler enriches the snapshot with tenant config / store / salesperson / logo / terms.
-        // Phase 16F PR2: Create / Rewrite are Path B, so the terms are explicitly LIVE and both V19
-        // columns are written null - a Rewrite of a Path A invoice therefore clears the quote source
-        // and the frozen terms along with the acceptance (back to Path B semantics).
+        // assembler enriches the snapshot with tenant config / store / salesperson / logo.
+        // Create / Rewrite write no source quote version - a Rewrite of a Path A invoice therefore clears
+        // the quote source along with the acceptance - and the freshly frozen business terms, so the
+        // version reports terms_source BUSINESS.
         byte[] pdfBytes = invoicePdfGenerator.render(invoicePdfModelAssembler.assemble(new Inputs(
                 ctx.business(),
                 order,
                 versionNumber,
                 invoiceDate,
                 dueDate,
-                customerName(customer),
-                billingLine1(addresses),
-                billingLine2(addresses),
+                customerNameSnapshot,
+                billingLine1Snapshot,
+                billingLine2Snapshot,
                 detailsSnapshot,
                 salePriceIncGst,
                 totalPaid,
                 balanceDue,
                 null, null, null,
-                InvoiceTermsSelection.live())));
+                InvoiceTermsSelection.forInvoice(null, termsSnapshot))));
 
         String storagePath = fileStorageService.store(pdfBytes, ctx.businessId(), orderId, PDF_EXTENSION);
         deleteFileOnRollback(storagePath);
@@ -381,7 +403,8 @@ public class OrderInvoiceService {
                     salePriceExGst, salePriceIncGst, totalPaid, balanceDue,
                     storedFileId, ctx.userId(),
                     null, null, null, null,
-                    null, null);
+                    null, termsSnapshot,
+                    customerNameSnapshot, billingLine1Snapshot, billingLine2Snapshot);
 
             // Dashboard mirror invariant (Phase 13 §11.1): whenever a new current invoice version is
             // created, sales_order.last_emailed_at is set to that version's last_emailed_at — null here
@@ -389,7 +412,7 @@ public class OrderInvoiceService {
             // previous version. Same transaction as the insert; the order row is held FOR UPDATE.
             invoiceRepository.updateSalesOrderLastEmailedAt(orderId, row.lastEmailedAt());
 
-            InvoiceDetailDto dto = toDto(slug, orderId, row, liveTerms(ctx, order));
+            InvoiceDetailDto dto = toDto(slug, orderId, row);
             return ApiResponse.ok(new InvoiceResponse(dto), successMessage);
         } catch (RuntimeException ex) {
             fileStorageService.deleteQuietly(storagePath);
@@ -431,11 +454,13 @@ public class OrderInvoiceService {
      * version; {@code accepted_at} / {@code accepted_customer_name} / {@code accepted_signature_file_id}
      * inherited verbatim (the SAME signature {@code stored_file} row: no upload, copy, re-normalisation or
      * new file, and no D.8 name-length gate). {@code invoice_date} = today; {@code due_date} = the
-     * order's current {@code proposed_lay_date} minus 2 days; Invoice To = the live saved customer and
-     * billing rows (the existing derivation); {@code total_paid} = active (non-voided) payments;
-     * {@code balance_due} = signed inc total − active payments; {@code last_emailed_at} null. The invoice
-     * stays details + totals even for an itemised quote (no invoice lines, nothing copied into Products
-     * &amp; Charges).
+     * order's current {@code proposed_lay_date} minus 2 days; Invoice To (Phase 16G PR 2, #125) = the
+     * accepted version's {@code V17} {@code customer_name_snapshot} / {@code customer_address_line1_snapshot}
+     * / {@code customer_address_line2_snapshot}, verbatim, including null - never the live saved
+     * customer or address, which only feed the retained preconditions; {@code total_paid} = active
+     * (non-voided) payments; {@code balance_due} = signed inc total − active payments;
+     * {@code last_emailed_at} null. The invoice stays details + totals even for an itemised quote (no
+     * invoice lines, nothing copied into Products &amp; Charges).
      *
      * <p><b>Writes:</b> the new invoice PDF is written FIRST with rollback cleanup (in-method + an
      * {@code afterCompletion} hook), then its {@code stored_file} row, the invoice row (both {@code V19}
@@ -514,7 +539,13 @@ public class OrderInvoiceService {
         LocalDate invoiceDate = LocalDate.now();
         LocalDate dueDate = order.getProposedLayDate().minusDays(DUE_DATE_OFFSET_DAYS);
         String detailsSnapshot = quote.detailsOfSaleSnapshot();
+        // Phase 16G PR 2 (#125): the words are the accepted version's OWN snapshot, verbatim (nulls
+        // too): its frozen terms and its V17 "Quotation To" identity - never the live customer or
+        // address read above for the preconditions, even when they differ today.
         String termsSnapshot = quote.termsSnapshot();
+        String customerNameSnapshot = quote.customerNameSnapshot();
+        String billingLine1Snapshot = quote.customerAddressLine1Snapshot();
+        String billingLine2Snapshot = quote.customerAddressLine2Snapshot();
 
         String fileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
         byte[] pdfBytes = invoicePdfGenerator.render(invoicePdfModelAssembler.assemble(new Inputs(
@@ -523,9 +554,9 @@ public class OrderInvoiceService {
                 versionNumber,
                 invoiceDate,
                 dueDate,
-                customerName(customer),
-                billingLine1(addresses),
-                billingLine2(addresses),
+                customerNameSnapshot,
+                billingLine1Snapshot,
+                billingLine2Snapshot,
                 detailsSnapshot,
                 salePriceIncGst,
                 totalPaid,
@@ -533,7 +564,7 @@ public class OrderInvoiceService {
                 accepted.acceptedAt(),
                 accepted.acceptedCustomerName(),
                 signaturePng,
-                InvoiceTermsSelection.frozenQuoteTerms(termsSnapshot))));
+                InvoiceTermsSelection.forInvoice(quote.quoteVersionId(), termsSnapshot))));
 
         String storagePath = fileStorageService.store(pdfBytes, ctx.businessId(), orderId, PDF_EXTENSION);
         deleteFileOnRollback(storagePath);
@@ -544,13 +575,14 @@ public class OrderInvoiceService {
                     salePriceExGst, salePriceIncGst, totalPaid, balanceDue,
                     storedFileId, ctx.userId(),
                     accepted.acceptedAt(), accepted.acceptedCustomerName(), accepted.acceptedSignatureFileId(), null,
-                    quote.quoteVersionId(), termsSnapshot);
+                    quote.quoteVersionId(), termsSnapshot,
+                    customerNameSnapshot, billingLine1Snapshot, billingLine2Snapshot);
 
             // Dashboard mirror invariant (Phase 13 section 11.1): the new current version is unemailed, so the
             // sales_order mirror is reset to its null last_emailed_at in the same transaction.
             invoiceRepository.updateSalesOrderLastEmailedAt(orderId, row.lastEmailedAt());
 
-            InvoiceDetailDto dto = toDto(slug, orderId, row, liveTerms(ctx, order));
+            InvoiceDetailDto dto = toDto(slug, orderId, row);
             return ApiResponse.ok(new InvoiceResponse(dto), CREATED_FROM_ACCEPTED_QUOTE_MESSAGE);
         } catch (RuntimeException ex) {
             fileStorageService.deleteQuietly(storagePath);
@@ -598,14 +630,14 @@ public class OrderInvoiceService {
                                                           HttpServletRequest httpRequest) {
         RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
         long orderId = parsePositiveLong(orderIdRaw, "order_id");
-        SalesOrder order = requireOrderInScope(orderId, ctx);
+        requireOrderInScope(orderId, ctx);
 
         InvoiceRow row = invoiceRepository.findCurrentByOrderId(orderId)
                 .orElseThrow(() -> new NotFoundException(ErrorCode.INVOICE_NOT_FOUND,
                         ErrorCode.INVOICE_NOT_FOUND.defaultMessage()));
 
-        return ApiResponse.ok(new InvoiceResponse(
-                toDto(slug, orderId, row, liveTerms(ctx, order))));
+        // Phase 16G PR 2: the version's stored words only - no live customer, address or terms read.
+        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, row)));
     }
 
     // ------------------------------------------------------------------
@@ -681,7 +713,7 @@ public class OrderInvoiceService {
                         stampEmailSuccess(orderId, ctx, accepted.row().invoiceId(), LocalDateTime.now()))
                 : accepted.row();
 
-        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, finalRow, accepted::liveTermsHtml)),
+        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, finalRow)),
                 emailed ? ACCEPT_EMAILED_MESSAGE : ACCEPT_EMAIL_FAILED_MESSAGE);
     }
 
@@ -736,12 +768,13 @@ public class OrderInvoiceService {
                     signatureFileName, signaturePath, SIGNATURE_MIME, signatureBytes.length);
 
             // Signed PDF: sale snapshot + totals carried forward from the current row UNCHANGED (no
-            // live re-read — accepting never makes unsent edits official); customer/billing lines are
-            // presentational (mirrors the payment receipt). The acceptance block embeds the signature.
-            // Phase 16F PR2: the two V19 columns are carried verbatim from the current row (defensive -
-            // a Path A row is already accepted, so it is refused above) and the terms follow that
-            // row's source: frozen quote terms when it has one, live terms otherwise.
-            List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
+            // live re-read — accepting never makes unsent edits official). The acceptance block embeds
+            // the signature. Phase 16F PR2: the source quote version is carried verbatim from the
+            // current row (defensive - a Path A row is already accepted, so it is refused above).
+            // Phase 16G PR 2 (#125): the words - Invoice To name, both billing lines and the terms -
+            // are the current version's stored values, copied verbatim (nulls too) into both the PDF
+            // and the row; the live customer and address are never read for them. (The accepted name
+            // is still the submitted part until 16G PR 3.)
             String pdfFileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
             byte[] pdfBytes = invoicePdfGenerator.render(invoicePdfModelAssembler.assemble(new Inputs(
                     ctx.business(),
@@ -749,9 +782,9 @@ public class OrderInvoiceService {
                     versionNumber,
                     invoiceDate,
                     current.dueDate(),
-                    customerName(customer),
-                    billingLine1(addresses),
-                    billingLine2(addresses),
+                    current.customerNameSnapshot(),
+                    current.customerAddressLine1Snapshot(),
+                    current.customerAddressLine2Snapshot(),
                     current.detailsOfSaleSnapshot(),
                     current.salePriceIncGst(),
                     current.totalPaid(),
@@ -772,7 +805,9 @@ public class OrderInvoiceService {
                         current.totalPaid(), current.balanceDue(),
                         pdfFileId, ctx.userId(),
                         acceptedAt, acceptedCustomerName, signatureFileId, null,
-                        current.sourceQuoteVersionId(), current.termsSnapshot());
+                        current.sourceQuoteVersionId(), current.termsSnapshot(),
+                        current.customerNameSnapshot(), current.customerAddressLine1Snapshot(),
+                        current.customerAddressLine2Snapshot());
 
                 // §11.1 mirror: the new current version starts unemailed, so the dashboard mirror is
                 // reset to null here; the post-commit email-success stamp sets both to the same value.
@@ -785,11 +820,7 @@ public class OrderInvoiceService {
                 // ACCEPTED quote is never touched and never blocks D.8; no ISSUED version → no-op.
                 cancelActiveQuoteLink(orderId, acceptedAt);
 
-                // Phase 16F PR2: the response's live terms are resolved HERE, inside the acceptance
-                // transaction, so building the response after the commit and email needs no DB read.
-                String liveTermsHtml = invoicePdfModelAssembler.liveTermsHtml(ctx.businessId(), order.getFlooringType());
-
-                return new AcceptedInvoice(row, order.getOrderNumber(), liveTermsHtml,
+                return new AcceptedInvoice(row, order.getOrderNumber(),
                         customer.getEmail().trim(), pdfBytes, pdfFileName);
             } catch (RuntimeException ex) {
                 fileStorageService.deleteQuietly(pdfPath);
@@ -860,7 +891,7 @@ public class OrderInvoiceService {
 
         InvoiceRow finalRow = transactionTemplate.execute(status ->
                 stampEmailSuccess(orderId, ctx, email.invoiceId(), LocalDateTime.now()));
-        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, finalRow, email::liveTermsHtml)), RESEND_MESSAGE);
+        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, finalRow)), RESEND_MESSAGE);
     }
 
     /** D.9 validation chain + current-PDF load (read-only; runs in its own short transaction). */
@@ -891,12 +922,8 @@ public class OrderInvoiceService {
         // No regeneration: the stored signed PDF is re-sent as-is. Missing-on-disk -> 500.
         byte[] pdfBytes = fileStorageService.read(file.storagePath());
 
-        // Phase 16F PR2: the response's live terms are resolved here, before the send, so building the
-        // response after the send and the stamp needs no DB read.
-        String liveTermsHtml = invoicePdfModelAssembler.liveTermsHtml(ctx.businessId(), order.getFlooringType());
-
         return new ResendEmail(current.invoiceId(), current.versionNumber(), order.getOrderNumber(),
-                liveTermsHtml, customer.getEmail().trim(), pdfBytes, file.fileName());
+                customer.getEmail().trim(), pdfBytes, file.fileName());
     }
 
     // ------------------------------------------------------------------
@@ -1185,19 +1212,19 @@ public class OrderInvoiceService {
     // ------------------------------------------------------------------
 
     /**
-     * Map an invoice row to the E.2 InvoiceDetail. {@code liveTermsHtml} supplies the business's current
-     * per-flooring-type terms and is only called for a LIVE row: in-transaction callers pass
-     * {@link #liveTerms}, while D.8 / D.9 pass a value they resolved inside their transaction BEFORE the
-     * email send, so no database read happens after a commit or a send.
+     * Map an invoice row to the E.2 InvoiceDetail. Pure mapping (no database read), so every route -
+     * including D.8 / D.9, which build their response after a commit and an email send - returns the
+     * row's own stored values.
      */
-    private static InvoiceDetailDto toDto(String slug, long orderId, InvoiceRow row, Supplier<String> liveTermsHtml) {
+    private static InvoiceDetailDto toDto(String slug, long orderId, InvoiceRow row) {
         // accepted_signature_present / the download path are DERIVED from the internal
         // accepted_signature_file_id, which itself is never serialized (mirrors how stored_file_id is
         // hidden behind pdf_download_path). The path is built only when a signature is actually stored.
         boolean signaturePresent = row.acceptedSignatureFileId() != null;
-        // Phase 16F PR2 (D7): terms_html / terms_source by the SAME rule the invoice PDF uses - the
-        // row's source quote version decides (QUOTE: frozen terms_snapshot verbatim, even null; LIVE:
-        // the business's current per-flooring-type terms, sanitised). The source id is never exposed.
+        // terms_html / terms_source by the SAME rule the invoice PDF uses: since 16G PR 2 terms_html is
+        // the row's stored terms_snapshot verbatim (null = no terms, never a live fall-back) and the
+        // source quote version only decides the reported provenance (QUOTE / BUSINESS). The source id
+        // is never exposed.
         InvoiceTermsSelection terms = InvoiceTermsSelection.forInvoice(row.sourceQuoteVersionId(), row.termsSnapshot());
         return new InvoiceDetailDto(
                 row.invoiceId(),
@@ -1213,18 +1240,17 @@ public class OrderInvoiceService {
                 row.createdByUserId(),
                 row.createdAt(),
                 buildPdfDownloadPath(slug, orderId),
+                // Phase 16G PR 2: the version's frozen Invoice To words, straight from the row.
+                row.customerNameSnapshot(),
+                row.customerAddressLine1Snapshot(),
+                row.customerAddressLine2Snapshot(),
                 row.acceptedAt(),
                 row.acceptedCustomerName(),
                 signaturePresent,
                 signaturePresent ? buildSignatureDownloadPath(slug, orderId) : null,
                 row.lastEmailedAt(),
-                terms.resolve(liveTermsHtml),
+                terms.frozenTermsHtml(),
                 terms.source().name());
-    }
-
-    /** Lazy live-terms reader for the InvoiceDetail of a LIVE row; call only inside a transaction. */
-    private Supplier<String> liveTerms(RequestContext ctx, SalesOrder order) {
-        return () -> invoicePdfModelAssembler.liveTermsHtml(ctx.businessId(), order.getFlooringType());
     }
 
     // Stable current-invoice file path (always resolves to the current version at request time).
@@ -1282,25 +1308,24 @@ public class OrderInvoiceService {
                 .orElse(null);
     }
 
+    // Phase 16G PR 2: the V17 blank -> null rule (QuoteSendService), applied when D.1 / D.2 freeze a
+    // derived name or billing line, so a missing or blank value is stored as null, never "". Copied
+    // snapshots are never passed through it.
+    private static String blankToNull(String value) {
+        return (value == null || value.isBlank()) ? null : value.trim();
+    }
+
     /** Carrier for the D.4 binary response — the controller turns this into a raw {@code ResponseEntity}. */
     public record InvoiceFileDownload(byte[] bytes, String mimeType, String fileName, long fileSize) {
     }
 
-    /**
-     * Committed D.8 acceptance + what the post-commit auto-email needs (never serialized).
-     * {@code liveTermsHtml} is the business's live terms resolved inside the acceptance transaction,
-     * used for the response's terms_html when the final row is LIVE (Phase 16F PR2).
-     */
-    private record AcceptedInvoice(InvoiceRow row, String orderNumber, String liveTermsHtml,
+    /** Committed D.8 acceptance + what the post-commit auto-email needs (never serialized). */
+    private record AcceptedInvoice(InvoiceRow row, String orderNumber,
                                    String recipientEmail, byte[] pdfBytes, String pdfFileName) {
     }
 
-    /**
-     * Validated D.9 resend input: the current accepted invoice + its stored PDF (never serialized).
-     * {@code liveTermsHtml} is resolved in the validation transaction for the response's terms_html
-     * when the final row is LIVE (Phase 16F PR2).
-     */
-    private record ResendEmail(long invoiceId, int versionNumber, String orderNumber, String liveTermsHtml,
+    /** Validated D.9 resend input: the current accepted invoice + its stored PDF (never serialized). */
+    private record ResendEmail(long invoiceId, int versionNumber, String orderNumber,
                                String recipientEmail, byte[] pdfBytes, String pdfFileName) {
     }
 }

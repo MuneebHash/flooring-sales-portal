@@ -12,8 +12,9 @@ import java.time.LocalDateTime;
  * {@code InvoiceDetail}). Returned inside {@link InvoiceResponse} by D.1 Create (and reused by the
  * later D.2 Rewrite / D.3 Read branches).
  *
- * <p>Only the thirteen Phase 12 contract columns plus the five Phase 13 acceptance/email fields and
- * the two Phase 16F PR2 terms fields are exposed. The internal {@code invoice.stored_file_id},
+ * <p>Only the thirteen Phase 12 contract columns plus the five Phase 13 acceptance/email fields, the
+ * two Phase 16F PR2 terms fields and the three Phase 16G PR 2 frozen identity fields are exposed. The
+ * internal {@code invoice.stored_file_id},
  * {@code invoice.accepted_signature_file_id}, {@code invoice.source_quote_version_id} and
  * {@code stored_file.storage_path} (server disk path) are NEVER returned - the PDF is reached only
  * via {@code pdf_download_path} and the signature only via {@code accepted_signature_download_path},
@@ -31,11 +32,16 @@ import java.time.LocalDateTime;
  *
  * <p>Phase 16F PR2 (decision D7) - {@code terms_html} and {@code terms_source} are ALWAYS present,
  * selected by the one invoice terms rule ({@code InvoiceTermsSelection}) the invoice PDF also uses.
- * {@code terms_source} is {@code QUOTE} when the invoice row carries a source quote version (Path A
- * and its carried versions): {@code terms_html} is then the invoice's frozen terms snapshot verbatim,
- * and {@code null} means frozen "no terms" (never a fall-back to live terms). Otherwise
- * {@code terms_source} is {@code LIVE} and {@code terms_html} is the business's current
- * per-flooring-type terms, sanitised ({@code null} when none are set).
+ * Since 16G PR 2 (#125) {@code terms_html} is the version's stored {@code terms_snapshot}, verbatim,
+ * and {@code null} means no terms (never a fall-back to the business's current terms).
+ * {@code terms_source} reports provenance only: {@code QUOTE} when the invoice row carries a source
+ * quote version (Path A and its carried versions: the signed quote's frozen terms), otherwise
+ * {@code BUSINESS} (the business's per-flooring-type terms frozen at Create or Rewrite, and carried).
+ *
+ * <p>Phase 16G PR 2 (#125) - {@code customer_name_snapshot}, {@code customer_address_line1_snapshot}
+ * and {@code customer_address_line2_snapshot} are ALWAYS present (nullable, serialized as JSON
+ * {@code null}): the Invoice To name and billing lines stored on this version, mapped straight from the
+ * row. They are never read from the live customer or address.
  */
 public record InvoiceDetailDto(
         long invoiceId,
@@ -51,6 +57,9 @@ public record InvoiceDetailDto(
         long createdByUserId,
         @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss") LocalDateTime createdAt,
         String pdfDownloadPath,
+        @JsonInclude(JsonInclude.Include.ALWAYS) String customerNameSnapshot,
+        @JsonInclude(JsonInclude.Include.ALWAYS) String customerAddressLine1Snapshot,
+        @JsonInclude(JsonInclude.Include.ALWAYS) String customerAddressLine2Snapshot,
         @JsonInclude(JsonInclude.Include.ALWAYS) @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss") LocalDateTime acceptedAt,
         @JsonInclude(JsonInclude.Include.ALWAYS) String acceptedCustomerName,
         boolean acceptedSignaturePresent,

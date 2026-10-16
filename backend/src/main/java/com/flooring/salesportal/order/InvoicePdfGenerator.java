@@ -134,7 +134,8 @@ public class InvoicePdfGenerator {
 
     /**
      * Flat, pre-resolved data the invoice template needs. Built by {@link InvoicePdfModelAssembler} from
-     * the order / customer / billing address / live financial summary + tenant invoice config + store +
+     * the version being written - its money and details snapshot and, since 16G PR 2, its stored words
+     * (Invoice To name, billing lines, terms; each nullable) - plus tenant invoice config + store +
      * salesperson, then frozen onto the PDF.
      *
      * <p>Phase 15C added the tenant layout fields: business {@code abn} / {@code logoDataUri} /

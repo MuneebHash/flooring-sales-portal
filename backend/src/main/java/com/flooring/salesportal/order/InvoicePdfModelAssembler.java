@@ -25,21 +25,22 @@ import javax.imageio.ImageIO;
  *
  * <p>Enriches the order/customer/financial data the invoice-PDF build sites already have (D.1 Create /
  * D.2 Rewrite, D.8 Accept, D.7 Payment / D.10 Void regenerate, and Phase 16F PR2 Path A create from
- * an accepted quote) with the tenant invoice layout data: private tenant config (ABN, bank details,
- * per-flooring-type terms, logo), store contact/address, and the order-bound salesperson name.
+ * an accepted quote) with the tenant invoice layout data: private tenant config (ABN, bank details),
+ * the logo, store contact/address, and the order-bound salesperson name.
  * Centralising this guarantees EVERY flow renders the same layout - adding a field here covers every
  * flow at once.
  *
- * <p>Terms (Phase 16F PR2, decision D7): every build site passes an explicit
- * {@link InvoiceTermsSelection}. {@code QUOTE} renders the invoice's frozen terms snapshot verbatim
- * (null = no terms page, even when live terms exist); {@code LIVE} renders the business's current
- * per-flooring-type terms through the {@link InvoiceTermsSanitizer} (Path B, unchanged). The rule
- * itself is {@link InvoiceTermsSelection#resolve}; the InvoiceDetail {@code terms_html} applies it
- * with {@link #liveTermsHtml} as the live side.
+ * <p>Words (Phase 16G PR 2, #125): the Invoice To name, both billing lines and the terms are the
+ * version's own stored words, passed in by the build site and rendered verbatim. Terms come from the
+ * caller's explicit {@link InvoiceTermsSelection}: the version's stored {@code terms_snapshot}
+ * (null = no terms page) for both sources, with no live lookup at render time. The business's
+ * per-flooring-type terms are read only when Create / Rewrite freeze them
+ * ({@link #businessTermsHtml}). Business presentation (name, logo, ABN, bank details, store contact,
+ * salesperson) stays live and is outside the freeze.
  *
  * <p>Tenant-isolation: store and salesperson are loaded scoped to the session business id; tenant
  * config is read by business id through the leak-guarded native projection. Fail-soft: a missing
- * store/salesperson/config row, an unreadable/unsupported logo, or unsafe/blank live terms degrade
+ * store/salesperson/config row, an unreadable/unsupported logo, or unsafe/blank business terms degrade
  * gracefully (omit the field / fall back to business name) and never break PDF generation.
  */
 @Component
@@ -74,8 +75,9 @@ public class InvoicePdfModelAssembler {
 
     /**
      * Build the full {@link InvoicePdfModel} from the caller's snapshot inputs + the tenant/store/
-     * salesperson layout data. The caller still passes the frozen money/details/acceptance values; this
-     * method only ADDS layout fields and never re-reads live sale state.
+     * salesperson layout data. The caller still passes the frozen money/details/acceptance values and
+     * the version's words (Invoice To name, billing lines, terms); this method only ADDS layout fields
+     * and never re-reads live sale state, the live customer or address, or the business's terms.
      */
     public InvoicePdfModel assemble(Inputs in) {
         Business business = in.business();
@@ -93,11 +95,9 @@ public class InvoicePdfModelAssembler {
         String salespersonName = salespersonResolver.resolveName(in.order().getUserId(), businessId);
         String logoDataUri = resolveLogoDataUri(business.getLogoPath());
 
-        // Terms by the caller's explicit source (Phase 16F PR2, InvoiceTermsSelection.resolve): source
-        // presence decides, never the HTML's nullness. A quote-origin invoice renders its frozen terms
-        // verbatim, and frozen null terms render NO terms even when live terms exist; a Path B invoice
-        // renders the live per-flooring-type terms, sanitised.
-        String termsHtml = in.terms().resolve(() -> liveTermsHtml(config, flooringType));
+        // Terms (Phase 16G PR 2): the version's stored terms_snapshot, verbatim, for BOTH sources -
+        // null renders NO terms page, even when the business has terms today. There is no live branch.
+        String termsHtml = in.terms().frozenTermsHtml();
         // Terms render on a dedicated page for SOFT and HARD alike. termsOnSeparatePage is still passed
         // to the generator, but the current invoice template does not read it.
         boolean termsOnSeparatePage = FLOORING_HARD.equals(flooringType);
@@ -136,21 +136,21 @@ public class InvoicePdfModelAssembler {
     }
 
     /**
-     * Phase 16F PR2 - the business's CURRENT per-flooring-type terms, sanitised: the LIVE side of the
-     * {@link InvoiceTermsSelection} rule, as the PDF renders it, for the InvoiceDetail
-     * {@code terms_html} of a LIVE invoice. It reads the tenant config, so callers resolve it inside
-     * their transaction (never after a commit or an email send).
+     * Phase 16G PR 2 (#125) - the business's CURRENT per-flooring-type terms, sanitised ONCE: the
+     * value D.1 Create and D.2 Rewrite freeze into the new version's {@code terms_snapshot} (null when
+     * none are set, or when they are blank or unsafe). Read only at that freeze, inside the writer's
+     * transaction; it never renders or reads an existing version, whose terms are its stored snapshot.
      */
-    public String liveTermsHtml(Long businessId, String flooringType) {
+    public String businessTermsHtml(Long businessId, String flooringType) {
         BusinessInvoiceConfigView config = businessRepository
                 .findInvoiceConfigByBusinessId(businessId)
                 .orElse(null);
-        return liveTermsHtml(config, flooringType);
+        return businessTermsHtml(config, flooringType);
     }
 
-    // Per-flooring-type live terms: SOFT -> terms_soft, HARD -> terms_hard. NO fallback to the legacy
-    // terms_and_conditions. Sanitize to safe, XML-well-formed HTML (null when blank/unsafe/fails).
-    private String liveTermsHtml(BusinessInvoiceConfigView config, String flooringType) {
+    // Per-flooring-type business terms: SOFT -> terms_soft, HARD -> terms_hard. NO fallback to the
+    // legacy terms_and_conditions. Sanitize to safe, XML-well-formed HTML (null when blank/unsafe/fails).
+    private String businessTermsHtml(BusinessInvoiceConfigView config, String flooringType) {
         String rawTerms = config == null
                 ? null
                 : (FLOORING_SOFT.equals(flooringType) ? config.getTermsSoft() : config.getTermsHard());
@@ -287,13 +287,14 @@ public class InvoicePdfModelAssembler {
 
     /**
      * The frozen snapshot inputs a build site already has. The assembler adds tenant/store/salesperson/
-     * logo/terms; it never re-reads live sale state. {@code business} and {@code order} carry the ids
+     * logo; it never re-reads live sale state. {@code business} and {@code order} carry the ids
      * (business id, store id, order user id, flooring type) used for the scoped layout lookups.
      *
-     * <p>{@code terms} (Phase 16F PR2) is REQUIRED and explicit: a nullable HTML override could not tell
-     * frozen "no terms" apart from "use live terms". Path A, D.8 and payment / void pass
-     * {@link InvoiceTermsSelection#forInvoice} of the row they write; D.1 / D.2 pass
-     * {@link InvoiceTermsSelection#live()}.
+     * <p>Phase 16G PR 2: {@code customerName}, {@code billingLine1}, {@code billingLine2} and
+     * {@code terms} are the words of the version being written - the SAME values the build site passes
+     * to {@link InvoiceRepository#insertInvoice} - each rendered verbatim, a null rendering as absent.
+     * {@code terms} is REQUIRED and explicit: every build site passes
+     * {@link InvoiceTermsSelection#forInvoice} of the source and terms it inserts.
      */
     public record Inputs(
             Business business,

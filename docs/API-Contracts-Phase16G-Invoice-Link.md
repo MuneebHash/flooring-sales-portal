@@ -143,23 +143,24 @@ The PR 2 migration adds three nullable columns to `invoice`:
 
 `terms_source` keeps its name and stays always present on InvoiceDetail. It reports where the version's stored terms came from. It never triggers a lookup.
 
-| Value | Meaning (from PR 2) |
+| Value | Meaning (since PR 2) |
 |---|---|
 | `QUOTE` | The version has a source quote version: its terms are the frozen terms of the signed quote, copied by Path A and carried by payment, void and signing versions. Null means the quote had no terms. |
 | `BUSINESS` | No source quote version: its terms are the business's per-flooring-type terms, frozen into the version at Create or Rewrite and carried by payment, void and signing versions. Null means none were set at that moment. |
 
-- **Today and until PR 2 merges** the API returns `QUOTE` or `LIVE`, with the 16F meaning (16B §4.6): `LIVE` terms are the business's current terms, read at every render. PR 2 renames the value to `BUSINESS` in the API, OpenAPI and frontend types, and changes the Invoice tab terms-source line (UX lock §20).
+- **Implemented in PR 2.** Before PR 2 the API returned `QUOTE` or `LIVE`, with the 16F meaning (16B §4.6): `LIVE` terms were the business's current terms, read at every render. PR 2 renamed the value to `BUSINESS` in the API and the frontend types (the OpenAPI enum already listed `BUSINESS` from PR 1; PR 2 removed its `LIVE` caveat) and changed the Invoice tab terms-source line (UX lock §20). `LIVE` is no longer returned.
+- **Versions written before PR 2.** A Path B version written before PR 2 has a null `terms_snapshot` (16F read its terms live), and the PR 2 migration does not backfill terms (section 4.1). Such a version reports `BUSINESS` with null `terms_html` (worded by the Invoice tab as none were set), although its own stored PDF keeps the terms page it was rendered with; later payment, void and signing versions copy the null. Only a new version with frozen terms brings terms back: a Rewrite (which clears a signature and is refused on a LAID order) or Path A.
 - The value is selected by source presence, never by whether the HTML is null (unchanged).
 
 ### 4.5 InvoiceDetail (E.2) changes (PR 2, PR 4)
 
-InvoiceDetail gains four always-present nullable fields: the three frozen identity fields (PR 2) and one derived link field (PR 4). E.1 `current_invoice_summary` is unchanged. The source quote version id is still never exposed.
+InvoiceDetail carries three always-present nullable frozen identity fields beyond 16F (implemented in PR 2), and gains a fourth always-present nullable field, the derived link field, in PR 4 (not yet implemented). E.1 `current_invoice_summary` is unchanged. The source quote version id is still never exposed.
 
 | Field | Type | PR | Content |
 |---|---|---|---|
-| `customer_name_snapshot` | string, nullable | 2 | the version's frozen Invoice To name (section 4.1) |
-| `customer_address_line1_snapshot` | string, nullable | 2 | the version's frozen billing line 1 |
-| `customer_address_line2_snapshot` | string, nullable | 2 | the version's frozen billing line 2 |
+| `customer_name_snapshot` | string, nullable | 2 (implemented) | the version's frozen Invoice To name (section 4.1) |
+| `customer_address_line1_snapshot` | string, nullable | 2 (implemented) | the version's frozen billing line 1 |
+| `customer_address_line2_snapshot` | string, nullable | 2 (implemented) | the version's frozen billing line 2 |
 | `invoice_link_expires_at` | timestamp, nullable | 4 | the `expires_at` of the order's `ACTIVE`, unexpired invoice link; otherwise null |
 
 **`invoice_link_expires_at` (PR 4)** is response metadata, not a frozen word:
@@ -171,7 +172,7 @@ InvoiceDetail gains four always-present nullable fields: the three frozen identi
 - The Invoice tab uses it only to decide whether to poll (section 13.2). It is never displayed: no link status line, no expiry display, no cancel control.
 - It is not part of E.1 `current_invoice_summary` (the payment and void responses) or of any public invoice payload (the public view carries the presented token's own `expires_at`, section 9.3).
 
-Target shape (the three `customer_*_snapshot` fields arrive in PR 2 and `invoice_link_expires_at` in PR 4; each is absent until its PR merges):
+Target shape (the three `customer_*_snapshot` fields are returned since PR 2; `invoice_link_expires_at` arrives in PR 4 and is absent until it merges):
 
 ```json
 {

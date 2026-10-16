@@ -85,7 +85,10 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  * follows the order's CURRENT lay date (moved after D.1 and again after the acceptance),
  * created_by_user_id is the session user (a second business-1 user, not the order owner), invoice_date
  * lies within the local dates read just before and after the request, signature times are compared
- * (never creation or email times), and a replaced in-app signature never reaches the Path A PDF.
+ * (never creation or email times), a replaced in-app signature never reaches the Path A PDF, and Invoice
+ * To (16G PR 2, #125) is the accepted version's {@code V17} identity snapshot on the row, the InvoiceDetail
+ * and the PDF, never the customer renamed or the billing street moved after the acceptance (the retained
+ * Path A preconditions still read the live customer and addresses).
  *
  * <p>Every accepted quote version is created through the REAL chain: protected draft save, protected
  * send-email (the plaintext token is read from the recorded link-only email), then the PUBLIC multipart
@@ -130,6 +133,10 @@ class QuoteInvoiceConversionControllerTest {
     private static final String VALID_MOBILE = "0412345678";
     // The V17 issue-time snapshot of the seeded customer ('Quote' + 'Tester') - the frozen accepted name.
     private static final String SNAPSHOT_NAME = "Quote Tester";
+    // The V17 issue-time billing lines of the seeded BILLING address: with SNAPSHOT_NAME, the Invoice To
+    // words a Path A invoice copies (16G PR 2, #125).
+    private static final String SNAPSHOT_BILLING_LINE1 = "12 Billing Street";
+    private static final String SNAPSHOT_BILLING_LINE2 = "Sydney NSW 2000";
     private static final String FROZEN_DETAILS = "Supply and lay carpet (frozen at issue)";
     // Sanitizer-stable tenant terms: frozen into terms_snapshot when a quote is issued.
     private static final String FROZEN_TERMS = "<p>Quote conversion frozen terms</p>";
@@ -188,7 +195,14 @@ class QuoteInvoiceConversionControllerTest {
             "details_of_sale_snapshot", "sale_price_ex_gst", "sale_price_inc_gst", "total_paid",
             "balance_due", "created_by_user_id", "created_at", "pdf_download_path", "accepted_at",
             "accepted_customer_name", "accepted_signature_present", "accepted_signature_download_path",
-            "last_emailed_at", "terms_html", "terms_source");
+            "last_emailed_at", "terms_html", "terms_source",
+            // 16G PR 2 (#125): the version's frozen Invoice To words, always present (nullable).
+            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot");
+
+    // 16G PR 2 (#125): the Invoice To words, in Invoice To order. The same names on quote_version (V17),
+    // invoice (V20) and InvoiceDetail: Path A copies them from the accepted version, verbatim.
+    private static final List<String> INVOICE_TO_WORDS = List.of(
+            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot");
 
     // The plaintext token inside the delivered link .../q/{token} (URL-safe Base64).
     private static final Pattern PUBLIC_LINK_TOKEN = Pattern.compile("/q/([A-Za-z0-9_-]{43,128})");
@@ -644,13 +658,21 @@ class QuoteInvoiceConversionControllerTest {
         Map<String, Object> quote = quoteVersionRow(orderId, 1);
         Assertions.assertEquals(FROZEN_DETAILS, quote.get("details_of_sale_snapshot"));
         Assertions.assertEquals(FROZEN_TERMS, quote.get("terms_snapshot"), "fixture: the issue froze the tenant terms");
+        List<String> frozenInvoiceTo = List.of(SNAPSHOT_NAME, SNAPSHOT_BILLING_LINE1, SNAPSHOT_BILLING_LINE2);
+        Assertions.assertEquals(frozenInvoiceTo, invoiceToWords(quote), "fixture: the issue froze the V17 Invoice To");
         Map<String, Object> signatureFileBefore = storedFileRow(quote.get("accepted_signature_file_id"));
         byte[] quoteSignature = diskBytes((String) signatureFileBefore.get("storage_path"));
 
-        // LIVE state moves on after the signature: only the Invoice To block may follow it.
+        // LIVE state moves on after the signature (details, price, customer name, billing street, tenant terms)
+        // and none of it reaches the Path A invoice: since 16G PR 2 (#125) Invoice To is frozen too. The
+        // renamed customer and the moved billing row still satisfy the live preconditions.
         jdbcTemplate.update("UPDATE sales_order SET details_of_sale = 'Live details edited after acceptance', "
                 + "price_adjustment_inc_gst = 99.00 WHERE order_id = ?", orderId);
-        jdbcTemplate.update("UPDATE order_customer SET first_name = 'Renamed' WHERE order_id = ?", orderId);
+        Assertions.assertEquals(1, jdbcTemplate.update("UPDATE order_customer SET first_name = 'Renamed' "
+                + "WHERE order_id = ?", orderId), "fixture: the customer is renamed");
+        Assertions.assertEquals(1, jdbcTemplate.update("UPDATE order_address SET street = 'Moved Street' "
+                + "WHERE order_id = ? AND address_type = 'BILLING'::address_type", orderId),
+                "fixture: exactly the billing row moved");
         setTenantTerms(LIVE_TERMS);
 
         Assertions.assertEquals(0, invoiceCount(orderId));
@@ -660,6 +682,12 @@ class QuoteInvoiceConversionControllerTest {
         JsonNode invoice = assertConverted(orderId, result, 1, 1, "250.00", "275.00", "0.00", "275.00");
         Assertions.assertEquals(FROZEN_DETAILS, invoice.get("details_of_sale_snapshot").asText());
         Assertions.assertEquals(FROZEN_TERMS, invoice.get("terms_html").asText(), "the frozen quote terms, never live");
+        // Invoice To (16G PR 2): the row and the InvoiceDetail carry the V17 words, never the live ones.
+        Assertions.assertEquals(frozenInvoiceTo, invoiceToWords(invoiceRow(orderId, 1)),
+                "the row's Invoice To is the V17 snapshot, never the renamed customer or the moved street");
+        Assertions.assertEquals(frozenInvoiceTo, invoiceToWords(invoice), "the InvoiceDetail Invoice To is the V17 snapshot");
+        Assertions.assertFalse(invoice.toString().contains("Renamed") || invoice.toString().contains("Moved Street"),
+                () -> "no live Invoice To word in the InvoiceDetail: " + invoice);
 
         // The inherited signature is the SAME stored_file row and the same bytes on disk (no copy).
         Assertions.assertEquals(signatureFileBefore, storedFileRow(quote.get("accepted_signature_file_id")));
@@ -668,11 +696,13 @@ class QuoteInvoiceConversionControllerTest {
                 "SELECT COUNT(*) FROM stored_file WHERE storage_path LIKE ? AND mime_type = 'image/png'",
                 Integer.class, orderStoragePrefix(orderId) + "%"), "no new signature file was stored");
 
-        // PDF: Invoice To follows the LIVE customer + billing rows; acceptance, details and terms are frozen.
+        // PDF: Invoice To shows the frozen V17 words (16G PR 2), like the acceptance, details and terms.
         byte[] pdf = currentInvoicePdf(orderId);
         String text = noSpace(pdfText(pdf));
-        Assertions.assertTrue(text.contains("RenamedTester"), "Invoice To is the live customer");
-        Assertions.assertTrue(text.contains("12BillingStreet"), "Invoice To is the live billing address");
+        Assertions.assertTrue(text.contains(noSpace("INVOICE TO " + String.join(" ", frozenInvoiceTo))),
+                () -> "Invoice To is the frozen V17 name and billing lines: " + text);
+        Assertions.assertFalse(text.contains("Renamed"), "the renamed live customer never reaches the PDF");
+        Assertions.assertFalse(text.contains("MovedStreet"), "the moved live billing street never reaches the PDF");
         Assertions.assertFalse(text.contains(noSpace("Live details edited after acceptance")));
         Assertions.assertTrue(text.contains(noSpace(FROZEN_TERMS_TEXT)), "the frozen terms are rendered");
         Assertions.assertFalse(text.contains(noSpace(LIVE_TERMS_TEXT)), "the live terms are never rendered");
@@ -1770,7 +1800,8 @@ class QuoteInvoiceConversionControllerTest {
     /**
      * The persisted row, the PDF on disk and the 201 body of a Path A conversion to invoice version
      * {@code expectedVersion} from quote version {@code quoteVersionNumber}: due on {@code expectedDueDate},
-     * created by {@code expectedCreatedBy}, dated within the conversion's before / after day window.
+     * created by {@code expectedCreatedBy}, dated within the conversion's before / after day window, and
+     * carrying that quote version's frozen details, terms and (16G PR 2) {@code V17} Invoice To words.
      */
     private JsonNode assertConverted(long orderId, Conversion conversion, int expectedVersion, int quoteVersionNumber,
                                      String ex, String inc, String totalPaid, String balance,
@@ -1798,6 +1829,11 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertEquals(asLong(quote.get("quote_version_id")), asLong(row.get("source_quote_version_id")),
                 label + ": source_quote_version_id");
         Assertions.assertEquals(quote.get("terms_snapshot"), row.get("terms_snapshot"), label + ": frozen terms");
+        // 16G PR 2 (#125): Invoice To is the accepted version's own V17 identity snapshot, copied verbatim.
+        for (String word : INVOICE_TO_WORDS) {
+            Assertions.assertNotNull(quote.get(word), label + ": fixture: the issue froze " + word);
+            Assertions.assertEquals(quote.get(word), row.get(word), label + ": " + word + " = the quote's V17 snapshot");
+        }
         Assertions.assertEquals(quote.get("details_of_sale_snapshot"), row.get("details_of_sale_snapshot"),
                 label + ": frozen details");
         assertMoney(ex, row.get("sale_price_ex_gst"), label + " sale_price_ex_gst");
@@ -1824,8 +1860,8 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertEquals(asLong(pdfFile.get("file_size")), pdf.length, label + ": file_size is the stored length");
         Assertions.assertEquals("%PDF-", new String(pdf, 0, 5, StandardCharsets.US_ASCII), label + ": PDF magic");
         Assertions.assertNotEquals(asLong(row.get("stored_file_id")), asLong(row.get("accepted_signature_file_id")));
-        assertInvoicePdfText(pdf, orderNumber, (String) quote.get("details_of_sale_snapshot"), inc, totalPaid, balance,
-                expectedDueDate, quoteAcceptedAt, label);
+        assertInvoicePdfText(pdf, orderNumber, invoiceToWords(quote), (String) quote.get("details_of_sale_snapshot"),
+                inc, totalPaid, balance, expectedDueDate, quoteAcceptedAt, label);
 
         // ---- the inherited signature file is the quote's own, still on disk ----
         Map<String, Object> signatureFile = storedFileRow(row.get("accepted_signature_file_id"));
@@ -1871,6 +1907,9 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertTrue(invoice.get("last_emailed_at").isNull(), label + ": last_emailed_at present and null");
         Assertions.assertEquals("QUOTE", invoice.get("terms_source").asText(), label);
         assertJsonTextOrNull((String) quote.get("terms_snapshot"), invoice.get("terms_html"), label + " terms_html");
+        for (String word : INVOICE_TO_WORDS) {
+            assertJsonTextOrNull((String) quote.get(word), invoice.get(word), label + " json " + word);
+        }
 
         // No internal reference leaks anywhere in the body.
         for (String forbidden : List.of("source_quote_version_id", "stored_file_id", "accepted_signature_file_id",
@@ -1880,14 +1919,23 @@ class QuoteInvoiceConversionControllerTest {
         return invoice;
     }
 
-    /** The signed, quote-sourced invoice PDF text. */
-    private static void assertInvoicePdfText(byte[] pdf, String orderNumber, String details, String inc, String paid,
-                                             String balance, LocalDate dueDate, LocalDateTime acceptedAt, String label)
-            throws IOException {
+    /** The signed, quote-sourced invoice PDF text; {@code invoiceTo} = the quote's V17 words (16G PR 2). */
+    private static void assertInvoicePdfText(byte[] pdf, String orderNumber, List<Object> invoiceTo, String details,
+                                             String inc, String paid, String balance, LocalDate dueDate,
+                                             LocalDateTime acceptedAt, String label) throws IOException {
         String raw = pdfText(pdf);
         String text = noSpace(raw);
         Assertions.assertTrue(text.contains("TAXINVOICE"), () -> label + ": title missing: " + raw);
         Assertions.assertTrue(text.contains(noSpace(orderNumber)), () -> label + ": order number missing: " + raw);
+        // Invoice To: the frozen words in order under their heading (a null word renders as an empty line).
+        // The acceptance caption repeats the name, so the whole block is matched, never the name alone.
+        StringBuilder block = new StringBuilder("INVOICETO");
+        for (Object word : invoiceTo) {
+            block.append(word == null ? "" : noSpace((String) word));
+        }
+        String invoiceToBlock = block.toString();
+        Assertions.assertTrue(text.contains(invoiceToBlock),
+                () -> label + ": Invoice To block '" + invoiceToBlock + "' missing: " + raw);
         if (details != null) {
             Assertions.assertTrue(text.contains(noSpace(details)), () -> label + ": frozen details missing: " + raw);
         }
@@ -2368,6 +2416,16 @@ class QuoteInvoiceConversionControllerTest {
     private static String textOrNull(JsonNode node, String field) {
         JsonNode value = node.get(field);
         return value == null || value.isNull() ? null : value.asText();
+    }
+
+    /** A quote version's or invoice row's Invoice To words, in Invoice To order (a null stays null). */
+    private static List<Object> invoiceToWords(Map<String, Object> row) {
+        return INVOICE_TO_WORDS.stream().map(row::get).toList();
+    }
+
+    /** An InvoiceDetail's Invoice To words, in Invoice To order (JSON null read as null). */
+    private static List<String> invoiceToWords(JsonNode invoice) {
+        return INVOICE_TO_WORDS.stream().map(key -> textOrNull(invoice, key)).toList();
     }
 
     private static void assertJsonTextOrNull(String expected, JsonNode actual, String label) {

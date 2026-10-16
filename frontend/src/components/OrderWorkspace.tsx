@@ -654,7 +654,6 @@ function WorkspaceShell({
                 notice={invoiceTabNotice}
                 orderNumber={orderNumber}
                 customer={customer}
-                billingAddress={billingAddress}
                 saleDetails={saleDetails}
                 salespersonName={salespersonName}
                 // Lets an accept/resend customer-email error send the user
