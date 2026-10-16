@@ -79,14 +79,17 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 /**
  * Phase 16F PR2 - Path A ({@code POST /api/v1/{slug}/orders/{orderId}/quote/create-invoice}) proven
  * against REAL persisted state: the invoice row, its {@code stored_file} row, the PDF bytes on disk and
- * the rendered PDF text, never just the response code.
+ * the rendered PDF text, never just the response code. Amended for Phase 16G PR 2 (#125): every invoice
+ * version stores and renders its own words (the Invoice To name, both billing lines and the terms).
  *
  * <ul>
  *   <li><b>Snapshot fidelity</b> in both quote modes (itemised, and non-itemised over dormant itemised
  *       draft rows). After the quote is signed, the live details of sale, working price, product and
  *       charge lines, customer name, billing street and tenant terms all move on; the invoice still
- *       carries the signed snapshot (details, totals, accepted name and time, frozen terms) while
- *       Invoice To stays the live saved customer. No quote line reaches the invoice or its PDF, no
+ *       carries the signed snapshot (details, totals, accepted name and time, frozen terms), and its
+ *       Invoice To is the accepted quote version's {@code V17} name and billing lines, copied into the
+ *       invoice row's three identity columns, so the renamed customer and the changed street reach
+ *       neither the row, the API nor the PDF. No quote line reaches the invoice or its PDF, no
  *       invoice line table exists, and Products and Charges are never written. Totals that do not
  *       round-trip through x 1.10 (1000.06 inc / 909.15 ex) are copied verbatim, never re-grossed.</li>
  *   <li><b>Acceptance, files and side effects</b>: the invoice references the quote's own signature
@@ -96,10 +99,14 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  *       ACTIVE token - is left untouched. The inherited signature time is the quote's to the
  *       microsecond (never the conversion time), and a 201-character accepted name is inherited
  *       untruncated.</li>
- *   <li><b>Terms</b>: the InvoiceDetail {@code terms_html} / {@code terms_source} rule (QUOTE frozen
- *       terms, including frozen null, versus LIVE per-flooring-type sanitised terms) on every
- *       InvoiceDetail response, and in every PDF that Path A, payment, void and Path B produce. Frozen
- *       terms the sanitizer would rewrite are carried byte for byte, never re-sanitised.</li>
+ *   <li><b>Terms</b>: the InvoiceDetail {@code terms_html} / {@code terms_source} rule on every
+ *       InvoiceDetail response - {@code terms_html} is the version's stored {@code terms_snapshot}
+ *       verbatim, reported as QUOTE (the signed quote's frozen terms, including frozen null) or BUSINESS
+ *       (the business's per-flooring-type terms, sanitised once and frozen at Create / Rewrite, then
+ *       carried by payment, void and D.8) - and the same terms in every PDF that Path A, payment, void
+ *       and Path B produce; a later business terms edit or clear never reaches an existing version or
+ *       the next payment version. Every InvoiceDetail response also carries the three frozen Invoice To
+ *       keys. Frozen terms the sanitizer would rewrite are carried byte for byte, never re-sanitised.</li>
  * </ul>
  *
  * <p>Self-seeded (Phase 14D): orders are inserted under business 1 / store 1 / user 1 (slug
@@ -156,6 +163,9 @@ class QuoteInvoiceConversionSnapshotTest {
     private static final String CHANGED_BILLING_STREET = "Changed Billing Road";
     private static final String LIVE_FIRST_NAME = "Livefirst";
     private static final String LIVE_LAST_NAME = "Livelast";
+    // The seeded BILLING address as the V17 issue snapshot and D.1 / D.2 freeze it (16G PR 2): no unit.
+    private static final String ORIGINAL_BILLING_LINE1 = "12 " + ORIGINAL_BILLING_STREET;
+    private static final String BILLING_LINE2 = "Sydney NSW 2000";
 
     /** proposed_lay_date 2026-12-01 minus 2 days. */
     private static final LocalDate EXPECTED_DUE_DATE = LocalDate.of(2026, 11, 29);
@@ -206,13 +216,18 @@ class QuoteInvoiceConversionSnapshotTest {
 
     private static final String CREATED_FROM_QUOTE_MESSAGE = "Invoice created from accepted quote.";
 
-    /** openapi InvoiceDetail: the Phase 12 / 13 keys plus the two Phase 16F PR2 terms keys, ALWAYS present. */
+    /**
+     * openapi InvoiceDetail: the Phase 12 / 13 keys, the two Phase 16F PR2 terms keys and the three
+     * Phase 16G PR 2 frozen Invoice To keys, ALWAYS present.
+     */
     private static final Set<String> INVOICE_DETAIL_KEYS = Set.of(
             "invoice_id", "order_id", "version_number", "invoice_date", "due_date",
             "details_of_sale_snapshot", "sale_price_ex_gst", "sale_price_inc_gst", "total_paid", "balance_due",
             "created_by_user_id", "created_at", "pdf_download_path", "accepted_at", "accepted_customer_name",
             "accepted_signature_present", "accepted_signature_download_path", "last_emailed_at",
-            "terms_html", "terms_source");
+            "terms_html", "terms_source",
+            // 16G PR 2 (#125): the version's frozen Invoice To words, always present (nullable).
+            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot");
 
     // The plaintext token inside the delivered link .../q/{token} (URL-safe Base64).
     private static final Pattern PUBLIC_LINK_TOKEN = Pattern.compile("/q/([A-Za-z0-9_-]{43,128})");
@@ -247,7 +262,8 @@ class QuoteInvoiceConversionSnapshotTest {
     @Autowired
     private RecordingQuoteAcceptanceNotificationSender acceptanceNotificationSender;
 
-    // The production sanitizer: LIVE terms_html must equal exactly what it makes of the raw tenant terms.
+    // The production sanitizer: the BUSINESS terms D.1 / D.2 freeze (and so terms_html) must equal exactly
+    // what it makes of the raw tenant terms.
     @Autowired
     private InvoiceTermsSanitizer termsSanitizer;
 
@@ -829,8 +845,9 @@ class QuoteInvoiceConversionSnapshotTest {
 
     /**
      * {@code data.invoice} of an InvoiceDetail response: EXACTLY the InvoiceDetail keys (so both terms
-     * keys are present and no internal id such as source_quote_version_id / stored_file_id /
-     * accepted_signature_file_id or the raw terms_snapshot column is keyed), with the expected terms.
+     * keys and the three frozen Invoice To keys are present, and no internal id such as
+     * source_quote_version_id / stored_file_id / accepted_signature_file_id or the raw terms_snapshot
+     * column is keyed), with the expected terms.
      */
     private static JsonNode assertInvoiceDetail(MvcResult result, int expectedVersion, String expectedSource,
                                                 String expectedTermsHtml, String label) throws IOException {
@@ -858,6 +875,29 @@ class QuoteInvoiceConversionSnapshotTest {
                     () -> label + ": '" + internal + "' must never appear in an InvoiceDetail response: " + body);
         }
         return invoice;
+    }
+
+    /**
+     * The three frozen Invoice To keys of an InvoiceDetail (16G PR 2, #125): each a PRESENT key holding
+     * the version's stored word (an expected {@code null} must be a present JSON null, never absent).
+     */
+    private static void assertInvoiceToWords(JsonNode invoice, String expectedName, String expectedLine1,
+                                             String expectedLine2, String label) {
+        Map<String, String> expected = new LinkedHashMap<>();
+        expected.put("customer_name_snapshot", expectedName);
+        expected.put("customer_address_line1_snapshot", expectedLine1);
+        expected.put("customer_address_line2_snapshot", expectedLine2);
+        for (Map.Entry<String, String> word : expected.entrySet()) {
+            String key = word.getKey();
+            Assertions.assertTrue(invoice.has(key), () -> label + ": '" + key + "' must be a present key: " + invoice);
+            JsonNode value = invoice.get(key);
+            if (word.getValue() == null) {
+                Assertions.assertTrue(value.isNull(), () -> label + ": " + key + " must be JSON null but was " + value);
+            } else {
+                Assertions.assertTrue(value.isTextual(), () -> label + ": " + key + " must be a string but was " + value);
+                Assertions.assertEquals(word.getValue(), value.asText(), label + ": " + key);
+            }
+        }
     }
 
     // ================================================================
@@ -974,7 +1014,7 @@ class QuoteInvoiceConversionSnapshotTest {
     }
 
     /**
-     * The PDF terms rule: frozen / live terms text present -> exactly 2 pages, the terms (and their
+     * The PDF terms rule: the version's stored terms text present -> exactly 2 pages, the terms (and their
      * uppercase heading) on page 2 only; {@code expectedTermsText == null} -> exactly 1 page and no terms
      * heading. Either way the footer renders exactly once and none of {@code forbiddenTexts} appears.
      */
@@ -1037,8 +1077,9 @@ class QuoteInvoiceConversionSnapshotTest {
     /**
      * Itemised quote with distinctive line descriptions: after the signature the live details, working
      * price, product and charge lines, customer name, billing street and tenant terms all move on, and
-     * Path A still bills the signed snapshot. Invoice To is the live saved customer; no quote line
-     * reaches the invoice row, the response or the PDF.
+     * Path A still bills the signed snapshot. Invoice To (16G PR 2, #125) is the accepted version's V17
+     * name and billing lines - the renamed customer and the changed street reach neither the row, the
+     * API nor the PDF; no quote line reaches the invoice row, the response or the PDF.
      */
     @Test
     void pathA_itemisedQuote_invoiceFreezesSignedSnapshot_afterLiveDetailsPriceLinesCustomerAndTermsMoveOn()
@@ -1089,6 +1130,13 @@ class QuoteInvoiceConversionSnapshotTest {
                 "precondition: the tenant terms were sanitised once and frozen at issue");
         Assertions.assertTrue(frozenTerms.contains(ISSUE_TERMS_TEXT));
         Assertions.assertEquals(SNAPSHOT_NAME, quote.get("accepted_customer_name"));
+        // The V17 issue snapshot (16G PR 2: Path A's Invoice To): the saved name and the ORIGINAL billing lines.
+        Assertions.assertEquals(SNAPSHOT_NAME, quote.get("customer_name_snapshot"),
+                "precondition: the quote froze the saved customer name at issue");
+        Assertions.assertEquals(ORIGINAL_BILLING_LINE1, quote.get("customer_address_line1_snapshot"),
+                "precondition: the quote froze the original billing line 1 at issue");
+        Assertions.assertEquals(BILLING_LINE2, quote.get("customer_address_line2_snapshot"),
+                "precondition: the quote froze billing line 2 at issue");
         LocalDateTime quoteAcceptedAt = asLocalDateTime(quote.get("accepted_at"));
         long quoteVersionId = asLong(quote.get("quote_version_id"));
         int quoteLinesAtAcceptance = versionLineCount(orderId);
@@ -1099,12 +1147,19 @@ class QuoteInvoiceConversionSnapshotTest {
                 new BigDecimal("777.77"), orderId);
         seedProductLine(orderId, SOFT, "60.00", "30.00");
         seedChargeLine(orderId, SOFT, "500.00", "200.00");
-        jdbcTemplate.update("UPDATE order_customer SET first_name = ?, last_name = ? WHERE order_id = ?",
-                LIVE_FIRST_NAME, LIVE_LAST_NAME, orderId);
-        jdbcTemplate.update("UPDATE order_address SET street = ? WHERE order_id = ? AND address_type = 'BILLING'::address_type",
-                CHANGED_BILLING_STREET, orderId);
+        // The rename and the street change must really land: nothing below may see them.
+        Assertions.assertEquals(1, jdbcTemplate.update(
+                        "UPDATE order_customer SET first_name = ?, last_name = ? WHERE order_id = ?",
+                        LIVE_FIRST_NAME, LIVE_LAST_NAME, orderId),
+                "precondition: the live customer is renamed");
+        Assertions.assertEquals(1, jdbcTemplate.update(
+                        "UPDATE order_address SET street = ? WHERE order_id = ? AND address_type = 'BILLING'::address_type",
+                        CHANGED_BILLING_STREET, orderId),
+                "precondition: the live billing street changes");
         setTenantTerms(AFTER_ACCEPTANCE_TERMS_HTML, AFTER_ACCEPTANCE_TERMS_HTML);
         clearJpaCache();
+        // The live state the Invoice To must never show (16G PR 2): the renamed customer and the new street.
+        List<String> liveIdentity = List.of(LIVE_FIRST_NAME, LIVE_LAST_NAME, CHANGED_BILLING_STREET);
 
         List<Map<String, Object>> productLinesBefore = productLines(orderId);
         List<Map<String, Object>> chargeLinesBefore = chargeLines(orderId);
@@ -1130,9 +1185,23 @@ class QuoteInvoiceConversionSnapshotTest {
         Assertions.assertTrue(invoice.get("accepted_signature_present").booleanValue());
         Assertions.assertEquals(EXPECTED_DUE_DATE.toString(), invoice.get("due_date").asText());
         Assertions.assertTrue(invoice.get("last_emailed_at").isNull());
-        for (String leaked : List.of(LINE_ALPHA, LINE_BETA, LIVE_DETAILS, AFTER_ACCEPTANCE_TERMS_TEXT, "777.77")) {
+        // Invoice To (16G PR 2): the accepted version's V17 words, never the live customer or address.
+        assertInvoiceToWords(invoice, SNAPSHOT_NAME, ORIGINAL_BILLING_LINE1, BILLING_LINE2, mode + " Path A response");
+        List<String> neverInTheResponse = new ArrayList<>(
+                List.of(LINE_ALPHA, LINE_BETA, LIVE_DETAILS, AFTER_ACCEPTANCE_TERMS_TEXT, "777.77"));
+        neverInTheResponse.addAll(liveIdentity);
+        for (String leaked : neverInTheResponse) {
             Assertions.assertFalse(responseBody.contains(leaked),
                     () -> mode + ": '" + leaked + "' must not reach the Path A response: " + responseBody);
+        }
+        // D.3 maps the same stored words (no live re-read).
+        MvcResult currentResult = getCurrentInvoice(orderId);
+        JsonNode current = assertInvoiceDetail(currentResult, 1, "QUOTE", frozenTerms, mode + " D.3 after Path A");
+        assertInvoiceToWords(current, SNAPSHOT_NAME, ORIGINAL_BILLING_LINE1, BILLING_LINE2, mode + " D.3 after Path A");
+        String currentBody = body(currentResult);
+        for (String leaked : liveIdentity) {
+            Assertions.assertFalse(currentBody.contains(leaked),
+                    () -> mode + ": '" + leaked + "' must not reach D.3 after Path A: " + currentBody);
         }
 
         // ---- The persisted invoice row ----
@@ -1158,6 +1227,25 @@ class QuoteInvoiceConversionSnapshotTest {
                 "accepted_at = the quote's accepted_at (DB value), not the conversion time");
         Assertions.assertEquals(quote.get("terms_snapshot"), row.get("terms_snapshot"),
                 "terms_snapshot = the quote's frozen terms verbatim");
+        // Invoice To (16G PR 2): the three identity columns = the quote version's V17 columns verbatim.
+        for (String column : List.of("customer_name_snapshot", "customer_address_line1_snapshot",
+                "customer_address_line2_snapshot")) {
+            Assertions.assertEquals(quote.get(column), row.get(column),
+                    () -> "invoice." + column + " = quote_version." + column + " verbatim");
+        }
+        Assertions.assertEquals(SNAPSHOT_NAME, row.get("customer_name_snapshot"),
+                "the frozen name, not the renamed live customer");
+        Assertions.assertEquals(ORIGINAL_BILLING_LINE1, row.get("customer_address_line1_snapshot"),
+                "the original billing street, not the changed live one");
+        Assertions.assertEquals(BILLING_LINE2, row.get("customer_address_line2_snapshot"));
+        for (Map.Entry<String, Object> column : row.entrySet()) {
+            if (column.getValue() instanceof String value) {
+                for (String leaked : liveIdentity) {
+                    Assertions.assertFalse(value.contains(leaked),
+                            () -> mode + ": '" + leaked + "' must not reach invoice." + column.getKey() + ": " + value);
+                }
+            }
+        }
         Assertions.assertEquals(quoteVersionId, asLong(row.get("source_quote_version_id")));
         Assertions.assertEquals(asLong(quote.get("accepted_signature_file_id")),
                 asLong(row.get("accepted_signature_file_id")));
@@ -1183,13 +1271,16 @@ class QuoteInvoiceConversionSnapshotTest {
         assertPdfContains(text, "Balance Due $" + expectedInc, label);
         assertPdfLacks(text, "$777.77", label);
         assertAcceptedCaption(pdf, SNAPSHOT_NAME, quoteAcceptedAt);
-        Assertions.assertEquals(1, countOccurrences(noSpace(text), noSpace(SNAPSHOT_NAME)),
-                () -> label + ": the frozen name appears only in the acceptance caption: " + flat(text));
-        // Invoice To stays LIVE: the renamed customer and the changed billing street.
-        assertPdfContains(text, LIVE_FIRST_NAME + " " + LIVE_LAST_NAME, label);
-        assertPdfContains(text, "12 " + CHANGED_BILLING_STREET, label);
-        assertPdfContains(text, "Sydney NSW 2000", label);
-        assertPdfLacks(text, ORIGINAL_BILLING_STREET, label);
+        // Invoice To (16G PR 2) is the accepted version's V17 snapshot, so the frozen name renders exactly
+        // twice - Invoice To and the acceptance caption - and Invoice To shows the ORIGINAL billing lines.
+        Assertions.assertEquals(2, countOccurrences(noSpace(text), noSpace(SNAPSHOT_NAME)),
+                () -> label + ": the frozen name appears in Invoice To and the acceptance caption only: " + flat(text));
+        assertPdfContains(text, SNAPSHOT_NAME + " " + ORIGINAL_BILLING_LINE1 + " " + BILLING_LINE2,
+                label + " (Invoice To)");
+        // The renamed customer and the changed billing street appear NOWHERE in the PDF.
+        for (String leaked : liveIdentity) {
+            assertPdfLacks(text, leaked, label);
+        }
         // No quote line description anywhere in the invoice PDF (itemised lines are never copied).
         assertPdfLacks(text, LINE_ALPHA, label);
         assertPdfLacks(text, LINE_BETA, label);
@@ -1670,12 +1761,14 @@ class QuoteInvoiceConversionSnapshotTest {
     }
 
     /**
-     * Path B (a D.1 invoice, no quote at all): terms_source LIVE and terms_html = the production
-     * sanitizer's output for the business's CURRENT per-type terms (terms_soft for SOFT, terms_hard for
-     * HARD); the PDF renders the same; with the tenant terms cleared, terms_html is a present JSON null.
+     * Path B (a D.1 invoice, no quote at all): D.1 FREEZES the production sanitizer's output for the
+     * business's per-type terms at that moment (terms_soft for SOFT, terms_hard for HARD) into the row's
+     * terms_snapshot (16G PR 2, #125); D.1 and D.3 report terms_source BUSINESS with terms_html = that
+     * frozen value, and the PDF renders the same. After the business CLEARS its terms, D.3 still returns
+     * the frozen terms (never a null, never a re-read) and the row keeps them.
      */
     @Test
-    void pathB_d1Invoice_termsSourceLive_termsHtmlIsTheSanitizedLivePerTypeTerms_softAndHard_nullWhenCleared()
+    void pathB_d1Invoice_termsSourceBusiness_termsHtmlIsTheFrozenSanitizedPerTypeTerms_softAndHard_keptWhenCleared()
             throws Exception {
         setTenantTerms(RAW_LIVE_SOFT_TERMS, RAW_LIVE_HARD_TERMS);
         String expectedSoft = termsSanitizer.sanitize(RAW_LIVE_SOFT_TERMS);
@@ -1689,43 +1782,64 @@ class QuoteInvoiceConversionSnapshotTest {
         long softOrder = invoiceReadyOrder(SOFT);
         long hardOrder = invoiceReadyOrder(HARD);
 
-        assertInvoiceDetail(createInvoice(softOrder), 1, "LIVE", expectedSoft, "SOFT D.1");
-        assertInvoiceDetail(createInvoice(hardOrder), 1, "LIVE", expectedHard, "HARD D.1");
-        assertInvoiceDetail(getCurrentInvoice(softOrder), 1, "LIVE", expectedSoft, "SOFT D.3");
-        assertInvoiceDetail(getCurrentInvoice(hardOrder), 1, "LIVE", expectedHard, "HARD D.3");
+        assertInvoiceDetail(createInvoice(softOrder), 1, "BUSINESS", expectedSoft, "SOFT D.1");
+        assertInvoiceDetail(createInvoice(hardOrder), 1, "BUSINESS", expectedHard, "HARD D.1");
+        assertInvoiceDetail(getCurrentInvoice(softOrder), 1, "BUSINESS", expectedSoft, "SOFT D.3");
+        assertInvoiceDetail(getCurrentInvoice(hardOrder), 1, "BUSINESS", expectedHard, "HARD D.3");
         for (long orderId : new long[] {softOrder, hardOrder}) {
             Map<String, Object> row = invoiceRow(orderId, 1);
             Assertions.assertNull(row.get("source_quote_version_id"), "D.1 writes no quote source");
-            Assertions.assertNull(row.get("terms_snapshot"), "D.1 writes no frozen terms");
+            Assertions.assertEquals(orderId == softOrder ? expectedSoft : expectedHard, row.get("terms_snapshot"),
+                    "D.1 freezes the sanitised per-type business terms into terms_snapshot");
         }
         assertPdfTerms(invoicePdfFromDisk(softOrder, 1), LIVE_SOFT_TERMS_TEXT, "SOFT D.1 PDF", LIVE_HARD_TERMS_TEXT);
         assertPdfTerms(invoicePdfFromDisk(hardOrder, 1), LIVE_HARD_TERMS_TEXT, "HARD D.1 PDF", LIVE_SOFT_TERMS_TEXT);
 
-        // LIVE follows the business's CURRENT terms: cleared -> a present JSON null.
+        // BUSINESS terms were frozen at D.1: clearing the business's terms changes nothing on the version.
         clearTenantTerms();
-        assertInvoiceDetail(getCurrentInvoice(softOrder), 1, "LIVE", null, "SOFT D.3 after clearing terms");
-        assertInvoiceDetail(getCurrentInvoice(hardOrder), 1, "LIVE", null, "HARD D.3 after clearing terms");
+        assertInvoiceDetail(getCurrentInvoice(softOrder), 1, "BUSINESS", expectedSoft, "SOFT D.3 after clearing terms");
+        assertInvoiceDetail(getCurrentInvoice(hardOrder), 1, "BUSINESS", expectedHard, "HARD D.3 after clearing terms");
+        for (long orderId : new long[] {softOrder, hardOrder}) {
+            Assertions.assertEquals(orderId == softOrder ? expectedSoft : expectedHard,
+                    invoiceRow(orderId, 1).get("terms_snapshot"),
+                    "the row keeps its frozen terms after the business clears its terms");
+        }
     }
 
     /**
-     * terms_html and terms_source are present (exact InvoiceDetail key set) on EVERY InvoiceDetail
-     * response: D.1 create, D.2 rewrite, D.3 GET current, D.8 accept, D.9 resend (all LIVE), and Path A
-     * (QUOTE, after a quote signed strictly later than the in-app invoice signature). Editing the live
-     * terms after the quote signature never changes the Path A terms.
+     * terms_html, terms_source and the three frozen Invoice To keys are present (exact InvoiceDetail key
+     * set) on EVERY InvoiceDetail response: D.1 create, D.2 rewrite, D.3 GET current, D.8 accept, D.9
+     * resend (all BUSINESS, with terms_html = the version's stored terms_snapshot: frozen by D.1 / D.2,
+     * copied by D.8; 16G PR 2, #125), and Path A (QUOTE, after a quote signed strictly later than the
+     * in-app invoice signature). Editing the live terms after the quote signature never changes the
+     * Path A terms.
      */
     @Test
     void everyInvoiceDetailResponse_carriesTermsHtmlAndTermsSource_d1_d2_d3_d8_d9_andPathA() throws Exception {
         setTenantTerms(KEYS_TERMS_HTML, KEYS_TERMS_HTML);
-        String live = termsSanitizer.sanitize(KEYS_TERMS_HTML);
-        Assertions.assertNotNull(live);
+        String businessTerms = termsSanitizer.sanitize(KEYS_TERMS_HTML);
+        Assertions.assertNotNull(businessTerms);
         long orderId = invoiceReadyOrder(SOFT);
 
-        assertInvoiceDetail(createInvoice(orderId), 1, "LIVE", live, "D.1 create");
-        assertInvoiceDetail(rewriteInvoice(orderId), 2, "LIVE", live, "D.2 rewrite");
-        assertInvoiceDetail(getCurrentInvoice(orderId), 2, "LIVE", live, "D.3 get current");
-        JsonNode accepted = assertInvoiceDetail(acceptInvoiceInApp(orderId), 3, "LIVE", live, "D.8 accept");
+        Map<String, JsonNode> responses = new LinkedHashMap<>();
+        responses.put("D.1 create",
+                assertInvoiceDetail(createInvoice(orderId), 1, "BUSINESS", businessTerms, "D.1 create"));
+        responses.put("D.2 rewrite",
+                assertInvoiceDetail(rewriteInvoice(orderId), 2, "BUSINESS", businessTerms, "D.2 rewrite"));
+        responses.put("D.3 get current",
+                assertInvoiceDetail(getCurrentInvoice(orderId), 2, "BUSINESS", businessTerms, "D.3 get current"));
+        JsonNode accepted = assertInvoiceDetail(acceptInvoiceInApp(orderId), 3, "BUSINESS", businessTerms, "D.8 accept");
         Assertions.assertTrue(accepted.get("accepted_signature_present").booleanValue());
-        assertInvoiceDetail(resendInvoice(orderId), 3, "LIVE", live, "D.9 resend");
+        responses.put("D.8 accept", accepted);
+        responses.put("D.9 resend",
+                assertInvoiceDetail(resendInvoice(orderId), 3, "BUSINESS", businessTerms, "D.9 resend"));
+        // The Path B terms_html above is each version's STORED terms: Create / Rewrite froze them, D.8 copied them.
+        for (int version = 1; version <= 3; version++) {
+            Map<String, Object> row = invoiceRow(orderId, version);
+            Assertions.assertNull(row.get("source_quote_version_id"), "Path B v" + version + " has no quote source");
+            Assertions.assertEquals(businessTerms, row.get("terms_snapshot"),
+                    "Path B v" + version + " stores the frozen business terms");
+        }
 
         // A quote signed AFTER the in-app invoice signature (strictly newer) -> Path A appends v4.
         saveDistinctiveItemisedDraft(orderId);
@@ -1735,12 +1849,25 @@ class QuoteInvoiceConversionSnapshotTest {
                         .isAfter(asLocalDateTime(invoiceRow(orderId, 3).get("accepted_at"))),
                 "precondition: the quote signature is strictly newer than the invoice signature");
         String frozen = (String) quote.get("terms_snapshot");
-        Assertions.assertEquals(live, frozen, "precondition: the quote froze the then-live terms");
+        Assertions.assertEquals(businessTerms, frozen, "precondition: the quote froze the then-live terms");
+        Assertions.assertEquals(SNAPSHOT_NAME, quote.get("customer_name_snapshot"), "precondition: V17 name");
+        Assertions.assertEquals(ORIGINAL_BILLING_LINE1, quote.get("customer_address_line1_snapshot"),
+                "precondition: V17 billing line 1");
+        Assertions.assertEquals(BILLING_LINE2, quote.get("customer_address_line2_snapshot"),
+                "precondition: V17 billing line 2");
         setTenantTerms(KEYS_EDITED_TERMS_HTML, KEYS_EDITED_TERMS_HTML);   // live terms move on
 
-        assertInvoiceDetail(createInvoiceFromQuote(orderId), 4, "QUOTE", frozen, "Path A");
-        assertInvoiceDetail(getCurrentInvoice(orderId), 4, "QUOTE", frozen, "D.3 after Path A");
+        responses.put("Path A", assertInvoiceDetail(createInvoiceFromQuote(orderId), 4, "QUOTE", frozen, "Path A"));
+        responses.put("D.3 after Path A",
+                assertInvoiceDetail(getCurrentInvoice(orderId), 4, "QUOTE", frozen, "D.3 after Path A"));
         assertPdfTerms(invoicePdfFromDisk(orderId, 4), KEYS_TERMS_TEXT, "Path A PDF", KEYS_EDITED_TERMS_TEXT);
+
+        // The three frozen Invoice To keys are present on every response: the saved customer and BILLING
+        // address frozen by D.1 / D.2 (and copied by D.8), and the quote's V17 snapshot on Path A.
+        for (Map.Entry<String, JsonNode> response : responses.entrySet()) {
+            assertInvoiceToWords(response.getValue(), SNAPSHOT_NAME, ORIGINAL_BILLING_LINE1, BILLING_LINE2,
+                    response.getKey());
+        }
     }
 
     /** Populated frozen terms survive a payment and its void, after the live terms are edited. */
@@ -1783,30 +1910,41 @@ class QuoteInvoiceConversionSnapshotTest {
 
         // Payment -> v2: carries the source + frozen terms; never the edited live terms.
         MvcResult payment = recordCashPayment(orderId, "50.00");
-        assertSummaryHasNoTermsKeys(payment, label + " payment");
+        assertSummaryHasNoTermsOrInvoiceToKeys(payment, label + " payment");
         assertInvoiceDetail(getCurrentInvoice(orderId), 2, "QUOTE", frozen, label + " D.3 after payment");
         assertCarriedQuoteSource(orderId, 2, quoteVersionId, frozen, label + " payment version");
         assertPdfTerms(invoicePdfFromDisk(orderId, 2), termsAtIssueText, label + " payment PDF", EDITED_TERMS_TEXT);
 
         // Void -> v3: the same.
         MvcResult voided = voidPayment(orderId, latestPaymentId(orderId));
-        assertSummaryHasNoTermsKeys(voided, label + " void");
+        assertSummaryHasNoTermsOrInvoiceToKeys(voided, label + " void");
         assertInvoiceDetail(getCurrentInvoice(orderId), 3, "QUOTE", frozen, label + " D.3 after void");
         assertCarriedQuoteSource(orderId, 3, quoteVersionId, frozen, label + " void version");
         assertPdfTerms(invoicePdfFromDisk(orderId, 3), termsAtIssueText, label + " void PDF", EDITED_TERMS_TEXT);
     }
 
-    /** Payment / void responses use CurrentInvoiceSummaryDto, which is unchanged: no terms keys. */
-    private static void assertSummaryHasNoTermsKeys(MvcResult result, String label) throws IOException {
+    /**
+     * Payment / void responses use CurrentInvoiceSummaryDto, which is unchanged: no terms keys and (16G
+     * PR 2) none of the three frozen Invoice To keys, which are InvoiceDetail-only.
+     */
+    private static void assertSummaryHasNoTermsOrInvoiceToKeys(MvcResult result, String label) throws IOException {
         String responseBody = body(result);
         JsonNode summary = JSON.readTree(responseBody).path("data").path("current_invoice");
         Assertions.assertTrue(summary.isObject(), () -> label + ": data.current_invoice must be an object: " + responseBody);
         Assertions.assertFalse(summary.has("terms_html"), () -> label + ": CurrentInvoiceSummary has no terms_html");
         Assertions.assertFalse(summary.has("terms_source"), () -> label + ": CurrentInvoiceSummary has no terms_source");
         Assertions.assertFalse(responseBody.contains("terms_"), () -> label + ": no terms key anywhere: " + responseBody);
+        for (String key : List.of("customer_name_snapshot", "customer_address_line1_snapshot",
+                "customer_address_line2_snapshot")) {
+            Assertions.assertFalse(responseBody.contains(key),
+                    () -> label + ": no '" + key + "' key anywhere: " + responseBody);
+        }
     }
 
-    /** A payment / void version carries BOTH V19 columns and the acceptance verbatim from Path A. */
+    /**
+     * A payment / void version carries BOTH V19 columns, the three V20 Invoice To words (16G PR 2) and
+     * the acceptance verbatim from Path A.
+     */
     private void assertCarriedQuoteSource(long orderId, int versionNumber, long quoteVersionId, String frozen,
                                           String label) {
         Map<String, Object> pathA = invoiceRow(orderId, 1);
@@ -1814,6 +1952,10 @@ class QuoteInvoiceConversionSnapshotTest {
         Assertions.assertEquals(quoteVersionId, asLong(row.get("source_quote_version_id")),
                 label + ": source_quote_version_id carried");
         Assertions.assertEquals(frozen, row.get("terms_snapshot"), label + ": terms_snapshot carried verbatim");
+        for (String word : List.of("customer_name_snapshot", "customer_address_line1_snapshot",
+                "customer_address_line2_snapshot")) {
+            Assertions.assertEquals(pathA.get(word), row.get(word), label + ": " + word + " copied verbatim");
+        }
         Assertions.assertEquals(pathA.get("accepted_at"), row.get("accepted_at"), label + ": accepted_at carried");
         Assertions.assertEquals(pathA.get("accepted_customer_name"), row.get("accepted_customer_name"));
         Assertions.assertEquals(pathA.get("accepted_signature_file_id"), row.get("accepted_signature_file_id"));
@@ -1866,7 +2008,7 @@ class QuoteInvoiceConversionSnapshotTest {
         setTenantTerms(FALLBACK_EDITED_TERMS_HTML, FALLBACK_EDITED_TERMS_HTML);
 
         // ---- Payment -> v2: row and D.3 byte for byte; the new PDF renders the frozen terms ----
-        assertSummaryHasNoTermsKeys(recordCashPayment(orderId, "50.00"), "payment");
+        assertSummaryHasNoTermsOrInvoiceToKeys(recordCashPayment(orderId, "50.00"), "payment");
         Assertions.assertEquals(2, invoiceCount(orderId));
         Assertions.assertEquals(frozen, invoiceRow(orderId, 2).get("terms_snapshot"),
                 "payment row terms_snapshot byte for byte");
@@ -1876,7 +2018,7 @@ class QuoteInvoiceConversionSnapshotTest {
         assertPdfTerms(paymentPdf, UNSANITISED_FROZEN_TERMS_TEXT, "payment PDF", liveTexts);
 
         // ---- Void -> v3: the same ----
-        assertSummaryHasNoTermsKeys(voidPayment(orderId, latestPaymentId(orderId)), "void");
+        assertSummaryHasNoTermsOrInvoiceToKeys(voidPayment(orderId, latestPaymentId(orderId)), "void");
         Assertions.assertEquals(3, invoiceCount(orderId));
         Assertions.assertEquals(frozen, invoiceRow(orderId, 3).get("terms_snapshot"),
                 "void row terms_snapshot byte for byte");
@@ -1891,30 +2033,37 @@ class QuoteInvoiceConversionSnapshotTest {
     }
 
     /**
-     * Path B is unchanged: a D.1 invoice PDF shows the live terms; after the live terms are edited, a
-     * payment's new version renders the NEW live terms and D.3 returns them sanitised with source LIVE.
-     * The older stored PDF never changes.
+     * Path B freezes its terms (16G PR 2, #125): a D.1 invoice freezes the business's terms and its PDF
+     * shows them; after the business edits its terms, a payment's new version RETAINS the D.1 frozen
+     * terms - its row (terms_snapshot copied verbatim), its new PDF and D.3 (terms_html, source BUSINESS)
+     * - and never shows the edited terms. The older stored PDF stays byte for byte unchanged.
      */
     @Test
-    void pathB_paymentAfterLiveTermsEdit_newVersionPdfAndApiFollowTheNewLiveTerms_olderStoredPdfUnchanged()
+    void pathB_paymentAfterBusinessTermsEdit_newVersionKeepsTheFrozenTermsInRowPdfAndApi_olderStoredPdfUnchanged()
             throws Exception {
         setTenantTerms(PATH_B_TERMS_HTML, PATH_B_TERMS_HTML);
+        String frozen = termsSanitizer.sanitize(PATH_B_TERMS_HTML);
+        Assertions.assertNotNull(frozen);
         long orderId = invoiceReadyOrder(SOFT);
-        assertInvoiceDetail(createInvoice(orderId), 1, "LIVE", termsSanitizer.sanitize(PATH_B_TERMS_HTML), "D.1");
+        assertInvoiceDetail(createInvoice(orderId), 1, "BUSINESS", frozen, "D.1");
         byte[] v1Pdf = invoicePdfFromDisk(orderId, 1);
         assertPdfTerms(v1Pdf, PATH_B_TERMS_TEXT, "D.1 PDF", PATH_B_EDITED_TERMS_TEXT);
 
+        // The business edits its terms AFTER the D.1 freeze.
         setTenantTerms(PATH_B_EDITED_TERMS_HTML, PATH_B_EDITED_TERMS_HTML);
-        String editedLive = termsSanitizer.sanitize(PATH_B_EDITED_TERMS_HTML);
+        Assertions.assertNotEquals(frozen, termsSanitizer.sanitize(PATH_B_EDITED_TERMS_HTML),
+                "precondition: a re-read of the edited business terms would be visible");
 
-        assertSummaryHasNoTermsKeys(recordCashPayment(orderId, "50.00"), "Path B payment");
-        assertPdfTerms(invoicePdfFromDisk(orderId, 2), PATH_B_EDITED_TERMS_TEXT, "Path B payment PDF",
-                PATH_B_TERMS_TEXT);
-        assertInvoiceDetail(getCurrentInvoice(orderId), 2, "LIVE", editedLive, "Path B D.3 after payment");
+        assertSummaryHasNoTermsOrInvoiceToKeys(recordCashPayment(orderId, "50.00"), "Path B payment");
+        Assertions.assertEquals(2, invoiceCount(orderId), "the payment appended exactly one version");
+        assertPdfTerms(invoicePdfFromDisk(orderId, 2), PATH_B_TERMS_TEXT, "Path B payment PDF",
+                PATH_B_EDITED_TERMS_TEXT);
+        assertInvoiceDetail(getCurrentInvoice(orderId), 2, "BUSINESS", frozen, "Path B D.3 after payment");
         for (int version = 1; version <= 2; version++) {
             Map<String, Object> row = invoiceRow(orderId, version);
             Assertions.assertNull(row.get("source_quote_version_id"), "Path B v" + version + " has no quote source");
-            Assertions.assertNull(row.get("terms_snapshot"), "Path B v" + version + " has no frozen terms");
+            Assertions.assertEquals(frozen, row.get("terms_snapshot"),
+                    "Path B v" + version + " stores the D.1 frozen terms, never the edited business terms");
         }
         Assertions.assertArrayEquals(v1Pdf, invoicePdfFromDisk(orderId, 1), "an older stored PDF never auto-updates");
     }

@@ -28,6 +28,12 @@ import type { ApiSuccess } from './types'
 // are internal/plumbing and must NOT be rendered in the UI. due_date is nullable (always
 // serialized, never omitted).
 //
+// Phase 16G PR 2 (#125) frozen identity fields, ALWAYS present (nullable, serialized as null):
+// customer_name_snapshot, customer_address_line1_snapshot and customer_address_line2_snapshot are
+// the Invoice To name and billing lines stored on this version (frozen at Create / Rewrite, copied
+// from the accepted quote by Path A, carried by payment, void and accept). The Invoice tab builds
+// Invoice To from these alone, never from the live customer or billing address; a null is not shown.
+//
 // Phase 13 acceptance/email fields are ALWAYS present (nullable values serialized as null):
 // an unaccepted invoice has accepted_at / accepted_customer_name /
 // accepted_signature_download_path / last_emailed_at all null and accepted_signature_present
@@ -36,15 +42,15 @@ import type { ApiSuccess } from './types'
 // delivery marker: null = this invoice version has never been emailed (including when an
 // Accept's auto-email failed — Re-send retries it).
 //
-// Phase 16F PR2 (decision D7) terms fields, ALWAYS present on every InvoiceDetail response:
-// terms_source is QUOTE for an invoice created from an accepted quote (Path A, and the payment,
-// void and in-app accept versions carried from it) and LIVE otherwise (Create / Rewrite).
-// terms_html is selected by the same rule the invoice PDF renderer uses: with QUOTE it is the
-// frozen quote terms snapshot verbatim, and null means frozen "no terms" (never a fall-back to
-// live terms); with LIVE it is the business's CURRENT per-flooring-type terms at read time (null
-// when none are set), which may differ from the terms inside an already-stored PDF. The Invoice
-// tab renders terms from these fields only.
-export type InvoiceTermsSource = 'QUOTE' | 'LIVE'
+// Phase 16F PR2 (decision D7) terms fields, ALWAYS present on every InvoiceDetail response. Since
+// 16G PR 2 (#125) terms_html is the version's own stored terms, verbatim, the same terms its PDF
+// renders: null means no terms, never a fall-back to the business's current terms. terms_source
+// only reports where those stored terms came from: QUOTE for an invoice created from an accepted
+// quote (Path A, and the payment, void and in-app accept versions carried from it - the signed
+// quote's frozen terms), BUSINESS otherwise (the business's terms, frozen when the invoice was
+// created or rewritten, and carried). Neither value means a live lookup. The Invoice tab renders
+// terms from these fields only.
+export type InvoiceTermsSource = 'QUOTE' | 'BUSINESS'
 
 export type InvoiceDetail = {
   invoice_id: number
@@ -60,6 +66,9 @@ export type InvoiceDetail = {
   created_by_user_id: number
   created_at: string
   pdf_download_path: string
+  customer_name_snapshot: string | null
+  customer_address_line1_snapshot: string | null
+  customer_address_line2_snapshot: string | null
   accepted_at: string | null
   accepted_customer_name: string | null
   accepted_signature_present: boolean

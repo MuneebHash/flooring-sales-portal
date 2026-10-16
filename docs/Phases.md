@@ -233,21 +233,23 @@ Lead Enquiry:    order_enquiry (V15), one row per order, UNIQUE(order_id); order
 **Migration rules**
 
 ```text
-Current migrations are V1 to V19. Never edit any committed migration; any schema change is a NEW migration.
+Current migrations are V1 to V20. Never edit any committed migration; any schema change is a NEW migration.
   V1–V7 base · V8 LM/SQM factor · V9 negative-price constraint · V10 invoice accept/signature/email
   V11 reserved slug words · V12 per-tenant branding/invoice-legal/quick-add · V13 per-type terms
   V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
   V16 quote tables · V17 quote_version customer name/billing snapshots · V18 reserved slug 'q'
   V19 accepted-name columns widened to TEXT + invoice.source_quote_version_id / terms_snapshot
+  V20 (16G PR 2, #125) invoice frozen identity columns (customer_name_snapshot,
+      customer_address_line1_snapshot, customer_address_line2_snapshot) + backfill
 Phase 16A added NO migration (invoice tab + PDF logo path + Aire Compact PDF were app/template only).
-Phase 16 quote migrations are V16 (16C), V17 and V18 (16E-C), and V19 (16F PR1).
-16G plans exactly two more migrations, numbered when they are written (the next free numbers after
-  V19): PR 2 (invoice frozen identity columns + backfill, #125) and PR 4 (invoice_token table +
-  chk_business_slug_reserved replaced with the 16 V18 words plus 'i'). V1 to V19 are unchanged.
-CI "Locked migration protection" guards V1–V13 only (.github/workflows/ci.yml). V14 to V19 are on main
+Phase 16 quote migrations are V16 (16C), V17 and V18 (16E-C), and V19 (16F PR1); 16G PR 2 added V20.
+16G plans exactly one more migration, numbered when it is written (the next free number after
+  V20): PR 4 (invoice_token table + chk_business_slug_reserved replaced with the 16 V18 words plus
+  'i'). V1 to V19 were unchanged by V20.
+CI "Locked migration protection" guards V1–V13 only (.github/workflows/ci.yml). V14 to V20 are on main
   but OUTSIDE the guard; they are still never edited — the rule applies regardless of guard
   coverage. Do not casually expand or rewrite the guard: the Phase 17 squash/baseline folds
-  V1 to V19 (and the two 16G migrations once merged) into one baseline and re-locks CI. Verify the
+  V1 to V20 (and the PR 4 migration once merged) into one baseline and re-locks CI. Verify the
   live CI guard range if it matters.
 Schema = Flyway migration. Demo/dev data = db/dev-seed (manual, idempotent, never auto-runs).
   New tests must self-seed and must NOT depend on the V4 legacy seed.
@@ -308,17 +310,16 @@ Settled decisions — do **not** re-litigate or "fix" these; they are deliberate
 
 ```text
 - Terms product rule (do not re-raise): changing business terms requires a NEW invoice +
-  re-sign. Implementation today (16F, D7): a Path A invoice (terms_source QUOTE) renders the frozen
-  quote terms_snapshot verbatim (null = no terms page, even when live terms exist). A Path B
-  invoice (Create / Rewrite, terms_source LIVE) renders the business's current per-flooring-type
-  terms on every render: its payment and void versions re-render live terms, also after
-  acceptance, and its InvoiceDetail terms_html is live. Payment, void and D.8 carry the current
-  invoice's source + snapshot forward.
-  16G PR 2 (#125, decided in 16G; planned): every invoice version freezes its words. Create and
-  Rewrite freeze the live Invoice To name, billing lines and sanitised per-type terms; payment,
-  void, D.8 and remote signing copy the previous version's words verbatim (null terms kept);
-  Path A copies its quote's V17 identity and frozen terms. Every version renders its stored words;
-  null terms = no terms page, no live fallback. terms_source LIVE becomes BUSINESS (16G contract §4).
+  re-sign. Implementation today (16G PR 2, #125): every invoice version freezes its words (V20
+  identity columns + the V19 terms_snapshot). Create and Rewrite freeze the saved Invoice To name,
+  billing lines and sanitised per-type terms; payment, void and D.8 (and remote signing from PR 4)
+  copy the previous version's words verbatim (null terms kept); Path A copies its quote's V17
+  identity and frozen terms. Every version renders its stored words; null terms = no terms page,
+  no live fallback, and no Path B live render remains. terms_source is QUOTE or BUSINESS (BUSINESS
+  replaced the 16F LIVE; 16G contract §4). Pre-PR-2 Path B versions keep a null terms_snapshot (no
+  terms backfill): their InvoiceDetail and every later payment, void or D.8 version show no terms
+  (their own stored PDF keeps its terms page) until a Rewrite (refused when LAID; clears a
+  signature) or Path A writes a version with frozen terms.
 - Rewrite-after-accept CLEARS acceptance/signature by design — a rewrite is a new
   customer-facing invoice that requires fresh acceptance.
 - Payment AND payment-void carry acceptance/signature forward (no re-sign) and send NO email.
@@ -445,7 +446,7 @@ The 16F read-only verify gate ran on 1 October 2026, and its decisions (D1 to D1
 - both public pages show the specific dead-link reason ([#126](https://github.com/MuneebHash/flooring-sales-portal/issues/126), in 16G);
 - send link and remote signing are allowed when LAID; no CANCELLED rule.
 
-The six 16G PRs (in order; two new migrations, in PR 2 and PR 4, numbered when written):
+The six 16G PRs (in order; two new migrations: V20 in PR 2, and one in PR 4, numbered when written):
 
 | PR | Scope |
 |---|---|
@@ -494,7 +495,7 @@ Batch A or Batch B, placement undecided: [#135](https://github.com/MuneebHash/fl
 
 ```text
 - Schema-only migration squash/baseline (deferred from 14D): collapse all committed pre-production
-  migrations into one clean baseline — V1 to V19 plus any later pre-production migrations — before
+  migrations into one clean baseline — V1 to V20 plus any later pre-production migrations — before
   any real store's data exists; re-lock the new baseline in CI.
 - Automatic deployment on merge to main.
 - A private sample-data test environment before commercial launch.

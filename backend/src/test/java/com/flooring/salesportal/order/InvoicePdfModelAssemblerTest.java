@@ -18,10 +18,10 @@ import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Optional;
-import java.util.function.Supplier;
 import javax.imageio.ImageIO;
 
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -36,8 +36,13 @@ import static org.mockito.Mockito.when;
 /**
  * Phase 15C — unit tests for {@link InvoicePdfModelAssembler}: the single enrichment path all three
  * invoice-PDF build sites (Create/Rewrite, Accept, Payment) route through. Proves tenant config / store
- * / salesperson / logo / per-type terms are wired in, that lookups are tenant-scoped (business id), and
- * that every missing/unsafe input fails soft instead of throwing.
+ * / salesperson / logo are wired in, that lookups are tenant-scoped (business id), and that every
+ * missing/unsafe input fails soft instead of throwing.
+ *
+ * <p>Phase 16G PR 2 (#125): the Invoice To name, billing lines and terms are the version's stored words,
+ * passed in through {@link Inputs} and rendered verbatim - for both terms sources, including null.
+ * {@link InvoicePdfModelAssembler#assemble} never reads the business's per-type terms; only the
+ * freeze-time reader {@link InvoicePdfModelAssembler#businessTermsHtml} (Create / Rewrite) does.
  */
 class InvoicePdfModelAssemblerTest {
 
@@ -111,15 +116,22 @@ class InvoicePdfModelAssemblerTest {
         return v;
     }
 
+    /**
+     * The terms STORED on the version under render (a BUSINESS row: frozen at Create / Rewrite). Distinct
+     * from every config value below, so a model holding it proves the stored words - not the business's
+     * current terms - reached the PDF.
+     */
+    private static final String STORED_BUSINESS_TERMS = "<p>Stored business terms frozen on this version.</p>";
+
     private Inputs inputs(SalesOrder order) {
-        return inputs(business(null), order, InvoiceTermsSelection.live());
+        return inputs(business(null), order, InvoiceTermsSelection.forInvoice(null, STORED_BUSINESS_TERMS));
     }
 
     private Inputs inputs(Business business, SalesOrder order) {
-        return inputs(business, order, InvoiceTermsSelection.live());
+        return inputs(business, order, InvoiceTermsSelection.forInvoice(null, STORED_BUSINESS_TERMS));
     }
 
-    // Phase 16F PR2: every build site passes an explicit terms source (Path B tests above use LIVE).
+    // Every build site passes an explicit terms selection: the source and terms of the row it writes.
     private Inputs inputs(Business business, SalesOrder order, InvoiceTermsSelection terms) {
         return new Inputs(
                 business, order, 1,
@@ -156,9 +168,8 @@ class InvoicePdfModelAssemblerTest {
         Assertions.assertEquals("12345678", m.accountNumber());
         Assertions.assertNotNull(m.logoDataUri());
         Assertions.assertTrue(m.logoDataUri().startsWith("data:image/png;base64,"), m.logoDataUri());
-        Assertions.assertNotNull(m.termsHtml());
-        Assertions.assertTrue(m.termsHtml().contains("Soft flooring terms."), m.termsHtml());
-        Assertions.assertFalse(m.termsHtml().contains("Hard flooring terms."), "must not include hard terms");
+        // 16G PR 2: the version's stored terms, verbatim - never the config's current soft or hard terms.
+        Assertions.assertEquals(STORED_BUSINESS_TERMS, m.termsHtml());
         Assertions.assertFalse(m.termsOnSeparatePage(),
                 "SOFT keeps termsOnSeparatePage false (unread by the template; terms still get a dedicated page)");
 
@@ -169,7 +180,9 @@ class InvoicePdfModelAssemblerTest {
     }
 
     @Test
-    void hardOrderSelectsHardTermsOnSeparatePage() {
+    void hardOrderRendersTheStoredTermsOnSeparatePage_notTheConfigsHardTerms() {
+        // Per-type SOFT / HARD selection now happens once, when Create / Rewrite freeze the terms
+        // (businessTermsHtml, below); the render takes the stored value whatever the type.
         BusinessInvoiceConfigView cfg = config("<p>Soft flooring terms.</p>", "<p>Hard flooring terms.</p>");
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(cfg));
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
@@ -178,9 +191,8 @@ class InvoicePdfModelAssemblerTest {
         InvoicePdfModel m = assembler.assemble(inputs(order("HARD")));
 
         Assertions.assertEquals("Hard Flooring", m.flooringTypeLabel());
-        Assertions.assertNotNull(m.termsHtml());
-        Assertions.assertTrue(m.termsHtml().contains("Hard flooring terms."), m.termsHtml());
-        Assertions.assertFalse(m.termsHtml().contains("Soft flooring terms."), "must not include soft terms");
+        Assertions.assertEquals(STORED_BUSINESS_TERMS, m.termsHtml(),
+                "a HARD version renders its stored terms, never the business's current hard terms");
         Assertions.assertTrue(m.termsOnSeparatePage(), "HARD terms render on a dedicated page");
     }
 
@@ -194,7 +206,8 @@ class InvoicePdfModelAssemblerTest {
 
         Assertions.assertNull(m.abn());
         Assertions.assertNull(m.bankName());
-        Assertions.assertNull(m.termsHtml());
+        // 16G PR 2: the stored terms do not depend on the config row - they still render.
+        Assertions.assertEquals(STORED_BUSINESS_TERMS, m.termsHtml());
         // Store + salesperson still resolved.
         Assertions.assertEquals("Sydney CBD", m.storeName());
         Assertions.assertEquals("Liam Carter", m.salespersonName());
@@ -323,14 +336,17 @@ class InvoicePdfModelAssemblerTest {
     }
 
     @Test
-    void blankTermsYieldNullTerms() {
+    void blankConfigTerms_neverChangeTheStoredTerms_eitherWay() {
+        // The business's current terms are blank / unset: a version that stored terms still renders them,
+        // and a version that stored null still renders none (blank -> null applies only at the freeze).
         BusinessInvoiceConfigView cfg = config("   ", null);
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(cfg));
         when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
         when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
 
-        InvoicePdfModel m = assembler.assemble(inputs(order("SOFT")));
-        Assertions.assertNull(m.termsHtml());
+        Assertions.assertEquals(STORED_BUSINESS_TERMS, assembler.assemble(inputs(order("SOFT"))).termsHtml());
+        Assertions.assertNull(assembler.assemble(inputs(business(null), order("SOFT"),
+                InvoiceTermsSelection.forInvoice(null, null))).termsHtml());
     }
 
     @Test
@@ -350,21 +366,49 @@ class InvoicePdfModelAssemblerTest {
         Assertions.assertEquals(new BigDecimal("500.00"), m.totalPaid());
         Assertions.assertEquals(new BigDecimal("424.00"), m.balanceDue());
         Assertions.assertEquals(1, m.versionNumber());
+        Assertions.assertEquals(STORED_BUSINESS_TERMS, m.termsHtml());
+    }
+
+    @Test
+    void nullIdentityWords_reachTheModelAsNull_neverFilledFromAnywhere() {
+        // Characterisation of the unchanged pass-through (16G PR 2 relies on it): a version whose stored
+        // Invoice To name or billing lines are null reaches the model as null; the assembler has no live
+        // customer or address to fill them from. The end-to-end proof that a stored null renders as an
+        // empty Invoice To block is in InvoiceFrozenWordsTest and QuoteInvoiceFrozenWordsTest.
+        when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
+        when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
+
+        InvoicePdfModel m = assembler.assemble(new Inputs(
+                business(null), order("SOFT"), 3,
+                LocalDate.of(2026, 4, 14), LocalDate.of(2026, 4, 29),
+                null, null, null,
+                "Supply and install plush carpet.",
+                new BigDecimal("924.00"), new BigDecimal("500.00"), new BigDecimal("424.00"),
+                null, null, null,
+                InvoiceTermsSelection.forInvoice(null, null)));
+
+        Assertions.assertNull(m.customerName());
+        Assertions.assertNull(m.billingLine1());
+        Assertions.assertNull(m.billingLine2());
+        Assertions.assertNull(m.termsHtml());
     }
 
     // ------------------------------------------------------------------
-    // Phase 16F PR2 (decision D7) - the explicit terms source (QUOTE = frozen verbatim, LIVE = sanitised)
+    // Phase 16G PR 2 (#125) - stored terms render verbatim for BOTH sources (QUOTE and BUSINESS); the
+    // render never reads the business's current terms. Sanitising happens once, at the freeze.
     // ------------------------------------------------------------------
 
-    // Frozen quote terms holding markup the sanitizer WOULD strip (an id and a style attribute) plus
-    // surrounding whitespace: a QUOTE selection must hand them to the model verbatim (no re-sanitise,
-    // no trim), which is only provable with input the sanitizer would change.
+    // Frozen terms holding markup the sanitizer WOULD strip (an id and a style attribute) plus
+    // surrounding whitespace: a selection must hand them to the model verbatim (no re-sanitise, no
+    // trim), which is only provable with input the sanitizer would change.
     private static final String FROZEN_QUOTE_TERMS =
             "  <p id=\"frozen\" style=\"color:red\">Frozen quote terms.</p>\n";
     private static final String LIVE_SOFT_TERMS = "<p>Live soft terms.</p>";
     private static final String LIVE_HARD_TERMS = "<p>Live hard terms.</p>";
+    private static final Long SOURCE_QUOTE_VERSION_ID = 77L;
 
-    /** Config with DIFFERENT live terms + a store + a salesperson, so only the terms source can differ. */
+    /** Config with DIFFERENT business terms + a store + a salesperson, so only the stored terms can differ. */
     private void stubLayoutWithLiveTerms(String termsSoft, String termsHard) {
         // Build the config mock BEFORE the outer when(...): nesting its own stubbing inside thenReturn(...)
         // would leave the outer stubbing unfinished.
@@ -375,89 +419,100 @@ class InvoicePdfModelAssemblerTest {
     }
 
     @Test
-    void quoteTerms_reachTheModelVerbatim_neverResanitised_evenWhenLiveTermsDiffer() {
+    void storedTerms_reachTheModelVerbatim_neverResanitised_forBothSources_evenWhenTheBusinessTermsDiffer() {
         stubLayoutWithLiveTerms(LIVE_SOFT_TERMS, LIVE_HARD_TERMS);
         // Fixture guard: the sanitizer really would change this input, so verbatim output proves no re-sanitise.
         Assertions.assertNotEquals(FROZEN_QUOTE_TERMS, new InvoiceTermsSanitizer().sanitize(FROZEN_QUOTE_TERMS));
 
-        for (String flooringType : List.of("SOFT", "HARD")) {
-            InvoicePdfModel m = assembler.assemble(inputs(business(null), order(flooringType),
-                    InvoiceTermsSelection.frozenQuoteTerms(FROZEN_QUOTE_TERMS)));
+        for (Long sourceQuoteVersionId : Arrays.asList(SOURCE_QUOTE_VERSION_ID, null)) {
+            for (String flooringType : List.of("SOFT", "HARD")) {
+                String label = (sourceQuoteVersionId == null ? "BUSINESS " : "QUOTE ") + flooringType;
+                InvoicePdfModel m = assembler.assemble(inputs(business(null), order(flooringType),
+                        InvoiceTermsSelection.forInvoice(sourceQuoteVersionId, FROZEN_QUOTE_TERMS)));
 
-            Assertions.assertEquals(FROZEN_QUOTE_TERMS, m.termsHtml(),
-                    () -> flooringType + ": QUOTE terms must be the frozen snapshot verbatim, not the live terms");
-            // Only the terms follow the quote: the tenant config still feeds the other layout fields.
-            Assertions.assertEquals("11 222 333 444", m.abn(), flooringType);
-            Assertions.assertEquals("Example Bank", m.bankName(), flooringType);
-            Assertions.assertEquals("Sydney CBD", m.storeName(), flooringType);
+                Assertions.assertEquals(FROZEN_QUOTE_TERMS, m.termsHtml(),
+                        () -> label + ": the stored terms must render verbatim, not the business's current terms");
+                // Only the terms are frozen: the tenant config still feeds the other (live) layout fields.
+                Assertions.assertEquals("11 222 333 444", m.abn(), label);
+                Assertions.assertEquals("Example Bank", m.bankName(), label);
+                Assertions.assertEquals("Sydney CBD", m.storeName(), label);
+            }
         }
     }
 
     @Test
-    void quoteTermsNull_rendersNoTerms_forSoftAndHard_evenWhenLiveTermsExist() {
+    void storedNullTerms_renderNoTerms_forBothSourcesAndTypes_evenWhenTheBusinessHasTerms() {
         stubLayoutWithLiveTerms(LIVE_SOFT_TERMS, LIVE_HARD_TERMS);
 
-        for (String flooringType : List.of("SOFT", "HARD")) {
-            InvoicePdfModel frozenNoTerms = assembler.assemble(inputs(business(null), order(flooringType),
-                    InvoiceTermsSelection.frozenQuoteTerms(null)));
-            Assertions.assertNull(frozenNoTerms.termsHtml(),
-                    () -> flooringType + ": frozen 'no terms' must never fall back to the live terms");
-
-            // The per-row selection of a quote-sourced invoice with a null terms_snapshot is the same.
-            InvoicePdfModel viaRow = assembler.assemble(inputs(business(null), order(flooringType),
-                    InvoiceTermsSelection.forInvoice(77L, null)));
-            Assertions.assertNull(viaRow.termsHtml(), flooringType);
+        for (Long sourceQuoteVersionId : Arrays.asList(SOURCE_QUOTE_VERSION_ID, null)) {
+            for (String flooringType : List.of("SOFT", "HARD")) {
+                InvoicePdfModel noTerms = assembler.assemble(inputs(business(null), order(flooringType),
+                        InvoiceTermsSelection.forInvoice(sourceQuoteVersionId, null)));
+                Assertions.assertNull(noTerms.termsHtml(),
+                        () -> (sourceQuoteVersionId == null ? "BUSINESS " : "QUOTE ") + flooringType
+                                + ": stored null terms must never fall back to the business's current terms");
+            }
         }
     }
 
     @Test
-    void sameRawMarkup_isSanitisedWhenLive_butVerbatimWhenQuote() {
-        // The same markup as the business's live SOFT terms vs as a frozen quote snapshot.
+    void sameRawMarkup_isSanitisedOnceWhenFrozen_thenRenderedVerbatimFromTheStoredSnapshot() {
+        // The business's raw SOFT terms: businessTermsHtml (the Create / Rewrite freeze) sanitises them;
+        // a version that stored those raw bytes (a copied quote snapshot) renders them verbatim - the
+        // render never sanitises a second time.
         stubLayoutWithLiveTerms(FROZEN_QUOTE_TERMS, LIVE_HARD_TERMS);
-        String expectedLive = new InvoiceTermsSanitizer().sanitize(FROZEN_QUOTE_TERMS);
+        String expectedFrozen = new InvoiceTermsSanitizer().sanitize(FROZEN_QUOTE_TERMS);
 
-        InvoicePdfModel live = assembler.assemble(inputs(business(null), order("SOFT"), InvoiceTermsSelection.live()));
-        InvoicePdfModel quote = assembler.assemble(inputs(business(null), order("SOFT"),
-                InvoiceTermsSelection.frozenQuoteTerms(FROZEN_QUOTE_TERMS)));
+        String frozen = assembler.businessTermsHtml(BUSINESS_ID, "SOFT");
+        InvoicePdfModel fromFrozen = assembler.assemble(inputs(business(null), order("SOFT"),
+                InvoiceTermsSelection.forInvoice(null, frozen)));
+        InvoicePdfModel fromRaw = assembler.assemble(inputs(business(null), order("SOFT"),
+                InvoiceTermsSelection.forInvoice(SOURCE_QUOTE_VERSION_ID, FROZEN_QUOTE_TERMS)));
 
-        Assertions.assertEquals(expectedLive, live.termsHtml(), "LIVE terms go through the sanitizer");
-        Assertions.assertFalse(live.termsHtml().contains("style="), live.termsHtml());
-        Assertions.assertEquals(FROZEN_QUOTE_TERMS, quote.termsHtml(), "QUOTE terms are never re-sanitised");
+        Assertions.assertEquals(expectedFrozen, frozen, "the freeze goes through the sanitizer");
+        Assertions.assertFalse(frozen.contains("style="), frozen);
+        Assertions.assertEquals(frozen, fromFrozen.termsHtml(), "the frozen value renders unchanged");
+        Assertions.assertEquals(FROZEN_QUOTE_TERMS, fromRaw.termsHtml(), "a stored value is never re-sanitised");
     }
 
     @Test
-    void quoteSelection_resolvesToTheFrozenValue_withoutCallingTheLiveTermsReader() {
-        for (String flooringType : List.of("SOFT", "HARD")) {
-            // The live side is the real assembler reader: a QUOTE selection must never invoke it.
-            Supplier<String> live = () -> assembler.liveTermsHtml(BUSINESS_ID, flooringType);
-            Assertions.assertEquals(FROZEN_QUOTE_TERMS,
-                    InvoiceTermsSelection.frozenQuoteTerms(FROZEN_QUOTE_TERMS).resolve(live));
-            Assertions.assertEquals(FROZEN_QUOTE_TERMS,
-                    InvoiceTermsSelection.forInvoice(77L, FROZEN_QUOTE_TERMS).resolve(live));
-            Assertions.assertNull(InvoiceTermsSelection.frozenQuoteTerms(null).resolve(live));
-            Assertions.assertNull(InvoiceTermsSelection.forInvoice(77L, null).resolve(live));
+    void assemble_neverReadsTheBusinessTerms_forEitherSource_includingNull() {
+        BusinessInvoiceConfigView cfg = config(LIVE_SOFT_TERMS, LIVE_HARD_TERMS);
+        when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(cfg));
+        when(storeRepository.findByStoreIdAndBusinessId(STORE_ID, BUSINESS_ID)).thenReturn(Optional.of(store()));
+        when(salespersonResolver.resolveName(USER_ID, BUSINESS_ID)).thenReturn("Liam Carter");
+
+        for (Long sourceQuoteVersionId : Arrays.asList(SOURCE_QUOTE_VERSION_ID, null)) {
+            for (String terms : Arrays.asList(FROZEN_QUOTE_TERMS, null)) {
+                for (String flooringType : List.of("SOFT", "HARD")) {
+                    assembler.assemble(inputs(business(null), order(flooringType),
+                            InvoiceTermsSelection.forInvoice(sourceQuoteVersionId, terms)));
+                }
+            }
         }
 
-        // A QUOTE selection never consults the tenant config (nor any other collaborator).
-        verify(businessRepository, never()).findInvoiceConfigByBusinessId(anyLong());
-        verifyNoInteractions(businessRepository, storeRepository, salespersonResolver, fileStorageService);
+        // The config row still feeds ABN / bank (live presentation), but no terms getter is ever read
+        // at render time: no per-type terms, and no legacy single block.
+        verify(cfg, never()).getTermsSoft();
+        verify(cfg, never()).getTermsHard();
+        verify(cfg, never()).getTermsAndConditions();
     }
 
     @Test
-    void liveTermsHtml_returnsTheSanitisedPerTypeLiveTerms_readByTheBusinessId() {
+    void businessTermsHtml_returnsTheSanitisedPerTypeTerms_readByTheBusinessId() {
+        // The Create / Rewrite freeze-time reader: the business's CURRENT per-type terms, sanitised once.
         String rawSoft = "<p style=\"color:red\" onclick=\"steal()\">Live soft terms.</p>";
         String rawHard = "<p id=\"h\">Live hard terms.</p><script>alert('x')</script>";
         BusinessInvoiceConfigView cfg = config(rawSoft, rawHard);
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(cfg));
         InvoiceTermsSanitizer sanitizer = new InvoiceTermsSanitizer();
 
-        String soft = assembler.liveTermsHtml(BUSINESS_ID, "SOFT");
-        // Through the selection rule, a LIVE selection yields exactly the live reader's value.
-        String hard = InvoiceTermsSelection.live().resolve(() -> assembler.liveTermsHtml(BUSINESS_ID, "HARD"));
+        String soft = assembler.businessTermsHtml(BUSINESS_ID, "SOFT");
+        String hard = assembler.businessTermsHtml(BUSINESS_ID, "HARD");
 
         // SOFT -> terms_soft, HARD -> terms_hard, each through the sanitizer (never the raw value).
         Assertions.assertEquals(sanitizer.sanitize(rawSoft), soft);
-        Assertions.assertNotEquals(rawSoft, soft, "the raw live terms must not pass through unsanitised");
+        Assertions.assertNotEquals(rawSoft, soft, "the raw business terms must not pass through unsanitised");
         Assertions.assertTrue(soft.contains("Live soft terms."), soft);
         Assertions.assertFalse(soft.contains("onclick") || soft.contains("style="), soft);
         Assertions.assertFalse(soft.contains("Live hard terms."), "SOFT must never get the hard terms");
@@ -467,36 +522,37 @@ class InvoicePdfModelAssemblerTest {
         Assertions.assertFalse(hard.contains("script") || hard.contains("alert"), hard);
         Assertions.assertFalse(hard.contains("Live soft terms."), "HARD must never get the soft terms");
 
-        // Tenant-scoped read (the business id) once per resolution; nothing else is touched.
+        // Tenant-scoped read (the business id) once per freeze; nothing else is touched.
         verify(businessRepository, times(2)).findInvoiceConfigByBusinessId(BUSINESS_ID);
         verifyNoInteractions(storeRepository, salespersonResolver, fileStorageService);
     }
 
     @Test
-    void liveTermsHtml_returnsNullWhenTheTypesTermsAreBlankUnsetUnsafeOrTheConfigIsMissing() {
+    void businessTermsHtml_returnsNullWhenTheTypesTermsAreBlankUnsetUnsafeOrTheConfigIsMissing() {
         // Blank SOFT terms and unset HARD terms; the legacy single block is set but never used.
         BusinessInvoiceConfigView blankAndUnset = config("   ", null);
         when(blankAndUnset.getTermsAndConditions()).thenReturn("<p>Legacy terms must never be used.</p>");
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(blankAndUnset));
-        Assertions.assertNull(assembler.liveTermsHtml(BUSINESS_ID, "SOFT"), "blank live terms -> null");
-        Assertions.assertNull(assembler.liveTermsHtml(BUSINESS_ID, "HARD"),
-                "unset live terms -> null (no cross-type or legacy fallback)");
+        Assertions.assertNull(assembler.businessTermsHtml(BUSINESS_ID, "SOFT"), "blank business terms -> null");
+        Assertions.assertNull(assembler.businessTermsHtml(BUSINESS_ID, "HARD"),
+                "unset business terms -> null (no cross-type or legacy fallback)");
 
         // Terms that sanitise down to nothing visible -> null.
         BusinessInvoiceConfigView unsafeOrEmpty = config("<script>alert(1)</script>", "<p></p>");
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.of(unsafeOrEmpty));
-        Assertions.assertNull(assembler.liveTermsHtml(BUSINESS_ID, "SOFT"));
-        Assertions.assertNull(assembler.liveTermsHtml(BUSINESS_ID, "HARD"));
+        Assertions.assertNull(assembler.businessTermsHtml(BUSINESS_ID, "SOFT"));
+        Assertions.assertNull(assembler.businessTermsHtml(BUSINESS_ID, "HARD"));
 
         // No tenant config row at all -> null.
         when(businessRepository.findInvoiceConfigByBusinessId(BUSINESS_ID)).thenReturn(Optional.empty());
-        Assertions.assertNull(assembler.liveTermsHtml(BUSINESS_ID, "SOFT"));
-        Assertions.assertNull(assembler.liveTermsHtml(BUSINESS_ID, "HARD"));
+        Assertions.assertNull(assembler.businessTermsHtml(BUSINESS_ID, "SOFT"));
+        Assertions.assertNull(assembler.businessTermsHtml(BUSINESS_ID, "HARD"));
     }
 
     @Test
     void inputs_requireAnExplicitTermsSelection_nullIsRejected() {
-        // A null selection could not tell frozen "no terms" apart from "use the live terms".
+        // Every build site states the source and stored terms of the row it writes; a null selection
+        // could be mistaken for "no terms" or for a missing argument.
         Assertions.assertThrows(NullPointerException.class,
                 () -> inputs(business(null), order("SOFT"), null));
     }

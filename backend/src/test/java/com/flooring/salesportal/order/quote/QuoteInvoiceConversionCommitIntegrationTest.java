@@ -398,7 +398,8 @@ class QuoteInvoiceConversionCommitIntegrationTest {
             // The insert was really reached, for the next version and the selected quote version.
             verify(invoiceRepository).insertInvoice(eq(fixture.orderId()), eq(fixture.expectedVersion()),
                     any(), any(), any(), any(), any(), any(), any(), anyLong(), anyLong(),
-                    any(), any(), any(), any(), eq(fixture.quoteVersionId()), any());
+                    any(), any(), any(), any(), eq(fixture.quoteVersionId()), any(),
+                    any(), any(), any());
             verify(invoiceRepository, never()).updateSalesOrderLastEmailedAt(anyLong(), any());
         } finally {
             Mockito.reset(invoiceRepository);
@@ -541,7 +542,8 @@ class QuoteInvoiceConversionCommitIntegrationTest {
                     argThat(totalPaid -> totalPaid != null && totalPaid.compareTo(new BigDecimal("10.00")) == 0),
                     argThat(balanceDue -> balanceDue != null && balanceDue.compareTo(new BigDecimal("265.00")) == 0),
                     anyLong(), anyLong(),
-                    any(), any(), any(), any(), eq(orderB.quoteVersionId()), any());
+                    any(), any(), any(), any(), eq(orderB.quoteVersionId()), any(),
+                    any(), any(), any());
             verify(invoiceRepository, never()).updateSalesOrderLastEmailedAt(eq(orderA.orderId()), any());
         } finally {
             Mockito.reset(invoiceRepository);
@@ -1081,10 +1083,10 @@ class QuoteInvoiceConversionCommitIntegrationTest {
         return failures;
     }
 
-    /** {@code insertInvoice} (17 parameters) for this order with any other argument - stub or verify target. */
+    /** {@code insertInvoice} (20 parameters) for this order with any other argument - stub or verify target. */
     private static InvoiceRow insertInvoiceFor(InvoiceRepository target, long orderId) {
         return target.insertInvoice(eq(orderId), anyInt(), any(), any(), any(), any(), any(), any(), any(),
-                anyLong(), anyLong(), any(), any(), any(), any(), any(), any());
+                anyLong(), anyLong(), any(), any(), any(), any(), any(), any(), any(), any(), any());
     }
 
     private void clearSpyInvocations() {

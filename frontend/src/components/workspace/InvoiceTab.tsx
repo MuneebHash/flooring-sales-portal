@@ -14,7 +14,6 @@ import {
 } from '../../lib/api/orderInvoicesApi'
 import type {
   DetailsOfSaleFields,
-  OrderAddress,
   OrderCustomer,
 } from '../../lib/api/orderWorkspaceApi'
 import { fetchPublicBusiness } from '../../lib/api/tenantApi'
@@ -31,8 +30,9 @@ type Props = {
   // prop here — Accept, Re-send and the signature download are all allowed when
   // LAID (acceptance parallels payment, not rewrite), so the lock never gates this tab.
   orderNumber?: string
+  // The saved customer, used ONLY to derive the name the in-store Accept (D.8) submits until 16G
+  // PR 3. Invoice To never reads it: it comes from the InvoiceDetail's frozen snapshot fields.
   customer?: OrderCustomer | null
-  billingAddress?: OrderAddress | null
   saleDetails?: DetailsOfSaleFields | null
   // Order-bound salesperson name (sales_order.user_id -> app_user first/last), the same
   // source the PDF uses — NOT the session user. Rendered in the document meta; hidden
@@ -93,24 +93,6 @@ function composeFullName(customer: OrderCustomer | null | undefined): string {
     .join(' ')
 }
 
-function composeAddressLines(
-  address: OrderAddress | null | undefined,
-): string[] {
-  if (!address) return []
-  const streetParts: string[] = []
-  if (address.unit_number) {
-    streetParts.push(`${address.unit_number}/${address.street_number}`)
-  } else {
-    streetParts.push(address.street_number)
-  }
-  streetParts.push(address.street)
-  const line1 = streetParts.filter(Boolean).join(' ')
-  const line2 = [address.suburb, address.state_code, address.postcode]
-    .filter(Boolean)
-    .join(' ')
-  return [line1, line2].filter((line) => line.length > 0)
-}
-
 // Download filename mirrors the backend Content-Disposition pattern
 // (invoice-{order_number}-v{version}.pdf). A blob object URL does not carry the
 // server's Content-Disposition, so the anchor sets the name explicitly.
@@ -137,8 +119,9 @@ const ACCEPTANCE_LINES: string[] = [
 ]
 
 // Phase 16F PR3 - the plain terms-source label. It reports the API's own terms_source
-// (QUOTE = the terms frozen on the signed quote; LIVE = the business's current terms). It
-// makes no claim about any stored PDF.
+// (QUOTE = the terms frozen on the signed quote; BUSINESS, since 16G PR 2 = the business's
+// terms, frozen into this version when it was created or rewritten). No wording promises a
+// live terms lookup (UX lock section 20).
 function termsSourceLabel(
   source: InvoiceDetail['terms_source'],
   hasTerms: boolean,
@@ -149,8 +132,8 @@ function termsSourceLabel(
       : 'Terms source: frozen from the signed quote, which has no terms.'
   }
   return hasTerms
-    ? 'Terms source: the business’s current terms.'
-    : 'Terms source: the business’s current terms (none are set).'
+    ? 'Terms source: the business’s terms, frozen when this invoice was created or rewritten.'
+    : 'Terms source: the business’s terms, frozen when this invoice was created or rewritten (none were set).'
 }
 
 export function InvoiceTab({
@@ -158,7 +141,6 @@ export function InvoiceTab({
   notice,
   orderNumber,
   customer,
-  billingAddress,
   saleDetails,
   onGoToCustomer,
 }: Props) {
@@ -625,18 +607,22 @@ export function InvoiceTab({
     }
   }
 
-  const customerName = composeFullName(customer)
   // accepted_customer_name sent on Accept — auto-derived from the order's saved
-  // customer (same composeFullName source as the document's "Invoice To" block),
-  // trimmed, never typed by the customer. Blank (no saved customer) or
+  // customer, trimmed, never typed by the customer. Blank (no saved customer) or
   // over-length (> 150 chars) blocks Accept with an inline notice — the name is
   // never silently truncated. The ACCEPTED state renders
   // invoice.accepted_customer_name (the immutable response snapshot), not this
-  // live value.
-  const derivedAcceptedName = customerName.trim()
+  // live value. (Until 16G PR 3, which takes the name from the frozen version.)
+  const derivedAcceptedName = composeFullName(customer).trim()
   const derivedNameTooLong =
     derivedAcceptedName.length > ACCEPTED_NAME_MAX_LENGTH
-  const billingAddressLines = composeAddressLines(billingAddress)
+  // Phase 16G PR 2 (#125) - Invoice To is the version's FROZEN words only (InvoiceDetail's
+  // customer_*_snapshot fields), on signed and unsigned invoices alike: never the live
+  // customer or billing address, and a null name or line is simply not shown (no sample or
+  // placeholder). It is a separate value from the D.8 signing name above.
+  const invoiceToName = nonBlank(invoice?.customer_name_snapshot)
+  const invoiceToLine1 = nonBlank(invoice?.customer_address_line1_snapshot)
+  const invoiceToLine2 = nonBlank(invoice?.customer_address_line2_snapshot)
   const detailsOfSaleText =
     invoice?.details_of_sale_snapshot || saleDetails?.details_of_sale || ''
   const dueDateText =
@@ -647,11 +633,10 @@ export function InvoiceTab({
   // TAX INVOICE + number on the right. Store name/address/phone/email, ABN, bank/payment
   // details, Flooring Type and Salesperson are deliberately NOT rendered on this screen. All of
   // that data is unchanged in auth/workspace/tenant-config and still appears on the PDF.
-  // Terms (Phase 16F PR3, decision D7): rendered ONLY from the invoice's own terms_html -
-  // the same selection the invoice PDF uses (terms_source QUOTE: the frozen quote terms,
-  // where null means frozen "no terms" and never falls back to the tenant's terms; LIVE: the
-  // business's current per-flooring-type terms). There is no tenant-config lookup and no
-  // fallback of any kind here.
+  // Terms (Phase 16F PR3, decision D7; 16G PR 2): rendered ONLY from the invoice's own
+  // terms_html - the terms stored on this version, the same terms its PDF renders, for both
+  // terms sources. Null means no terms and never falls back to the tenant's terms. There is no
+  // tenant-config lookup and no fallback of any kind here.
   const termsText = nonBlank(invoice?.terms_html)
   // Terms are stored as HTML (sanitized server-side). Render them as HTML on screen too, but
   // ALWAYS sanitize client-side first (defense in depth) with an EXPLICIT restricted allowlist
@@ -857,18 +842,19 @@ export function InvoiceTab({
               <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">
                 Invoice To
               </div>
-              {customerName ? (
+              {invoiceToName !== null && (
                 <div className="mt-2 text-sm font-semibold text-slate-900">
-                  {customerName}
+                  {invoiceToName}
                 </div>
-              ) : (
-                <div className="mt-2 text-sm text-slate-400">—</div>
               )}
-              {billingAddressLines.length > 0 && (
-                <div className="mt-1 text-sm text-slate-700 leading-relaxed">
-                  {billingAddressLines.map((line) => (
-                    <div key={line}>{line}</div>
-                  ))}
+              {(invoiceToLine1 !== null || invoiceToLine2 !== null) && (
+                <div
+                  className={`${
+                    invoiceToName !== null ? 'mt-1' : 'mt-2'
+                  } text-sm text-slate-700 leading-relaxed`}
+                >
+                  {invoiceToLine1 !== null && <div>{invoiceToLine1}</div>}
+                  {invoiceToLine2 !== null && <div>{invoiceToLine2}</div>}
                 </div>
               )}
             </div>

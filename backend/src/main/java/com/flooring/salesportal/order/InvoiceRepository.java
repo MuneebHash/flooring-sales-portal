@@ -30,12 +30,18 @@ import java.util.Optional;
  *
  * <p>Phase 16F PR2 adds the two {@code V19} columns to every insert and read:
  * {@code source_quote_version_id} (the accepted quote version a Path A invoice was created from) and
- * {@code terms_snapshot} (that quote's frozen terms). Both ride on {@link InvoiceRow} as
- * SERVER-INTERNAL values: the source id is never serialized, and the terms reach the API only through
- * the {@link InvoiceTermsSelection} rule. Because the {@code V19} foreign key is single-column, the
- * database does not guarantee that a source quote version belongs to the invoice's own order, so
+ * {@code terms_snapshot} (the version's frozen terms). The source id rides on {@link InvoiceRow} as a
+ * SERVER-INTERNAL value and is never serialized; the terms reach the API only through
+ * {@link InvoiceTermsSelection}. Because the {@code V19} foreign key is single-column, the database
+ * does not guarantee that a source quote version belongs to the invoice's own order, so
  * {@link #insertInvoice} verifies that ownership in code for EVERY writer (Path A, payment, void,
  * D.8) before the row is inserted.
+ *
+ * <p>Phase 16G PR 2 (#125) adds the three {@code V20} frozen identity columns
+ * ({@code customer_name_snapshot}, {@code customer_address_line1_snapshot},
+ * {@code customer_address_line2_snapshot}) to every insert and read. With {@code terms_snapshot} they
+ * are the version's words: every writer passes them explicitly and every render and InvoiceDetail
+ * read uses the stored values, never the live customer, address or business terms.
  */
 @Repository
 public class InvoiceRepository {
@@ -52,10 +58,11 @@ public class InvoiceRepository {
             """;
 
     // RETURNING projection = the E.2 invoice_detail columns (NO stored_file_id) plus the Phase 13
-    // acceptance/email columns and the two Phase 16F PR2 (V19) quote-source columns.
-    // accepted_signature_file_id and source_quote_version_id are SERVER-INTERNAL: they ride on
-    // InvoiceRow only so the services can derive accepted_signature_present / the signature download
-    // path and the terms source, and carry both forward; the DTO mapping never exposes either id.
+    // acceptance/email columns, the two Phase 16F PR2 (V19) quote-source columns and the three
+    // Phase 16G PR 2 (V20) frozen identity columns. accepted_signature_file_id and
+    // source_quote_version_id are SERVER-INTERNAL: they ride on InvoiceRow only so the services can
+    // derive accepted_signature_present / the signature download path and the terms source, and carry
+    // both forward; the DTO mapping never exposes either id.
     private static final String RETURN_COLUMNS = """
                 invoice_id,
                 order_id,
@@ -74,29 +81,36 @@ public class InvoiceRepository {
                 accepted_signature_file_id,
                 last_emailed_at,
                 source_quote_version_id,
-                terms_snapshot
+                terms_snapshot,
+                customer_name_snapshot,
+                customer_address_line1_snapshot,
+                customer_address_line2_snapshot
             """;
 
     // The four Phase 13 acceptance/email columns are written explicitly: Create / Rewrite pass nulls
     // (an unaccepted version), the Accept flow (D.8) passes the captured acceptance values with
     // last_emailed_at = null (stamped post-commit on email success), payment / void carry the previous
     // version's acceptance values forward, and Path A (16F PR2) passes the accepted quote's inherited
-    // acceptance. The two V19 columns follow the 16F PR2 write table: Path A writes the selected quote
-    // version id + its frozen terms (including null terms); D.1 Create and D.2 Rewrite write null/null;
-    // payment, void and D.8 carry both verbatim from the current invoice.
+    // acceptance. source_quote_version_id: Path A writes the selected quote version id, D.1 Create and
+    // D.2 Rewrite write null, payment, void and D.8 carry it. The four word columns follow the 16G PR 2
+    // write table (16G contract section 4.2): D.1 / D.2 write the freshly frozen saved name, BILLING
+    // lines and sanitised business terms; Path A writes the accepted quote version's V17 identity and
+    // frozen terms; payment, void and D.8 copy all four verbatim from the current invoice (nulls too).
     private static final String INSERT_INVOICE_SQL = """
             INSERT INTO invoice
                 (order_id, version_number, invoice_date, due_date, details_of_sale_snapshot,
                  sale_price_ex_gst, sale_price_inc_gst, total_paid, balance_due,
                  stored_file_id, created_by_user_id,
                  accepted_at, accepted_customer_name, accepted_signature_file_id, last_emailed_at,
-                 source_quote_version_id, terms_snapshot)
+                 source_quote_version_id, terms_snapshot,
+                 customer_name_snapshot, customer_address_line1_snapshot, customer_address_line2_snapshot)
             VALUES
                 (:orderId, :versionNumber, :invoiceDate, :dueDate, :detailsOfSaleSnapshot,
                  :salePriceExGst, :salePriceIncGst, :totalPaid, :balanceDue,
                  :storedFileId, :createdByUserId,
                  :acceptedAt, :acceptedCustomerName, :acceptedSignatureFileId, :lastEmailedAt,
-                 :sourceQuoteVersionId, :termsSnapshot)
+                 :sourceQuoteVersionId, :termsSnapshot,
+                 :customerNameSnapshot, :customerAddressLine1Snapshot, :customerAddressLine2Snapshot)
             RETURNING
             """ + RETURN_COLUMNS;
 
@@ -188,6 +202,11 @@ public class InvoiceRepository {
      * {@link #updateInvoiceLastEmailedAt}); payment / void and Path A pass carried or inherited
      * acceptance values.
      *
+     * <p>Phase 16G PR 2 - {@code termsSnapshot}, {@code customerNameSnapshot},
+     * {@code customerAddressLine1Snapshot} and {@code customerAddressLine2Snapshot} are the version's
+     * words (all nullable, stored verbatim; see the write table on {@code INSERT_INVOICE_SQL}). The
+     * caller resolves them ONCE and passes the same values to the PDF it renders for this row.
+     *
      * <p>Phase 16F PR2 - {@code sourceQuoteVersionId} / {@code termsSnapshot} are the {@code V19}
      * columns (both nullable; see the write table on {@code INSERT_INVOICE_SQL}). <b>Source ownership
      * is enforced HERE, at the one write boundary every writer shares:</b> when
@@ -216,7 +235,10 @@ public class InvoiceRepository {
                                     Long acceptedSignatureFileId,
                                     LocalDateTime lastEmailedAt,
                                     Long sourceQuoteVersionId,
-                                    String termsSnapshot) {
+                                    String termsSnapshot,
+                                    String customerNameSnapshot,
+                                    String customerAddressLine1Snapshot,
+                                    String customerAddressLine2Snapshot) {
         if (sourceQuoteVersionId != null) {
             requireSourceQuoteVersionOfOrder(orderId, sourceQuoteVersionId);
         }
@@ -237,7 +259,10 @@ public class InvoiceRepository {
                 .addValue("acceptedSignatureFileId", acceptedSignatureFileId)
                 .addValue("lastEmailedAt", lastEmailedAt == null ? null : Timestamp.valueOf(lastEmailedAt))
                 .addValue("sourceQuoteVersionId", sourceQuoteVersionId)
-                .addValue("termsSnapshot", termsSnapshot);
+                .addValue("termsSnapshot", termsSnapshot)
+                .addValue("customerNameSnapshot", customerNameSnapshot)
+                .addValue("customerAddressLine1Snapshot", customerAddressLine1Snapshot)
+                .addValue("customerAddressLine2Snapshot", customerAddressLine2Snapshot);
         return jdbc.queryForObject(INSERT_INVOICE_SQL, params, ROW_MAPPER);
     }
 
@@ -336,7 +361,10 @@ public class InvoiceRepository {
                 rs.getObject("accepted_signature_file_id", Long.class),
                 lastEmailedAt == null ? null : lastEmailedAt.toLocalDateTime(),
                 rs.getObject("source_quote_version_id", Long.class),
-                rs.getString("terms_snapshot"));
+                rs.getString("terms_snapshot"),
+                rs.getString("customer_name_snapshot"),
+                rs.getString("customer_address_line1_snapshot"),
+                rs.getString("customer_address_line2_snapshot"));
     };
 
     private static final RowMapper<InvoiceFile> FILE_ROW_MAPPER = (rs, n) -> new InvoiceFile(
@@ -347,13 +375,16 @@ public class InvoiceRepository {
 
     /**
      * The E.2 invoice columns returned by an insert / current read (no stored_file_id / storage_path),
-     * plus the Phase 13 acceptance/email columns and the Phase 16F PR2 {@code V19} quote-source
-     * columns. {@code acceptedSignatureFileId} and {@code sourceQuoteVersionId} are SERVER-INTERNAL -
-     * the services derive {@code accepted_signature_present} / the signature download path and the
-     * terms source from them and never serialize either id. Create / Rewrite inserts leave the
-     * acceptance/email and quote-source columns NULL; D.8 writes the three acceptance columns on its
+     * plus the Phase 13 acceptance/email columns, the Phase 16F PR2 {@code V19} quote-source columns
+     * and the Phase 16G PR 2 {@code V20} frozen identity columns. {@code acceptedSignatureFileId} and
+     * {@code sourceQuoteVersionId} are SERVER-INTERNAL - the services derive
+     * {@code accepted_signature_present} / the signature download path and the terms source from them
+     * and never serialize either id. Create / Rewrite inserts leave the acceptance/email and
+     * quote-source columns NULL and freeze fresh words; D.8 writes the three acceptance columns on its
      * appended version; payment / void carry acceptance and quote source forward; Path A writes the
-     * inherited acceptance plus its source quote version and frozen {@code termsSnapshot}.
+     * inherited acceptance plus its source quote version. {@code termsSnapshot} and the three
+     * {@code customer*Snapshot} values are the version's stored words (each nullable), rendered and
+     * returned verbatim.
      */
     public record InvoiceRow(
             long invoiceId,
@@ -373,7 +404,10 @@ public class InvoiceRepository {
             Long acceptedSignatureFileId,
             LocalDateTime lastEmailedAt,
             Long sourceQuoteVersionId,
-            String termsSnapshot) {
+            String termsSnapshot,
+            String customerNameSnapshot,
+            String customerAddressLine1Snapshot,
+            String customerAddressLine2Snapshot) {
     }
 
     /**

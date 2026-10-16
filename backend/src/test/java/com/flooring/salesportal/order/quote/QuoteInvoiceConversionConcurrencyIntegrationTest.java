@@ -11,6 +11,7 @@ import com.flooring.salesportal.common.email.RecordingQuoteEmailSender;
 import com.flooring.salesportal.common.error.ErrorCode;
 import com.flooring.salesportal.common.sms.RecordingSmsSender;
 import com.flooring.salesportal.common.storage.FileStorageService;
+import com.flooring.salesportal.order.InvoiceTermsSanitizer;
 import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
@@ -102,7 +103,9 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  * <p><b>Seed (real flows).</b> A committed invoice-ready order (customer "Quote Tester" with a valid
  * email, BILLING + INSTALLATION addresses, details of sale, lay date 2026-12-01 CONFIRMED, one charge
  * line 100.00 ex / 40.00 cost), an UNSIGNED Path B invoice v1 created through the real D.1 endpoint
- * (100.00 ex / 110.00 inc), then a REAL accepted quote: itemised draft PUT (250.00 ex / 275.00 inc),
+ * (100.00 ex / 110.00 inc; since 16G PR 2 it freezes its words: the saved Invoice To and the
+ * business's SOFT terms as they stand, sanitised - null when the business sets none, and this suite
+ * never writes them), then a REAL accepted quote: itemised draft PUT (250.00 ex / 275.00 inc),
  * protected send-email, token taken from the recorded email, public multipart accept. The ONLY SQL
  * edit on the quote is its frozen {@code terms_snapshot} (set to known sanitizer-style HTML right after
  * the real acceptance) so the frozen terms carried by Path A and by a later payment are provable. The
@@ -122,9 +125,10 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  *
  * <p>Every race asserts the HTTP outcomes, the committed invoice versions (consecutive, exactly the
  * expected new rows), the V19 source / frozen terms and the inherited acceptance on every Path A row,
- * the untouched quote / order / content rows, the payment row, the stored_file rows against the files
- * on disk (exactly the expected set, no orphan, none missing, sizes equal), the invoice PDF content,
- * the recorded emails and the workspace {@code invoice_eligible} read.
+ * the words every writer froze or copied (16G PR 2: the Invoice To and the terms, on the row and in
+ * its InvoiceDetail), the untouched quote / order / content rows, the payment row, the stored_file
+ * rows against the files on disk (exactly the expected set, no orphan, none missing, sizes equal), the
+ * invoice PDF content, the recorded emails and the workspace {@code invoice_eligible} read.
  */
 @ExtendWith(SpringExtension.class)
 @SpringBootTest(properties = "app.storage.base-dir=target/test-storage/quote-acceptance")
@@ -145,6 +149,10 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
     private static final String CUSTOMER_NAME = CUSTOMER_FIRST_NAME + " " + CUSTOMER_LAST_NAME;
     private static final String CUSTOMER_EMAIL = "quote.invoice.race@example.com";
     private static final String CUSTOMER_MOBILE = "0412345678";
+    // The Invoice To billing lines of the seeded BILLING address, as D.1 and the V17 quote snapshot both
+    // derive them ([unit/]street_number street / suburb state_code postcode).
+    private static final String BILLING_LINE_1 = "12 Test Street";
+    private static final String BILLING_LINE_2 = "Sydney NSW 2000";
     private static final String DETAILS_OF_SALE = "Supply and install carpet (quote to invoice race)";
     private static final LocalDate EXPECTED_DUE_DATE = LocalDate.of(2026, 11, 29); // lay date 2026-12-01 minus 2 days
 
@@ -194,7 +202,9 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
             "details_of_sale_snapshot", "sale_price_ex_gst", "sale_price_inc_gst", "total_paid",
             "balance_due", "created_by_user_id", "created_at", "pdf_download_path", "accepted_at",
             "accepted_customer_name", "accepted_signature_present", "accepted_signature_download_path",
-            "last_emailed_at", "terms_html", "terms_source");
+            "last_emailed_at", "terms_html", "terms_source",
+            // 16G PR 2 (#125): the version's frozen Invoice To words, always present (nullable).
+            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot");
     private static final Set<String> CURRENT_INVOICE_SUMMARY_KEYS = Set.of(
             "invoice_id", "version_number", "invoice_date", "due_date", "sale_price_inc_gst",
             "total_paid", "balance_due", "created_by_user_id", "created_at", "pdf_download_path",
@@ -296,6 +306,10 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
     @Autowired
     private RecordingQuoteAcceptanceNotificationSender notificationSender;
 
+    // Only to compute the terms D.1 freezes (the business's SOFT terms, sanitised once) at seed time.
+    @Autowired
+    private InvoiceTermsSanitizer termsSanitizer;
+
     @Value("${app.storage.base-dir}")
     private String storageBaseDir;
 
@@ -359,11 +373,13 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         Assertions.assertEquals(INVOICE_ACCEPT_EMAILED_MESSAGE, invoiceAcceptBody.path("message").asText(),
                 "D.8 (queue head) message");
         JsonNode signedInvoice = invoiceAcceptBody.path("data").path("invoice");
+        Assertions.assertEquals(new TreeSet<>(INVOICE_DETAIL_KEYS), fieldNames(signedInvoice),
+                "D.8 InvoiceDetail keys (terms and the frozen Invoice To words always present)");
         Assertions.assertEquals(2, signedInvoice.path("version_number").asInt(), "D.8 appended invoice v2");
         Assertions.assertTrue(signedInvoice.path("accepted_signature_present").asBoolean(), "D.8 v2 is signed");
         Assertions.assertEquals(CUSTOMER_NAME, signedInvoice.path("accepted_customer_name").asText());
-        Assertions.assertEquals("LIVE", signedInvoice.path("terms_source").asText(),
-                "a D.8 version of a Path B invoice has no quote source, so its terms stay LIVE");
+        Assertions.assertEquals("BUSINESS", signedInvoice.path("terms_source").asText(),
+                "a D.8 version of a Path B invoice has no quote source, so its terms source is BUSINESS");
         // Path A ran only after D.8 committed: the current invoice is signed LATER than the quote -> 409.
         assertPathARefused(pathAResult, "Path A (queued behind D.8)");
 
@@ -379,12 +395,17 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
                         + " must be strictly later than the quote signature time " + order.quoteAcceptedAt());
         Assertions.assertEquals(CUSTOMER_NAME, invoiceV2.get("accepted_customer_name"), "D.8 accepted name");
         Assertions.assertNull(invoiceV2.get("source_quote_version_id"), "D.8 carries v1's null quote source");
-        Assertions.assertNull(invoiceV2.get("terms_snapshot"), "D.8 carries v1's null frozen terms");
+        // 16G PR 2: D.8 also copies v1's words verbatim - the Invoice To and the business terms D.1 froze
+        // (null when the business set none) - never the quote's V17 snapshot or frozen terms.
         for (String carried : List.of("details_of_sale_snapshot", "sale_price_ex_gst", "sale_price_inc_gst",
-                "total_paid", "balance_due", "due_date")) {
+                "total_paid", "balance_due", "due_date", "customer_name_snapshot",
+                "customer_address_line1_snapshot", "customer_address_line2_snapshot", "terms_snapshot")) {
             Assertions.assertEquals(invoiceV1.get(carried), invoiceV2.get(carried),
                     "D.8 carries v1's " + carried + " forward (never the quote snapshot)");
         }
+        // Its InvoiceDetail maps v2's stored words: terms_html is the terms copied into v2 (the business
+        // terms frozen when the Path B v1 was created), the Invoice To fields are v2's snapshot.
+        assertInvoiceDetailWords(signedInvoice, invoiceV2, "D.8 InvoiceDetail");
         assertMoney(INVOICE_V1_INC, invoiceV2.get("sale_price_inc_gst"), "D.8 v2 inc is still the Path B v1 total");
         long d8SignatureFileId = longValue(invoiceV2.get("accepted_signature_file_id"));
         Assertions.assertNotEquals(order.quoteSignatureFileId(), d8SignatureFileId,
@@ -555,14 +576,18 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         Assertions.assertEquals(List.of(1, 2, 3), invoiceVersions(order.orderId()), "consecutive versions 1..3");
         Assertions.assertEquals(invoiceV1, invoiceRow(order.orderId(), 1), "invoice v1 is never rewritten");
         Map<String, Object> invoiceV2 = invoiceRow(order.orderId(), 2);
+        // 16G PR 2: the receipt also copies v1's words verbatim (the Invoice To and the business terms
+        // D.1 froze), never the live customer or the business's current terms.
         for (String carried : List.of("details_of_sale_snapshot", "sale_price_ex_gst", "sale_price_inc_gst",
-                "due_date")) {
+                "due_date", "customer_name_snapshot", "customer_address_line1_snapshot",
+                "customer_address_line2_snapshot", "terms_snapshot")) {
             Assertions.assertEquals(invoiceV1.get(carried), invoiceV2.get(carried),
                     "the payment version carries v1's " + carried + " forward");
         }
         assertMoney(PAYMENT_AMOUNT, invoiceV2.get("total_paid"), "payment v2 total_paid");
         assertMoney("60.00", invoiceV2.get("balance_due"), "payment v2 balance_due");
-        assertUnsignedPathBRow(invoiceV2, "payment v2 (receipt of the Path B v1)");
+        assertUnsignedPathBRow(invoiceV2, (String) invoiceV1.get("terms_snapshot"),
+                "payment v2 (receipt of the Path B v1)");
         assertQuoteBilledInvoiceRow(order, 3, PAYMENT_AMOUNT, "225.00", dayBefore, dayAfter);
 
         OrderState after = orderState(order.orderId());
@@ -623,8 +648,10 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         assertQuoteBilledInvoiceRow(order, 2, "0.00", QUOTE_TOTAL_INC, dayBefore, dayAfter);
         Map<String, Object> invoiceV2 = invoiceRow(order.orderId(), 2);
         Map<String, Object> invoiceV3 = invoiceRow(order.orderId(), 3);
-        // The payment version carries the V19 pair and the inherited acceptance verbatim from v2.
-        for (String carried : List.of("source_quote_version_id", "terms_snapshot", "accepted_at",
+        // The payment version carries the V19 pair, the V20 Invoice To words (16G PR 2) and the inherited
+        // acceptance verbatim from v2.
+        for (String carried : List.of("source_quote_version_id", "terms_snapshot", "customer_name_snapshot",
+                "customer_address_line1_snapshot", "customer_address_line2_snapshot", "accepted_at",
                 "accepted_customer_name", "accepted_signature_file_id", "details_of_sale_snapshot",
                 "sale_price_ex_gst", "sale_price_inc_gst", "due_date")) {
             Assertions.assertEquals(invoiceV2.get(carried), invoiceV3.get(carried),
@@ -1196,8 +1223,14 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
                 orderId, chargeId, code);
     }
 
-    /** D.1 Create through the API: the unsigned Path B invoice v1 (110.00 inc from the live summary). */
+    /**
+     * D.1 Create through the API: the unsigned Path B invoice v1 (110.00 inc from the live summary). Since
+     * 16G PR 2 it freezes v1's words: the saved Invoice To and the business's SOFT terms as they stand
+     * now, sanitised once (null when the business sets none; this suite only reads them).
+     */
     private void createUnsignedInvoice(long orderId) throws Exception {
+        String businessSoftTerms = termsSanitizer.sanitize(jdbcTemplate.queryForObject(
+                "SELECT terms_soft FROM business WHERE business_id = ?", String.class, BUSINESS_AUSSIE));
         MvcResult result = mockMvc.perform(post(orderUrl(orderId) + "/invoices").session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON).content("{}"))
                 .andReturn();
@@ -1209,7 +1242,7 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         assertMoney(INVOICE_V1_INC, invoice.get("sale_price_inc_gst"), "setup: invoice v1 inc");
         assertMoney("0.00", invoice.get("total_paid"), "setup: invoice v1 total_paid");
         assertMoney(INVOICE_V1_INC, invoice.get("balance_due"), "setup: invoice v1 balance_due");
-        assertUnsignedPathBRow(invoice, "setup: invoice v1 (D.1)");
+        assertUnsignedPathBRow(invoice, businessSoftTerms, "setup: invoice v1 (D.1)");
     }
 
     private void saveDraft(long orderId, String body) throws Exception {
@@ -1451,9 +1484,9 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
 
     /**
      * The invoice row Path A appended (or that a later payment receipts): the accepted quote's frozen
-     * snapshot verbatim - details, ex / inc totals, frozen terms, source = the accepted v1, the
-     * inherited acceptance (accepted_at, name and the SAME signature stored_file) - with today's
-     * invoice_date, the lay date minus 2 days, {@code totalPaid} active payments and
+     * snapshot verbatim - details, ex / inc totals, frozen terms, the V17 Invoice To (16G PR 2), source
+     * = the accepted v1, the inherited acceptance (accepted_at, name and the SAME signature stored_file)
+     * - with today's invoice_date, the lay date minus 2 days, {@code totalPaid} active payments and
      * {@code balanceDue} = quote inc - payments; never emailed; created by the session user.
      */
     private void assertQuoteBilledInvoiceRow(ConvertibleOrder order, int versionNumber, String totalPaid,
@@ -1466,6 +1499,17 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         Assertions.assertEquals(quote.get("terms_snapshot"), invoice.get("terms_snapshot"),
                 label + ": terms_snapshot copied verbatim from the quote");
         Assertions.assertEquals(FROZEN_QUOTE_TERMS, invoice.get("terms_snapshot"), label + ": frozen terms");
+        // 16G PR 2: the Invoice To is the accepted version's V17 snapshot, copied verbatim.
+        for (String word : List.of("customer_name_snapshot", "customer_address_line1_snapshot",
+                "customer_address_line2_snapshot")) {
+            Assertions.assertEquals(quote.get(word), invoice.get(word),
+                    label + ": " + word + " copied verbatim from the quote's V17 snapshot");
+        }
+        Assertions.assertEquals(CUSTOMER_NAME, invoice.get("customer_name_snapshot"), label + ": Invoice To name");
+        Assertions.assertEquals(BILLING_LINE_1, invoice.get("customer_address_line1_snapshot"),
+                label + ": billing line 1");
+        Assertions.assertEquals(BILLING_LINE_2, invoice.get("customer_address_line2_snapshot"),
+                label + ": billing line 2");
         Assertions.assertEquals(quote.get("details_of_sale_snapshot"), invoice.get("details_of_sale_snapshot"),
                 label + ": details of sale from the quote snapshot");
         assertMoney(QUOTE_TOTAL_EX, invoice.get("sale_price_ex_gst"), label + ": sale_price_ex_gst = quote ex total");
@@ -1487,10 +1531,21 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
                 label + ": invoice_date is today, but was " + invoiceDate);
     }
 
-    /** A Path B row (D.1 or its payment receipt): no quote source, no frozen terms, unsigned, unemailed. */
-    private static void assertUnsignedPathBRow(Map<String, Object> invoice, String label) {
+    /**
+     * A Path B row (D.1 or its payment receipt): no quote source; the words D.1 froze (16G PR 2), carried
+     * verbatim by the receipt - the saved Invoice To and {@code expectedTerms}, the business's SOFT terms
+     * sanitised when D.1 ran (null when none were set); unsigned; unemailed.
+     */
+    private static void assertUnsignedPathBRow(Map<String, Object> invoice, String expectedTerms, String label) {
         Assertions.assertNull(invoice.get("source_quote_version_id"), label + ": no quote source");
-        Assertions.assertNull(invoice.get("terms_snapshot"), label + ": no frozen terms");
+        Assertions.assertEquals(expectedTerms, invoice.get("terms_snapshot"),
+                label + ": terms_snapshot = the business's SOFT terms frozen at D.1");
+        Assertions.assertEquals(CUSTOMER_NAME, invoice.get("customer_name_snapshot"),
+                label + ": the Invoice To name frozen from the saved customer");
+        Assertions.assertEquals(BILLING_LINE_1, invoice.get("customer_address_line1_snapshot"),
+                label + ": billing line 1 frozen from the saved BILLING address");
+        Assertions.assertEquals(BILLING_LINE_2, invoice.get("customer_address_line2_snapshot"),
+                label + ": billing line 2 frozen from the saved BILLING address");
         Assertions.assertNull(invoice.get("accepted_at"), label + ": unsigned");
         Assertions.assertNull(invoice.get("accepted_customer_name"), label + ": no accepted name");
         Assertions.assertNull(invoice.get("accepted_signature_file_id"), label + ": no signature");
@@ -1620,10 +1675,35 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         Assertions.assertEquals("QUOTE", invoice.path("terms_source").asText(), label + ": terms_source");
         Assertions.assertEquals(FROZEN_QUOTE_TERMS, invoice.path("terms_html").asText(),
                 label + ": terms_html = the frozen quote terms verbatim");
+        assertInvoiceDetailWords(invoice, row, label);
         for (String leak : List.of("/uploads/", "storage_path", "stored_file_id", "accepted_signature_file_id",
                 "source_quote_version_id", "terms_snapshot", "token")) {
             Assertions.assertFalse(raw.contains(leak), label + ": the response must not leak " + leak + ": " + raw);
         }
+    }
+
+    /**
+     * 16G PR 2 (#125): an InvoiceDetail maps its version's stored words straight from the row -
+     * {@code terms_html} = {@code terms_snapshot} and the three {@code customer_*_snapshot} fields - each
+     * always present, a stored null as JSON null (never filled from the live customer or business).
+     */
+    private static void assertInvoiceDetailWords(JsonNode invoice, Map<String, Object> row, String label) {
+        Assertions.assertEquals(row.get("terms_snapshot"), nullableText(invoice, "terms_html", label),
+                label + ": terms_html = the version's stored terms_snapshot");
+        for (String word : List.of("customer_name_snapshot", "customer_address_line1_snapshot",
+                "customer_address_line2_snapshot")) {
+            Assertions.assertEquals(row.get(word), nullableText(invoice, word, label),
+                    label + ": " + word + " = the version's stored value");
+        }
+    }
+
+    /** A present, nullable string field: JSON null is {@code null}; a missing key or a non-string fails. */
+    private static String nullableText(JsonNode node, String field, String label) {
+        Assertions.assertTrue(node.has(field), label + ": " + field + " must always be present");
+        JsonNode value = node.get(field);
+        Assertions.assertTrue(value.isNull() || value.isTextual(),
+                label + ": " + field + " must be a string or null but was " + value);
+        return value.isNull() ? null : value.textValue();
     }
 
     /** Path A 409: INVOICE_ALREADY_ACCEPTED with the Path A wording, no details, no data. */

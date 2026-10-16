@@ -94,7 +94,6 @@ public class OrderPaymentService {
     private static final int MAX_PAYMENT_REFERENCE_LENGTH = 100;
     private static final String PDF_MIME = "application/pdf";
     private static final String PDF_EXTENSION = "pdf";
-    private static final String ADDRESS_BILLING = "BILLING";
 
     // OpenAPI PaymentCreateRequest declares additionalProperties: false. The ONLY request-body keys a
     // client may send.
@@ -110,8 +109,6 @@ public class OrderPaymentService {
 
     private final RequestContextGuard requestContextGuard;
     private final SalesOrderRepository salesOrderRepository;
-    private final OrderCustomerRepository orderCustomerRepository;
-    private final OrderAddressRepository orderAddressRepository;
     private final PaymentTransactionRepository paymentTransactionRepository;
     private final InvoiceRepository invoiceRepository;
     private final InvoicePdfGenerator invoicePdfGenerator;
@@ -126,8 +123,6 @@ public class OrderPaymentService {
 
     public OrderPaymentService(RequestContextGuard requestContextGuard,
                                SalesOrderRepository salesOrderRepository,
-                               OrderCustomerRepository orderCustomerRepository,
-                               OrderAddressRepository orderAddressRepository,
                                PaymentTransactionRepository paymentTransactionRepository,
                                InvoiceRepository invoiceRepository,
                                InvoicePdfGenerator invoicePdfGenerator,
@@ -137,8 +132,6 @@ public class OrderPaymentService {
                                ObjectMapper objectMapper) {
         this.requestContextGuard = requestContextGuard;
         this.salesOrderRepository = salesOrderRepository;
-        this.orderCustomerRepository = orderCustomerRepository;
-        this.orderAddressRepository = orderAddressRepository;
         this.paymentTransactionRepository = paymentTransactionRepository;
         this.invoiceRepository = invoiceRepository;
         this.invoicePdfGenerator = invoicePdfGenerator;
@@ -277,8 +270,7 @@ public class OrderPaymentService {
      * {@code invoice} rows. The PDF is written before the rows with a rollback-cleanup hook so a rollback
      * (commit-time failure, or an exception thrown after the file write) never orphans the file —
      * {@code invoice.stored_file_id} is NOT NULL + UNIQUE so the file row must exist before the invoice
-     * row. The customer / billing lines on the receipt PDF are read live (presentational only — they are
-     * not {@code invoice} columns and so cannot make a sale edit "official").
+     * row.
      *
      * <p>Phase 13 §6 carry-forward: when {@code latest} is accepted, the new version copies
      * {@code accepted_at} / {@code accepted_customer_name} / {@code accepted_signature_file_id}
@@ -290,13 +282,15 @@ public class OrderPaymentService {
      * null on EVERY payment- and void-created version and stays null (Phase 15D: these flows never
      * email; manual Re-send is the only email path).
      *
-     * <p>Phase 16F PR2: the two {@code V19} columns ({@code source_quote_version_id},
-     * {@code terms_snapshot}) are carried forward VERBATIM from {@code latest}, and the regenerated PDF
-     * takes its terms from that same source rule ({@link InvoiceTermsSelection#forInvoice}): a Path A
-     * invoice keeps its frozen quote terms, or its frozen absence of terms, across every payment and
-     * void, even after the business edits its live terms. Path B invoices (no source) keep rendering
-     * the live terms, unchanged. The carried source is re-verified as this order's quote version at the
-     * insert boundary ({@link InvoiceRepository#insertInvoice}).
+     * <p>Phase 16F PR2: {@code source_quote_version_id} is carried forward VERBATIM from {@code latest}
+     * and re-verified as this order's quote version at the insert boundary
+     * ({@link InvoiceRepository#insertInvoice}).
+     *
+     * <p>Phase 16G PR 2 (#125): the version's words - {@code customer_name_snapshot}, the two billing
+     * line snapshots and {@code terms_snapshot} - are copied VERBATIM from {@code latest} (a null stays
+     * null) into both the regenerated PDF and the new row. Neither the live customer and address nor
+     * the business's current terms are read, so a rename, an address edit or a terms edit after
+     * {@code latest} was written never reaches this version, on either terms source.
      */
     private InvoiceRow regenerateInvoiceVersion(RequestContext ctx,
                                                 SalesOrder order,
@@ -311,7 +305,11 @@ public class OrderPaymentService {
         BigDecimal salePriceExGst = latest.salePriceExGst();        // carried forward
         BigDecimal salePriceIncGst = latest.salePriceIncGst();      // carried forward
         Long sourceQuoteVersionId = latest.sourceQuoteVersionId();  // carried forward (V19)
-        String termsSnapshot = latest.termsSnapshot();              // carried forward (V19)
+        // The version's words, copied verbatim (16G PR 2) - including null; never the live values.
+        String termsSnapshot = latest.termsSnapshot();
+        String customerNameSnapshot = latest.customerNameSnapshot();
+        String billingLine1Snapshot = latest.customerAddressLine1Snapshot();
+        String billingLine2Snapshot = latest.customerAddressLine2Snapshot();
 
         // Acceptance metadata carried forward UNCHANGED from the paid version (§6) — the customer does
         // not re-sign, and the same signature stored_file is referenced (never duplicated).
@@ -328,21 +326,18 @@ public class OrderPaymentService {
             signaturePng = fileStorageService.read(signatureFile.storagePath());
         }
 
-        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
-        List<OrderAddress> addresses = orderAddressRepository.findByOrderId(orderId);
-
         String fileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
         // Phase 15C: the assembler enriches the carried-forward snapshot with tenant config / store /
-        // salesperson / logo / terms so the payment-regenerated PDF matches the other flows' layout.
+        // salesperson / logo so the payment-regenerated PDF matches the other flows' layout.
         byte[] pdfBytes = invoicePdfGenerator.render(invoicePdfModelAssembler.assemble(new Inputs(
                 ctx.business(),
                 order,
                 versionNumber,
                 invoiceDate,
                 dueDate,
-                customerName(customer),
-                billingLine1(addresses),
-                billingLine2(addresses),
+                customerNameSnapshot,
+                billingLine1Snapshot,
+                billingLine2Snapshot,
                 detailsSnapshot,
                 salePriceIncGst,
                 totalPaidAfter,
@@ -359,7 +354,8 @@ public class OrderPaymentService {
                     salePriceExGst, salePriceIncGst, totalPaidAfter, newBalance,
                     storedFileId, ctx.userId(),
                     acceptedAt, acceptedCustomerName, acceptedSignatureFileId, null,
-                    sourceQuoteVersionId, termsSnapshot);
+                    sourceQuoteVersionId, termsSnapshot,
+                    customerNameSnapshot, billingLine1Snapshot, billingLine2Snapshot);
 
             // Dashboard mirror invariant (Phase 13 §11.1): whenever a new current invoice version is
             // created, sales_order.last_emailed_at is set to that version's last_emailed_at — null here
@@ -758,56 +754,6 @@ public class OrderPaymentService {
                         ? "/api/v1/" + slug + "/orders/" + orderId + "/invoices/current/signature"
                         : null,
                 row.lastEmailedAt());
-    }
-
-    // Presentational PDF helpers (mirror OrderInvoiceService — kept local so Branch D stays self-contained
-    // and does not refactor the merged Branch A/C invoice code). Null-safe for a deleted customer.
-    private static String customerName(OrderCustomer customer) {
-        if (customer == null) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder();
-        appendIfPresent(sb, customer.getFirstName());
-        appendIfPresent(sb, customer.getMiddleName());
-        appendIfPresent(sb, customer.getLastName());
-        return sb.toString();
-    }
-
-    private static void appendIfPresent(StringBuilder sb, String value) {
-        if (value != null && !value.isBlank()) {
-            if (sb.length() > 0) {
-                sb.append(' ');
-            }
-            sb.append(value.trim());
-        }
-    }
-
-    private static String billingLine1(List<OrderAddress> addresses) {
-        OrderAddress billing = billing(addresses);
-        if (billing == null) {
-            return "";
-        }
-        StringBuilder sb = new StringBuilder();
-        if (billing.getUnitNumber() != null && !billing.getUnitNumber().isBlank()) {
-            sb.append(billing.getUnitNumber().trim()).append('/');
-        }
-        sb.append(billing.getStreetNumber()).append(' ').append(billing.getStreet());
-        return sb.toString();
-    }
-
-    private static String billingLine2(List<OrderAddress> addresses) {
-        OrderAddress billing = billing(addresses);
-        if (billing == null) {
-            return "";
-        }
-        return billing.getSuburb() + " " + billing.getStateCode() + " " + billing.getPostcode();
-    }
-
-    private static OrderAddress billing(List<OrderAddress> addresses) {
-        return addresses.stream()
-                .filter(a -> ADDRESS_BILLING.equals(a.getAddressType()))
-                .findFirst()
-                .orElse(null);
     }
 
     private record Paging(int page, int pageSize) {

@@ -98,7 +98,7 @@ Post-16F docs reconciliation: done (#137, merged 13 October 2026).
   Muneeb's 16G decisions done (13 October 2026, amended before PR 1). Target contract:
   docs/API-Contracts-Phase16G-Invoice-Link.md (UX: docs/Phase16D-Quotation-UX-Lock.md §20).
   16G PR 1 = docs + OpenAPI amendments only. NOTHING 16G is implemented until its PR merges:
-  PR 2 #125 frozen invoice words · PR 3 #69/#123 stale checks + Path A signed-PDF email ·
+  PR 2 #125 frozen invoice words (implemented, V20) · PR 3 #69/#123 stale checks + Path A signed-PDF email ·
   PR 4 remote invoice backend · PR 5 remote invoice frontend · PR 6 #120 #121 #122 #124.
 
 Next development step: the 16G implementation PRs 2 to 6, in order (docs/Phases.md §7).
@@ -130,7 +130,7 @@ Local DB:  Docker Postgres 17 (infra/docker-compose.yml) —
 ```bash
 # local DB
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal && docker compose -f infra/docker-compose.yml up -d
-# backend (Flyway applies V1 to V19 on boot)
+# backend (Flyway applies V1 to V20 on boot)
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal/backend && ./mvnw spring-boot:run
 # frontend
 cd /Users/muneebsmacbook/Desktop/flooring-sales-portal/frontend && npm run dev
@@ -186,7 +186,7 @@ The frontend guard (`RESERVED_BUSINESS_SLUGS` in `frontend/src/lib/tenant.ts`, v
 ## Migration rules
 
 ```text
-Current migrations are V1 to V19:
+Current migrations are V1 to V20:
   V1–V7 base · V8 LM/SQM factor · V9 negative-price constraint · V10 invoice accept/signature/email
   V11 reserved slug words · V12 per-tenant branding/invoice-legal/quick-add · V13 per-type terms
   V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
@@ -196,19 +196,21 @@ Current migrations are V1 to V19:
   V19 (16F PR1) quote_version.accepted_customer_name + invoice.accepted_customer_name widened to TEXT ·
       invoice.source_quote_version_id BIGINT NULL (non-unique FK fk_invoice_source_quote_version,
       index idx_invoice_source_quote_version) · invoice.terms_snapshot TEXT NULL
-16G plans exactly TWO more migrations (not on main yet; numbers assigned when written, the next free
-  after V19): PR 2 — invoice.customer_name_snapshot / customer_address_line1_snapshot /
-  customer_address_line2_snapshot TEXT NULL + backfill from the saved customer (#125); PR 4 —
-  invoice_token table + chk_business_slug_reserved replaced with the 16 V18 words plus 'i'.
+  V20 (16G PR 2, #125) invoice.customer_name_snapshot / customer_address_line1_snapshot /
+      customer_address_line2_snapshot TEXT NULL + backfill of every invoice row from its order's saved
+      customer + BILLING address (the V17 derivation); terms_snapshot is not backfilled
+16G plans exactly ONE more migration (not on main yet; number assigned when written, the next free
+  after V20): PR 4 — invoice_token table + chk_business_slug_reserved replaced with the 16 V18 words
+  plus 'i'.
 
 Never edit any committed migration. Any schema change is a NEW migration.
 Phase 16A added NO migration (invoice tab + PDF logo path + Aire Compact PDF were app/template only).
-CI "Locked migration protection" guards V1–V13 only (.github/workflows/ci.yml). V14 to V19 are on main
+CI "Locked migration protection" guards V1–V13 only (.github/workflows/ci.yml). V14 to V20 are on main
   but OUTSIDE the guard — they are still never edited; the rule applies regardless of guard coverage.
-  Any migration/CI work before the Phase 17 squash must explicitly account for V14 to V19. Do not
+  Any migration/CI work before the Phase 17 squash must explicitly account for V14 to V20. Do not
   casually expand or rewrite the guard if the Phase 17 squash/baseline will supersede it.
 The Phase 17 schema-only squash/baseline must collapse ALL committed pre-production migrations —
-  V1 to V19 plus any later pre-production migrations — into one clean baseline before any real store
+  V1 to V20 plus any later pre-production migrations — into one clean baseline before any real store
   data exists, and re-lock it in CI.
 Do NOT create a Flyway migration per customer/tenant — onboarding seeds are not product migrations.
 ```
@@ -225,7 +227,7 @@ Dev-seed scripts live in `backend/src/main/resources/db/dev-seed/` (sibling of `
 
 ```text
 1. start Postgres
-2. start backend (Flyway applies V1 to V19)
+2. start backend (Flyway applies V1 to V20)
 3. psql -f db/dev-seed/quick_descriptions_demo.sql
 4. psql -f db/dev-seed/multi_store_user_demo.sql
 5. psql -f db/dev-seed/payment_helpers_demo.sql      # bank + Stripe-link demo data (Phase 15E)
@@ -397,19 +399,17 @@ Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-
   the accepted quote (Path A) — and from 16G PR 4 remote signing — each INSERT a new version;
   current invoice = max(version_number). last_emailed_at is the only in-place update.
 - Terms product rule (do not re-raise): changing business terms needs a NEW invoice + re-sign.
-  Implementation today (16F, D7): a Path A invoice (terms_source QUOTE) renders the frozen quote
-  terms_snapshot verbatim (null = no terms page, even when live terms exist). A Path B invoice
-  (Create / Rewrite, terms_source LIVE) renders the business's current per-flooring-type terms,
-  sanitised, on every render: its payment and void versions re-render live terms, also after
-  acceptance, and its InvoiceDetail terms_html is live. Payment, void and D.8 carry the current
-  invoice's source + snapshot forward.
-  16G PR 2 (#125, in 16G, planned): every version stores and renders its own words. Create/Rewrite
-  freeze live Invoice To name, billing lines + sanitised per-type terms; payment/void/D.8/remote
-  signing copy the previous version's words verbatim (null terms kept); Path A copies its quote's
-  V17 identity + frozen terms. Null terms = no terms page, NO live fallback. terms_source keeps its
-  name: QUOTE (signed quote's frozen terms) or BUSINESS (business terms frozen at Create/Rewrite;
-  replaces LIVE in PR 2). InvoiceDetail gains customer_name_snapshot / customer_address_line1_snapshot
-  / customer_address_line2_snapshot; the Invoice tab takes Invoice To from them (PR 2).
+  Implementation today (16G PR 2, #125): every invoice version stores and renders its own words
+  (V20 identity columns + V19 terms_snapshot). Create/Rewrite freeze the saved Invoice To name,
+  billing lines + sanitised per-type terms; payment/void/D.8 (and remote signing from PR 4) copy the
+  previous version's words verbatim (null terms kept); Path A copies its quote's V17 identity +
+  frozen terms. Null terms = no terms page, NO live fallback, and no Path B live render remains.
+  terms_source keeps its name: QUOTE (signed quote's frozen terms) or BUSINESS (business terms
+  frozen at Create/Rewrite; replaced the 16F LIVE). InvoiceDetail carries customer_name_snapshot /
+  customer_address_line1_snapshot / customer_address_line2_snapshot; the Invoice tab takes Invoice To
+  from them. Pre-PR-2 Path B versions keep a null terms_snapshot (terms are not backfilled): their
+  InvoiceDetail and every later payment/void/D.8 version show no terms (their own stored PDF keeps its
+  terms page) until a Rewrite (refused when LAID; clears a signature) or Path A writes frozen terms.
 - Rewrite-after-accept CLEARS acceptance/signature by design (new customer-facing invoice; re-accept).
 - Blank per-type terms display is CORRECT (terms_hard/terms_soft nullable; no backfill).
 - Logo is fail-soft to business-name TEXT on BOTH surfaces (screen <img> and backend PDF data URI).

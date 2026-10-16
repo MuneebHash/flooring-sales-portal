@@ -1222,8 +1222,8 @@ paths:
         order, validated before the invoice preconditions (else 422 CUSTOMER_EMAIL_REQUIRED
         when missing or CUSTOMER_EMAIL_INVALID when malformed). The created invoice is
         unsigned/unaccepted and creating it sends NO email (last_emailed_at null;
-        sales_order.last_emailed_at mirror null). 16G PR 2 (planned, #125): the version freezes
-        its words - the Invoice To name and billing lines from the saved customer and BILLING
+        sales_order.last_emailed_at mirror null). 16G PR 2 (#125): the version freezes its
+        words - the Invoice To name and billing lines from the saved customer and BILLING
         address, and the business's per-flooring-type terms, sanitised once (null when none are
         set) - into customer_name_snapshot, customer_address_line1_snapshot,
         customer_address_line2_snapshot and terms_snapshot; terms_source BUSINESS.
@@ -1271,9 +1271,9 @@ paths:
         signature reference and last_emailed_at (sales_order.last_emailed_at mirror becomes
         null); the customer must re-accept. Rewrite sends NO email. Returns 422 when rewrite
         is blocked (including LAID order lock, missing first invoice, or failed preconditions).
-        16G PR 2 (planned, #125): the new version freezes the current Invoice To name, billing
-        lines and per-flooring-type terms, as createInvoice does (terms_source BUSINESS; the
-        source quote version is cleared). 16G PR 4 (planned): in the same transaction an ACTIVE
+        16G PR 2 (#125): the new version freezes the current Invoice To name, billing lines and
+        per-flooring-type terms, as createInvoice does (terms_source BUSINESS; the source quote
+        version is cleared). 16G PR 4 (planned): in the same transaction an ACTIVE
         invoice link becomes REWRITTEN (the customer's page then shows "This invoice has been
         revised. Please contact the store for the updated invoice."). Rewrite gains no
         expected-version precondition in 16G.
@@ -1683,9 +1683,9 @@ paths:
         mirror is reset to null with the new version). Manual Resend is the only email
         action after a payment change. The response message is always
         "Payment recorded. Current invoice updated." regardless of acceptance state.
-        16G PR 2 (planned, #125): the new version copies the previous version's frozen words (the
-        Invoice To name, billing lines and terms_snapshot, verbatim, including null) - never the
-        live customer or the business's current terms. 16G PR 4 (planned): an ACTIVE invoice link
+        16G PR 2 (#125): the new version copies the previous version's frozen words (the Invoice
+        To name, billing lines and terms_snapshot, verbatim, including null) - never the live
+        customer or the business's current terms. 16G PR 4 (planned): an ACTIVE invoice link
         survives; the customer's next read shows the new version and amounts. No expected-version
         precondition in 16G.
       parameters:
@@ -1732,7 +1732,7 @@ paths:
         mirror is reset to null with the new version); manual Resend remains the only email action.
         This endpoint takes no request body and is allowed when order status is LAID. The voided
         payment stays visible in payment history with voided_at and voided_by_name populated.
-        16G PR 2 (planned, #125): the new version copies the previous version's frozen words, as
+        16G PR 2 (#125): the new version copies the previous version's frozen words, as
         recordPayment does. 16G PR 4 (planned): an ACTIVE invoice link survives. No
         expected-version precondition in 16G.
       parameters:
@@ -2100,17 +2100,20 @@ paths:
         quote_total_inc_gst verbatim, its frozen terms_snapshot (including null) and
         source_quote_version_id, and inherits accepted_at, accepted_customer_name and the same
         signature stored_file (no new signature file); invoice_date is today, due_date is the
-        order's proposed lay date minus 2 days, Invoice To is the live saved customer and billing
-        address, total_paid is the active payment sum, balance_due is the signed inc total minus
-        it, and last_emailed_at is null (sales_order.last_emailed_at is reset to null). The signed
-        invoice PDF is stored; the invoice has no lines. The order status, working price, lines,
+        order's proposed lay date minus 2 days, Invoice To (16G PR 2, #125) is the accepted
+        quote's V17 customer_name_snapshot, customer_address_line1_snapshot and
+        customer_address_line2_snapshot, verbatim (including null) - never the live customer,
+        which only feeds the preconditions above - total_paid is the active payment sum,
+        balance_due is the signed inc total minus it, and last_emailed_at is null
+        (sales_order.last_emailed_at is reset to null). The signed invoice PDF is stored; the
+        invoice has no lines. The order status, working price, lines,
         quote draft, quote versions and tokens (an ISSUED quote stays live), customer data and
         payments are not changed, and no email or notification is sent. Any failure rolls back
         every write and deletes only the new invoice PDF. 201 returns the InvoiceDetail (accepted,
         terms_source QUOTE) with the message "Invoice created from accepted quote."
         The paragraph above describes the behaviour TODAY (an empty body). The request schema
         below is the 16G PR 3 target. 16G amendments (planned;
-        docs/API-Contracts-Phase16G-Invoice-Link.md sections 4, 5.5 and 6):
+        docs/API-Contracts-Phase16G-Invoice-Link.md sections 5.5 and 6):
         16G PR 3 (#123): the body is mandatory, {"quote_version_id": N}, the accepted version
         shown in the open confirmation (CreateInvoiceFromQuoteRequest; an absent or empty body
         is 400 "Required."). Order of checks: guard and positive orderId; the order scoped and
@@ -2132,9 +2135,6 @@ paths:
         Invoice to try again." (failed); "Invoice created from accepted quote. It was not emailed
         because the customer has no valid email address — add one on the Customer tab, then use
         Re-send Invoice." (skipped). No store notification.
-        16G PR 2 (#125): Invoice To is frozen from the accepted quote's V17
-        customer_name_snapshot, customer_address_line1_snapshot and
-        customer_address_line2_snapshot, verbatim (including null), not the live customer.
         16G PR 4: the same transaction marks an ACTIVE invoice link SIGNED. Path A still never
         changes a quote version or quote token.
       parameters:
@@ -3812,16 +3812,14 @@ components:
           type: string
           nullable: true
           description: >-
-            Phase 16F PR2 (decision D7). Always present. The terms the version renders. TODAY: when
-            terms_source is QUOTE it is the invoice's frozen quote terms snapshot, verbatim (null
-            means frozen "no terms" and never falls back to the live terms); when terms_source is
-            LIVE it is the business's current per-flooring-type terms, sanitised and read at every
-            render (null when none are set). FROM 16G PR 2 (#125, planned): always the version's
-            own stored terms_snapshot, verbatim - frozen when the version was created (Create and
-            Rewrite freeze the business's per-flooring-type terms, sanitised once; Path A copies
-            the accepted quote's frozen terms; payment, void and signing versions copy the
-            previous version's terms, including null). Null means no terms page, with no live
-            fallback, on every version.
+            Phase 16F PR2 (decision D7); since 16G PR 2 (#125). Always present. The terms the
+            version renders: always the version's own stored terms_snapshot, verbatim - frozen
+            when the version was created (Create and Rewrite freeze the business's
+            per-flooring-type terms, sanitised once; Path A copies the accepted quote's frozen
+            terms; payment, void and signing versions copy the previous version's terms,
+            including null). Null means no terms page, with no live fallback, on every version
+            and both terms sources. (In 16F a LIVE invoice's terms were read at every render;
+            that branch is removed.)
         terms_source:
           type: string
           enum:
@@ -3834,34 +3832,34 @@ components:
             versions carried from it). BUSINESS (16G PR 2, #125): no source quote version - the
             business's per-flooring-type terms, frozen into the version at Create or Rewrite and
             carried by payment, void and signing versions; a manual rewrite returns to BUSINESS.
-            UNTIL 16G PR 2 MERGES the server returns LIVE in place of BUSINESS, with the 16F
-            meaning (the business's current terms, read at every render). The internal source
-            quote version id is never exposed.
+            BUSINESS replaced the 16F value LIVE in 16G PR 2. The internal source quote version
+            id is never exposed.
         customer_name_snapshot:
           type: string
           nullable: true
           description: >-
-            16G PR 2 (planned, #125; not returned until PR 2 merges). Always present once
-            implemented. The Invoice To name frozen into this version: first, middle (when
-            present) and last name, each trimmed, joined by single spaces (the V17 quote
-            derivation). Create and Rewrite freeze it from the saved customer; payment, void, D.8
-            and remote signing copy it verbatim (including null); Path A copies the accepted
-            quote's V17 customer_name_snapshot. The Invoice tab and the PDF show Invoice To from
-            these three fields, never from the live customer. From 16G PR 3 it is also the
-            accepted name D.8 records (a null or blank value gives 422
+            16G PR 2 (#125). Always present. The Invoice To name frozen into this version: first,
+            middle (when present) and last name, each trimmed, joined by single spaces (the V17
+            quote derivation). Create and Rewrite freeze it from the saved customer; payment, void
+            and D.8 copy it verbatim (including null), as remote signing will from 16G PR 4; Path A
+            copies the accepted quote's V17 customer_name_snapshot. The Invoice tab and the PDF show
+            Invoice To from these three fields, never from the live customer. From 16G PR 3 it is
+            also the accepted name D.8 records (a null or blank value gives 422
             ACCEPTED_CUSTOMER_NAME_REQUIRED).
         customer_address_line1_snapshot:
           type: string
           nullable: true
           description: >-
-            16G PR 2 (planned, #125). Billing line 1 frozen into this version, "[unit/]street_number
-            street"; written and copied as customer_name_snapshot. Null renders as absent.
+            16G PR 2 (#125). Always present. Billing line 1 frozen into this version,
+            "[unit/]street_number street"; written and copied as customer_name_snapshot. Null
+            renders as absent.
         customer_address_line2_snapshot:
           type: string
           nullable: true
           description: >-
-            16G PR 2 (planned, #125). Billing line 2 frozen into this version, "suburb state_code
-            postcode"; written and copied as customer_name_snapshot. Null renders as absent.
+            16G PR 2 (#125). Always present. Billing line 2 frozen into this version, "suburb
+            state_code postcode"; written and copied as customer_name_snapshot. Null renders as
+            absent.
         invoice_link_expires_at:
           allOf:
             - $ref: '#/components/schemas/Timestamp'
