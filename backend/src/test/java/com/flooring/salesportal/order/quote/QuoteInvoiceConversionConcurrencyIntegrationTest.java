@@ -227,7 +227,9 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
             "accepted_customer_name", "accepted_signature_present", "accepted_signature_download_path",
             "last_emailed_at", "terms_html", "terms_source",
             // 16G PR 2 (#125): the version's frozen Invoice To words, always present (nullable).
-            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot");
+            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot",
+            // 16G PR 4: the derived link field, always present (nullable; never on E.1 or a public payload).
+            "invoice_link_expires_at");
     private static final Set<String> CURRENT_INVOICE_SUMMARY_KEYS = Set.of(
             "invoice_id", "version_number", "invoice_date", "due_date", "sale_price_inc_gst",
             "total_paid", "balance_due", "created_by_user_id", "created_at", "pdf_download_path",

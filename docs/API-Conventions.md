@@ -515,7 +515,7 @@ An invoice can be created or rewritten only if all of these are true:
 
 **Phase 13 — customer email gate (Create, Rewrite, Accept, Resend).** In addition to the 9 preconditions above, a **valid customer email** must be present before Create Invoice, Rewrite Invoice, Accept Invoice, and Resend Invoice (so the accepted invoice can be emailed). This is a backend contract rule, not frontend-only. It is a **separate gate** evaluated before the 9 preconditions and returns its own codes (not bundled into `INVOICE_PRECONDITIONS_NOT_MET`): a missing/blank email → 422 `CUSTOMER_EMAIL_REQUIRED`; a malformed email → 422 `CUSTOMER_EMAIL_INVALID`. Create and Rewrite validate the email as a precondition but still **send no email**. Full Phase 13 contract: `docs/API-Contracts-Phase13-Acceptance-Signature-Email.md`.
 
-**16G (target contract, [`docs/API-Contracts-Phase16G-Invoice-Link.md`](API-Contracts-Phase16G-Invoice-Link.md)).** The same gate also applies to the invoice link send (PR 4: `POST …/invoices/current/send-link`). Two signing routes deliberately have **no** email gate: Create Invoice from the accepted quote (Path A) and remote invoice signing (PR 4). Each emails the signed PDF after commit and skips the send with a WARN log when the saved email is missing or invalid (16G contract §6).
+**16G (contract, [`docs/API-Contracts-Phase16G-Invoice-Link.md`](API-Contracts-Phase16G-Invoice-Link.md)).** The same gate also applies to the invoice link send (PR 4: `POST …/invoices/current/send-link`). Two signing routes deliberately have **no** email gate: Create Invoice from the accepted quote (Path A) and remote invoice signing (PR 4). Each emails the signed PDF after commit and skips the send with a WARN log when the saved email is missing or invalid (16G contract §6).
 
 ### Address requirement
 Both installation address and billing address must exist as separate rows in `order_address`.
@@ -695,7 +695,7 @@ Reason: LAID does not require full payment. Final payments may still be collecte
 ### What "editable" means
 When an order is not LAID, all order data can be modified freely.
 An order that has an invoice can still be edited — the existing invoice snapshot is not affected.
-Order edits never create an invoice version: only Rewrite Invoice makes them official. (Invoice versions are also created by payment, payment void, acceptance, Create Invoice from the accepted quote and, from 16G PR 4, remote signing; see §14. Of all the version writers, only Create and Rewrite take the sale content from the live order.)
+Order edits never create an invoice version: only Rewrite Invoice makes them official. (Invoice versions are also created by payment, payment void, acceptance, Create Invoice from the accepted quote and, since 16G PR 4, remote signing; see §14. Of all the version writers, only Create and Rewrite take the sale content from the live order.)
 
 ---
 

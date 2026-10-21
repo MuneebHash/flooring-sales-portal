@@ -6,6 +6,8 @@ package com.flooring.salesportal.common.error;
  * {@code QUOTE_LINK_CANCELLED} / {@code QUOTE_LINK_INACTIVE}). Raised only by the public
  * viewed/pdf (and, in 16F, accept) actions on a dead link; the public GET never throws this —
  * it returns 200 with a {@code state} instead so the customer page can render the message.
+ * Since Phase 16G PR 4 the same holds for a dead public invoice link ({@code INVOICE_LINK_*},
+ * raised by the public invoice accept and pdf).
  */
 public class GoneException extends ApiException {
 

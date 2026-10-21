@@ -1273,7 +1273,7 @@ paths:
         is blocked (including LAID order lock, missing first invoice, or failed preconditions).
         16G PR 2 (#125): the new version freezes the current Invoice To name, billing lines and
         per-flooring-type terms, as createInvoice does (terms_source BUSINESS; the source quote
-        version is cleared). 16G PR 4 (planned): in the same transaction an ACTIVE
+        version is cleared). 16G PR 4: in the same transaction an ACTIVE
         invoice link becomes REWRITTEN (the customer's page then shows "This invoice has been
         revised. Please contact the store for the updated invoice."). Rewrite gains no
         expected-version precondition in 16G.
@@ -1314,7 +1314,7 @@ paths:
       description: >
         Returns the current (latest) invoice snapshot for the order. MVP exposes only the
         current invoice; invoice history and per-version detail are deferred post-MVP.
-        Returns 404 when no invoice exists yet for the order. 16G PR 4 (planned): the response
+        Returns 404 when no invoice exists yet for the order. 16G PR 4: the response
         carries invoice_link_expires_at, derived in this read from the order's ACTIVE, unexpired
         invoice link (null otherwise); the read writes nothing and never expires a token. 16G
         PR 6 (planned, #120): the Invoice tab re-reads this endpoint every 15 seconds while the
@@ -1431,7 +1431,7 @@ paths:
         than this invoice's, createInvoiceFromQuote (Path A, 16F PR2) may convert it by appending
         a new invoice version, with this signed version kept in history (decision D5(b) as
         amended on 8 October 2026; quotation contract section 13). An ACCEPTED quote never blocks
-        this endpoint and is never touched (D5(d)). From 16G PR 4 the same transaction marks an
+        this endpoint and is never touched (D5(d)). Since 16G PR 4 the same transaction marks an
         ACTIVE invoice link SIGNED.
       parameters:
         - $ref: '#/components/parameters/OrderId'
@@ -1520,8 +1520,8 @@ paths:
       summary: Email the customer a link to sign the current invoice (Accept Remotely)
       operationId: sendInvoiceLink
       description: >
-        16G PR 4 (planned; not implemented until PR 4 merges;
-        docs/API-Contracts-Phase16G-Invoice-Link.md section 8). The Invoice tab's Accept Remotely
+        16G PR 4
+        (docs/API-Contracts-Phase16G-Invoice-Link.md section 8). The Invoice tab's Accept Remotely
         button calls it (PR 5). Standard
         protected. The request body is an empty JSON object (EmptyObjectRequest); no signature,
         name or declaration is sent. Order of checks: standard guard and positive orderId; the
@@ -1682,7 +1682,7 @@ paths:
         "Payment recorded. Current invoice updated." regardless of acceptance state.
         16G PR 2 (#125): the new version copies the previous version's frozen words (the Invoice
         To name, billing lines and terms_snapshot, verbatim, including null) - never the live
-        customer or the business's current terms. 16G PR 4 (planned): an ACTIVE invoice link
+        customer or the business's current terms. 16G PR 4: an ACTIVE invoice link
         survives; the customer's next read shows the new version and amounts. No expected-version
         precondition in 16G.
       parameters:
@@ -1730,7 +1730,7 @@ paths:
         This endpoint takes no request body and is allowed when order status is LAID. The voided
         payment stays visible in payment history with voided_at and voided_by_name populated.
         16G PR 2 (#125): the new version copies the previous version's frozen words, as
-        recordPayment does. 16G PR 4 (planned): an ACTIVE invoice link survives. No
+        recordPayment does. 16G PR 4: an ACTIVE invoice link survives. No
         expected-version precondition in 16G.
       parameters:
         - $ref: '#/components/parameters/OrderId'
@@ -2126,7 +2126,7 @@ paths:
         Invoice to try again." (failed); "Invoice created from accepted quote. It was not emailed
         because the customer has no valid email address — add one on the Customer tab, then use
         Re-send Invoice." (skipped).
-        16G PR 4 (planned): the same transaction marks an ACTIVE invoice link SIGNED. Path A
+        16G PR 4: the same transaction marks an ACTIVE invoice link SIGNED. Path A
         still never changes a quote version or quote token.
       parameters:
         - $ref: '#/components/parameters/OrderId'
@@ -2536,7 +2536,7 @@ paths:
         recording-only in this build - no real email is sent). A notification failure is logged
         and never undoes the acceptance. The signed PDF is portal-only
         (GET /orders/{orderId}/quote/pdf?type=accepted; from 16G PR 6 the version-addressed
-        downloadAcceptedQuoteVersionPdf) and is never served on the public surface. From 16G PR 4
+        downloadAcceptedQuoteVersionPdf) and is never served on the public surface. Since 16G PR 4
         a remote invoice signing (acceptPublicInvoice) also cancels an ISSUED quote and its ACTIVE
         token, as the in-app invoice acceptance does (16F decision D5(c), extended), giving
         QUOTE_LINK_CANCELLED here. Rate limiting (contract §8) is not implemented at this base
@@ -2627,7 +2627,7 @@ paths:
       operationId: getPublicInvoice
       security: []
       description: >
-        16G PR 4 (planned; not implemented until PR 4 merges; the /i/{token} page is PR 5;
+        16G PR 4 (the /i/{token} page is PR 5;
         docs/API-Contracts-Phase16G-Invoice-Link.md section 9). Public, slugless, token-only: no
         session is read or created, no Set-Cookie, no RequestContextGuard; the secret token is the
         only credential and only the single order's current invoice behind it is readable. The
@@ -2674,7 +2674,7 @@ paths:
       operationId: acceptPublicInvoice
       security: []
       description: >
-        16G PR 4 (planned; docs/API-Contracts-Phase16G-Invoice-Link.md sections 9.4 and 10). The
+        16G PR 4 (docs/API-Contracts-Phase16G-Invoice-Link.md sections 9.4 and 10). The
         customer signs the invoice version the page shows. multipart/form-data with exactly two
         parts: expected_version_number (the version_number shown) and signature (see
         PublicInvoiceAcceptRequest). No name, declaration flags or money values are accepted; the
@@ -2781,7 +2781,7 @@ paths:
       operationId: downloadPublicInvoicePdf
       security: []
       description: >
-        16G PR 4 (planned; docs/API-Contracts-Phase16G-Invoice-Link.md section 9.5). Streams the
+        16G PR 4 (docs/API-Contracts-Phase16G-Invoice-Link.md section 9.5). Streams the
         stored PDF of the version the page shows, only while the link is ACTIVE; never
         regenerated, and no other version is reachable (no history on the public surface). Order:
         token gate (404 INVOICE_TOKEN_NOT_FOUND; lazy expiry; 410 for a dead link); the
@@ -2924,7 +2924,7 @@ components:
       schema:
         type: string
       description: >
-        16G PR 4 (planned). Opaque secret public invoice token (not an order, invoice or quote id):
+        16G PR 4. Opaque secret public invoice token (not an order, invoice or quote id):
         43 to 128 characters of [A-Za-z0-9_-] (a minted token is 32 random bytes as unpadded
         URL-safe Base64, 43 characters). A value of any other shape, a quote token, or an unknown
         token gives 404 INVOICE_TOKEN_NOT_FOUND "Invoice not found." with no database access for a
@@ -3744,11 +3744,11 @@ components:
           allOf:
             - $ref: '#/components/schemas/Date'
           description: >-
-            Today every invoice writer dates its new version with the server's current date
-            (LocalDate.now()), in-store acceptance included; from 16G PR 3 (acceptCurrentInvoice)
-            and 16G PR 4 (acceptPublicInvoice) a signing version instead copies invoice_date from
-            the version it signs, while createInvoice, rewriteInvoice, createInvoiceFromQuote,
-            recordPayment and voidPayment keep dating their version the day it is written.
+            Since 16G PR 3 (acceptCurrentInvoice) and 16G PR 4 (acceptPublicInvoice) a signing
+            version copies invoice_date from the version it signs, while createInvoice,
+            rewriteInvoice, createInvoiceFromQuote, recordPayment and voidPayment date their version
+            the day it is written, with the server's current date (LocalDate.now()). Before 16G PR 3,
+            in-store acceptance also dated its version the signing day.
         due_date:
           nullable: true
           allOf:
@@ -3767,7 +3767,7 @@ components:
           type: integer
           format: int64
           description: >-
-            The staff user who created the version. From 16G PR 4, a version appended by remote
+            The staff user who created the version. Since 16G PR 4, a version appended by remote
             signing (acceptPublicInvoice) records the staff user who sent the link
             (invoice_token.sent_by_user_id).
         created_at:
@@ -3797,7 +3797,7 @@ components:
             - $ref: '#/components/schemas/Timestamp'
           description: >-
             When this version's signed PDF was emailed successfully, or null. Set by Accept and
-            Re-send today; from 16G PR 3 also by createInvoiceFromQuote; from 16G PR 4 also by
+            Re-send today; from 16G PR 3 also by createInvoiceFromQuote; since 16G PR 4 also by
             remote signing. An invoice link email (sendInvoiceLink) never sets it.
         terms_html:
           type: string
@@ -3832,7 +3832,7 @@ components:
             16G PR 2 (#125). Always present. The Invoice To name frozen into this version: first,
             middle (when present) and last name, each trimmed, joined by single spaces (the V17
             quote derivation). Create and Rewrite freeze it from the saved customer; payment, void
-            and D.8 copy it verbatim (including null), as remote signing will from 16G PR 4; Path A
+            and D.8 copy it verbatim (including null), as remote signing does since 16G PR 4; Path A
             copies the accepted quote's V17 customer_name_snapshot. The Invoice tab and the PDF show
             Invoice To from these three fields, never from the live customer. From 16G PR 3 it is
             also the accepted name D.8 records (a null or blank value gives 422
@@ -3856,7 +3856,7 @@ components:
             - $ref: '#/components/schemas/Timestamp'
           nullable: true
           description: >-
-            16G PR 4 (planned; not returned until PR 4 merges). Always present once implemented.
+            16G PR 4. Always present.
             Derived response metadata, not a frozen word and not one of the three PR 2
             customer_*_snapshot fields: computed in the read from server state as the expires_at
             of the order's ACTIVE invoice link (invoice_token) whose expiry is still in the
@@ -4282,9 +4282,9 @@ components:
             mirror that ALWAYS equals the current invoice's last_emailed_at, including null
             (Phase 13 section 11.1). Every new invoice version resets it to that version's value,
             null at creation: Create, Rewrite, Accept, payment, payment void, Create Invoice from the
-            accepted quote (createInvoiceFromQuote) and, from 16G PR 4, remote invoice signing. A
+            accepted quote (createInvoiceFromQuote) and, since 16G PR 4, remote invoice signing. A
             successful signed-PDF email sets it to the send timestamp: Accept and Re-send; from 16G
-            PR 3 createInvoiceFromQuote; from 16G PR 4 remote signing. Payment and payment void never
+            PR 3 createInvoiceFromQuote; since 16G PR 4 remote signing. Payment and payment void never
             email (since Phase 15D), and a 16G invoice link email (sendInvoiceLink) never sets it. It
             never retains a previous version's emailed time once a new, unemailed current invoice
             exists.
@@ -5156,9 +5156,9 @@ components:
             Machine-readable error code, a free-form string (deliberately not enumerated here; the
             contracts list the codes). 16G adds (docs/API-Contracts-Phase16G-Invoice-Link.md
             section 14): INVOICE_VERSION_STALE (409; acceptCurrentInvoice, implemented in PR 3;
-            acceptPublicInvoice and downloadPublicInvoicePdf from PR 4, not implemented until it
-            merges); QUOTE_VERSION_STALE (409; createInvoiceFromQuote, implemented in PR 3); and,
-            as target contract not implemented until PR 4 merges: INVOICE_TOKEN_NOT_FOUND (404; the
+            acceptPublicInvoice and downloadPublicInvoicePdf, implemented in PR 4);
+            QUOTE_VERSION_STALE (409; createInvoiceFromQuote, implemented in PR 3); and,
+            implemented in PR 4: INVOICE_TOKEN_NOT_FOUND (404; the
             public invoice endpoints); INVOICE_LINK_REPLACED, INVOICE_LINK_REWRITTEN,
             INVOICE_LINK_SIGNED and INVOICE_LINK_EXPIRED (410; acceptPublicInvoice and
             downloadPublicInvoicePdf).
@@ -6013,7 +6013,7 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        16G PR 4 (planned). sendInvoiceLink success data: the new link's send and expiry times
+        16G PR 4. sendInvoiceLink success data: the new link's send and expiry times
         only - never the token, its hash, the link URL, a storage path or the recipient.
       required:
         - invoice_link
@@ -6049,7 +6049,7 @@ components:
     PublicInvoiceState:
       type: string
       description: >-
-        16G PR 4 (planned). The public state of an invoice link, equal to its invoice_token status.
+        16G PR 4. The public state of an invoice link, equal to its invoice_token status.
         ACTIVE: viewable and signable. REPLACED: a newer link replaced it ("This invoice link has
         been replaced. Please use the latest invoice link."). REWRITTEN: a manual Rewrite revised
         the invoice ("This invoice has been revised. Please contact the store for the updated
@@ -6069,7 +6069,7 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        16G PR 4 (planned; docs/API-Contracts-Phase16G-Invoice-Link.md section 9.3). Public,
+        16G PR 4 (docs/API-Contracts-Phase16G-Invoice-Link.md section 9.3). Public,
         token-only view of the order's CURRENT invoice version. Every key is always present (null
         values serialised). ACTIVE: the document fields are populated (nullable ones may be null)
         and message is null. A dead state (REPLACED, REWRITTEN, SIGNED, EXPIRED): only state,
@@ -6249,7 +6249,7 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        16G PR 4 (planned). acceptPublicInvoice multipart parts: exactly one
+        16G PR 4. acceptPublicInvoice multipart parts: exactly one
         expected_version_number form field and one signature file. Nothing else is accepted (no
         name, declaration flags or money values): any other file part or form field gives 400
         VALIDATION_FAILED "Not allowed."; a repeated part "Must appear at most once.".
@@ -6355,7 +6355,7 @@ components:
             $ref: '#/components/schemas/StandardErrorResponse'
     InvoiceLinkGone:
       description: >
-        Gone (16G PR 4, planned). The public invoice link was found but is dead, so the action
+        Gone (16G PR 4). The public invoice link was found but is dead, so the action
         (accept or pdf) is refused: INVOICE_LINK_REPLACED "This invoice link has been replaced.
         Please use the latest invoice link."; INVOICE_LINK_REWRITTEN "This invoice has been
         revised. Please contact the store for the updated invoice."; INVOICE_LINK_SIGNED "This

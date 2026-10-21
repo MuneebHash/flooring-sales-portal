@@ -2,6 +2,7 @@ package com.flooring.salesportal.order;
 
 import com.flooring.salesportal.common.api.ApiResponse;
 import com.flooring.salesportal.order.OrderInvoiceService.InvoiceFileDownload;
+import com.flooring.salesportal.order.dto.InvoiceLinkSendResultDto;
 import com.flooring.salesportal.order.dto.InvoiceResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.ContentDisposition;
@@ -130,6 +131,24 @@ public class OrderInvoiceController {
             HttpServletRequest httpRequest) {
 
         return orderInvoiceService.resendCurrentInvoice(slug, orderId, body, httpRequest);
+    }
+
+    /**
+     * Phase 16G PR 4 send-link (16G contract §8; Accept Remotely): email the customer a link to sign the
+     * current invoice remotely. Standard protected; the body is an {@code EmptyObjectRequest}, taken raw
+     * ({@code required = false}) so the service validates it strictly after the scope gate, like the other
+     * empty-body invoice routes. 201 with the link's {@code sent_at} / {@code expires_at} only; 502
+     * {@code EMAIL_SEND_FAILED} when the link email fails (the new link stays ACTIVE).
+     */
+    @PostMapping("/invoices/current/send-link")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ApiResponse<InvoiceLinkSendResultDto> sendInvoiceLink(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @RequestBody(required = false) String body,
+            HttpServletRequest httpRequest) {
+
+        return orderInvoiceService.sendInvoiceLink(slug, orderId, body, httpRequest);
     }
 
     /**

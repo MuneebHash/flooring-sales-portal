@@ -10,6 +10,8 @@ import com.flooring.salesportal.common.api.ErrorDetail;
 import com.flooring.salesportal.common.email.InvoiceEmailException;
 import com.flooring.salesportal.common.email.InvoiceEmailRequest;
 import com.flooring.salesportal.common.email.InvoiceEmailSender;
+import com.flooring.salesportal.common.email.InvoiceLinkEmailRequest;
+import com.flooring.salesportal.common.email.InvoiceLinkEmailSender;
 import com.flooring.salesportal.common.error.BusinessRuleException;
 import com.flooring.salesportal.common.error.ConflictException;
 import com.flooring.salesportal.common.error.EmailSendException;
@@ -21,10 +23,15 @@ import com.flooring.salesportal.common.error.ValidationException;
 import com.flooring.salesportal.common.session.RequestContext;
 import com.flooring.salesportal.common.session.RequestContextGuard;
 import com.flooring.salesportal.common.storage.FileStorageService;
+import com.flooring.salesportal.common.token.TokenHash;
 import com.flooring.salesportal.order.InvoicePdfModelAssembler.Inputs;
 import com.flooring.salesportal.order.InvoiceRepository.InvoiceFile;
 import com.flooring.salesportal.order.InvoiceRepository.InvoiceRow;
+import com.flooring.salesportal.order.SignedInvoiceEmailer.CommittedSignedInvoice;
+import com.flooring.salesportal.order.SignedInvoiceEmailer.PostCommitEmail;
+import com.flooring.salesportal.order.SignedInvoiceEmailer.SignedEmailOutcome;
 import com.flooring.salesportal.order.dto.InvoiceDetailDto;
+import com.flooring.salesportal.order.dto.InvoiceLinkSendResultDto;
 import com.flooring.salesportal.order.dto.InvoiceResponse;
 import com.flooring.salesportal.order.dto.OrderFinancialSummaryDto;
 import com.flooring.salesportal.order.financial.OrderFinancialCalculator;
@@ -34,8 +41,10 @@ import com.flooring.salesportal.order.quote.QuoteVersionRepository.QuoteVersionR
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Isolation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -47,15 +56,13 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.net.URLDecoder;
-import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.Arrays;
+import java.util.Base64;
 import java.util.Enumeration;
 import java.util.Iterator;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -113,6 +120,16 @@ import java.util.Optional;
  * the version they appended, strictly after their own commit, and no post-commit failure - a delivery
  * failure, any other sender failure or a failure of the success stamp - turns a committed signing or
  * conversion into an error.
+ *
+ * <p>Phase 16G PR 4 (16G contract §7 to §12): the order-bound invoice link ({@code invoice_token}). The
+ * protected send-link ({@link #sendInvoiceLink}) mints the order's new {@code ACTIVE} link (replacing an
+ * older one) and emails it, link-only, after commit; the token-only public surface that reads and signs
+ * it is {@link PublicInvoiceService}. Every invoice writer that ends a link does so in its own
+ * order-locked transaction: D.2 Rewrite kills an {@code ACTIVE} link as {@code REWRITTEN}, D.8 and Path A
+ * as {@code SIGNED}; D.1 Create, payment and void never touch it. The signed-PDF email and its stamp live
+ * in the package-private {@link SignedInvoiceEmailer}, shared with the remote accept. Every InvoiceDetail
+ * carries the derived {@code invoice_link_expires_at}, computed by the route and passed to the pure
+ * {@link #toDto} mapping.
  */
 @Service
 public class OrderInvoiceService {
@@ -130,6 +147,16 @@ public class OrderInvoiceService {
     // Phase 16F PR1 D5(c): the quote version / token status written when D.8 kills an active link.
     private static final String QUOTE_VERSION_CANCELLED = "CANCELLED";
     private static final String QUOTE_TOKEN_CANCELLED = "CANCELLED";
+    // Phase 16G PR 4 (16G contract §7.5): the invoice_token reasons the protected writers record when they
+    // end an ACTIVE invoice link (status-guarded, in the writer's own order-locked transaction).
+    private static final String INVOICE_TOKEN_REPLACED = "REPLACED";
+    private static final String INVOICE_TOKEN_REWRITTEN = "REWRITTEN";
+    private static final String INVOICE_TOKEN_SIGNED = "SIGNED";
+    // Phase 16G PR 4 invoice link mint (16G contract §7.3): 32 CSPRNG bytes as unpadded URL-safe Base64
+    // (43 characters, the QuoteSendService rule), expiring 7 days after the send (JVM clock).
+    private static final int INVOICE_LINK_TOKEN_BYTES = 32;
+    private static final int INVOICE_LINK_TTL_DAYS = 7;
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
 
     // Phase 13 D.8 Accept multipart contract (§5.1) as amended by 16G PR 3 (16G contract §5.4): exactly
     // two parts - the form field expected_version_number and the file part signature. Any other part,
@@ -149,6 +176,11 @@ public class OrderInvoiceService {
     private static final String ACCEPT_EMAIL_FAILED_MESSAGE =
             "Invoice accepted. The invoice could not be emailed — use Re-send Invoice to try again.";
     private static final String RESEND_MESSAGE = "Invoice re-sent to the customer.";
+    // Phase 16G PR 4 send-link (16G contract §8): the 201 message, and the route's own wording for the
+    // reused 502 EMAIL_SEND_FAILED (its default message stays D.9's).
+    private static final String INVOICE_LINK_SENT_MESSAGE = "Invoice link emailed to the customer.";
+    private static final String INVOICE_LINK_EMAIL_FAILED_MESSAGE =
+            "The invoice link could not be emailed. Please try again.";
 
     // Phase 16F PR2 Path A (create invoice from the accepted quote) messages. The 409 reuses
     // INVOICE_ALREADY_ACCEPTED with this Path A wording; D.8's default message is unchanged. Since 16G
@@ -184,13 +216,20 @@ public class OrderInvoiceService {
     private final FileStorageService fileStorageService;
     private final InvoiceEmailSender invoiceEmailSender;
     private final QuoteVersionRepository quoteVersionRepository;
+    // Phase 16G PR 4: the order-bound invoice link, its link-only email, and the shared signed-PDF email.
+    private final InvoiceTokenRepository invoiceTokenRepository;
+    private final InvoiceLinkEmailSender invoiceLinkEmailSender;
+    private final SignedInvoiceEmailer signedInvoiceEmailer;
     private final ObjectMapper objectMapper;
-    // Programmatic transactions for the Phase 13 accept/resend flows and, since 16G PR 3, Path A: the
-    // email send must run AFTER the acceptance / conversion commit (and the email-success stamp in its
-    // own follow-up transaction), so those public methods cannot be @Transactional. Spring's proxy
-    // ignores self-invocation, so a private @Transactional helper would not work either —
-    // TransactionTemplate is the supported alternative.
+    // Programmatic transactions for the Phase 13 accept/resend flows and, since 16G PR 3, Path A (and,
+    // since PR 4, send-link): the email send must run AFTER the acceptance / conversion / send commit
+    // (and the email-success stamp in its own follow-up transaction), so those public methods cannot be
+    // @Transactional. Spring's proxy ignores self-invocation, so a private @Transactional helper would not
+    // work either — TransactionTemplate is the supported alternative.
     private final TransactionTemplate transactionTemplate;
+    // Phase 16G PR 4: absolute app origin for the public /i/{token} link (app.public-base-url, the quote
+    // link's property; normalized like QuoteSendService to no trailing slash). The page is SLUGLESS.
+    private final String publicBaseUrl;
 
     public OrderInvoiceService(RequestContextGuard requestContextGuard,
                                SalesOrderRepository salesOrderRepository,
@@ -208,8 +247,12 @@ public class OrderInvoiceService {
                                FileStorageService fileStorageService,
                                InvoiceEmailSender invoiceEmailSender,
                                QuoteVersionRepository quoteVersionRepository,
+                               InvoiceTokenRepository invoiceTokenRepository,
+                               InvoiceLinkEmailSender invoiceLinkEmailSender,
+                               SignedInvoiceEmailer signedInvoiceEmailer,
                                PlatformTransactionManager transactionManager,
-                               ObjectMapper objectMapper) {
+                               ObjectMapper objectMapper,
+                               @Value("${app.public-base-url}") String publicBaseUrl) {
         this.requestContextGuard = requestContextGuard;
         this.salesOrderRepository = salesOrderRepository;
         this.orderCustomerRepository = orderCustomerRepository;
@@ -226,8 +269,14 @@ public class OrderInvoiceService {
         this.fileStorageService = fileStorageService;
         this.invoiceEmailSender = invoiceEmailSender;
         this.quoteVersionRepository = quoteVersionRepository;
+        this.invoiceTokenRepository = invoiceTokenRepository;
+        this.invoiceLinkEmailSender = invoiceLinkEmailSender;
+        this.signedInvoiceEmailer = signedInvoiceEmailer;
         this.objectMapper = objectMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
+        // Normalize once (the QuoteSendService rule): no trailing slash, so publicBaseUrl + "/i/" + token
+        // is always clean.
+        this.publicBaseUrl = publicBaseUrl == null ? "" : publicBaseUrl.trim().replaceAll("/+$", "");
     }
 
     /** POST /orders/{orderId}/invoices — create the first (version 1) invoice. */
@@ -257,8 +306,9 @@ public class OrderInvoiceService {
 
         // Snapshot the live order state onto version 1 (shared with D.2 Rewrite). Payments are
         // invoice-first (D.7 requires an existing invoice), so a brand-new order's total_paid is 0 and
-        // balance_due = inc - 0 = inc > 0 (precondition 9).
-        return snapshotAndPersistInvoice(slug, orderId, order, ctx, FIRST_VERSION, "Invoice created.");
+        // balance_due = inc - 0 = inc > 0 (precondition 9). Create is not a Rewrite: no invoice existed, so
+        // no invoice link can exist and nothing is killed (16G contract §7.5).
+        return snapshotAndPersistInvoice(slug, orderId, order, ctx, FIRST_VERSION, "Invoice created.", false);
     }
 
     // ------------------------------------------------------------------
@@ -310,8 +360,10 @@ public class OrderInvoiceService {
                 .orElseThrow(() -> new BusinessRuleException(
                         ErrorCode.INVOICE_REQUIRED, ErrorCode.INVOICE_REQUIRED.defaultMessage()));
 
+        // Phase 16G PR 4: the Rewrite branch also kills the order's ACTIVE invoice link as REWRITTEN, in
+        // this same order-locked transaction (see snapshotAndPersistInvoice).
         return snapshotAndPersistInvoice(
-                slug, orderId, order, ctx, current.versionNumber() + 1, "Invoice rewritten.");
+                slug, orderId, order, ctx, current.versionNumber() + 1, "Invoice rewritten.", true);
     }
 
     // ------------------------------------------------------------------
@@ -340,13 +392,21 @@ public class OrderInvoiceService {
      * blank value stored as null, never {@code ""}) and the business's per-flooring-type terms,
      * sanitised once (null when none are set). Those same values are rendered into the PDF and
      * inserted, and the response maps them back from the inserted row.
+     *
+     * <p>Phase 16G PR 4 (16G contract §7.5, §4.5): only the {@code rewrite} branch (D.2) kills the order's
+     * {@code ACTIVE} invoice link, as {@code REWRITTEN} with {@code dead_at} = now, status-guarded, after the
+     * insert and in this same transaction (a rollback leaves the link untouched; an over-age link that no
+     * public request has flipped yet takes {@code REWRITTEN}, not {@code EXPIRED}). D.1 Create kills
+     * nothing: with no invoice, no link can exist. The response's derived
+     * {@code invoice_link_expires_at} is therefore null for D.2 and computed after the writes for D.1.
      */
     private ApiResponse<InvoiceResponse> snapshotAndPersistInvoice(String slug,
                                                                    long orderId,
                                                                    SalesOrder order,
                                                                    RequestContext ctx,
                                                                    int versionNumber,
-                                                                   String successMessage) {
+                                                                   String successMessage,
+                                                                   boolean rewrite) {
         // Phase 13 email gate (contract §12): a valid customer email is required BEFORE the 9
         // preconditions are evaluated; when it fails, the 9-check evaluation is skipped entirely. A
         // missing customer row is therefore 422 CUSTOMER_EMAIL_REQUIRED, never
@@ -440,7 +500,16 @@ public class OrderInvoiceService {
             // previous version. Same transaction as the insert; the order row is held FOR UPDATE.
             invoiceRepository.updateSalesOrderLastEmailedAt(orderId, row.lastEmailedAt());
 
-            InvoiceDetailDto dto = toDto(slug, orderId, row);
+            // Phase 16G PR 4: a manual Rewrite revises the invoice, so an ACTIVE link to it dies as
+            // REWRITTEN (0 rows when there is no live link). Create (no invoice existed) has no link.
+            LocalDateTime invoiceLinkExpiresAt = null;
+            if (rewrite) {
+                invoiceTokenRepository.killActiveByOrderId(orderId, INVOICE_TOKEN_REWRITTEN, LocalDateTime.now());
+            } else {
+                invoiceLinkExpiresAt = invoiceLinkExpiresAt(orderId, row);
+            }
+
+            InvoiceDetailDto dto = toDto(slug, orderId, row, invoiceLinkExpiresAt);
             return ApiResponse.ok(new InvoiceResponse(dto), successMessage);
         } catch (RuntimeException ex) {
             fileStorageService.deleteQuietly(storagePath);
@@ -502,8 +571,9 @@ public class OrderInvoiceService {
      *
      * <p><b>Writes:</b> the new invoice PDF is written FIRST with rollback cleanup (in-method + an
      * {@code afterCompletion} hook), then its {@code stored_file} row, the invoice row (both {@code V19}
-     * columns set; source ownership verified by {@link InvoiceRepository#insertInvoice}) and the section 11.1
-     * mirror reset ({@code sales_order.last_emailed_at} = null - the only order write). Any render,
+     * columns set; source ownership verified by {@link InvoiceRepository#insertInvoice}), the section 11.1
+     * mirror reset ({@code sales_order.last_emailed_at} = null - the only order write) and, since 16G PR 4,
+     * the kill of an {@code ACTIVE} invoice link as {@code SIGNED} (16G contract §7.5). Any render,
      * storage, insert or commit failure rolls every write back, deletes only this request's PDF and sends
      * no email; the inherited signature and every pre-existing PDF are never registered for deletion. The
      * order's status, working price / override, GP / cost / header financials, product and charge lines, the
@@ -528,13 +598,15 @@ public class OrderInvoiceService {
 
         // Post-commit signed-PDF email (16G contract §6): never throws; the conversion above is durable.
         // The 201 always describes the version this conversion appended (respondWithAppendedVersion).
-        PostCommitEmail email = emailSignedInvoiceAfterCommit(ctx, orderId, converted, true);
+        PostCommitEmail email = signedInvoiceEmailer.emailAfterCommit(log, orderId, converted, true);
         String message = switch (email.outcome()) {
             case DELIVERED -> CREATED_FROM_QUOTE_EMAILED_MESSAGE;
             case FAILED -> CREATED_FROM_QUOTE_EMAIL_FAILED_MESSAGE;
             case SKIPPED -> CREATED_FROM_QUOTE_EMAIL_SKIPPED_MESSAGE;
         };
-        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, email.responseRow())), message);
+        // invoice_link_expires_at (16G contract §4.5): null - the conversion killed any ACTIVE invoice link
+        // as SIGNED in its own transaction, and the version it appended is signed.
+        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, email.responseRow(), null)), message);
     }
 
     /**
@@ -647,13 +719,19 @@ public class OrderInvoiceService {
             // sales_order mirror is reset to its null last_emailed_at in the same transaction.
             invoiceRepository.updateSalesOrderLastEmailedAt(orderId, row.lastEmailedAt());
 
+            // Phase 16G PR 4 (16G contract §7.5): the conversion appends a SIGNED current version, so an
+            // ACTIVE invoice link dies as SIGNED in this transaction (0 rows when there is none). Path A
+            // still never changes a quote version or quote token.
+            invoiceTokenRepository.killActiveByOrderId(orderId, INVOICE_TOKEN_SIGNED, LocalDateTime.now());
+
             // Phase 16G PR 3: everything the post-commit email needs, captured here, in the committing
             // transaction - this version's own PDF bytes and the saved customer email read under the lock
             // (trimmed; null when missing or invalid, which skips the send: there is no email gate).
             String recipientEmail = customerEmailValidator.hasValidCustomerEmail(customer)
                     ? customer.getEmail().trim()
                     : null;
-            return new CommittedSignedInvoice(row, order.getOrderNumber(), recipientEmail, pdfBytes, fileName);
+            return new CommittedSignedInvoice(row, order.getOrderNumber(), ctx.business().getName(),
+                    ctx.businessId(), ctx.storeId(), recipientEmail, pdfBytes, fileName);
         } catch (RuntimeException ex) {
             fileStorageService.deleteQuietly(storagePath);
             throw ex;
@@ -693,8 +771,15 @@ public class OrderInvoiceService {
      * (404 {@code ORDER_NOT_FOUND}, no existence leak) -> current invoice lookup (404
      * {@code INVOICE_NOT_FOUND} when none). The response is the E.2 invoice_detail with NO top-level
      * {@code message} (D.3), so {@link ApiResponse#ok(Object)} is used (message stays null/omitted).
+     *
+     * <p><b>One snapshot (REPEATABLE_READ, 16G PR 4).</b> The current version and the order's invoice link
+     * (the derived {@code invoice_link_expires_at}) are read in separate statements and D.3 takes no order
+     * lock; under READ COMMITTED a signing or Rewrite committing between them would pair the old unsigned
+     * version with the dead link's null - a moment that never existed. A read-only REPEATABLE_READ transaction
+     * pins both reads to one committed moment, takes no row locks and never blocks a writer (the
+     * {@code QuoteService.getWorkspace} precedent).
      */
-    @Transactional(readOnly = true)
+    @Transactional(readOnly = true, isolation = Isolation.REPEATABLE_READ)
     public ApiResponse<InvoiceResponse> getCurrentInvoice(String slug,
                                                           String orderIdRaw,
                                                           HttpServletRequest httpRequest) {
@@ -707,7 +792,9 @@ public class OrderInvoiceService {
                         ErrorCode.INVOICE_NOT_FOUND.defaultMessage()));
 
         // Phase 16G PR 2: the version's stored words only - no live customer, address or terms read.
-        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, row)));
+        // Phase 16G PR 4: plus the derived invoice_link_expires_at, read here without writing (a staff read
+        // never expires a link, even an over-age ACTIVE one).
+        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, row, invoiceLinkExpiresAt(orderId, row))));
     }
 
     // ------------------------------------------------------------------
@@ -766,7 +853,8 @@ public class OrderInvoiceService {
      *
      * <p>Deliberately NOT {@code @Transactional}: the persist runs in ONE programmatic transaction
      * (signature {@code stored_file} + signed-PDF {@code stored_file} + appended {@code invoice} row +
-     * §11.1 mirror reset + the D5(c) quote-link cancellation — any failure rolls all of it back and the
+     * §11.1 mirror reset + the D5(c) quote-link cancellation + since 16G PR 4 the {@code SIGNED} kill of an
+     * {@code ACTIVE} invoice link — any failure rolls all of it back and the
      * rollback hooks remove both just-written files), the email is sent strictly AFTER that commit, and
      * on delivery success the timestamp is stamped in a short follow-up transaction. Since 16G PR 3 no
      * post-commit step can fail this endpoint (16G contract §6.2): a delivery failure, any other sender
@@ -791,9 +879,11 @@ public class OrderInvoiceService {
 
         // Post-commit auto-email (16G contract §6): never throws; the acceptance above is durable. The
         // response row after a recorded delivery is the stamp's re-read current row, as before PR 3.
-        PostCommitEmail email = emailSignedInvoiceAfterCommit(ctx, orderId, accepted, false);
+        PostCommitEmail email = signedInvoiceEmailer.emailAfterCommit(log, orderId, accepted, false);
 
-        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, email.responseRow())),
+        // invoice_link_expires_at (16G contract §4.5): null - the acceptance killed any ACTIVE invoice link
+        // as SIGNED in its own transaction.
+        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, email.responseRow(), null)),
                 email.outcome() == SignedEmailOutcome.DELIVERED ? ACCEPT_EMAILED_MESSAGE : ACCEPT_EMAIL_FAILED_MESSAGE);
     }
 
@@ -913,12 +1003,15 @@ public class OrderInvoiceService {
                 // lock as this acceptance, so both commit or roll back together (never post-commit,
                 // never dependent on the email below). One direction only (D5(d)): an already
                 // ACCEPTED quote is never touched and never blocks D.8; no ISSUED version → no-op.
-                cancelActiveQuoteLink(orderId, acceptedAt);
+                cancelActiveQuoteLink(quoteVersionRepository, orderId, acceptedAt);
+                // Phase 16G PR 4 (16G contract §7.5): beside D5(c), an ACTIVE invoice link dies as SIGNED
+                // (dead_at = the signing time) - a signed current version is never signable remotely.
+                invoiceTokenRepository.killActiveByOrderId(orderId, INVOICE_TOKEN_SIGNED, acceptedAt);
 
                 // The post-commit email's inputs, captured in this transaction: this version's own PDF
                 // and the saved customer email the gate above just passed (trimmed).
-                return new CommittedSignedInvoice(row, order.getOrderNumber(),
-                        customer.getEmail().trim(), pdfBytes, pdfFileName);
+                return new CommittedSignedInvoice(row, order.getOrderNumber(), ctx.business().getName(),
+                        ctx.businessId(), ctx.storeId(), customer.getEmail().trim(), pdfBytes, pdfFileName);
             } catch (RuntimeException ex) {
                 fileStorageService.deleteQuietly(pdfPath);
                 throw ex;
@@ -939,8 +1032,13 @@ public class OrderInvoiceService {
      * CANCELLED versions and their (already dead) tokens are never touched. The guarded
      * {@code moveIssuedVersionTo} cannot miss under the held order lock (every quote transition,
      * including the public lazy expiry and accept, takes the same lock).
+     *
+     * <p>Package-private and static since 16G PR 4: the remote invoice accept
+     * ({@link PublicInvoiceService}) runs this exact D5(c) transition in its own signing transaction
+     * (16G contract §10.5), under the same order lock.
      */
-    private void cancelActiveQuoteLink(long orderId, LocalDateTime cancelledAt) {
+    static void cancelActiveQuoteLink(QuoteVersionRepository quoteVersionRepository, long orderId,
+                                      LocalDateTime cancelledAt) {
         quoteVersionRepository.findIssuedByOrderId(orderId).ifPresent(issued -> {
             quoteVersionRepository.moveIssuedVersionTo(issued.quoteVersionId(), QUOTE_VERSION_CANCELLED);
             quoteVersionRepository.killActiveToken(issued.quoteVersionId(), QUOTE_TOKEN_CANCELLED, cancelledAt);
@@ -974,8 +1072,8 @@ public class OrderInvoiceService {
         try {
             invoiceEmailSender.send(new InvoiceEmailRequest(
                     email.recipientEmail(),
-                    emailSubject(ctx.business().getName()),
-                    emailBody(email.orderNumber(), ctx.business().getName()),
+                    SignedInvoiceEmailer.emailSubject(ctx.business().getName()),
+                    SignedInvoiceEmailer.emailBody(email.orderNumber(), ctx.business().getName()),
                     email.pdfBytes(),
                     email.pdfFileName(),
                     orderId,
@@ -986,9 +1084,15 @@ public class OrderInvoiceService {
             throw new EmailSendException(ErrorCode.EMAIL_SEND_FAILED.defaultMessage());
         }
 
-        InvoiceRow finalRow = transactionTemplate.execute(status ->
-                stampEmailSuccess(orderId, ctx, email.invoiceId(), LocalDateTime.now()));
-        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, finalRow)), RESEND_MESSAGE);
+        // The existing D.9 stamp (shared with the signed-PDF email since 16G PR 4), in its own short
+        // transaction; the InvoiceDetail - with the derived invoice_link_expires_at (16G contract §4.5) -
+        // is built from the stamp's current row inside that same transaction, after its write.
+        InvoiceDetailDto dto = transactionTemplate.execute(status -> {
+            InvoiceRow finalRow = signedInvoiceEmailer.stampEmailSuccess(
+                    orderId, ctx.businessId(), ctx.storeId(), email.invoiceId(), LocalDateTime.now());
+            return toDto(slug, orderId, finalRow, invoiceLinkExpiresAt(orderId, finalRow));
+        });
+        return ApiResponse.ok(new InvoiceResponse(dto), RESEND_MESSAGE);
     }
 
     /** D.9 validation chain + current-PDF load (read-only; runs in its own short transaction). */
@@ -1068,111 +1172,154 @@ public class OrderInvoiceService {
     }
 
     // ------------------------------------------------------------------
-    // Phase 13 shared email helpers
+    // Phase 16G PR 4 - POST /orders/{orderId}/invoices/current/send-link (Accept Remotely)
     // ------------------------------------------------------------------
 
     /**
-     * The post-commit signed-PDF email shared by D.8 and Path A (16G contract §6). Called only after the
-     * signing / conversion transaction has COMMITTED, with what that transaction captured: the appended
-     * row, this version's own PDF bytes and file name, the order number and the trimmed saved customer
-     * email (null for a Path A customer with no valid email). Nothing here re-reads the recipient or the
-     * attachment, and NOTHING here throws (16G contract §6.2):
-     * <ul>
-     *   <li>no recipient → the send is skipped with a WARN ({@link SignedEmailOutcome#SKIPPED}; Path A only,
-     *       D.8 gates the email before persisting);</li>
-     *   <li>any sender failure - the transport's {@link InvoiceEmailException} or any other runtime
-     *       failure - is WARN-logged ({@link SignedEmailOutcome#FAILED});</li>
-     *   <li>after a delivery the existing short stamp transaction ({@link #stampEmailSuccess}) records
-     *       {@code last_emailed_at} + the §11.1 mirror; ANY failure of that transaction, its commit
-     *       included, is WARN-logged and the committed row is returned instead (both markers stay null,
-     *       Re-send stays available) - the outcome is still {@link SignedEmailOutcome#DELIVERED}.</li>
-     * </ul>
-     * Each WARN carries the order id and the version number only - never the recipient, the body, the
-     * exception or its text. The returned row is the response basis. After a recorded delivery it is read
-     * in the stamp transaction: for D.8 the stamp's re-read CURRENT row (its existing behaviour, the F49
-     * window of contract §6.3, not changed here); with {@code respondWithAppendedVersion} (Path A) the
-     * version this request appended, so a version committed by another request between the commit and
-     * the stamp never becomes Path A's response. Without a recorded delivery it is the committed row
-     * itself (no further database read).
+     * Email the customer a link to review and sign the CURRENT invoice remotely (16G contract §8). The
+     * link is order-bound: the public surface ({@link PublicInvoiceService}) always shows the order's
+     * current version, so payments and voids made after the send are shown, and the link needs no
+     * version precondition, signature, declaration or quote state here.
+     *
+     * <p><b>Order of checks</b>: standard-protected guard → positive {@code orderId} (400) → scoped
+     * {@code FOR UPDATE} order lookup (404 {@code ORDER_NOT_FOUND}; no existence leak) → the
+     * {@code EmptyObjectRequest} body ({@link #rejectNonEmptyBody}, unchanged: 400 {@code VALIDATION_FAILED}
+     * / {@code MALFORMED_JSON}) → the current invoice read under the lock (none → 422
+     * {@code INVOICE_REQUIRED}) → a signed current invoice (409 {@code INVOICE_ALREADY_ACCEPTED}, default
+     * message; no token is written) → the saved customer email gate, as D.1 (422
+     * {@code CUSTOMER_EMAIL_REQUIRED} / {@code CUSTOMER_EMAIL_INVALID}) → in the same transaction an
+     * {@code ACTIVE} link becomes {@code REPLACED} ({@code dead_at} = now) and a new {@code ACTIVE} link is
+     * minted ({@code sent_by_user_id} = the session user, {@code sent_at} = now, {@code expires_at} = now +
+     * 7 days) → commit → one link-only email to the trimmed saved email captured in that transaction,
+     * outside the lock → on delivery, this token's {@code emailed_at} in a short follow-up transaction.
+     * Every refusal happens before any token write. Allowed when LAID; no CANCELLED rule.
+     *
+     * <p><b>Delivery is the operation</b>: any sender failure → 502 {@code EMAIL_SEND_FAILED} with the
+     * route's own message. The committed new link stays {@code ACTIVE} (undelivered) and an older one stays
+     * {@code REPLACED}; nothing is rolled back or restored, and a retry is another send, which replaces the
+     * undelivered link. A failure of the {@code emailed_at} stamp after a delivery (its commit included) is
+     * WARN-logged and the response is still 201 - the link WAS delivered, and failing the request would
+     * invite a resend that replaces it.
+     *
+     * <p><b>Markers</b>: only the token's own {@code sent_at} / {@code emailed_at}. A link send never touches
+     * {@code invoice.last_emailed_at}, the {@code sales_order.last_emailed_at} mirror or any invoice row, and
+     * creates no invoice version, PDF or store notification. The plaintext token lives only in method scope
+     * and the delivered email body; the 201 carries only {@code sent_at} and {@code expires_at}.
      */
-    private PostCommitEmail emailSignedInvoiceAfterCommit(RequestContext ctx, long orderId,
-                                                          CommittedSignedInvoice committed,
-                                                          boolean respondWithAppendedVersion) {
-        int versionNumber = committed.row().versionNumber();
-        if (committed.recipientEmail() == null) {
-            log.warn("Signed invoice email skipped for order {} invoice v{}: no valid saved customer email "
-                    + "(non-fatal; markers stay null)", orderId, versionNumber);
-            return new PostCommitEmail(SignedEmailOutcome.SKIPPED, committed.row());
-        }
+    public ApiResponse<InvoiceLinkSendResultDto> sendInvoiceLink(String slug,
+                                                                 String orderIdRaw,
+                                                                 String body,
+                                                                 HttpServletRequest httpRequest) {
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+        long orderId = parsePositiveLong(orderIdRaw, "order_id");
+
+        PreparedInvoiceLink link = transactionTemplate.execute(status -> prepareInvoiceLink(orderId, ctx, body));
+
+        // After commit, outside the order lock. The send IS the operation: a transport failure or any other
+        // sender runtime failure -> 502, with the committed new link left ACTIVE (never rolled back).
         try {
-            invoiceEmailSender.send(new InvoiceEmailRequest(
-                    committed.recipientEmail(),
-                    emailSubject(ctx.business().getName()),
-                    emailBody(committed.orderNumber(), ctx.business().getName()),
-                    committed.pdfBytes(),
-                    committed.pdfFileName(),
+            invoiceLinkEmailSender.send(new InvoiceLinkEmailRequest(
+                    link.recipientEmail(),
+                    invoiceLinkEmailSubject(link.businessName()),
+                    invoiceLinkEmailBody(link.orderNumber(), link.businessName(), link.publicLink()),
                     orderId,
-                    versionNumber));
-        } catch (Exception ex) {
-            // The signing / conversion is committed and durable; last_emailed_at stays null on BOTH the
-            // invoice and the sales_order mirror, and the 201 message points the user at Re-send.
-            log.warn("Signed invoice email failed for order {} invoice v{} (non-fatal; the committed invoice "
-                    + "stands, markers stay null)", orderId, versionNumber);
-            return new PostCommitEmail(SignedEmailOutcome.FAILED, committed.row());
+                    link.versionNumber()));
+        } catch (RuntimeException ex) {
+            log.warn("Invoice link email failed for order {} invoice v{} (the new link stays ACTIVE and "
+                    + "undelivered; a previous link stays REPLACED)", orderId, link.versionNumber());
+            throw new EmailSendException(INVOICE_LINK_EMAIL_FAILED_MESSAGE);
         }
+
+        // Delivered: stamp THIS token's success-only emailed_at (never whichever token is ACTIVE later).
         try {
-            long appendedInvoiceId = committed.row().invoiceId();
-            InvoiceRow stamped = transactionTemplate.execute(status -> {
-                InvoiceRow current = stampEmailSuccess(orderId, ctx, appendedInvoiceId, LocalDateTime.now());
-                if (!respondWithAppendedVersion || current.invoiceId() == appendedInvoiceId) {
-                    return current;
-                }
-                // Path A: another version became current after the conversion committed. The response
-                // still describes the version this request created, as stamped just now.
-                return invoiceRepository.findByInvoiceId(appendedInvoiceId)
-                        .orElseThrow(() -> new IllegalStateException(
-                                "Appended invoice disappeared while stamping last_emailed_at for order " + orderId));
-            });
-            return new PostCommitEmail(SignedEmailOutcome.DELIVERED, stamped != null ? stamped : committed.row());
-        } catch (Exception ex) {
-            // Delivered but not recorded: the stamp transaction rolled back as a whole, so both markers
-            // stay null and the Invoice tab offers Re-send; the response keeps the delivered message.
-            log.warn("Email-success stamp failed for order {} invoice v{} after delivery (non-fatal; markers "
-                    + "stay null)", orderId, versionNumber);
-            return new PostCommitEmail(SignedEmailOutcome.DELIVERED, committed.row());
+            transactionTemplate.executeWithoutResult(status ->
+                    stampInvoiceLinkEmailed(orderId, ctx, link.invoiceTokenId(), LocalDateTime.now()));
+        } catch (RuntimeException ex) {
+            log.warn("Invoice link emailed_at stamp failed for order {} invoice v{} after delivery (non-fatal; "
+                    + "the delivered link stays ACTIVE)", orderId, link.versionNumber());
         }
+
+        return ApiResponse.ok(new InvoiceLinkSendResultDto(
+                        new InvoiceLinkSendResultDto.InvoiceLink(link.sentAt(), link.expiresAt())),
+                INVOICE_LINK_SENT_MESSAGE);
     }
 
     /**
-     * Email-success stamp (one short transaction): set {@code invoice.last_emailed_at} in place, then
-     * set the §11.1 mirror to the CURRENT invoice's value re-read from the database — so both columns
-     * carry the SAME timestamp. The scoped order row is taken {@code FOR UPDATE} FIRST (the same lock
-     * every version-creating transaction holds from its first statement), so the current-invoice
-     * re-read cannot race a concurrent rewrite/payment and overwrite the mirror with a stale value.
-     * Returns the current row (the D.8 and D.9 response basis; Path A responds with the version it
-     * appended, see {@link #emailSignedInvoiceAfterCommit}).
+     * The send-link check chain + the replace-and-mint persist (16G contract §8 steps 2 to 7), inside
+     * {@code transactionTemplate.execute}: the order row is held {@code FOR UPDATE} for the whole block, so
+     * the current-invoice read, the signed check and the token transition are serialised with every invoice
+     * writer and with the public surface's locked transitions (one {@code ACTIVE} link per order).
      */
-    private InvoiceRow stampEmailSuccess(long orderId, RequestContext ctx, long invoiceId, LocalDateTime sentAt) {
+    private PreparedInvoiceLink prepareInvoiceLink(long orderId, RequestContext ctx, String body) {
+        SalesOrder order = salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        // EmptyObjectRequest: the shared empty-body rule of the other eight routes, unchanged.
+        rejectNonEmptyBody(body);
+
+        InvoiceRow current = invoiceRepository.findCurrentByOrderId(orderId)
+                .orElseThrow(() -> new BusinessRuleException(
+                        ErrorCode.INVOICE_REQUIRED, ErrorCode.INVOICE_REQUIRED.defaultMessage()));
+
+        // A signed current invoice is never sent for signing (16G contract §7.6): default staff wording,
+        // no link created and any existing link untouched.
+        if (current.acceptedAt() != null) {
+            throw new ConflictException(ErrorCode.INVOICE_ALREADY_ACCEPTED,
+                    ErrorCode.INVOICE_ALREADY_ACCEPTED.defaultMessage());
+        }
+
+        // The saved customer email gate, as D.1 (the link email must be addressable).
+        OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
+        customerEmailValidator.requireValidCustomerEmail(customer);
+
+        // Replace, then mint - in this transaction, under the lock. The plaintext token exists only here and
+        // in the delivered email body; only its hash is stored.
+        LocalDateTime sentAt = LocalDateTime.now();
+        LocalDateTime expiresAt = sentAt.plusDays(INVOICE_LINK_TTL_DAYS);
+        invoiceTokenRepository.killActiveByOrderId(orderId, INVOICE_TOKEN_REPLACED, sentAt);
+        String plainToken = mintPlainToken();
+        long invoiceTokenId = invoiceTokenRepository.insertActive(
+                orderId, TokenHash.sha256Hex(plainToken), ctx.userId(), sentAt, expiresAt);
+
+        return new PreparedInvoiceLink(invoiceTokenId, current.versionNumber(), order.getOrderNumber(),
+                ctx.business().getName(), customer.getEmail().trim(), publicBaseUrl + "/i/" + plainToken,
+                sentAt, expiresAt);
+    }
+
+    /**
+     * The link's success-only delivery marker (one short transaction after the delivery): the scoped order
+     * row is taken {@code FOR UPDATE} first (the lock every token transition holds), then {@code emailed_at}
+     * is stamped on the ONE token this send delivered.
+     */
+    private void stampInvoiceLinkEmailed(long orderId, RequestContext ctx, long invoiceTokenId,
+                                         LocalDateTime emailedAt) {
         salesOrderRepository
                 .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new IllegalStateException(
-                        "Order disappeared while stamping last_emailed_at: " + orderId));
-        invoiceRepository.updateInvoiceLastEmailedAt(invoiceId, sentAt);
-        InvoiceRow current = invoiceRepository.findCurrentByOrderId(orderId)
-                .orElseThrow(() -> new IllegalStateException(
-                        "Current invoice disappeared while stamping last_emailed_at for order " + orderId));
-        invoiceRepository.updateSalesOrderLastEmailedAt(orderId, current.lastEmailedAt());
-        return current;
+                        "Order disappeared while stamping an invoice link's emailed_at: " + orderId));
+        if (invoiceTokenRepository.stampEmailedAt(invoiceTokenId, emailedAt) != 1) {
+            throw new IllegalStateException("invoice_token " + invoiceTokenId + " missing while stamping emailed_at");
+        }
     }
 
-    // Simple MVP wording (contract §9): subject + short body, PDF attached.
-    private static String emailSubject(String businessName) {
+    /** 32 CSPRNG bytes, URL-safe Base64 (no padding) - never persisted, never in any response. */
+    private static String mintPlainToken() {
+        byte[] bytes = new byte[INVOICE_LINK_TOKEN_BYTES];
+        SECURE_RANDOM.nextBytes(bytes);
+        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
+    }
+
+    // Link-only (16G contract §8): the invoice email subject and a short plain-text body carrying the order
+    // number and the public link - the ONLY place the plaintext token appears, exactly once. No attachment.
+    private static String invoiceLinkEmailSubject(String businessName) {
         return "Your invoice from " + businessName;
     }
 
-    private static String emailBody(String orderNumber, String businessName) {
-        return "Hi,\n\nPlease find your invoice " + orderNumber + " from " + businessName
-                + " attached.\n\nThank you.";
+    private static String invoiceLinkEmailBody(String orderNumber, String businessName, String publicLink) {
+        return "Hi,\n\nYour invoice " + orderNumber + " from " + businessName
+                + " is ready to review and sign. You can view and sign your invoice online here: " + publicLink
+                + "\n\nThank you.";
     }
 
     // ------------------------------------------------------------------
@@ -1184,12 +1331,13 @@ public class OrderInvoiceService {
      * exactly once, holding a positive integer (the {@code orderId} rule). Missing → {@code Required.};
      * repeated → {@code Must appear at most once.}; any other value that is not a positive integer, blank
      * included → {@code Must be a positive integer.} (400 {@code VALIDATION_FAILED}, field
-     * {@code expected_version_number}). Only multipart FORM-FIELD values count ({@link #formFieldValues}):
+     * {@code expected_version_number}). Only multipart FORM-FIELD values count
+     * ({@link MultipartFormFields#formFieldValues}):
      * a URL query-string {@code expected_version_number} is not the precondition, and the allowlist
      * refuses it. The parsed value is only compared, never used as a selector.
      */
     private static long parseExpectedVersionNumber(MultipartHttpServletRequest request) {
-        List<String> values = formFieldValues(request, EXPECTED_VERSION_FIELD);
+        List<String> values = MultipartFormFields.formFieldValues(request, EXPECTED_VERSION_FIELD);
         if (values.isEmpty()) {
             throw fieldValidation(EXPECTED_VERSION_FIELD, "Required.");
         }
@@ -1197,55 +1345,6 @@ public class OrderInvoiceService {
             throw fieldValidation(EXPECTED_VERSION_FIELD, "Must appear at most once.");
         }
         return parsePositiveLong(values.get(0), EXPECTED_VERSION_FIELD);
-    }
-
-    /**
-     * The values a multipart request carries for {@code name} as FORM FIELDS. The servlet container
-     * reports URL query-string parameters through the same {@code getParameterValues} lists, so each
-     * query-string occurrence of the name is taken out again (contract §5.3 wants a form field; the
-     * conventions take no query-string data on a mutation).
-     */
-    private static List<String> formFieldValues(MultipartHttpServletRequest request, String name) {
-        String[] merged = request.getParameterValues(name);
-        if (merged == null) {
-            return List.of();
-        }
-        List<String> values = new ArrayList<>(Arrays.asList(merged));
-        for (String queryValue : queryStringParameters(request).getOrDefault(name, List.of())) {
-            values.remove(queryValue);
-        }
-        return values;
-    }
-
-    /**
-     * The request's URL query-string parameters, decoded as the container decodes parameters (UTF-8,
-     * {@code +} as a space); a component that cannot be decoded is kept as it was sent.
-     */
-    private static Map<String, List<String>> queryStringParameters(HttpServletRequest request) {
-        Map<String, List<String>> parameters = new LinkedHashMap<>();
-        String query = request.getQueryString();
-        if (query == null || query.isEmpty()) {
-            return parameters;
-        }
-        for (String pair : query.split("&")) {
-            if (pair.isEmpty()) {
-                continue;
-            }
-            int equals = pair.indexOf('=');
-            String rawName = equals < 0 ? pair : pair.substring(0, equals);
-            String rawValue = equals < 0 ? "" : pair.substring(equals + 1);
-            parameters.computeIfAbsent(decodeQueryComponent(rawName), key -> new ArrayList<>())
-                    .add(decodeQueryComponent(rawValue));
-        }
-        return parameters;
-    }
-
-    private static String decodeQueryComponent(String raw) {
-        try {
-            return URLDecoder.decode(raw, StandardCharsets.UTF_8);
-        } catch (IllegalArgumentException undecodable) {
-            return raw;
-        }
     }
 
     /**
@@ -1268,7 +1367,7 @@ public class OrderInvoiceService {
                 errors.add(new ErrorDetail(null, name, "Not allowed."));
             }
         }
-        Map<String, List<String>> queryParameters = queryStringParameters(request);
+        Map<String, List<String>> queryParameters = MultipartFormFields.queryStringParameters(request);
         for (Enumeration<String> paramNames = request.getParameterNames(); paramNames.hasMoreElements();) {
             String name = paramNames.nextElement();
             if (!EXPECTED_VERSION_FIELD.equals(name) || queryParameters.containsKey(name)) {
@@ -1510,11 +1609,34 @@ public class OrderInvoiceService {
     // ------------------------------------------------------------------
 
     /**
+     * Phase 16G PR 4 - InvoiceDetail's derived {@code invoice_link_expires_at} (16G contract §4.5): the
+     * {@code expires_at} of the order's {@code ACTIVE} invoice link while it is still in the future by the
+     * JVM clock; otherwise null (no link was ever sent, the link is dead, or an {@code ACTIVE} link is
+     * already past {@code expires_at} but no public request has flipped it yet). A signed {@code row}
+     * always gives null (a signed current version never has a live link, §7.6). Read-only: it writes
+     * nothing and never expires a token - lazy expiry stays on the public surface (§7.7). It describes the
+     * order's link, not the version, so it is not an invoice column and no writer copies it. Callers
+     * compute it after their own writes and pass it to {@link #toDto}.
+     */
+    private LocalDateTime invoiceLinkExpiresAt(long orderId, InvoiceRow row) {
+        if (row.acceptedAt() != null) {
+            return null;
+        }
+        LocalDateTime now = LocalDateTime.now();
+        return invoiceTokenRepository.findActiveByOrderId(orderId)
+                .map(InvoiceTokenRepository.InvoiceTokenRow::expiresAt)
+                .filter(expiresAt -> expiresAt.isAfter(now))
+                .orElse(null);
+    }
+
+    /**
      * Map an invoice row to the E.2 InvoiceDetail. Pure mapping (no database read), so every route -
      * including D.8 / D.9, which build their response after a commit and an email send - returns the
-     * row's own stored values.
+     * row's own stored values. Phase 16G PR 4: {@code invoiceLinkExpiresAt} is the derived
+     * {@code invoice_link_expires_at} the route computed ({@link #invoiceLinkExpiresAt}, or null for the
+     * routes that killed the link); the mapping never reads it itself.
      */
-    private static InvoiceDetailDto toDto(String slug, long orderId, InvoiceRow row) {
+    private static InvoiceDetailDto toDto(String slug, long orderId, InvoiceRow row, LocalDateTime invoiceLinkExpiresAt) {
         // accepted_signature_present / the download path are DERIVED from the internal
         // accepted_signature_file_id, which itself is never serialized (mirrors how stored_file_id is
         // hidden behind pdf_download_path). The path is built only when a signature is actually stored.
@@ -1548,7 +1670,8 @@ public class OrderInvoiceService {
                 signaturePresent ? buildSignatureDownloadPath(slug, orderId) : null,
                 row.lastEmailedAt(),
                 terms.frozenTermsHtml(),
-                terms.source().name());
+                terms.source().name(),
+                invoiceLinkExpiresAt);
     }
 
     // Stable current-invoice file path (always resolves to the current version at request time).
@@ -1617,25 +1740,19 @@ public class OrderInvoiceService {
     public record InvoiceFileDownload(byte[] bytes, String mimeType, String fileName, long fileSize) {
     }
 
-    /**
-     * A committed D.8 signing or Path A conversion and everything its post-commit email needs, captured
-     * inside the committing transaction (never serialized): the appended row, the order number, the
-     * trimmed saved customer email (null = no valid email, so Path A skips the send) and this version's
-     * own PDF bytes and file name.
-     */
-    private record CommittedSignedInvoice(InvoiceRow row, String orderNumber,
-                                          String recipientEmail, byte[] pdfBytes, String pdfFileName) {
-    }
-
-    /** The post-commit email outcome (16G contract §6.1); each route's 201 message is chosen from it. */
-    private enum SignedEmailOutcome { DELIVERED, FAILED, SKIPPED }
-
-    /** A post-commit email outcome + the row the response is built from (stamped current, or committed). */
-    private record PostCommitEmail(SignedEmailOutcome outcome, InvoiceRow responseRow) {
-    }
-
     /** Validated D.9 resend input: the current accepted invoice + its stored PDF (never serialized). */
     private record ResendEmail(long invoiceId, int versionNumber, String orderNumber,
                                String recipientEmail, byte[] pdfBytes, String pdfFileName) {
+    }
+
+    /**
+     * A committed invoice-link send (16G PR 4) and what its post-commit delivery needs, captured inside the
+     * send transaction (never serialized): the new token's id, the current version number (logging), the
+     * order number, the business name, the trimmed saved customer email, the bearer link (the only copy of
+     * the plaintext token) and the send / expiry times for the 201.
+     */
+    private record PreparedInvoiceLink(long invoiceTokenId, int versionNumber, String orderNumber,
+                                       String businessName, String recipientEmail, String publicLink,
+                                       LocalDateTime sentAt, LocalDateTime expiresAt) {
     }
 }

@@ -100,9 +100,11 @@ Post-16F docs reconciliation: done (#137, merged 13 October 2026).
   16G PR 1 = docs + OpenAPI amendments only. NOTHING 16G is implemented until its PR merges:
   PR 2 #125 frozen invoice words (implemented, V20) · PR 3 #69/#123 stale checks + Path A signed-PDF email
   (implemented for in-app D.8 + Path A, server + Invoice/Quote tabs, no migration; remote signing's check is PR 4) ·
-  PR 4 remote invoice backend · PR 5 remote invoice frontend · PR 6 #120 #121 #122 #124.
+  PR 4 remote invoice backend (implemented, V21: invoice link + send-link, public invoice API, remote signing
+  with its signed-PDF email and store notification, link kills in D.2/D.8/Path A, slug 'i') ·
+  PR 5 remote invoice frontend · PR 6 #120 #121 #122 #124.
 
-Next development step: the 16G implementation PRs 2 to 6, in order (docs/Phases.md §7).
+Next development step: the 16G implementation PRs 5 and 6, in order (docs/Phases.md §7).
 
 Approved sequence (details: docs/Phases.md §7/§9):
   GitHub cleanup (done) -> post-16E docs reconciliation (done) -> 16F verify gate (done) -> 16F (done)
@@ -160,7 +162,7 @@ Tenant app URLs use the business slug as the first path segment; API calls use t
 API:  /api/v1/{slug}/...
 Application site:  floorxtack.com/{business-slug}      Marketing site:  tradextack.com
 Public quote (16E-C, slugless, token-only):  page /q/{token} · API /api/v1/public/quotes/{token}
-Public invoice (16G, planned PR 4 API / PR 5 page; slugless, token-only):  page /i/{token} ·
+Public invoice (16G, API since PR 4 / page PR 5; slugless, token-only):  page /i/{token} ·
   API /api/v1/public/invoices/{token} (GET view · POST /accept · GET /pdf?version_number=N)
 ```
 
@@ -173,21 +175,21 @@ Public invoice (16G, planned PR 4 API / PR 5 page; slugless, token-only):  page 
 
 ## Reserved business slugs
 
-Backend `V11` reserves app/system route words as invalid slugs; `V18` replaces that same `chk_business_slug_reserved` constraint with the V11 list plus `q` (the top-level, slugless public quote page `/q/{token}` would otherwise shadow a business whose slug is `q`):
+Backend `V11` reserves app/system route words as invalid slugs; `V18` replaces that same `chk_business_slug_reserved` constraint with the V11 list plus `q` (the top-level, slugless public quote page `/q/{token}` would otherwise shadow a business whose slug is `q`); `V21` (16G PR 4) replaces it again with the 16 `V18` words plus `i` (for the slugless public invoice page `/i/{token}`) — 17 words:
 
 ```text
 admin · api · login · static · auth · health · dashboard · orders ·
-select-store · assets · new · logout · account · settings · public · q
+select-store · assets · new · logout · account · settings · public · q · i
 ```
 
-The frontend guard (`RESERVED_BUSINESS_SLUGS` in `frontend/src/lib/tenant.ts`, via `isReservedBusinessSlug`) MUST mirror the backend `chk_business_slug_reserved` constraint as last replaced by `V18` (it already includes `q`). If the backend list changes, update the frontend list too. **16G PR 4 (planned)** replaces the constraint in a new migration with the 16 `V18` words plus `i` (for `/i/{token}`) and adds `i` to `RESERVED_BUSINESS_SLUGS` in the same PR; `V18` is never edited.
+The frontend guard (`RESERVED_BUSINESS_SLUGS` in `frontend/src/lib/tenant.ts`, via `isReservedBusinessSlug`) MUST mirror the backend `chk_business_slug_reserved` constraint as last replaced by `V21` (it includes `q` and `i`). If the backend list changes, update the frontend list too. `V21` (16G PR 4) replaced the constraint with the 16 `V18` words plus `i` and added `i` to `RESERVED_BUSINESS_SLUGS` in the same PR; `V18` is never edited.
 
 ---
 
 ## Migration rules
 
 ```text
-Current migrations are V1 to V20:
+Current migrations are V1 to V21:
   V1–V7 base · V8 LM/SQM factor · V9 negative-price constraint · V10 invoice accept/signature/email
   V11 reserved slug words · V12 per-tenant branding/invoice-legal/quick-add · V13 per-type terms
   V14 payment void fields (voided_at + voided_by_user_id) · V15 order_enquiry (Lead Enquiry form)
@@ -200,9 +202,9 @@ Current migrations are V1 to V20:
   V20 (16G PR 2, #125) invoice.customer_name_snapshot / customer_address_line1_snapshot /
       customer_address_line2_snapshot TEXT NULL + backfill of every invoice row from its order's saved
       customer + BILLING address (the V17 derivation); terms_snapshot is not backfilled
-16G plans exactly ONE more migration (not on main yet; number assigned when written, the next free
-  after V20): PR 4 — invoice_token table + chk_business_slug_reserved replaced with the 16 V18 words
-  plus 'i'.
+  V21 (16G PR 4) invoice_token table (the order-bound invoice link: ACTIVE / REPLACED / REWRITTEN /
+      SIGNED / EXPIRED, hash only, uq_invoice_token_one_active_per_order) + chk_business_slug_reserved
+      replaced with the 16 V18 words plus 'i'
 
 Never edit any committed migration. Any schema change is a NEW migration.
 Phase 16A added NO migration (invoice tab + PDF logo path + Aire Compact PDF were app/template only).
