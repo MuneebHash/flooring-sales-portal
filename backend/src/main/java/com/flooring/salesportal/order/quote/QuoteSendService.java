@@ -22,6 +22,7 @@ import com.flooring.salesportal.common.sms.SmsException;
 import com.flooring.salesportal.common.sms.SmsRequest;
 import com.flooring.salesportal.common.sms.SmsSender;
 import com.flooring.salesportal.common.storage.FileStorageService;
+import com.flooring.salesportal.common.token.TokenHash;
 import com.flooring.salesportal.order.CustomerEmailValidator;
 import com.flooring.salesportal.order.CustomerMobileValidator;
 import com.flooring.salesportal.order.InvoiceTermsSanitizer;
@@ -53,14 +54,10 @@ import org.springframework.transaction.support.TransactionTemplate;
 
 import java.math.BigDecimal;
 import java.math.RoundingMode;
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.security.SecureRandom;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Objects;
@@ -567,7 +564,7 @@ public class QuoteSendService {
         // body's public link ONLY) and the pre-delivery attempt markers (kept on failure).
         String plainToken = mintPlainToken();
         LocalDateTime expiresAt = now.plusDays(TOKEN_TTL_DAYS);
-        quoteVersionRepository.insertActiveToken(quoteVersionId, hashToken(plainToken), expiresAt);
+        quoteVersionRepository.insertActiveToken(quoteVersionId, TokenHash.sha256Hex(plainToken), expiresAt);
         quoteVersionRepository.stampAttemptMarkers(quoteVersionId, channel, now);
 
         // Re-read the stamped row so the summary basis reflects the persisted final state. The
@@ -755,16 +752,6 @@ public class QuoteSendService {
         byte[] bytes = new byte[TOKEN_BYTES];
         SECURE_RANDOM.nextBytes(bytes);
         return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
-    }
-
-    /** SHA-256 hex of the plaintext token — the ONLY token material ever stored ({@code token_hash}). */
-    private static String hashToken(String plainToken) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(plainToken.getBytes(StandardCharsets.UTF_8)));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 unavailable", e);
-        }
     }
 
     // ------------------------------------------------------------------

@@ -32,22 +32,30 @@ import org.springframework.transaction.annotation.Propagation;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.context.WebApplicationContext;
 
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.sql.Date;
 import java.sql.Timestamp;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
 import java.util.Base64;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
+import java.util.stream.Stream;
 
 import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
@@ -90,6 +98,17 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * {@link RecordingQuoteAcceptanceNotificationSender} (public accept), reset like the invoice sender.
  * Two of them COMMIT their fixture (the rollback proof and the durable post-commit proof) and delete it
  * in {@code finally}.
+ *
+ * <p>Phase 16G PR 3 (#69; 16G contract §5.4): every D.8 request here carries the mandatory form field
+ * {@code expected_version_number} = the order's CURRENT version, read from the database when the request
+ * is built ({@link #acceptAtCurrentVersion}), and NO {@code accepted_customer_name} part: that part is now
+ * an unexpected part (400 {@code Not allowed.}, whatever its value or length), and the accepted name is
+ * the current version's frozen {@code invoice.customer_name_snapshot}, verbatim and in full (null or blank
+ * -> 422 {@code ACCEPTED_CUSTOMER_NAME_REQUIRED}). For ORDER_FULL that frozen name is what the V20
+ * backfill derived from the V4 saved customer (James Wilson); the tests read it state-derived
+ * ({@link #currentFrozenName}). The signing version keeps the current version's {@code invoice_date}
+ * (ORDER_FULL's seeded v1 is dated in the past, so its accept is a cross-day signing) while
+ * {@code accepted_at} is the signing time.
  */
 @ExtendWith(SpringExtension.class)
 @SpringBootTest
@@ -110,6 +129,9 @@ class InvoiceAcceptanceControllerTest {
 
     private static final String ORDER_FULL_NUMBER = "SYD-CBD.LC1.00001";
     private static final String SIGNATURE_PART = "signature";
+    // 16G PR 3: the mandatory D.8 form field (compared with the current version under the order lock).
+    private static final String EXPECTED_VERSION_FIELD = "expected_version_number";
+    // 16G PR 3: the FORMER name part - now refused at the part allowlist like any unexpected part.
     private static final String ACCEPTED_NAME_FIELD = "accepted_customer_name";
     private static final long MAX_SIGNATURE_SIZE_BYTES = 2_097_152L;
 
@@ -117,6 +139,21 @@ class InvoiceAcceptanceControllerTest {
     private static final String ACCEPT_EMAIL_FAILED_MESSAGE =
             "Invoice accepted. The invoice could not be emailed — use Re-send Invoice to try again.";
     private static final String RESEND_MESSAGE = "Invoice re-sent to the customer.";
+    private static final String ALREADY_ACCEPTED_MESSAGE =
+            "This invoice has already been accepted. Use Re-send to email it again.";
+    private static final String ACCEPTED_NAME_REQUIRED_MESSAGE = "Accepted customer name is required.";
+    private static final String NOT_ALLOWED = "Not allowed.";
+
+    // How the invoice PDF prints the issued/due dates and the acceptance caption's timestamp.
+    private static final DateTimeFormatter DISPLAY_DATE = DateTimeFormatter.ofPattern("dd/MM/yyyy", Locale.ENGLISH);
+    private static final DateTimeFormatter DISPLAY_DATE_TIME =
+            DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm", Locale.ENGLISH);
+
+    // A frozen Invoice To name well over the former 150-character request limit (201 characters, words
+    // only, so the PDF may wrap it between words): 16G PR 3 accepts and stores it in full.
+    private static final String FROZEN_LONG_NAME =
+            "Alexandria Bernadette Cassiopeia Dorothea Evangeline Francesca Genevieve Henrietta Isadora Josephine "
+                    + "Kensington Livingstone Montgomery Northcott Pemberton Quartermaine Rutherford Stanhope Tremaine Ward";
 
     // A real, decodable 1x1 PNG: the accept flow embeds the uploaded bytes into the signed PDF via a
     // base64 data URI, so fake bytes would break rendering with a 500 instead of exercising the flow.
@@ -208,11 +245,72 @@ class InvoiceAcceptanceControllerTest {
         return new MockMultipartFile(SIGNATURE_PART, "signature.png", "image/png", bytes);
     }
 
-    /** A fully valid accept request (signature + name + session); tests mutate what they need. */
-    private MockMultipartHttpServletRequestBuilder validAccept(long orderId) {
+    /**
+     * The D.8 multipart carrying ONLY the mandatory form field {@code expected_version_number} = the
+     * order's CURRENT version, read state-derived when the request is built (the highest
+     * {@code version_number}; 0 for an order with no invoice, which only the scope and no-invoice tests
+     * send - both refusals are decided before the value is read). No signature and no name part: each
+     * test adds exactly the parts its case needs.
+     */
+    private MockMultipartHttpServletRequestBuilder acceptAtCurrentVersion(long orderId) {
         return (MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
-                .file(signaturePart(ONE_PIXEL_PNG))
-                .param(ACCEPTED_NAME_FIELD, "James Wilson");
+                .param(EXPECTED_VERSION_FIELD, String.valueOf(maxInvoiceVersion(orderId)));
+    }
+
+    /**
+     * A fully valid accept request (16G PR 3): the current version + the signature PNG, and NO name part
+     * (the accepted name is the current version's frozen customer_name_snapshot); tests mutate what they
+     * need and add the session.
+     */
+    private MockMultipartHttpServletRequestBuilder validAccept(long orderId) {
+        return acceptAtCurrentVersion(orderId).file(signaturePart(ONE_PIXEL_PNG));
+    }
+
+    /** The CURRENT version's frozen Invoice To name (V20) - since 16G PR 3 the D.8 accepted name, verbatim. */
+    private String currentFrozenName(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT customer_name_snapshot FROM invoice WHERE order_id = ? ORDER BY version_number DESC LIMIT 1",
+                String.class, orderId);
+    }
+
+    /** Overwrite one version's frozen Invoice To name (raw SQL, rolled back with the test), then clear JPA. */
+    private void setFrozenName(long invoiceId, String frozenName) {
+        Assertions.assertEquals(1, jdbcTemplate.update(
+                        "UPDATE invoice SET customer_name_snapshot = ? WHERE invoice_id = ?", frozenName, invoiceId),
+                "fixture: set exactly one version's customer_name_snapshot");
+        clearJpaCache();
+    }
+
+    private String acceptedNameOf(long invoiceId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT accepted_customer_name FROM invoice WHERE invoice_id = ?", String.class, invoiceId);
+    }
+
+    private LocalDate invoiceDateOf(long invoiceId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT invoice_date FROM invoice WHERE invoice_id = ?", Date.class, invoiceId).toLocalDate();
+    }
+
+    private LocalDate dueDateOf(long invoiceId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT due_date FROM invoice WHERE invoice_id = ?", Date.class, invoiceId).toLocalDate();
+    }
+
+    /** Every regular file under the class's storage TempDir (signature PNGs, invoice and quote PDFs). */
+    private static long filesOnDisk() throws IOException {
+        if (!Files.exists(tempStorageDir)) {
+            return 0;
+        }
+        try (Stream<Path> paths = Files.walk(tempStorageDir)) {
+            return paths.filter(Files::isRegularFile).count();
+        }
+    }
+
+    /** The stored bytes of one invoice version's PDF, read through its stored_file row. */
+    private byte[] storedInvoicePdf(long invoiceId) throws IOException {
+        String path = storagePathOf(invoicePdfFileId(invoiceId));
+        Assertions.assertTrue(diskFileExists(path), () -> "the invoice PDF must exist on disk: " + path);
+        return Files.readAllBytes(tempStorageDir.resolve(path.startsWith("/") ? path.substring(1) : path));
     }
 
     private void laidOrder(long orderId) {
@@ -310,19 +408,35 @@ class InvoiceAcceptanceControllerTest {
         int nextVersion = maxInvoiceVersion(ORDER_FULL) + 1;
         int storedFilesBefore = countStoredFiles();
         String expectedRecipient = customerEmail(ORDER_FULL).trim();
+        // 16G PR 3: the accepted name is the CURRENT version's frozen Invoice To name - for the seeded v1 the
+        // value the V20 backfill derived from the V4 saved customer - and no name part is sent.
+        long previousInvoiceId = latestInvoiceId(ORDER_FULL);
+        String frozenName = currentFrozenName(ORDER_FULL);
+        Assertions.assertFalse(frozenName == null || frozenName.isBlank(),
+                "precondition: the V20 backfill froze a name into ORDER_FULL's current version");
+        // 16G PR 3: the signing version keeps the CURRENT version's invoice_date. The seeded v1 is dated in
+        // the past, so this signing is cross-day: the old LocalDate.now() dating would differ.
+        LocalDate currentInvoiceDate = invoiceDateOf(previousInvoiceId);
+        LocalDate currentDueDate = dueDateOf(previousInvoiceId);
+        Assertions.assertTrue(currentInvoiceDate.isBefore(LocalDate.now()),
+                () -> "precondition: the current version is dated before the signing day: " + currentInvoiceDate);
+        LocalDateTime signingStarted = LocalDateTime.now();
 
         MvcResult result = mockMvc.perform(validAccept(ORDER_FULL).session(liamStore1Session()))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE))
                 .andExpect(jsonPath("$.data.invoice.version_number").value(nextVersion))
+                .andExpect(jsonPath("$.data.invoice.invoice_date").value(currentInvoiceDate.toString()))
                 .andExpect(jsonPath("$.data.invoice.accepted_at").isNotEmpty())
-                .andExpect(jsonPath("$.data.invoice.accepted_customer_name").value("James Wilson"))
+                .andExpect(jsonPath("$.data.invoice.accepted_customer_name").value(frozenName))
+                .andExpect(jsonPath("$.data.invoice.customer_name_snapshot").value(frozenName))
                 .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(true))
                 .andExpect(jsonPath("$.data.invoice.accepted_signature_download_path")
                         .value(signatureUrl(ORDER_FULL)))
                 // Final post-email state: the auto-email succeeded, so last_emailed_at is SET.
                 .andExpect(jsonPath("$.data.invoice.last_emailed_at").isNotEmpty())
                 .andReturn();
+        LocalDateTime signingEnded = LocalDateTime.now();
 
         // Appended version (max + 1), never an in-place mutation; the old version is untouched.
         Assertions.assertEquals(versionsBefore + 1, countInvoices(ORDER_FULL));
@@ -332,6 +446,18 @@ class InvoiceAcceptanceControllerTest {
         long newInvoiceId = latestInvoiceId(ORDER_FULL);
         Assertions.assertNotNull(invoiceAcceptedAt(newInvoiceId));
         Assertions.assertNotNull(acceptedSignatureFileId(newInvoiceId));
+        Assertions.assertEquals(frozenName, acceptedNameOf(newInvoiceId), "the stored accepted name is the frozen one");
+        Assertions.assertNull(invoiceAcceptedAt(previousInvoiceId), "the previous version stays unsigned");
+
+        // The signing version copies the current version's invoice_date (and due date); accepted_at is the
+        // real signing time.
+        Assertions.assertEquals(currentInvoiceDate, invoiceDateOf(newInvoiceId),
+                "the signing version keeps the current version's invoice_date, never the signing day");
+        Assertions.assertEquals(currentDueDate, dueDateOf(newInvoiceId), "the due date is carried as before");
+        LocalDateTime acceptedAt = invoiceAcceptedAt(newInvoiceId).toLocalDateTime();
+        Assertions.assertTrue(!acceptedAt.isBefore(signingStarted.minusSeconds(1))
+                        && !acceptedAt.isAfter(signingEnded.plusSeconds(1)),
+                () -> "accepted_at must be the signing time but was " + acceptedAt);
 
         // §11.1 mirror: invoice.last_emailed_at and sales_order.last_emailed_at carry the SAME timestamp.
         Timestamp invoiceStamp = invoiceLastEmailedAt(newInvoiceId);
@@ -345,9 +471,22 @@ class InvoiceAcceptanceControllerTest {
         InvoiceEmailRequest email = sent.get(0);
         Assertions.assertEquals(expectedRecipient, email.recipientEmail());
         Assertions.assertEquals("Your invoice from Aussie Floors Group", email.subject());
+        Assertions.assertEquals("Hi,\n\nPlease find your invoice " + ORDER_FULL_NUMBER
+                + " from Aussie Floors Group attached.\n\nThank you.", email.bodyText());
         Assertions.assertEquals("invoice-" + ORDER_FULL_NUMBER + "-v" + nextVersion + ".pdf", email.pdfFileName());
+        Assertions.assertEquals(ORDER_FULL, email.orderId());
+        Assertions.assertEquals(nextVersion, email.invoiceVersionNumber());
         Assertions.assertEquals("%PDF-", new String(email.pdfBytes(), 0, 5, StandardCharsets.US_ASCII),
                 "attached bytes must be a PDF");
+        Assertions.assertArrayEquals(storedInvoicePdf(newInvoiceId), email.pdfBytes(),
+                "the email attaches the appended version's own stored PDF");
+
+        // The signed PDF shows the kept invoice date (and due date) in its Issued / Due block, and the
+        // caption carries the frozen name and the signing time.
+        String pdfText = extractPdfText(email.pdfBytes());
+        Assertions.assertEquals(DISPLAY_DATE.format(currentInvoiceDate) + "Due" + DISPLAY_DATE.format(currentDueDate),
+                issuedDueBlock(pdfText), () -> "the signed PDF must show the kept invoice date: " + pdfText);
+        assertAcceptedCaption(email.pdfBytes(), frozenName, acceptedAt);
 
         // Server-internal ids/paths never leak.
         String json = result.getResponse().getContentAsString();
@@ -379,16 +518,23 @@ class InvoiceAcceptanceControllerTest {
                 "SELECT total_paid FROM invoice WHERE invoice_id = ?", BigDecimal.class, previousInvoiceId);
         BigDecimal frozenBalance = jdbcTemplate.queryForObject(
                 "SELECT balance_due FROM invoice WHERE invoice_id = ?", BigDecimal.class, previousInvoiceId);
+        LocalDate frozenInvoiceDate = invoiceDateOf(previousInvoiceId);
+        LocalDate frozenDueDate = dueDateOf(previousInvoiceId);
 
         // Unsent live edit: must NOT become official through acceptance (that is what Rewrite is for).
         jdbcTemplate.update("UPDATE sales_order SET details_of_sale = 'LIVE EDIT not on any invoice' "
                 + "WHERE order_id = ?", ORDER_FULL);
 
         mockMvc.perform(validAccept(ORDER_FULL).session(liamStore1Session()))
-                .andExpect(status().isCreated());
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.invoice.invoice_date").value(frozenInvoiceDate.toString()))
+                .andExpect(jsonPath("$.data.invoice.due_date").value(frozenDueDate.toString()));
 
         long newInvoiceId = latestInvoiceId(ORDER_FULL);
         Assertions.assertNotEquals(previousInvoiceId, newInvoiceId);
+        // 16G PR 3: the signing version is dated like the version it signs (never the signing day).
+        Assertions.assertEquals(frozenInvoiceDate, invoiceDateOf(newInvoiceId));
+        Assertions.assertEquals(frozenDueDate, dueDateOf(newInvoiceId));
         Assertions.assertEquals(frozenSnapshot, jdbcTemplate.queryForObject(
                 "SELECT details_of_sale_snapshot FROM invoice WHERE invoice_id = ?", String.class, newInvoiceId));
         assertMoneyEquals(frozenIncGst, jdbcTemplate.queryForObject(
@@ -417,33 +563,64 @@ class InvoiceAcceptanceControllerTest {
         byte[] exactlyMax = new byte[(int) MAX_SIGNATURE_SIZE_BYTES];
         System.arraycopy(ONE_PIXEL_PNG, 0, exactlyMax, 0, ONE_PIXEL_PNG.length);
 
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
+        mockMvc.perform(acceptAtCurrentVersion(ORDER_FULL)
                         .file(signaturePart(exactlyMax))
-                        .param(ACCEPTED_NAME_FIELD, "James Wilson"))
                         .session(liamStore1Session()))
                 .andExpect(status().isCreated());
     }
 
     @Test
-    void accept_nameAtExactly150Chars_isAllowed_and151Rejected() throws Exception {
-        // 151 first: once an accept succeeds, the already-accepted 409 (step 3) would fire before the
-        // name validation (step 4), so the over-length rejection must be tested on an unaccepted invoice.
+    void accept_namePartOf150Or151Chars_returns400NotAllowed_frozenNameOver150Chars_isAcceptedAndStoredInFull()
+            throws Exception {
+        // 16G PR 3 removed the part and its 150-character request limit: an accepted_customer_name part of
+        // ANY length is an unexpected part, refused at the part allowlist (step 7) - one detail, nothing
+        // written. Tested first, on the unaccepted current version (a successful accept would make the
+        // already-accepted 409 fire before the allowlist).
         int countBefore = countInvoices(ORDER_FULL);
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
-                        .file(signaturePart(ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, "X".repeat(151)))
-                        .session(liamStore1Session()))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
-                .andExpect(jsonPath("$.error.details[0].field").value(ACCEPTED_NAME_FIELD));
-        Assertions.assertEquals(countBefore, countInvoices(ORDER_FULL));
+        int nextVersion = maxInvoiceVersion(ORDER_FULL) + 1;
+        int storedFilesBefore = countStoredFiles();
+        long filesBefore = filesOnDisk();
+        for (int length : new int[] {150, 151}) {
+            mockMvc.perform(validAccept(ORDER_FULL)
+                            .param(ACCEPTED_NAME_FIELD, "X".repeat(length))
+                            .session(liamStore1Session()))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                    .andExpect(jsonPath("$.error.details", hasSize(1)))
+                    .andExpect(jsonPath("$.error.details[0].field").value(ACCEPTED_NAME_FIELD))
+                    .andExpect(jsonPath("$.error.details[0].message").value(NOT_ALLOWED));
+        }
+        Assertions.assertEquals(countBefore, countInvoices(ORDER_FULL), "a refused name part appends no version");
+        Assertions.assertEquals(storedFilesBefore, countStoredFiles(), "a refused name part writes no stored_file");
+        Assertions.assertEquals(filesBefore, filesOnDisk(), "a refused name part writes no file");
+        Assertions.assertTrue(recordingInvoiceEmailSender.sentEmails().isEmpty());
+        Assertions.assertTrue(recordingInvoiceEmailSender.failedEmails().isEmpty());
 
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
-                        .file(signaturePart(ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, "X".repeat(150)))
-                        .session(liamStore1Session()))
+        // The FROZEN name has no length limit: a current version whose customer_name_snapshot is longer than
+        // 150 characters is accepted with that name, stored and returned in full (never truncated).
+        Assertions.assertEquals(201, FROZEN_LONG_NAME.length(), "fixture: a 201-character frozen name");
+        long currentInvoiceId = latestInvoiceId(ORDER_FULL);
+        setFrozenName(currentInvoiceId, FROZEN_LONG_NAME);
+
+        mockMvc.perform(validAccept(ORDER_FULL).session(liamStore1Session()))
                 .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.data.invoice.accepted_customer_name").value("X".repeat(150)));
+                .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(nextVersion))
+                .andExpect(jsonPath("$.data.invoice.accepted_customer_name").value(FROZEN_LONG_NAME))
+                .andExpect(jsonPath("$.data.invoice.customer_name_snapshot").value(FROZEN_LONG_NAME));
+
+        long signedInvoiceId = latestInvoiceId(ORDER_FULL);
+        Assertions.assertNotEquals(currentInvoiceId, signedInvoiceId);
+        Assertions.assertEquals(FROZEN_LONG_NAME, acceptedNameOf(signedInvoiceId),
+                "invoice.accepted_customer_name = the frozen name, in full");
+        Assertions.assertEquals(FROZEN_LONG_NAME.length(), jdbcTemplate.queryForObject(
+                "SELECT char_length(accepted_customer_name) FROM invoice WHERE invoice_id = ?",
+                Integer.class, signedInvoiceId), "the stored accepted name is untruncated");
+        Assertions.assertEquals(FROZEN_LONG_NAME, currentFrozenName(ORDER_FULL),
+                "the signing version copies the frozen name verbatim");
+        // The signed PDF caption carries the full name (it may wrap between words, so whitespace is ignored).
+        assertAcceptedCaption(storedInvoicePdf(signedInvoiceId), FROZEN_LONG_NAME,
+                invoiceAcceptedAt(signedInvoiceId).toLocalDateTime());
     }
 
     @Test
@@ -496,8 +673,9 @@ class InvoiceAcceptanceControllerTest {
 
     @Test
     void accept_noCurrentInvoice_returns422_invoiceRequired_beforeEmailGate() throws Exception {
-        // ORDER_EMPTY has no invoice AND no customer: INVOICE_REQUIRED (step 2) must win over the
-        // email gate (step 7).
+        // ORDER_EMPTY has no invoice AND no customer: INVOICE_REQUIRED (step 3) must win over the
+        // email gate (step 10). It is also decided BEFORE the expected_version_number value is read
+        // (step 4): with no version, validAccept sends 0, which is not even a positive integer.
         mockMvc.perform(validAccept(ORDER_EMPTY).session(liamStore1Session()))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("INVOICE_REQUIRED"));
@@ -505,38 +683,101 @@ class InvoiceAcceptanceControllerTest {
 
     @Test
     void accept_alreadyAccepted_returns409() throws Exception {
+        // 16G PR 3: the request carries the MATCHING current version, so the stale check (step 5) passes
+        // and the already-accepted check (step 6) answers - with its default staff wording.
         seedAcceptance(ORDER_FULL);
         int countBefore = countInvoices(ORDER_FULL);
+        int storedFilesBefore = countStoredFiles();
 
         mockMvc.perform(validAccept(ORDER_FULL).session(liamStore1Session()))
                 .andExpect(status().isConflict())
-                .andExpect(jsonPath("$.error.code").value("INVOICE_ALREADY_ACCEPTED"));
+                .andExpect(jsonPath("$.error.code").value("INVOICE_ALREADY_ACCEPTED"))
+                .andExpect(jsonPath("$.error.message").value(ALREADY_ACCEPTED_MESSAGE));
         Assertions.assertEquals(countBefore, countInvoices(ORDER_FULL));
+        Assertions.assertEquals(storedFilesBefore, countStoredFiles());
+        Assertions.assertTrue(recordingInvoiceEmailSender.sentEmails().isEmpty());
+        Assertions.assertTrue(recordingInvoiceEmailSender.failedEmails().isEmpty());
     }
 
     @Test
-    void accept_missingName_returns422_acceptedCustomerNameRequired() throws Exception {
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
-                        .file(signaturePart(ONE_PIXEL_PNG)))
-                        .session(liamStore1Session()))
-                .andExpect(status().isUnprocessableEntity())
-                .andExpect(jsonPath("$.error.code").value("ACCEPTED_CUSTOMER_NAME_REQUIRED"));
+    void accept_nullOrBlankFrozenCustomerName_returns422_acceptedCustomerNameRequired_nothingWritten() throws Exception {
+        // 16G PR 3: sending NO name part is the correct request (validAccept never sends one); the 422 now
+        // means the CURRENT version's frozen customer_name_snapshot is NULL or blank (String.isBlank - spaces
+        // only, empty, other whitespace). The live saved customer (still named, with a valid email) is never
+        // a fallback.
+        long currentInvoiceId = latestInvoiceId(ORDER_FULL);
+        int countBefore = countInvoices(ORDER_FULL);
+        int storedFilesBefore = countStoredFiles();
+        long filesBefore = filesOnDisk();
+        Timestamp mirrorBefore = orderLastEmailedAt(ORDER_FULL);
+
+        for (String frozenName : new String[] {null, "   ", "", " \t\n "}) {
+            setFrozenName(currentInvoiceId, frozenName);
+            String label = "frozen name " + (frozenName == null ? "NULL"
+                    : "'" + frozenName.replace("\t", "\\t").replace("\n", "\\n") + "'");
+            Map<String, Object> currentBefore = jdbcTemplate.queryForMap(
+                    "SELECT * FROM invoice WHERE invoice_id = ?", currentInvoiceId);
+
+            mockMvc.perform(validAccept(ORDER_FULL).session(liamStore1Session()))
+                    .andExpect(status().isUnprocessableEntity())
+                    .andExpect(jsonPath("$.error.code").value("ACCEPTED_CUSTOMER_NAME_REQUIRED"))
+                    .andExpect(jsonPath("$.error.message").value(ACCEPTED_NAME_REQUIRED_MESSAGE));
+            Assertions.assertEquals(frozenName, currentFrozenName(ORDER_FULL),
+                    label + ": the refusal never rewrites the frozen name");
+
+            // A name part can never stand in for the missing or blank frozen name: it is refused at the
+            // allowlist (step 7), before the frozen name is even read (step 8).
+            mockMvc.perform(validAccept(ORDER_FULL)
+                            .param(ACCEPTED_NAME_FIELD, "James Wilson")
+                            .session(liamStore1Session()))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                    .andExpect(jsonPath("$.error.details", hasSize(1)))
+                    .andExpect(jsonPath("$.error.details[0].field").value(ACCEPTED_NAME_FIELD))
+                    .andExpect(jsonPath("$.error.details[0].message").value(NOT_ALLOWED));
+
+            // Nothing written: no version, no stored_file, no file, no email; the current row is untouched.
+            Assertions.assertEquals(countBefore, countInvoices(ORDER_FULL), label + ": no version is appended");
+            Assertions.assertEquals(storedFilesBefore, countStoredFiles(), label + ": no stored_file row");
+            Assertions.assertEquals(filesBefore, filesOnDisk(), label + ": no file on disk");
+            Assertions.assertEquals(currentBefore, jdbcTemplate.queryForMap(
+                    "SELECT * FROM invoice WHERE invoice_id = ?", currentInvoiceId), label + ": the current row is untouched");
+            Assertions.assertNull(invoiceAcceptedAt(currentInvoiceId), label + ": the current version stays unsigned");
+            Assertions.assertEquals(mirrorBefore, orderLastEmailedAt(ORDER_FULL), label + ": the mirror is untouched");
+            Assertions.assertTrue(recordingInvoiceEmailSender.sentEmails().isEmpty(), label + ": no email is sent");
+            Assertions.assertTrue(recordingInvoiceEmailSender.failedEmails().isEmpty(),
+                    label + ": no email is attempted");
+        }
     }
 
     @Test
-    void accept_blankName_returns422_acceptedCustomerNameRequired() throws Exception {
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
-                        .file(signaturePart(ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, "   "))
-                        .session(liamStore1Session()))
-                .andExpect(status().isUnprocessableEntity())
-                .andExpect(jsonPath("$.error.code").value("ACCEPTED_CUSTOMER_NAME_REQUIRED"));
+    void accept_blankNamePart_returns400NotAllowed_nothingWritten() throws Exception {
+        // 16G PR 3: a supplied name part is refused at the allowlist whatever its value - blank or empty
+        // included - with one Not allowed. detail (the valid frozen name is never reached).
+        int countBefore = countInvoices(ORDER_FULL);
+        int storedFilesBefore = countStoredFiles();
+        long filesBefore = filesOnDisk();
+        for (String blank : new String[] {"   ", ""}) {
+            mockMvc.perform(validAccept(ORDER_FULL)
+                            .param(ACCEPTED_NAME_FIELD, blank)
+                            .session(liamStore1Session()))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                    .andExpect(jsonPath("$.error.details", hasSize(1)))
+                    .andExpect(jsonPath("$.error.details[0].field").value(ACCEPTED_NAME_FIELD))
+                    .andExpect(jsonPath("$.error.details[0].message").value(NOT_ALLOWED));
+        }
+        Assertions.assertEquals(countBefore, countInvoices(ORDER_FULL));
+        Assertions.assertEquals(storedFilesBefore, countStoredFiles());
+        Assertions.assertEquals(filesBefore, filesOnDisk());
+        Assertions.assertNull(invoiceAcceptedAt(latestInvoiceId(ORDER_FULL)));
+        Assertions.assertTrue(recordingInvoiceEmailSender.sentEmails().isEmpty());
+        Assertions.assertTrue(recordingInvoiceEmailSender.failedEmails().isEmpty());
     }
 
     @Test
     void accept_missingSignaturePart_returns422_signatureRequired() throws Exception {
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
-                        .param(ACCEPTED_NAME_FIELD, "James Wilson"))
+        mockMvc.perform(acceptAtCurrentVersion(ORDER_FULL)
                         .session(liamStore1Session()))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("SIGNATURE_REQUIRED"));
@@ -544,9 +785,8 @@ class InvoiceAcceptanceControllerTest {
 
     @Test
     void accept_emptySignature_returns422_signatureRequired() throws Exception {
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
+        mockMvc.perform(acceptAtCurrentVersion(ORDER_FULL)
                         .file(signaturePart(new byte[0]))
-                        .param(ACCEPTED_NAME_FIELD, "James Wilson"))
                         .session(liamStore1Session()))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("SIGNATURE_REQUIRED"));
@@ -555,9 +795,8 @@ class InvoiceAcceptanceControllerTest {
     @Test
     void accept_wrongMimeType_returns400_signatureInvalid() throws Exception {
         MockMultipartFile jpeg = new MockMultipartFile(SIGNATURE_PART, "signature.jpg", "image/jpeg", ONE_PIXEL_PNG);
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
+        mockMvc.perform(acceptAtCurrentVersion(ORDER_FULL)
                         .file(jpeg)
-                        .param(ACCEPTED_NAME_FIELD, "James Wilson"))
                         .session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("SIGNATURE_INVALID"));
@@ -567,9 +806,8 @@ class InvoiceAcceptanceControllerTest {
     void accept_oversizeSignature_returns400_signatureInvalid() throws Exception {
         byte[] overMax = new byte[(int) MAX_SIGNATURE_SIZE_BYTES + 1];
         int countBefore = countInvoices(ORDER_FULL);
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
+        mockMvc.perform(acceptAtCurrentVersion(ORDER_FULL)
                         .file(signaturePart(overMax))
-                        .param(ACCEPTED_NAME_FIELD, "James Wilson"))
                         .session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("SIGNATURE_INVALID"));
@@ -578,59 +816,67 @@ class InvoiceAcceptanceControllerTest {
 
     @Test
     void accept_unexpectedExtraPart_returns400_validationFailed() throws Exception {
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
-                        .file(signaturePart(ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, "James Wilson")
-                        .param("order_id", "5"))
+        mockMvc.perform(validAccept(ORDER_FULL)
+                        .param("order_id", "5")
                         .session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
-                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+                .andExpect(jsonPath("$.error.details", hasSize(1)))
+                .andExpect(jsonPath("$.error.details[0].field").value("order_id"))
+                .andExpect(jsonPath("$.error.details[0].message").value(NOT_ALLOWED));
     }
 
     @Test
     void accept_unexpectedExtraFilePart_returns400_validationFailed() throws Exception {
         MockMultipartFile extra = new MockMultipartFile("file", "x.png", "image/png", ONE_PIXEL_PNG);
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
-                        .file(signaturePart(ONE_PIXEL_PNG))
+        mockMvc.perform(validAccept(ORDER_FULL)
                         .file(extra)
-                        .param(ACCEPTED_NAME_FIELD, "James Wilson"))
                         .session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
-                .andExpect(jsonPath("$.error.details[0].field").value("file"));
+                .andExpect(jsonPath("$.error.details", hasSize(1)))
+                .andExpect(jsonPath("$.error.details[0].field").value("file"))
+                .andExpect(jsonPath("$.error.details[0].message").value(NOT_ALLOWED));
     }
 
     @Test
     void accept_duplicateSignatureParts_returns400_validationFailed() throws Exception {
         // getFile() would silently pick one of the two — a repeated signature part must be rejected.
         int countBefore = countInvoices(ORDER_FULL);
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
+        mockMvc.perform(acceptAtCurrentVersion(ORDER_FULL)
                         .file(signaturePart(ONE_PIXEL_PNG))
                         .file(signaturePart(ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, "James Wilson"))
                         .session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
-                .andExpect(jsonPath("$.error.details[0].field").value(SIGNATURE_PART));
+                .andExpect(jsonPath("$.error.details", hasSize(1)))
+                .andExpect(jsonPath("$.error.details[0].field").value(SIGNATURE_PART))
+                .andExpect(jsonPath("$.error.details[0].message").value("Must appear at most once."));
         Assertions.assertEquals(countBefore, countInvoices(ORDER_FULL));
         Assertions.assertEquals(0, recordingInvoiceEmailSender.sentEmails().size());
     }
 
     @Test
-    void accept_duplicateAcceptedCustomerNameValues_returns400_validationFailed() throws Exception {
-        // getParameter() would silently pick one of the two values — duplicates must be rejected.
+    void accept_repeatedAcceptedCustomerNamePart_returns400_oneNotAllowedDetail_nothingWritten() throws Exception {
+        // 16G PR 3: the field is FORBIDDEN, not an allowed field that may appear once - two values of it
+        // give ONE Not allowed. detail (no "Must appear at most once."), and nothing is written.
         int countBefore = countInvoices(ORDER_FULL);
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(ORDER_FULL))
-                        .file(signaturePart(ONE_PIXEL_PNG))
+        int storedFilesBefore = countStoredFiles();
+        long filesBefore = filesOnDisk();
+        mockMvc.perform(validAccept(ORDER_FULL)
                         .param(ACCEPTED_NAME_FIELD, "James Wilson")
-                        .param(ACCEPTED_NAME_FIELD, "Someone Else"))
+                        .param(ACCEPTED_NAME_FIELD, "Someone Else")
                         .session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
-                .andExpect(jsonPath("$.error.details[0].field").value(ACCEPTED_NAME_FIELD));
+                .andExpect(jsonPath("$.error.details", hasSize(1)))
+                .andExpect(jsonPath("$.error.details[0].field").value(ACCEPTED_NAME_FIELD))
+                .andExpect(jsonPath("$.error.details[0].message").value(NOT_ALLOWED));
         Assertions.assertEquals(countBefore, countInvoices(ORDER_FULL));
+        Assertions.assertEquals(storedFilesBefore, countStoredFiles());
+        Assertions.assertEquals(filesBefore, filesOnDisk());
         Assertions.assertEquals(0, recordingInvoiceEmailSender.sentEmails().size());
+        Assertions.assertEquals(0, recordingInvoiceEmailSender.failedEmails().size());
     }
 
     @Test
@@ -985,7 +1231,10 @@ class InvoiceAcceptanceControllerTest {
 
     @Test
     void paymentOnAccepted_carriesAcceptanceForward_sameSignatureFile_dashboardStaysAccepted() throws Exception {
+        // 16G PR 3: the D.8 accepted name is the frozen Invoice To name of the version it signed.
+        String frozenName = currentFrozenName(ORDER_FULL);
         long acceptedInvoiceId = acceptWithFailedEmail(ORDER_FULL);
+        Assertions.assertEquals(frozenName, acceptedNameOf(acceptedInvoiceId));
         Timestamp acceptedAt = invoiceAcceptedAt(acceptedInvoiceId);
         long signatureFileId = acceptedSignatureFileId(acceptedInvoiceId);
         int nextVersion = maxInvoiceVersion(ORDER_FULL) + 1;
@@ -996,7 +1245,7 @@ class InvoiceAcceptanceControllerTest {
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.data.current_invoice.version_number").value(nextVersion))
                 .andExpect(jsonPath("$.data.current_invoice.accepted_at").isNotEmpty())
-                .andExpect(jsonPath("$.data.current_invoice.accepted_customer_name").value("James Wilson"))
+                .andExpect(jsonPath("$.data.current_invoice.accepted_customer_name").value(frozenName))
                 .andExpect(jsonPath("$.data.current_invoice.accepted_signature_present").value(true))
                 .andExpect(jsonPath("$.data.current_invoice.accepted_signature_download_path")
                         .value(signatureUrl(ORDER_FULL)));
@@ -1018,6 +1267,7 @@ class InvoiceAcceptanceControllerTest {
 
     @Test
     void paymentOnAccepted_regeneratesSignedPdf_withAcceptanceBlock_noAutoEmail() throws Exception {
+        String frozenName = currentFrozenName(ORDER_FULL);
         acceptWithFailedEmail(ORDER_FULL);
 
         mockMvc.perform(post(paymentsUrl(ORDER_FULL)).session(liamStore1Session())
@@ -1036,7 +1286,7 @@ class InvoiceAcceptanceControllerTest {
         Assertions.assertEquals("%PDF-", new String(pdf, 0, 5, StandardCharsets.US_ASCII));
         String text = extractPdfText(pdf);
         Assertions.assertTrue(text.contains("Accepted by"), () -> "missing acceptance caption: " + text);
-        Assertions.assertTrue(text.contains("James Wilson"), () -> "missing carried accepted name: " + text);
+        Assertions.assertTrue(text.contains(frozenName), () -> "missing carried accepted name: " + text);
         Assertions.assertFalse(text.contains("Customer signature"),
                 () -> "signed PDF must not show the blank-area caption: " + text);
     }
@@ -1193,6 +1443,7 @@ class InvoiceAcceptanceControllerTest {
 
     @Test
     void voidOnAccepted_carriesAcceptanceForward_sameSignatureFile_dashboardStaysAccepted() throws Exception {
+        String frozenName = currentFrozenName(ORDER_FULL);
         long acceptedInvoiceId = acceptWithFailedEmail(ORDER_FULL);
         Timestamp acceptedAt = invoiceAcceptedAt(acceptedInvoiceId);
         long signatureFileId = acceptedSignatureFileId(acceptedInvoiceId);
@@ -1204,7 +1455,7 @@ class InvoiceAcceptanceControllerTest {
                 .andExpect(jsonPath("$.message").value("Payment voided. Current invoice updated."))
                 .andExpect(jsonPath("$.data.current_invoice.version_number").value(versionBeforeVoid + 1))
                 .andExpect(jsonPath("$.data.current_invoice.accepted_at").isNotEmpty())
-                .andExpect(jsonPath("$.data.current_invoice.accepted_customer_name").value("James Wilson"))
+                .andExpect(jsonPath("$.data.current_invoice.accepted_customer_name").value(frozenName))
                 .andExpect(jsonPath("$.data.current_invoice.accepted_signature_present").value(true))
                 // Voiding the $100 payment drops total_paid back to the seeded baseline (the seeded
                 // 500.00 EFTPOS payment stays active) and balance rises from 324.00 to 424.00.
@@ -1233,6 +1484,7 @@ class InvoiceAcceptanceControllerTest {
 
     @Test
     void voidOnAccepted_regeneratesSignedPdf_withAcceptanceBlock() throws Exception {
+        String frozenName = currentFrozenName(ORDER_FULL);
         acceptWithFailedEmail(ORDER_FULL);
         long paymentId = recordPaymentReturningId(ORDER_FULL, "100.00");
 
@@ -1246,7 +1498,7 @@ class InvoiceAcceptanceControllerTest {
                 .andReturn();
         String text = extractPdfText(result.getResponse().getContentAsByteArray());
         Assertions.assertTrue(text.contains("Accepted by"), () -> "missing acceptance caption: " + text);
-        Assertions.assertTrue(text.contains("James Wilson"), () -> "missing carried accepted name: " + text);
+        Assertions.assertTrue(text.contains(frozenName), () -> "missing carried accepted name: " + text);
     }
 
     @Test
@@ -1492,11 +1744,13 @@ class InvoiceAcceptanceControllerTest {
         return new IssuedQuoteOrder(orderId, sendQuoteEmail(orderId));
     }
 
-    /** A valid D.8 request for a self-seeded order: the signature PNG + the saved customer's name. */
+    /**
+     * A valid D.8 request for a self-seeded order (16G PR 3): the signature PNG + expected_version_number =
+     * the order's current version, no name part. The accepted name is the frozen customer_name_snapshot
+     * D.1 wrote from the saved customer ({@link #D5C_CUSTOMER_NAME}).
+     */
     private MockMultipartHttpServletRequestBuilder signInvoice(long orderId) {
-        return (MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
-                .file(signaturePart(ONE_PIXEL_PNG))
-                .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME);
+        return validAccept(orderId);
     }
 
     /**
@@ -1777,11 +2031,29 @@ class InvoiceAcceptanceControllerTest {
                 .andExpect(status().isForbidden());
         assertQuoteLinkUntouched("403 no store", orderId, 1, token, versionBefore, tokenBefore);
 
-        // 400: an unexpected form field — even a quote-shaped one — is refused before any write.
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
+        // 400: a missing expected_version_number (16G PR 3) - refused under the lock, before any write.
+        mockMvc.perform(multipart(acceptUrl(orderId))
                         .file(signaturePart(ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME)
-                        .param("quote_version_id", "1"))
+                        .session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value(EXPECTED_VERSION_FIELD))
+                .andExpect(jsonPath("$.error.details[0].message").value("Required."));
+        assertQuoteLinkUntouched("400 missing expected_version_number", orderId, 1, token, versionBefore, tokenBefore);
+
+        // 409: a stale expected_version_number (a version that was never committed).
+        mockMvc.perform(multipart(acceptUrl(orderId))
+                        .file(signaturePart(ONE_PIXEL_PNG))
+                        .param(EXPECTED_VERSION_FIELD, String.valueOf(maxInvoiceVersion(orderId) + 1))
+                        .session(liamStore1Session()))
+                .andExpect(status().isConflict())
+                .andExpect(jsonPath("$.error.code").value("INVOICE_VERSION_STALE"))
+                .andExpect(jsonPath("$.error.message").value("Invoice updated, please refresh"));
+        assertQuoteLinkUntouched("409 stale version", orderId, 1, token, versionBefore, tokenBefore);
+
+        // 400: an unexpected form field — even a quote-shaped one — is refused before any write.
+        mockMvc.perform(signInvoice(orderId)
+                        .param("quote_version_id", "1")
                         .session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
@@ -1789,37 +2061,44 @@ class InvoiceAcceptanceControllerTest {
         assertQuoteLinkUntouched("400 extra form field", orderId, 1, token, versionBefore, tokenBefore);
 
         // 400: an unexpected extra FILE part.
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
-                        .file(signaturePart(ONE_PIXEL_PNG))
+        mockMvc.perform(signInvoice(orderId)
                         .file(new MockMultipartFile("quote_signature", "x.png", "image/png", ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME))
                         .session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
                 .andExpect(jsonPath("$.error.details[0].field").value("quote_signature"));
         assertQuoteLinkUntouched("400 extra file part", orderId, 1, token, versionBefore, tokenBefore);
 
-        // 422: blank accepted name.
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
-                        .file(signaturePart(ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, "   "))
+        // 400: the former accepted_customer_name part (16G PR 3: an unexpected part).
+        mockMvc.perform(signInvoice(orderId)
+                        .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME)
                         .session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value(ACCEPTED_NAME_FIELD))
+                .andExpect(jsonPath("$.error.details[0].message").value(NOT_ALLOWED));
+        assertQuoteLinkUntouched("400 name part", orderId, 1, token, versionBefore, tokenBefore);
+
+        // 422: a blank FROZEN name on the current version (restored afterwards).
+        long currentInvoiceId = latestInvoiceId(orderId);
+        String frozenName = currentFrozenName(orderId);
+        setFrozenName(currentInvoiceId, "   ");
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("ACCEPTED_CUSTOMER_NAME_REQUIRED"));
-        assertQuoteLinkUntouched("422 blank name", orderId, 1, token, versionBefore, tokenBefore);
+        assertQuoteLinkUntouched("422 blank frozen name", orderId, 1, token, versionBefore, tokenBefore);
+        setFrozenName(currentInvoiceId, frozenName);
 
         // 422: missing signature part.
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
-                        .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME))
+        mockMvc.perform(acceptAtCurrentVersion(orderId)
                         .session(liamStore1Session()))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("SIGNATURE_REQUIRED"));
         assertQuoteLinkUntouched("422 missing signature", orderId, 1, token, versionBefore, tokenBefore);
 
         // 400: a signature declared as a non-PNG type.
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
+        mockMvc.perform(acceptAtCurrentVersion(orderId)
                         .file(new MockMultipartFile(SIGNATURE_PART, "signature.jpg", "image/jpeg", ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, D5C_CUSTOMER_NAME))
                         .session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("SIGNATURE_INVALID"));
@@ -2203,9 +2482,9 @@ class InvoiceAcceptanceControllerTest {
     // BUSINESS and terms_html = the version's STORED terms (JSON null, key present, when D.1 froze none)
     // on both the D.8 201 and the D.9 200 response, and a business-terms edit, clear or later set, or a
     // customer rename / billing move, made after D.1 never reaches the signed version, its PDF or its
-    // InvoiceDetail. The D.8 accepted name is still the submitted accepted_customer_name part (unchanged
-    // until 16G PR 3). Self-seeded with the D5(c) fixtures above (own SOFT order + invoice v1 through
-    // D.1); business 1's terms are set here.
+    // InvoiceDetail. Since 16G PR 3 the D.8 accepted name is the current version's frozen
+    // customer_name_snapshot too (no name part is sent; one would be refused with 400). Self-seeded with
+    // the D5(c) fixtures above (own SOFT order + invoice v1 through D.1); business 1's terms are set here.
 
     // The business's SOFT terms when D.1 creates v1 (frozen into it), and the edit made after Create.
     private static final String PR2_SOFT_TERMS_TEXT = "Original soft acceptance terms apply.";
@@ -2447,10 +2726,11 @@ class InvoiceAcceptanceControllerTest {
     }
 
     @Test
-    void accept_afterCustomerRenameAndBillingMove_copiesTheInvoiceToWordsStoredAtCreate_captionShowsTheSubmittedName()
+    void accept_afterCustomerRenameAndBillingMove_copiesTheInvoiceToWordsStoredAtCreate_captionShowsTheFrozenName()
             throws Exception {
         long orderId = seedInvoicedOrder();
         long createdInvoiceId = latestInvoiceId(orderId);
+        LocalDate createdInvoiceDate = invoiceDateOf(createdInvoiceId);
         Map<String, Object> createdIdentity = invoiceIdentityColumns(createdInvoiceId);
         Assertions.assertEquals(D5C_CUSTOMER_NAME, createdIdentity.get("customer_name_snapshot"),
                 "precondition: D.1 froze the saved name into v1");
@@ -2470,46 +2750,88 @@ class InvoiceAcceptanceControllerTest {
                 MOVED_BILLING_STREET, MOVED_BILLING_SUBURB, orderId), "fixture: move the BILLING address");
         clearJpaCache();
 
-        // D.8 with the NEW name as the submitted accepted_customer_name part (the accepted name is still
-        // the submitted part until 16G PR 3): the InvoiceDetail Invoice To keys are the words stored at
-        // Create, while accepted_customer_name is the submitted name.
-        mockMvc.perform(((MockMultipartHttpServletRequestBuilder) multipart(acceptUrl(orderId))
-                        .file(signaturePart(ONE_PIXEL_PNG))
-                        .param(ACCEPTED_NAME_FIELD, RENAMED_CUSTOMER_NAME))
+        // 16G PR 3: the renamed name can no longer be SUBMITTED - a name part is refused (400) and nothing
+        // is written.
+        mockMvc.perform(signInvoice(orderId)
+                        .param(ACCEPTED_NAME_FIELD, RENAMED_CUSTOMER_NAME)
                         .session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details", hasSize(1)))
+                .andExpect(jsonPath("$.error.details[0].field").value(ACCEPTED_NAME_FIELD))
+                .andExpect(jsonPath("$.error.details[0].message").value(NOT_ALLOWED));
+        Assertions.assertEquals(1, countInvoices(orderId), "the refused name part appends no version");
+        Assertions.assertTrue(recordingInvoiceEmailSender.sentEmails().isEmpty());
+
+        // D.8 without a name part: the accepted name is v1's FROZEN Invoice To name - never the live rename -
+        // and the InvoiceDetail Invoice To keys are the words stored at Create.
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE))
                 .andExpect(jsonPath("$.data.invoice.version_number").value(2))
-                .andExpect(jsonPath("$.data.invoice.accepted_customer_name").value(RENAMED_CUSTOMER_NAME))
+                .andExpect(jsonPath("$.data.invoice.invoice_date").value(createdInvoiceDate.toString()))
+                .andExpect(jsonPath("$.data.invoice.accepted_customer_name").value(D5C_CUSTOMER_NAME))
                 .andExpect(jsonPath("$.data.invoice.customer_name_snapshot").value(D5C_CUSTOMER_NAME))
                 .andExpect(jsonPath("$.data.invoice.customer_address_line1_snapshot").value(D5C_BILLING_LINE1))
                 .andExpect(jsonPath("$.data.invoice.customer_address_line2_snapshot").value(D5C_BILLING_LINE2));
         clearJpaCache();
 
         // The signed version copies v1's three identity columns verbatim - never the renamed customer or
-        // the moved billing address.
+        // the moved billing address - stores the frozen name as its accepted name, and keeps v1's date.
         long signedInvoiceId = latestInvoiceId(orderId);
         Assertions.assertNotEquals(createdInvoiceId, signedInvoiceId);
         Assertions.assertEquals(createdIdentity, invoiceIdentityColumns(signedInvoiceId),
                 "D.8 v2 copies v1's Invoice To words verbatim");
+        Assertions.assertEquals(D5C_CUSTOMER_NAME, acceptedNameOf(signedInvoiceId),
+                "D.8 v2: the accepted name is v1's frozen name, not the live rename");
+        Assertions.assertEquals(createdInvoiceDate, invoiceDateOf(signedInvoiceId), "D.8 v2 keeps v1's invoice_date");
 
         // Its signed PDF (the stored file, which is also the auto-emailed attachment): Invoice To is the
-        // stored name and billing lines, never the moved address; the caption is the SUBMITTED name.
-        String signedPdfPath = storagePathOf(invoicePdfFileId(signedInvoiceId));
-        Assertions.assertTrue(diskFileExists(signedPdfPath), "the signed PDF must exist on disk");
-        byte[] signedPdf = Files.readAllBytes(tempStorageDir.resolve(signedPdfPath.substring(1)));
+        // stored name and billing lines, never the moved address; the caption is the FROZEN name, and the
+        // live rename appears nowhere.
+        byte[] signedPdf = storedInvoicePdf(signedInvoiceId);
         List<InvoiceEmailRequest> sent = recordingInvoiceEmailSender.sentEmails();
         Assertions.assertEquals(1, sent.size(), "D.8 auto-emails once");
         Assertions.assertArrayEquals(signedPdf, sent.get(0).pdfBytes(), "the auto-email attaches the stored signed PDF");
         String signedText = extractPdfText(signedPdf);
         Assertions.assertEquals(noSpace(D5C_CUSTOMER_NAME + D5C_BILLING_LINE1 + D5C_BILLING_LINE2),
                 invoiceToBlock(signedText), () -> "Invoice To must be the words stored at Create: " + signedText);
-        for (String moved : List.of(MOVED_BILLING_STREET, MOVED_BILLING_SUBURB)) {
+        for (String moved : List.of(MOVED_BILLING_STREET, MOVED_BILLING_SUBURB, RENAMED_FIRST_NAME, RENAMED_LAST_NAME)) {
             Assertions.assertFalse(noSpace(signedText).contains(noSpace(moved)),
-                    () -> "the moved billing address must never render (" + moved + "): " + signedText);
+                    () -> "the live rename / moved billing address must never render (" + moved + "): " + signedText);
         }
         String readingOrder = extractPdfTextInReadingOrder(signedPdf);
-        Assertions.assertTrue(noSpace(readingOrder).contains(noSpace("Accepted by " + RENAMED_CUSTOMER_NAME + " on")),
-                () -> "the caption must carry the submitted name: " + readingOrder);
+        Assertions.assertTrue(noSpace(readingOrder).contains(noSpace("Accepted by " + D5C_CUSTOMER_NAME + " on")),
+                () -> "the caption must carry the frozen name: " + readingOrder);
+    }
+
+    /**
+     * The PDF's Issued / Due block (content-stream order, whitespace removed): everything between the
+     * "Issued / Due" eyebrow and the next column's "Sales Person / Store" eyebrow (both rendered uppercase)
+     * - the invoice date, then "Due" and the due date.
+     */
+    private static String issuedDueBlock(String pdfText) {
+        String text = noSpace(pdfText);
+        int start = text.indexOf("ISSUED/DUE");
+        int end = text.indexOf("SALESPERSON/STORE", start);
+        Assertions.assertTrue(start >= 0 && end > start, () -> "the PDF must carry the Issued / Due block: " + pdfText);
+        return text.substring(start + "ISSUED/DUE".length(), end);
+    }
+
+    /**
+     * The signed caption "Accepted by {name} on {dd/MM/yyyy HH:mm}", read in visual order (whitespace
+     * ignored: a long name may wrap). Postgres keeps TIMESTAMP at microsecond precision (rounded), so the
+     * stored value can sit up to 1 microsecond after the rendered in-memory instant; the rendering of
+     * {@code acceptedAt - 1us} is accepted too, which keeps the check exact yet immune to a minute boundary.
+     */
+    private static void assertAcceptedCaption(byte[] pdf, String acceptedName, LocalDateTime acceptedAt)
+            throws Exception {
+        String readingOrder = extractPdfTextInReadingOrder(pdf);
+        String text = noSpace(readingOrder);
+        String exact = noSpace("Accepted by " + acceptedName + " on " + DISPLAY_DATE_TIME.format(acceptedAt));
+        String roundedBack = noSpace("Accepted by " + acceptedName + " on "
+                + DISPLAY_DATE_TIME.format(acceptedAt.minusNanos(1_000)));
+        Assertions.assertTrue(text.contains(exact) || text.contains(roundedBack),
+                () -> "the signed PDF must carry the caption '" + exact + "' in: " + readingOrder);
     }
 }

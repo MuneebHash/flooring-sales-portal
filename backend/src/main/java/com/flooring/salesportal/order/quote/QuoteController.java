@@ -160,11 +160,16 @@ public class QuoteController {
 
     /**
      * POST .../quote/create-invoice (Phase 16F PR2, Path A): create an invoice version from the order's
-     * latest ACCEPTED quote, inheriting its signature. Empty body only (the server selects the quote
-     * version). Allowed when LAID; no email. 201 with the InvoiceDetail envelope and the message
-     * "Invoice created from accepted quote."; 422 QUOTE_NOT_ACCEPTED / INVOICE_PRECONDITIONS_NOT_MET /
-     * BUSINESS_RULE_VIOLATION; 409 INVOICE_ALREADY_ACCEPTED when the current invoice was signed at the
-     * same time or later than the quote. All logic lives in {@link OrderInvoiceService}.
+     * latest ACCEPTED quote, inheriting its signature. The server selects the quote version; since 16G
+     * PR 3 the mandatory body {@code {"quote_version_id": N}} names the accepted version the client
+     * confirmed and is only compared with it (409 QUOTE_VERSION_STALE on a mismatch). The raw body is
+     * parsed inside the service, after its scope and accepted-quote gates. Allowed when LAID. 201 with the
+     * InvoiceDetail envelope; after commit the signed PDF is emailed to the saved customer email
+     * (non-fatal; the message says whether it was emailed, could not be emailed or was skipped for lack of
+     * a valid email). 400 VALIDATION_FAILED / MALFORMED_JSON; 422 QUOTE_NOT_ACCEPTED /
+     * INVOICE_PRECONDITIONS_NOT_MET / BUSINESS_RULE_VIOLATION; 409 INVOICE_ALREADY_ACCEPTED when the
+     * current invoice was signed at the same time or later than the quote. All logic lives in
+     * {@link OrderInvoiceService}.
      */
     @PostMapping("/create-invoice")
     @ResponseStatus(HttpStatus.CREATED)

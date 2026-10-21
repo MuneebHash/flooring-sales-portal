@@ -47,7 +47,9 @@ public enum ErrorCode {
     CUSTOMER_EMAIL_INVALID(HttpStatus.UNPROCESSABLE_ENTITY, "Customer email is not a valid email address."),
     // Phase 13 Accept / Resend / signature codes (contract §12). EMAIL_SEND_FAILED (502) is raised by
     // D.9 Resend ONLY: the non-fatal D.8 accept-send (and the later D.7 payment-after-accepted send)
-    // surface an email failure via last_emailed_at = null + a success message, never via this code.
+    // surface an email failure via last_emailed_at = null + a success message, never via this code;
+    // so does the 16G PR 3 Path A signed-PDF send. Since 16G PR 3, ACCEPTED_CUSTOMER_NAME_REQUIRED on
+    // D.8 means the current version's FROZEN customer_name_snapshot is blank (no name part is read).
     ACCEPTED_CUSTOMER_NAME_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "Accepted customer name is required."),
     SIGNATURE_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "A customer signature is required to accept the invoice."),
     SIGNATURE_INVALID(HttpStatus.BAD_REQUEST, "Signature must be a PNG image no larger than 2 MB."),
@@ -92,6 +94,13 @@ public enum ErrorCode {
     QUOTE_LINK_SUPERSEDED(HttpStatus.GONE, "This quote has been replaced. Please use the latest quote link."),
     QUOTE_LINK_CANCELLED(HttpStatus.GONE, "This quote has been cancelled. Please contact the store."),
     QUOTE_LINK_INACTIVE(HttpStatus.GONE, "This quote link is no longer active. Please contact the store."),
+    // Phase 16G PR 3 (#69, #123) version preconditions (16G contract §5): the mandatory expected value
+    // is only COMPARED with the row read under the order lock, never used to select a row, so an old,
+    // forged or foreign value can only produce these 409s. INVOICE_VERSION_STALE: D.8 in-store accept
+    // (and, from PR 4, the public invoice accept and pdf). QUOTE_VERSION_STALE: Path A
+    // (POST .../quote/create-invoice).
+    INVOICE_VERSION_STALE(HttpStatus.CONFLICT, "Invoice updated, please refresh"),
+    QUOTE_VERSION_STALE(HttpStatus.CONFLICT, "The accepted quote changed while the confirmation was open. Review the accepted quote before creating an invoice."),
     INTERNAL_SERVER_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
 
     private final HttpStatus status;

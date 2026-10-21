@@ -1,12 +1,19 @@
 package com.flooring.salesportal.order.quote;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.flooring.salesportal.common.email.InvoiceEmailRequest;
 import com.flooring.salesportal.common.email.QuoteEmailRequest;
 import com.flooring.salesportal.common.email.RecordingInvoiceEmailSender;
 import com.flooring.salesportal.common.email.RecordingQuoteAcceptanceNotificationSender;
 import com.flooring.salesportal.common.email.RecordingQuoteEmailSender;
+import com.flooring.salesportal.common.sms.RecordingSmsSender;
+import com.flooring.salesportal.order.OrderInvoiceService;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.PersistenceContext;
 import org.apache.pdfbox.pdmodel.PDDocument;
@@ -17,6 +24,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -51,6 +59,7 @@ import java.sql.Timestamp;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashSet;
@@ -78,7 +87,10 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  *
  * <p>Covered here: version selection and scope (no accepted version, highest ACCEPTED version despite
  * newer draft / issued / superseded / cancelled / expired history, tenant and store isolation, auth
- * and order-id gates, the empty-body rule and the gate order), every D5(b) signature-precedence row
+ * and order-id gates, the mandatory {@code {"quote_version_id": N}} body of 16G PR 3 - required, that one
+ * field only, an object, well-formed, and an id that is only COMPARED with the server's selection, so an
+ * older accepted or a newer issued version's id is 409 {@code QUOTE_VERSION_STALE} - and the gate order,
+ * with {@code QUOTE_NOT_ACCEPTED} ahead of any body validation), every D5(b) signature-precedence row
  * against the CURRENT invoice (with the workspace {@code accepted.invoice_eligible} flag read before and
  * after), the collected Path A preconditions, the payment / overpayment rule, and the LAID behaviour. Some
  * mapped sources are proven only by fixtures where the right and a likely wrong source differ: due_date
@@ -102,18 +114,35 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  * relaxations ({@code chk_order_customer_email_format}, the email NOT NULL and
  * {@code chk_sales_order_lay_date_pair}) are transactional DDL and roll back with the test.
  *
+ * <p>16G PR 3 request shapes: every Path A call that should get past the body carries
+ * {@code {"quote_version_id": N}} (JSON), N = the order's latest ACCEPTED {@code quote_version_id} read from
+ * the database just before the call (state-derived, never a seed id); every in-app D.8 signature carries
+ * {@code expected_version_number} = the order's current invoice version and NO name part (the accepted
+ * name is the signed version's frozen {@code customer_name_snapshot}).
+ *
  * <p>Allowed conversions are proven against the persisted rows: the new {@code invoice} row, its new
  * {@code stored_file} row and the PDF bytes on disk (and the PDF text), the untouched earlier invoice
  * versions (SELECT * per version plus their PDF bytes), the untouched quote / order / line / customer /
- * address / payment rows, the section 11.1 mirror reset and the silent recording senders. Refusals are
- * proven to write nothing at all (same rows, same stored files, same files on disk, same mirror).
+ * address / payment rows, and (16G PR 3, 16G contract section 6) the post-commit signed-PDF email: exactly one
+ * recorded invoice email for the appended version (recipient = the trimmed saved email, attachment = that
+ * version's stored PDF bytes) when it is delivered, one recorded failed attempt when the sender is armed to
+ * fail, no sender call when the saved email is missing or invalid, the matching 201 message, both email
+ * markers and the service's WARN line - and never a quote email, a store notification or an SMS. This class
+ * is {@code @Transactional}, so the service's programmatic transactions JOIN the test transaction: the email
+ * runs after the conversion's (joined) block and a delivered email's success stamp is written inside the test
+ * transaction, so a delivered conversion ends with the appended version and the {@code sales_order} mirror
+ * carrying the SAME stamp. The persist-time section 11.1 mirror RESET is therefore observed on the outcomes
+ * that stamp nothing - a forced delivery failure ({@code failNextSend}) or a skipped send - where a non-null
+ * mirror ends up null. Refusals are proven to write nothing at all (same rows, same stored files, same files
+ * on disk, same mirror, no sender call).
  *
  * <p>Self-seeded (Phase 14D): orders are inserted under business 1 / store 1 / user 1 with the
  * {@code QINVC.ZZ9.} order-number prefix (sequence base 130_000) and {@code QINVC} store_charge codes; no
  * V4 demo order, invoice or payment is used (one conversion runs as another active business-1 user,
  * granted store 1 inside the test transaction). Everything rolls back with the test transaction and the
  * services' rollback hooks delete the files they wrote under the shared quote test storage root. The
- * recording senders are singletons, so they are reset before AND after every test.
+ * recording senders (invoice email, quote email, store notification, SMS) are singletons, so they are reset
+ * before AND after every test.
  */
 @ExtendWith(SpringExtension.class)
 @SpringBootTest(properties = "app.storage.base-dir=target/test-storage/quote-acceptance")
@@ -156,7 +185,19 @@ class QuoteInvoiceConversionControllerTest {
     private static final Timestamp MIRROR_SENTINEL = Timestamp.valueOf("2026-01-02 03:04:05");
     private static final long MISSING_ORDER_ID = 9_999_999_999L;
 
-    private static final String CREATED_MESSAGE = "Invoice created from accepted quote.";
+    // 16G PR 3 (16G contract section 6.1): the 201 message reports the post-commit signed-PDF email; the 16F
+    // message "Invoice created from accepted quote." no longer exists. The dash is U+2014 (an em dash).
+    private static final String CREATED_EMAILED_MESSAGE =
+            "Invoice created from accepted quote and emailed to the customer.";
+    private static final String CREATED_EMAIL_FAILED_MESSAGE = "Invoice created from accepted quote. "
+            + "The invoice could not be emailed — use Re-send Invoice to try again.";
+    private static final String CREATED_EMAIL_SKIPPED_MESSAGE = "Invoice created from accepted quote. "
+            + "It was not emailed because the customer has no valid email address — add one on the "
+            + "Customer tab, then use Re-send Invoice.";
+    private static final String QUOTE_VERSION_STALE_MESSAGE = "The accepted quote changed while the "
+            + "confirmation was open. Review the accepted quote before creating an invoice.";
+    // A different saved email set after the acceptance: the signed invoice goes to the LIVE saved email.
+    private static final String MOVED_EMAIL = "moved.customer.email@example.com";
     private static final String QUOTE_NOT_ACCEPTED_MESSAGE = "This quote has not been accepted yet.";
     private static final String NOT_NEWER_MESSAGE = "The current invoice was signed at the same time or later "
             + "than this quote. A newer signed quote is required to create an invoice from a quote.";
@@ -236,6 +277,9 @@ class QuoteInvoiceConversionControllerTest {
     @Autowired
     private RecordingQuoteAcceptanceNotificationSender acceptanceNotificationSender;
 
+    @Autowired
+    private RecordingSmsSender smsSender;
+
     @PersistenceContext
     private EntityManager entityManager;
 
@@ -265,6 +309,7 @@ class QuoteInvoiceConversionControllerTest {
         invoiceEmailSender.reset();
         quoteEmailSender.reset();
         acceptanceNotificationSender.reset();
+        smsSender.reset();
     }
 
     // ================================================================
@@ -348,6 +393,14 @@ class QuoteInvoiceConversionControllerTest {
         Map<String, Object> token2Before = tokenRow(token2);
         Assertions.assertTrue(invoiceEligible(orderId), "a newer ISSUED version never makes v1 ineligible");
 
+        // 16G PR 3: the body id is only compared with the server's selection (the latest ACCEPTED v1), so the
+        // newer ISSUED v2's id never selects v2: 409 QUOTE_VERSION_STALE, nothing written.
+        long v2Id = asLong(v2Before.get("quote_version_id"));
+        Assertions.assertNotEquals(v2Id, latestAcceptedQuoteVersionId(orderId), "fixture: v2 is not the accepted one");
+        JsonNode stale = assertRefused(orderId, quoteVersionIdBody(v2Id), 409, "QUOTE_VERSION_STALE",
+                QUOTE_VERSION_STALE_MESSAGE, "the newer ISSUED v2's id");
+        Assertions.assertFalse(stale.has("details"), "QUOTE_VERSION_STALE carries no details");
+
         Conversion result = convertOk(orderId);
         assertConverted(orderId, result, 1, 1, "250.00", "275.00", "0.00", "275.00");
         Assertions.assertEquals(asLong(quoteVersionRow(orderId, 1).get("quote_version_id")),
@@ -380,8 +433,13 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertFalse(invoiceEligible(orderId), "the conversion tied the invoice with v1's signature");
 
         // The still-ACTIVE v3 link is signed later: a strictly newer signature makes the order eligible again.
+        long v1Id = asLong(quoteVersionRow(orderId, 1).get("quote_version_id"));
         acceptPublicly(token3, SECOND_SIGNATURE_PNG);
         Assertions.assertTrue(invoiceEligible(orderId));
+        // 16G PR 3: a confirmation still showing v1 once v3 is signed sends v1's id: 409 QUOTE_VERSION_STALE.
+        Assertions.assertNotEquals(v1Id, latestAcceptedQuoteVersionId(orderId), "fixture: v3 is now the latest");
+        assertRefused(orderId, quoteVersionIdBody(v1Id), 409, "QUOTE_VERSION_STALE", QUOTE_VERSION_STALE_MESSAGE,
+                "v1's id after v3 was accepted");
         Conversion second = convertOk(orderId);
         assertConverted(orderId, second, 2, 3, "400.00", "440.00", "0.00", "440.00");
         Assertions.assertFalse(invoiceEligible(orderId));
@@ -394,6 +452,13 @@ class QuoteInvoiceConversionControllerTest {
         acceptPublicly(sendAndExtractToken(orderId), SECOND_SIGNATURE_PNG);   // v2 ACCEPTED: 300.00 / 330.00
         Assertions.assertEquals("ACCEPTED", versionStatus(orderId, 1));
         Assertions.assertEquals("ACCEPTED", versionStatus(orderId, 2));
+
+        // 16G PR 3: an older ACCEPTED version's id never selects it (only compared): 409, nothing written.
+        long v1Id = asLong(quoteVersionRow(orderId, 1).get("quote_version_id"));
+        Assertions.assertEquals(asLong(quoteVersionRow(orderId, 2).get("quote_version_id")),
+                latestAcceptedQuoteVersionId(orderId), "fixture: the latest accepted version is v2");
+        assertRefused(orderId, quoteVersionIdBody(v1Id), 409, "QUOTE_VERSION_STALE", QUOTE_VERSION_STALE_MESSAGE,
+                "the older accepted v1's id");
 
         Conversion result = convertOk(orderId);
         assertConverted(orderId, result, 1, 2, "300.00", "330.00", "0.00", "330.00");
@@ -453,8 +518,13 @@ class QuoteInvoiceConversionControllerTest {
         grantStoreAccess(BUSINESS_PREMIER, otherBusinessUser, otherBusinessStore);
         MockHttpSession otherBusinessSession = session(otherBusinessUser, BUSINESS_PREMIER, otherBusinessStore);
 
-        // The scope check runs before the body: a forbidden field, a non-object and malformed JSON still 404.
-        for (String body : new String[] {"{}", null, "{\"quote_version_id\":1}", "[]", "{bad"}) {
+        // The scope check runs before the body (16G PR 3 shapes): the valid {"quote_version_id": N} body, a
+        // stale id, a missing or extra field, a non-integer id, a non-object and malformed JSON all still 404.
+        long quoteVersionId = latestAcceptedQuoteVersionId(orderId);
+        String validBody = quoteVersionIdBody(quoteVersionId);
+        for (String body : new String[] {validBody, quoteVersionIdBody(quoteVersionId + 1), "{}", null,
+                "{\"quote_version_id\":" + quoteVersionId + ",\"due_date\":\"2026-12-01\"}",
+                "{\"quote_version_id\":\"" + quoteVersionId + "\"}", "[]", "{bad"}) {
             String label = "body " + body;
             assertOrderNotFound(withBody(post(createInvoiceUrl(SLUG_AUSSIE, orderId)).session(otherStoreSession), body),
                     orderNumber, "other store, " + label);
@@ -464,9 +534,9 @@ class QuoteInvoiceConversionControllerTest {
 
         // No existence leak: the cross-store miss is byte-identical to a missing order's 404.
         String crossStore = bodyOf(perform(withBody(post(createInvoiceUrl(SLUG_AUSSIE, orderId))
-                .session(otherStoreSession), "{}")));
+                .session(otherStoreSession), validBody)));
         String missing = bodyOf(perform(withBody(post(createInvoiceUrl(SLUG_AUSSIE, MISSING_ORDER_ID))
-                .session(otherStoreSession), "{}")));
+                .session(otherStoreSession), validBody)));
         Assertions.assertEquals(missing, crossStore);
 
         Assertions.assertEquals(before, refusalState(orderId), "out-of-scope requests write nothing");
@@ -537,73 +607,152 @@ class QuoteInvoiceConversionControllerTest {
     }
 
     // ================================================================
-    // 1d. Body: empty only
+    // 1d. Body: the mandatory {"quote_version_id": N} (16G PR 3, 16G contract section 5.3)
     // ================================================================
 
     @Test
-    void createInvoice_absentBody_isAccepted_201() throws Exception {
-        long orderId = acceptedQuoteOrder();
-
-        Conversion result = convertOk(orderId, null);
-        assertConverted(orderId, result, 1, 1, "250.00", "275.00", "0.00", "275.00");
-    }
-
-    @Test
-    void createInvoice_eachClientSuppliedField_returns400NotAllowed_nothingWritten_thenEmptyBodyConverts()
+    void createInvoice_absentOrEmptyBody_returns400QuoteVersionIdRequired_nothingWritten_thenTheVersionBodyConverts()
             throws Exception {
         long orderId = acceptedQuoteOrder();
 
+        // The body is mandatory: an absent, empty or blank body, {} and a missing or null field are all one
+        // 400 VALIDATION_FAILED on quote_version_id "Required.", with nothing written (a JSON null body is a
+        // non-object body: see the non-object test).
         Map<String, String> bodies = new LinkedHashMap<>();
-        bodies.put("quote_version_id", "{\"quote_version_id\":1}");
-        bodies.put("sale_price_inc_gst", "{\"sale_price_inc_gst\":1}");
-        bodies.put("terms_html", "{\"terms_html\":\"x\"}");
-        bodies.put("accepted_signature_file_id", "{\"accepted_signature_file_id\":1}");
-        bodies.put("due_date", "{\"due_date\":\"2026-12-01\"}");
+        bodies.put("absent body", null);
+        bodies.put("empty body", "");
+        bodies.put("blank body", "   ");
+        bodies.put("empty object", "{}");
+        bodies.put("null field", "{\"quote_version_id\":null}");
         for (Map.Entry<String, String> entry : bodies.entrySet()) {
             JsonNode error = assertRefused(orderId, entry.getValue(), 400, "VALIDATION_FAILED", VALIDATION_MESSAGE,
-                    "field " + entry.getKey());
-            Assertions.assertEquals(List.of(new Detail(null, entry.getKey(), "Not allowed.")), details(error),
-                    "field " + entry.getKey());
+                    entry.getKey());
+            Assertions.assertEquals(List.of(new Detail(null, "quote_version_id", "Required.")), details(error),
+                    entry.getKey());
         }
+        Assertions.assertEquals(0, invoiceCount(orderId), "no invoice was created by any refused body");
 
-        // One detail per offending field.
-        JsonNode two = assertRefused(orderId, "{\"quote_version_id\":1,\"due_date\":\"2026-12-01\"}", 400,
-                "VALIDATION_FAILED", VALIDATION_MESSAGE, "two fields");
-        List<Detail> twoDetails = details(two);
-        Assertions.assertEquals(2, twoDetails.size());
-        Assertions.assertEquals(Set.of(new Detail(null, "quote_version_id", "Not allowed."),
-                new Detail(null, "due_date", "Not allowed.")), new HashSet<>(twoDetails));
-
-        // The same order converts with "{}": every refusal above was the body alone.
+        // The same order converts with {"quote_version_id": N}: every refusal above was the body alone.
         Conversion result = convertOk(orderId);
         assertConverted(orderId, result, 1, 1, "250.00", "275.00", "0.00", "275.00");
     }
 
     @Test
-    void createInvoice_nonObjectBody400OnBody_malformedJson400_nothingWritten() throws Exception {
+    void createInvoice_eachExtraField_aloneOrBesideAValidId_returns400NotAllowed_nothingWritten_thenTheVersionBodyConverts()
+            throws Exception {
         long orderId = acceptedQuoteOrder();
+        long quoteVersionId = latestAcceptedQuoteVersionId(orderId);
 
-        JsonNode array = assertRefused(orderId, "[]", 400, "VALIDATION_FAILED", VALIDATION_MESSAGE, "array body");
-        Assertions.assertEquals(List.of(new Detail(null, "body", "Request body must be empty.")), details(array));
+        // Only quote_version_id is allowed. Each other field is "Not allowed." - alone (then the missing
+        // quote_version_id is reported too, LAST) and beside a valid quote_version_id, before or after it.
+        Map<String, String> extraFields = new LinkedHashMap<>();   // field -> JSON value
+        extraFields.put("sale_price_inc_gst", "1");
+        extraFields.put("terms_html", "\"x\"");
+        extraFields.put("accepted_signature_file_id", "1");
+        extraFields.put("due_date", "\"2026-12-01\"");
+        extraFields.put("expected_version_number", "1");          // D.8's carrier, never Path A's
+        for (Map.Entry<String, String> entry : extraFields.entrySet()) {
+            String field = entry.getKey();
+            String member = "\"" + field + "\":" + entry.getValue();
+            Detail notAllowed = new Detail(null, field, "Not allowed.");
 
-        JsonNode malformed = assertRefused(orderId, "{bad", 400, "MALFORMED_JSON", MALFORMED_MESSAGE, "malformed");
-        Assertions.assertFalse(malformed.has("details"));
+            JsonNode alone = assertRefused(orderId, "{" + member + "}", 400, "VALIDATION_FAILED", VALIDATION_MESSAGE,
+                    field + " alone");
+            Assertions.assertEquals(List.of(notAllowed, new Detail(null, "quote_version_id", "Required.")),
+                    details(alone), field + " alone: its detail, then the missing quote_version_id");
+
+            JsonNode after = assertRefused(orderId, "{\"quote_version_id\":" + quoteVersionId + "," + member + "}",
+                    400, "VALIDATION_FAILED", VALIDATION_MESSAGE, field + " after a valid quote_version_id");
+            Assertions.assertEquals(List.of(notAllowed), details(after), field + " after a valid quote_version_id");
+
+            JsonNode before = assertRefused(orderId, "{" + member + ",\"quote_version_id\":" + quoteVersionId + "}",
+                    400, "VALIDATION_FAILED", VALIDATION_MESSAGE, field + " before a valid quote_version_id");
+            Assertions.assertEquals(List.of(notAllowed), details(before), field + " before a valid quote_version_id");
+        }
+
+        // One detail per offending field, in body order, all in ONE 400; a quote_version_id detail comes LAST.
+        JsonNode twoBeside = assertRefused(orderId,
+                "{\"due_date\":\"2026-12-01\",\"quote_version_id\":" + quoteVersionId + ",\"terms_html\":\"x\"}",
+                400, "VALIDATION_FAILED", VALIDATION_MESSAGE, "two fields beside a valid id");
+        Assertions.assertEquals(List.of(new Detail(null, "due_date", "Not allowed."),
+                new Detail(null, "terms_html", "Not allowed.")), details(twoBeside), "two fields beside a valid id");
+        JsonNode twoAlone = assertRefused(orderId, "{\"terms_html\":\"x\",\"due_date\":\"2026-12-01\"}", 400,
+                "VALIDATION_FAILED", VALIDATION_MESSAGE, "two fields, no id");
+        Assertions.assertEquals(List.of(new Detail(null, "terms_html", "Not allowed."),
+                new Detail(null, "due_date", "Not allowed."), new Detail(null, "quote_version_id", "Required.")),
+                details(twoAlone), "two fields, no id");
+        JsonNode badIdFirst = assertRefused(orderId, "{\"quote_version_id\":0,\"terms_html\":\"x\"}", 400,
+                "VALIDATION_FAILED", VALIDATION_MESSAGE, "a non-positive id written first");
+        Assertions.assertEquals(List.of(new Detail(null, "terms_html", "Not allowed."),
+                new Detail(null, "quote_version_id", "Must be a positive integer.")), details(badIdFirst),
+                "the quote_version_id detail comes last even when the id is written first");
+
+        // The field check runs before the stale comparison: beside a mismatching id it is still the 400.
+        JsonNode beforeStale = assertRefused(orderId, "{\"quote_version_id\":" + (quoteVersionId + 1)
+                + ",\"due_date\":\"2026-12-01\"}", 400, "VALIDATION_FAILED", VALIDATION_MESSAGE,
+                "an extra field beside a mismatching id");
+        Assertions.assertEquals(List.of(new Detail(null, "due_date", "Not allowed.")), details(beforeStale),
+                "an extra field beside a mismatching id");
+        Assertions.assertEquals(0, invoiceCount(orderId), "no invoice was created by any refused body");
+
+        // The same order converts with {"quote_version_id": N}: every refusal above was the body alone.
+        Conversion result = convertOk(orderId);
+        assertConverted(orderId, result, 1, 1, "250.00", "275.00", "0.00", "275.00");
+    }
+
+    @Test
+    void createInvoice_nonObjectBody400MustBeAnObject_malformedJson400_nothingWritten() throws Exception {
+        long orderId = acceptedQuoteOrder();
+        long quoteVersionId = latestAcceptedQuoteVersionId(orderId);
+
+        // A non-object JSON body - a JSON null, even an array holding the valid object, or the bare id - is one
+        // 400 VALIDATION_FAILED on "body": "Must be an object.".
+        for (String body : new String[] {"null", "[]", "[" + quoteVersionIdBody(quoteVersionId) + "]",
+                String.valueOf(quoteVersionId), "\"x\"", "true"}) {
+            JsonNode error = assertRefused(orderId, body, 400, "VALIDATION_FAILED", VALIDATION_MESSAGE,
+                    "non-object body " + body);
+            Assertions.assertEquals(List.of(new Detail(null, "body", "Must be an object.")), details(error),
+                    "non-object body " + body);
+        }
+
+        // Unparseable JSON stays 400 MALFORMED_JSON (no details), even when it starts like the valid body.
+        for (String body : new String[] {"{bad", "{\"quote_version_id\":" + quoteVersionId}) {
+            JsonNode malformed = assertRefused(orderId, body, 400, "MALFORMED_JSON", MALFORMED_MESSAGE,
+                    "malformed " + body);
+            Assertions.assertFalse(malformed.has("details"), "malformed " + body);
+        }
 
         Assertions.assertEquals(0, invoiceCount(orderId));
     }
 
     @Test
-    void createInvoice_bodyValidationRunsBeforeTheQuoteNotAcceptedCheck() throws Exception {
-        long orderId = invoiceReadyOrder();   // no quote at all: an empty body is 422 QUOTE_NOT_ACCEPTED
+    void createInvoice_noAcceptedQuote_returns422QuoteNotAccepted_beforeBodyValidation_whateverTheBody()
+            throws Exception {
+        long orderId = invoiceReadyOrder();   // no quote at all
 
-        assertRefused(orderId, "{}", 422, "QUOTE_NOT_ACCEPTED", QUOTE_NOT_ACCEPTED_MESSAGE, "baseline");
-        JsonNode field = assertRefused(orderId, "{\"quote_version_id\":1}", 400, "VALIDATION_FAILED",
-                VALIDATION_MESSAGE, "field before QUOTE_NOT_ACCEPTED");
-        Assertions.assertEquals(List.of(new Detail(null, "quote_version_id", "Not allowed.")), details(field));
-        JsonNode array = assertRefused(orderId, "[]", 400, "VALIDATION_FAILED", VALIDATION_MESSAGE,
-                "array before QUOTE_NOT_ACCEPTED");
-        Assertions.assertEquals(List.of(new Detail(null, "body", "Request body must be empty.")), details(array));
-        assertRefused(orderId, "{bad", 400, "MALFORMED_JSON", MALFORMED_MESSAGE, "malformed before QUOTE_NOT_ACCEPTED");
+        // 16G contract section 5.5: the accepted-quote gate (step 3) runs before the body (step 4), so with
+        // no accepted version every body - absent, missing / extra / non-integer field, a positive id, a
+        // non-object or malformed JSON - is the 422 QUOTE_NOT_ACCEPTED, with nothing written.
+        String[] bodies = {null, "{}", "{\"quote_version_id\":null}", "{\"quote_version_id\":1}",
+                "{\"quote_version_id\":\"abc\"}", "{\"due_date\":\"2026-12-01\"}", "[]", "5", "{bad"};
+        for (String body : bodies) {
+            JsonNode error = assertRefused(orderId, body, 422, "QUOTE_NOT_ACCEPTED", QUOTE_NOT_ACCEPTED_MESSAGE,
+                    "no quote, body " + body);
+            Assertions.assertFalse(error.has("details"), "no quote, body " + body);
+        }
+
+        // An ISSUED (unsigned) version is no accepted version either: even a well-formed body naming the
+        // issued version's own id is the 422 (never the 409 stale, never a conversion), its link stays ACTIVE.
+        saveItemisedTwoLineDraft(orderId);
+        String token = sendAndExtractToken(orderId);
+        long issuedId = asLong(quoteVersionRow(orderId, 1).get("quote_version_id"));
+        Assertions.assertEquals("ISSUED", versionStatus(orderId, 1), "fixture: v1 is issued, not accepted");
+        for (String body : new String[] {quoteVersionIdBody(issuedId), "{\"due_date\":\"2026-12-01\"}", "{bad"}) {
+            assertRefused(orderId, body, 422, "QUOTE_NOT_ACCEPTED", QUOTE_NOT_ACCEPTED_MESSAGE,
+                    "issued only, body " + body);
+        }
+        assertPublicState(token, "ACTIVE");
+        Assertions.assertEquals(0, invoiceCount(orderId));
     }
 
     // ================================================================
@@ -631,8 +780,8 @@ class QuoteInvoiceConversionControllerTest {
                 + "WHERE order_id = ?", orderId);
         clearJpaCache();
 
-        JsonNode error = assertRefused(orderId, "{}", 409, "INVOICE_ALREADY_ACCEPTED", NOT_NEWER_MESSAGE,
-                "D5(b) refusal with a null lay date");
+        JsonNode error = assertRefused(orderId, versionBody(orderId), 409, "INVOICE_ALREADY_ACCEPTED",
+                NOT_NEWER_MESSAGE, "D5(b) refusal with a null lay date");
         Assertions.assertFalse(error.has("details"), "the 409 fires before any precondition is collected");
     }
 
@@ -674,12 +823,24 @@ class QuoteInvoiceConversionControllerTest {
                 + "WHERE order_id = ? AND address_type = 'BILLING'::address_type", orderId),
                 "fixture: exactly the billing row moved");
         setTenantTerms(LIVE_TERMS);
+        // 16G PR 3: the signed PDF is emailed to the LIVE saved email, trimmed (read when the conversion
+        // commits) - never the address the quote link went to. The new address is saved padded.
+        List<QuoteEmailRequest> quoteEmails = quoteEmailSender.sentEmails();
+        Assertions.assertEquals(VALID_EMAIL, quoteEmails.get(quoteEmails.size() - 1).recipientEmail(),
+                "fixture: the quote link went to the seeded email");
+        Assertions.assertEquals(1, jdbcTemplate.update("UPDATE order_customer SET email = ? WHERE order_id = ?",
+                "  " + MOVED_EMAIL + "  ", orderId), "fixture: the saved email moved (padded)");
+        clearJpaCache();
 
         Assertions.assertEquals(0, invoiceCount(orderId));
         Assertions.assertTrue(invoiceEligible(orderId), "no invoice: eligible");
 
-        Conversion result = convertOk(orderId);
+        Conversion result = convertOk(orderId);                    // also asserts recipient = the trimmed saved email
         JsonNode invoice = assertConverted(orderId, result, 1, 1, "250.00", "275.00", "0.00", "275.00");
+        List<InvoiceEmailRequest> invoiceEmails = invoiceEmailSender.sentEmails();
+        Assertions.assertEquals(1, invoiceEmails.size(), "exactly one invoice email: the Path A signed PDF");
+        Assertions.assertEquals(MOVED_EMAIL, invoiceEmails.get(0).recipientEmail(),
+                "the signed PDF goes to the live saved email, trimmed");
         Assertions.assertEquals(FROZEN_DETAILS, invoice.get("details_of_sale_snapshot").asText());
         Assertions.assertEquals(FROZEN_TERMS, invoice.get("terms_html").asText(), "the frozen quote terms, never live");
         // Invoice To (16G PR 2): the row and the InvoiceDetail carry the V17 words, never the live ones.
@@ -759,11 +920,23 @@ class QuoteInvoiceConversionControllerTest {
                 quoteSignatureUploaded.getHeight()), "fixture: the quote signature is 7 x 3");
 
         long orderId = invoiceReadyOrder();
+        // 16G PR 3: D.8 has no name part - its accepted name is the current version's FROZEN Invoice To name.
+        // So the in-app signer is the customer as saved when D.1 froze v1; the customer is renamed back
+        // before the quote is issued, so the quote's V17 identity (the Path A accepted name) is SNAPSHOT_NAME.
+        renameCustomer(orderId, "Invoice", "Signer");
         createInvoiceD1(orderId);
-        signInvoiceInApp(orderId, SECOND_SIGNATURE_PNG, IN_APP_SIGNER_NAME);   // v2 signed (and auto-emailed) FIRST
+        Assertions.assertEquals(IN_APP_SIGNER_NAME, invoiceRow(orderId, 1).get("customer_name_snapshot"),
+                "fixture: D.1 froze the in-app signer's name");
+        signInvoiceInApp(orderId, SECOND_SIGNATURE_PNG);           // v2 signed (and auto-emailed) FIRST
+        Assertions.assertEquals(IN_APP_SIGNER_NAME, invoiceRow(orderId, 2).get("accepted_customer_name"),
+                "fixture: D.8 accepted v1's frozen name");
+        renameCustomer(orderId, "Quote", "Tester");                 // SNAPSHOT_NAME again, before the quote issue
         Timestamp invoiceSignedAt = (Timestamp) invoiceRow(orderId, 2).get("accepted_at");
         Assertions.assertNotNull(invoiceSignedAt);
-        Assertions.assertNotNull(mirror(orderId), "fixture: the D.8 auto-email stamped the mirror");
+        Timestamp emailedMirror = mirror(orderId);
+        Assertions.assertNotNull(emailedMirror, "fixture: the D.8 auto-email stamped the mirror");
+        Assertions.assertEquals(emailedMirror, invoiceRow(orderId, 2).get("last_emailed_at"),
+                "fixture: the mirror carries v2's D.8 stamp");
         // Fixture: the replaced v2 PDF embeds the 3 x 2 in-app signature and names the in-app signer.
         byte[] replacedPdf = invoicePdfsByVersion(orderId).get(2);
         List<EmbeddedImage> replacedImages = embeddedImages(replacedPdf);
@@ -784,8 +957,15 @@ class QuoteInvoiceConversionControllerTest {
                 "stored quote signature");
         assertSamePixels(quoteSignatureUploaded, quoteSignature, "fixture: the stored (normalised) quote signature");
 
-        Conversion result = convertOk(orderId);                    // asserts the mirror is reset to null
+        // 16G PR 3: a delivered email would stamp the mirror again at once (the stamp joins this test
+        // transaction), hiding the persist-time reset. The send is forced to fail instead, so the mirror's
+        // end state is the reset itself: null, from v2's emailed value (also asserted inside convertOk).
+        invoiceEmailSender.failNextSend();
+        Conversion result = convertOk(orderId, EmailOutcome.FAILED);
         assertConverted(orderId, result, 3, 1, "250.00", "275.00", "0.00", "275.00");
+        Assertions.assertNull(mirror(orderId), "the mirror is reset from the D.8 emailed value to v3's null");
+        Assertions.assertEquals(emailedMirror, invoiceRow(orderId, 2).get("last_emailed_at"),
+                "v2 keeps its own D.8 stamp");
         Assertions.assertFalse(invoiceEligible(orderId));
 
         // The Path A PDF embeds exactly the QUOTE's stored signature, never the replaced in-app one.
@@ -814,8 +994,8 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertTrue(invoiceSignedAt.after(quoteSignedAt), "fixture: the invoice signature is newer");
         Assertions.assertFalse(invoiceEligible(orderId), "an older quote signature: ineligible");
 
-        JsonNode error = assertRefused(orderId, "{}", 409, "INVOICE_ALREADY_ACCEPTED", NOT_NEWER_MESSAGE,
-                "older quote signature");
+        JsonNode error = assertRefused(orderId, versionBody(orderId), 409, "INVOICE_ALREADY_ACCEPTED",
+                NOT_NEWER_MESSAGE, "older quote signature");
         Assertions.assertFalse(error.has("details"));
         Assertions.assertEquals(2, invoiceCount(orderId));
         Assertions.assertFalse(invoiceEligible(orderId));
@@ -836,8 +1016,8 @@ class QuoteInvoiceConversionControllerTest {
                 "fixture: identical signature timestamps");
         Assertions.assertFalse(invoiceEligible(orderId), "a tie: ineligible");
 
-        JsonNode error = assertRefused(orderId, "{}", 409, "INVOICE_ALREADY_ACCEPTED", NOT_NEWER_MESSAGE,
-                "equal signatures");
+        JsonNode error = assertRefused(orderId, versionBody(orderId), 409, "INVOICE_ALREADY_ACCEPTED",
+                NOT_NEWER_MESSAGE, "equal signatures");
         Assertions.assertFalse(error.has("details"));
         Assertions.assertEquals(2, invoiceCount(orderId));
         Assertions.assertFalse(invoiceEligible(orderId));
@@ -912,8 +1092,16 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertEquals(resentAt, mirror(orderId), "fixture: the mirror carries the D.9 stamp");
         Assertions.assertTrue(invoiceEligible(orderId), "email times are never compared: eligible");
 
-        Conversion result = convertOk(orderId);                    // the D.9-stamped mirror is reset to null
+        // 16G PR 3: the conversion resets the D.9-stamped mirror at persist and then stamps it with v3's own
+        // delivery (the stamp joins this test transaction): the mirror follows the new current version and
+        // never keeps the D.9 value of v2, which keeps its own stamp.
+        Conversion result = convertOk(orderId);
         assertConverted(orderId, result, 3, 1, "250.00", "275.00", "0.00", "275.00");
+        Timestamp v3Stamp = (Timestamp) invoiceRow(orderId, 3).get("last_emailed_at");
+        Assertions.assertEquals(v3Stamp, mirror(orderId), "the mirror carries v3's own stamp");
+        Assertions.assertTrue(v3Stamp.after(resentAt),
+                () -> "a later delivery than the D.9 resend: " + v3Stamp + " vs " + resentAt);
+        Assertions.assertEquals(resentAt, invoiceRow(orderId, 2).get("last_emailed_at"), "v2 keeps its D.9 stamp");
         Assertions.assertFalse(invoiceEligible(orderId));
     }
 
@@ -926,15 +1114,21 @@ class QuoteInvoiceConversionControllerTest {
                 "the conversion copied the quote signature time");
         Assertions.assertFalse(invoiceEligible(orderId), "a tie after the first conversion: ineligible");
 
-        JsonNode error = assertRefused(orderId, "{}", 409, "INVOICE_ALREADY_ACCEPTED", NOT_NEWER_MESSAGE,
-                "second conversion");
+        // The second conversion names the same (still latest) accepted version: not stale, refused by D5(b).
+        JsonNode error = assertRefused(orderId, versionBody(orderId), 409, "INVOICE_ALREADY_ACCEPTED",
+                NOT_NEWER_MESSAGE, "second conversion");
         Assertions.assertFalse(error.has("details"));
         Assertions.assertEquals(1, invoiceCount(orderId));
 
-        // D.8 on the converted (already signed) invoice keeps its own unchanged 409 wording.
+        // D.8 on the converted (already signed) invoice keeps its own unchanged 409 wording. 16G PR 3: the
+        // request carries expected_version_number = the current version (1), so it passes the stale check
+        // and reaches the already-accepted refusal.
+        Assertions.assertEquals(1, currentInvoiceVersion(orderId), "fixture: the Path A version is current");
         Map<String, Object> before = refusalState(orderId);
         MvcResult d8 = perform(signInvoiceRequest(orderId));
-        assertError(d8, 409, "INVOICE_ALREADY_ACCEPTED", D8_ALREADY_ACCEPTED_MESSAGE, "D.8 on a Path A invoice");
+        JsonNode d8Error = assertError(d8, 409, "INVOICE_ALREADY_ACCEPTED", D8_ALREADY_ACCEPTED_MESSAGE,
+                "D.8 on a Path A invoice");
+        Assertions.assertFalse(d8Error.has("details"));
         Assertions.assertEquals(before, refusalState(orderId));
     }
 
@@ -982,7 +1176,8 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertNotEquals(USER_LIAM, secondUser, "fixture: a different business-1 user");
         grantStoreAccess(BUSINESS_AUSSIE, secondUser, STORE_SYD_CBD);
 
-        Conversion result = convertOk(orderId, "{}", session(secondUser, BUSINESS_AUSSIE, STORE_SYD_CBD));
+        Conversion result = convertOk(orderId, session(secondUser, BUSINESS_AUSSIE, STORE_SYD_CBD),
+                EmailOutcome.DELIVERED);
         assertConverted(orderId, result, 1, 1, "250.00", "275.00", "0.00", "275.00", EXPECTED_DUE_DATE, secondUser);
 
         long createdBy = asLong(invoiceRow(orderId, 1).get("created_by_user_id"));
@@ -1146,29 +1341,45 @@ class QuoteInvoiceConversionControllerTest {
     }
 
     @Test
-    void createInvoice_customerEmailNull_neverBlocks_andNothingIsEmailed() throws Exception {
+    void createInvoice_customerEmailNull_neverBlocks_emailSkippedWithAWarn_markersStayNull() throws Exception {
         long orderId = acceptedQuoteOrder();
         relaxCustomerEmailConstraints();
         jdbcTemplate.update("UPDATE order_customer SET email = NULL WHERE order_id = ?", orderId);
         clearJpaCache();
 
-        Conversion result = convertOk(orderId);                    // also asserts every sender stayed silent
+        // No email gate (16G contract section 6.1): the conversion commits; the post-commit send is SKIPPED -
+        // the skipped message, both markers null (from the non-null sentinel mirror: the persist-time reset),
+        // no sender call and exactly one WARN without a throwable (all asserted inside convertOk).
+        Conversion result = convertOk(orderId, EmailOutcome.SKIPPED);
         assertConverted(orderId, result, 1, 1, "250.00", "275.00", "0.00", "275.00");
+        Assertions.assertEquals(CREATED_EMAIL_SKIPPED_MESSAGE, readJson(result.result()).get("message").asText());
+        Assertions.assertNull(invoiceRow(orderId, 1).get("last_emailed_at"), "the appended version stays unemailed");
+        Assertions.assertNull(mirror(orderId), "the mirror stays at the persist-time null");
         Assertions.assertTrue(invoiceEmailSender.sentEmails().isEmpty(), "no invoice email");
         Assertions.assertTrue(invoiceEmailSender.failedEmails().isEmpty(), "no invoice email attempt");
+        Assertions.assertEquals("Signed invoice email skipped for order " + orderId + " invoice v1: no valid "
+                + "saved customer email (non-fatal; markers stay null)", result.warning(), "the WARN skip line");
     }
 
     @Test
-    void createInvoice_customerEmailInvalid_neverBlocks_andNothingIsEmailed() throws Exception {
+    void createInvoice_customerEmailInvalid_neverBlocks_emailSkippedWithAWarn_markersStayNull() throws Exception {
         long orderId = acceptedQuoteOrder();
         relaxCustomerEmailConstraints();
         jdbcTemplate.update("UPDATE order_customer SET email = 'not-an-email' WHERE order_id = ?", orderId);
         clearJpaCache();
 
-        Conversion result = convertOk(orderId);
+        // An app-invalid saved email (CustomerEmailValidator) is skipped like a missing one; the WARN line
+        // never carries the saved value (asserted inside convertOk).
+        Conversion result = convertOk(orderId, EmailOutcome.SKIPPED);
         assertConverted(orderId, result, 1, 1, "250.00", "275.00", "0.00", "275.00");
+        Assertions.assertEquals(CREATED_EMAIL_SKIPPED_MESSAGE, readJson(result.result()).get("message").asText());
+        Assertions.assertNull(invoiceRow(orderId, 1).get("last_emailed_at"), "the appended version stays unemailed");
+        Assertions.assertNull(mirror(orderId), "the mirror stays at the persist-time null");
         Assertions.assertTrue(invoiceEmailSender.sentEmails().isEmpty(), "no invoice email");
         Assertions.assertTrue(invoiceEmailSender.failedEmails().isEmpty(), "no invoice email attempt");
+        Assertions.assertEquals("Signed invoice email skipped for order " + orderId + " invoice v1: no valid "
+                + "saved customer email (non-fatal; markers stay null)", result.warning(), "the WARN skip line");
+        Assertions.assertFalse(result.warning().contains("not-an-email"), "the WARN never carries the saved value");
     }
 
     // ================================================================
@@ -1226,8 +1437,8 @@ class QuoteInvoiceConversionControllerTest {
         long orderId = overpaidAcceptedOrder();
         Assertions.assertTrue(invoiceEligible(orderId), "eligibility never looks at payments");
 
-        JsonNode error = assertRefused(orderId, "{}", 422, "BUSINESS_RULE_VIOLATION", PAYMENTS_EXCEED_MESSAGE,
-                "overpaid");
+        JsonNode error = assertRefused(orderId, versionBody(orderId), 422, "BUSINESS_RULE_VIOLATION",
+                PAYMENTS_EXCEED_MESSAGE, "overpaid");
         Assertions.assertFalse(error.has("details"));
         Assertions.assertEquals(2, invoiceCount(orderId), "no new version");
         Assertions.assertEquals(1, jdbcTemplate.queryForObject(
@@ -1295,7 +1506,8 @@ class QuoteInvoiceConversionControllerTest {
         signInvoiceInApp(orderId);                                 // D.8 is allowed on LAID; signed later
         Assertions.assertFalse(invoiceEligible(orderId));
 
-        assertRefused(orderId, "{}", 409, "INVOICE_ALREADY_ACCEPTED", NOT_NEWER_MESSAGE, "LAID, older quote");
+        assertRefused(orderId, versionBody(orderId), 409, "INVOICE_ALREADY_ACCEPTED", NOT_NEWER_MESSAGE,
+                "LAID, older quote");
         Assertions.assertEquals(2, invoiceCount(orderId));
         assertRewriteLocked(orderId);
     }
@@ -1316,7 +1528,8 @@ class QuoteInvoiceConversionControllerTest {
         clearJpaCache();
         Assertions.assertFalse(invoiceEligible(orderId));
 
-        assertRefused(orderId, "{}", 409, "INVOICE_ALREADY_ACCEPTED", NOT_NEWER_MESSAGE, "LAID, equal signatures");
+        assertRefused(orderId, versionBody(orderId), 409, "INVOICE_ALREADY_ACCEPTED", NOT_NEWER_MESSAGE,
+                "LAID, equal signatures");
         Assertions.assertEquals(2, invoiceCount(orderId));
         assertRewriteLocked(orderId);
     }
@@ -1381,20 +1594,40 @@ class QuoteInvoiceConversionControllerTest {
         return body == null ? request : request.contentType(MediaType.APPLICATION_JSON).content(body);
     }
 
-    /** The Path A request for Liam / business 1 / store 1; a null body sends no body at all. */
+    /**
+     * The Path A request for Liam / business 1 / store 1 (JSON when a body is given); a null body sends no
+     * body at all.
+     */
     private static MockHttpServletRequestBuilder createInvoiceRequest(long orderId, String body) {
         return withBody(post(createInvoiceUrl(SLUG_AUSSIE, orderId)).session(liamStore1Session()), body);
     }
 
-    private static RequestBuilder signInvoiceRequest(long orderId) {
-        return signInvoiceRequest(orderId, ONE_PIXEL_PNG, SNAPSHOT_NAME);
+    /** The 16G PR 3 Path A body naming one quote version id. */
+    private static String quoteVersionIdBody(long quoteVersionId) {
+        return "{\"quote_version_id\":" + quoteVersionId + "}";
     }
 
-    /** D.8 multipart: one PNG {@code signature} part plus the typed {@code accepted_customer_name}. */
-    private static RequestBuilder signInvoiceRequest(long orderId, byte[] signaturePng, String acceptedName) {
+    /**
+     * The 16G PR 3 Path A body a current client sends: {@code {"quote_version_id": N}} with N = the order's
+     * latest ACCEPTED quote version id, read from the database now (state-derived).
+     */
+    private String versionBody(long orderId) {
+        return quoteVersionIdBody(latestAcceptedQuoteVersionId(orderId));
+    }
+
+    private RequestBuilder signInvoiceRequest(long orderId) {
+        return signInvoiceRequest(orderId, ONE_PIXEL_PNG);
+    }
+
+    /**
+     * D.8 multipart as amended by 16G PR 3: the mandatory {@code expected_version_number} form field (the
+     * order's CURRENT invoice version, read from the database now) plus one PNG {@code signature} part. There
+     * is no name part: the accepted name is the current version's frozen {@code customer_name_snapshot}.
+     */
+    private RequestBuilder signInvoiceRequest(long orderId, byte[] signaturePng) {
         return multipart(invoicesUrl(orderId) + "/current/accept")
                 .file(signaturePart(signaturePng))
-                .param("accepted_customer_name", acceptedName)
+                .param("expected_version_number", String.valueOf(currentInvoiceVersion(orderId)))
                 .session(liamStore1Session());
     }
 
@@ -1508,6 +1741,14 @@ class QuoteInvoiceConversionControllerTest {
     /** No tenant logo (rolled back with the test): a signature is then the only image an invoice PDF embeds. */
     private void clearBusinessLogo() {
         jdbcTemplate.update("UPDATE business SET logo_path = NULL WHERE business_id = ?", BUSINESS_AUSSIE);
+        clearJpaCache();
+    }
+
+    /** Rename the order's saved customer (exactly one row). */
+    private void renameCustomer(long orderId, String firstName, String lastName) {
+        Assertions.assertEquals(1, jdbcTemplate.update(
+                "UPDATE order_customer SET first_name = ?, last_name = ? WHERE order_id = ?",
+                firstName, lastName, orderId), "fixture: exactly the order's customer is renamed");
         clearJpaCache();
     }
 
@@ -1658,12 +1899,15 @@ class QuoteInvoiceConversionControllerTest {
 
     /** D.8: the in-app invoice signature (appends a signed version and auto-emails it). */
     private void signInvoiceInApp(long orderId) throws Exception {
-        signInvoiceInApp(orderId, ONE_PIXEL_PNG, SNAPSHOT_NAME);
+        signInvoiceInApp(orderId, ONE_PIXEL_PNG);
     }
 
-    /** D.8 with a chosen signature image and signer name (D.8 stores the uploaded bytes as they are). */
-    private void signInvoiceInApp(long orderId, byte[] signaturePng, String acceptedName) throws Exception {
-        MvcResult result = perform(signInvoiceRequest(orderId, signaturePng, acceptedName));
+    /**
+     * D.8 with a chosen signature image (D.8 stores the uploaded bytes as they are). Since 16G PR 3 the signer
+     * is the current version's frozen Invoice To name, never a typed one.
+     */
+    private void signInvoiceInApp(long orderId, byte[] signaturePng) throws Exception {
+        MvcResult result = perform(signInvoiceRequest(orderId, signaturePng));
         assertStatus(result, 201, "D.8 in-app invoice acceptance");
     }
 
@@ -1720,24 +1964,31 @@ class QuoteInvoiceConversionControllerTest {
     // Helpers: Path A success and refusal
     // ================================================================
 
+    /** A Path A conversion by Liam whose signed-PDF email is delivered (every shared fixture's email is valid). */
     private Conversion convertOk(long orderId) throws Exception {
-        return convertOk(orderId, "{}");
+        return convertOk(orderId, liamStore1Session(), EmailOutcome.DELIVERED);
     }
 
-    private Conversion convertOk(long orderId, String body) throws Exception {
-        return convertOk(orderId, body, liamStore1Session());
+    /** A Path A conversion by Liam with the given post-commit email outcome. */
+    private Conversion convertOk(long orderId, EmailOutcome expectedEmail) throws Exception {
+        return convertOk(orderId, liamStore1Session(), expectedEmail);
     }
 
     /**
-     * A successful Path A call (as the given session) plus the invariants every allowed conversion must
-     * keep: no write to the quote / order / line / customer / address / payment rows, every earlier invoice
-     * version (SELECT *) and its PDF bytes untouched, exactly ONE new stored_file row and ONE new file on
-     * disk (the new invoice PDF: no signature copy), the section 11.1 mirror reset to null (from a non-null
-     * value) and no email of any kind. The local date is read immediately before and after the request, so
-     * the invoice_date checks hold even when a conversion straddles midnight.
+     * A successful Path A call (as the given session, with the 16G PR 3 body {@code {"quote_version_id": N}}
+     * naming the order's latest ACCEPTED version, state-derived) plus the invariants every allowed conversion
+     * must keep: no write to the quote / order / line / customer / address / payment rows, every earlier
+     * invoice version (SELECT *) and its PDF bytes untouched, exactly ONE new stored_file row and ONE new file
+     * on disk (the new invoice PDF: no signature copy), and the post-commit signed-PDF email with the expected
+     * outcome ({@link #assertPostCommitEmail}: the sender calls, both markers - the mirror starts non-null, so
+     * the persist-time reset shows wherever nothing is stamped - and the WARN lines; never a quote email, a
+     * store notification or an SMS). The local time is read immediately before and after the request, so the
+     * invoice_date checks hold even when a conversion straddles midnight.
      */
-    private Conversion convertOk(long orderId, String body, MockHttpSession session) throws Exception {
+    private Conversion convertOk(long orderId, MockHttpSession session, EmailOutcome expectedEmail) throws Exception {
         ensureMirrorSentinel(orderId);
+        String body = versionBody(orderId);
+        String savedEmail = savedCustomerEmail(orderId);
         Map<String, Object> untouched = untouchedState(orderId);
         List<Map<String, Object>> invoicesBefore = invoiceRows(orderId);
         Map<Integer, byte[]> pdfsBefore = invoicePdfsByVersion(orderId);
@@ -1745,9 +1996,18 @@ class QuoteInvoiceConversionControllerTest {
         Map<String, String> diskBefore = diskFilesForOrder(orderId);
         SenderCounts sendersBefore = senderCounts();
 
-        LocalDate dayBefore = LocalDate.now();
-        MvcResult result = perform(withBody(post(createInvoiceUrl(SLUG_AUSSIE, orderId)).session(session), body));
-        LocalDate dayAfter = LocalDate.now();
+        // The service's WARN lines are captured for exactly this request (16G contract section 6.2).
+        ListAppender<ILoggingEvent> serviceLog = captureServiceLog();
+        LocalDateTime requestStart;
+        LocalDateTime requestEnd;
+        MvcResult result;
+        try {
+            requestStart = LocalDateTime.now();
+            result = perform(withBody(post(createInvoiceUrl(SLUG_AUSSIE, orderId)).session(session), body));
+            requestEnd = LocalDateTime.now();
+        } finally {
+            releaseServiceLog(serviceLog);
+        }
         assertStatus(result, 201, "Path A conversion");
 
         Assertions.assertEquals(untouched, untouchedState(orderId),
@@ -1782,9 +2042,128 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertEquals(Set.of(fileNameOf((String) newStoredFile.get("storage_path"))), added,
                 "the only new file on disk is the new invoice PDF");
 
-        Assertions.assertNull(mirror(orderId), "the section 11.1 mirror is reset to the new version's null");
-        Assertions.assertEquals(sendersBefore, senderCounts(), "Path A sends no email of any kind");
-        return new Conversion(result, dayBefore, dayAfter);
+        byte[] newPdf = diskBytes((String) newStoredFile.get("storage_path"));
+        String warning = assertPostCommitEmail(orderId, newInvoice, newPdf, expectedEmail, savedEmail, sendersBefore,
+                serviceLog.list, requestStart, requestEnd);
+        return new Conversion(result, requestStart.toLocalDate(), requestEnd.toLocalDate(), expectedEmail, warning);
+    }
+
+    /**
+     * The post-commit signed-PDF email of one Path A conversion (16G PR 3, 16G contract sections 6 and 11), for
+     * the expected outcome, and the one WARN line it logged (null when none):
+     * <ul>
+     *   <li>DELIVERED: exactly one recorded invoice email for the appended version - recipient = the trimmed
+     *       saved email, the locked subject and body, attachment = that version's stored PDF bytes, its file
+     *       name, order id and version - and both markers (the appended row and the mirror) carrying the SAME
+     *       stamp, taken within the request (the stamp joins this test transaction); no WARN line;</li>
+     *   <li>FAILED (the sender armed with {@code failNextSend}): exactly one recorded failed attempt with the
+     *       same content, both markers null (the mirror keeps the persist-time reset) and the failed WARN;</li>
+     *   <li>SKIPPED (no valid saved email): no sender call at all, both markers null and the skip WARN.</li>
+     * </ul>
+     * Every WARN line is WARN level, names {@code order <id> invoice v<N>}, carries no throwable and never an
+     * email address. Never a quote email, a store notification or an SMS.
+     */
+    private String assertPostCommitEmail(long orderId, Map<String, Object> newInvoice, byte[] newPdf,
+                                         EmailOutcome expected, String savedEmail, SenderCounts before,
+                                         List<ILoggingEvent> logEvents, LocalDateTime requestStart,
+                                         LocalDateTime requestEnd) {
+        int version = ((Number) newInvoice.get("version_number")).intValue();
+        String label = "Path A invoice v" + version + " post-commit email (" + expected + ")";
+
+        // Exactly the expected invoice sender call; every other sender stays silent.
+        int sent = expected == EmailOutcome.DELIVERED ? 1 : 0;
+        int failed = expected == EmailOutcome.FAILED ? 1 : 0;
+        Assertions.assertEquals(new SenderCounts(before.invoiceSent() + sent, before.invoiceFailed() + failed,
+                        before.quoteSent(), before.quoteFailed(), before.notificationsSent(),
+                        before.notificationsFailed(), before.smsSent(), before.smsFailed()), senderCounts(),
+                label + ": one invoice sender call at most; never a quote email, a store notification or an SMS");
+        if (expected != EmailOutcome.SKIPPED) {
+            List<InvoiceEmailRequest> recorded = expected == EmailOutcome.DELIVERED
+                    ? invoiceEmailSender.sentEmails() : invoiceEmailSender.failedEmails();
+            Assertions.assertNotNull(savedEmail, label + ": fixture: a saved email to send to");
+            assertSignedInvoiceEmail(recorded.get(recorded.size() - 1), orderId, version, savedEmail.trim(), newPdf,
+                    label);
+        }
+
+        // The markers: the appended version and the section 11.1 mirror (non-null before the call).
+        Timestamp invoiceMarker = (Timestamp) newInvoice.get("last_emailed_at");
+        Timestamp mirror = mirror(orderId);
+        if (expected == EmailOutcome.DELIVERED) {
+            Assertions.assertNotNull(invoiceMarker, label + ": the delivery is stamped on the appended version");
+            Assertions.assertEquals(invoiceMarker, mirror, label + ": the mirror carries the SAME stamp");
+            LocalDateTime stamped = invoiceMarker.toLocalDateTime();
+            Assertions.assertFalse(stamped.isBefore(requestStart.truncatedTo(ChronoUnit.MICROS))
+                            || stamped.isAfter(requestEnd),
+                    () -> label + ": the stamp is the delivery time (" + requestStart + " to " + requestEnd
+                            + ") but was " + stamped);
+        } else {
+            Assertions.assertNull(invoiceMarker, label + ": nothing delivered: the appended version stays unemailed");
+            Assertions.assertNull(mirror, label + ": the mirror keeps the persist-time reset to null");
+        }
+
+        // The WARN line (the service logs nothing else at WARN or above during a conversion).
+        List<ILoggingEvent> warnings = logEvents.stream()
+                .filter(event -> event.getLevel().isGreaterOrEqual(Level.WARN)).toList();
+        List<String> warningTexts = warnings.stream().map(ILoggingEvent::getFormattedMessage).toList();
+        String expectedWarning = switch (expected) {
+            case DELIVERED -> null;
+            case FAILED -> "Signed invoice email failed for order " + orderId + " invoice v" + version
+                    + " (non-fatal; the committed invoice stands, markers stay null)";
+            case SKIPPED -> "Signed invoice email skipped for order " + orderId + " invoice v" + version
+                    + ": no valid saved customer email (non-fatal; markers stay null)";
+        };
+        if (expectedWarning == null) {
+            Assertions.assertEquals(List.of(), warningTexts, label + ": a delivered and stamped email logs no WARN");
+            return null;
+        }
+        Assertions.assertEquals(List.of(expectedWarning), warningTexts, label + ": exactly one WARN line");
+        ILoggingEvent warning = warnings.get(0);
+        Assertions.assertEquals(Level.WARN, warning.getLevel(), label);
+        String text = warning.getFormattedMessage();
+        Assertions.assertTrue(text.contains("order " + orderId + " invoice v" + version), () -> label + ": " + text);
+        Assertions.assertNull(warning.getThrowableProxy(), label + ": the WARN carries no throwable");
+        Assertions.assertFalse(text.contains("@"), () -> label + ": the WARN never carries an email address: " + text);
+        if (savedEmail != null && !savedEmail.isBlank()) {
+            Assertions.assertFalse(text.contains(savedEmail.trim()),
+                    () -> label + ": the WARN never carries the saved email: " + text);
+        }
+        return text;
+    }
+
+    /** One recorded signed-invoice email (16G contract section 6.1: the D.8 / D.9 request shape). */
+    private void assertSignedInvoiceEmail(InvoiceEmailRequest email, long orderId, int version,
+                                          String expectedRecipient, byte[] expectedPdf, String label) {
+        String orderNumber = orderNumber(orderId);
+        String businessName = jdbcTemplate.queryForObject(
+                "SELECT name FROM business WHERE business_id = ?", String.class, BUSINESS_AUSSIE);
+        Assertions.assertEquals(expectedRecipient, email.recipientEmail(),
+                label + ": recipient = the trimmed saved email");
+        Assertions.assertEquals("Your invoice from " + businessName, email.subject(), label + ": subject");
+        Assertions.assertEquals("Hi,\n\nPlease find your invoice " + orderNumber + " from " + businessName
+                + " attached.\n\nThank you.", email.bodyText(), label + ": body");
+        Assertions.assertArrayEquals(expectedPdf, email.pdfBytes(),
+                label + ": the attachment is the appended version's stored PDF, byte for byte");
+        Assertions.assertEquals("invoice-" + orderNumber + "-v" + version + ".pdf", email.pdfFileName(),
+                label + ": attachment file name");
+        Assertions.assertEquals(orderId, email.orderId(), label + ": order id");
+        Assertions.assertEquals(version, email.invoiceVersionNumber(), label + ": the appended version");
+    }
+
+    /** Attach a list appender to the OrderInvoiceService logger (detached again by {@link #releaseServiceLog}). */
+    private static ListAppender<ILoggingEvent> captureServiceLog() {
+        ListAppender<ILoggingEvent> appender = new ListAppender<>();
+        appender.start();
+        serviceLogger().addAppender(appender);
+        return appender;
+    }
+
+    private static void releaseServiceLog(ListAppender<ILoggingEvent> appender) {
+        serviceLogger().detachAppender(appender);
+        appender.stop();
+    }
+
+    private static Logger serviceLogger() {
+        return (Logger) LoggerFactory.getLogger(OrderInvoiceService.class);
     }
 
     /**
@@ -1801,7 +2180,9 @@ class QuoteInvoiceConversionControllerTest {
      * The persisted row, the PDF on disk and the 201 body of a Path A conversion to invoice version
      * {@code expectedVersion} from quote version {@code quoteVersionNumber}: due on {@code expectedDueDate},
      * created by {@code expectedCreatedBy}, dated within the conversion's before / after day window, and
-     * carrying that quote version's frozen details, terms and (16G PR 2) {@code V17} Invoice To words.
+     * carrying that quote version's frozen details, terms and (16G PR 2) {@code V17} Invoice To words; its
+     * 201 message and {@code last_emailed_at} (row and JSON) follow the conversion's post-commit email
+     * outcome (16G PR 3).
      */
     private JsonNode assertConverted(long orderId, Conversion conversion, int expectedVersion, int quoteVersionNumber,
                                      String ex, String inc, String totalPaid, String balance,
@@ -1847,7 +2228,13 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertEquals(expectedDueDate, ((Date) row.get("due_date")).toLocalDate(), label + " due_date");
         LocalDate invoiceDate = ((Date) row.get("invoice_date")).toLocalDate();
         assertConversionDay(invoiceDate, conversion, label + " invoice_date");
-        Assertions.assertNull(row.get("last_emailed_at"), label + ": never emailed");
+        // 16G PR 3: the appended version's email marker follows the post-commit email outcome.
+        Timestamp emailedAt = (Timestamp) row.get("last_emailed_at");
+        if (conversion.emailOutcome() == EmailOutcome.DELIVERED) {
+            Assertions.assertNotNull(emailedAt, label + ": the delivered signed PDF is stamped on the new version");
+        } else {
+            Assertions.assertNull(emailedAt, label + ": not emailed (" + conversion.emailOutcome() + "): stays null");
+        }
         Assertions.assertEquals(expectedCreatedBy, asLong(row.get("created_by_user_id")), label + ": the session user");
 
         // ---- the new invoice PDF: stored_file row + bytes on disk + text ----
@@ -1875,7 +2262,8 @@ class QuoteInvoiceConversionControllerTest {
         String raw = bodyOf(result);
         JsonNode body = JSON.readTree(raw);
         Assertions.assertEquals(Set.of("data", "message"), fieldNames(body), label + ": envelope keys");
-        Assertions.assertEquals(CREATED_MESSAGE, body.get("message").asText(), label);
+        Assertions.assertEquals(conversion.emailOutcome().message, body.get("message").asText(),
+                label + ": the 201 message reports the post-commit email (" + conversion.emailOutcome() + ")");
         JsonNode data = body.get("data");
         Assertions.assertEquals(Set.of("invoice"), fieldNames(data), label + ": data keys");
         JsonNode invoice = data.get("invoice");
@@ -1904,7 +2292,14 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertTrue(invoice.get("accepted_signature_present").booleanValue(), label);
         Assertions.assertEquals(signatureDownloadPath(orderId), invoice.get("accepted_signature_download_path").asText(),
                 label);
-        Assertions.assertTrue(invoice.get("last_emailed_at").isNull(), label + ": last_emailed_at present and null");
+        Assertions.assertNotNull(invoice.get("last_emailed_at"), label + ": last_emailed_at always present");
+        if (emailedAt != null) {
+            Assertions.assertEquals(JSON_TIMESTAMP.format(emailedAt.toLocalDateTime()),
+                    invoice.get("last_emailed_at").asText(), label + ": the stamp (seconds precision on the wire)");
+        } else {
+            Assertions.assertTrue(invoice.get("last_emailed_at").isNull(),
+                    label + ": last_emailed_at present and null");
+        }
         Assertions.assertEquals("QUOTE", invoice.get("terms_source").asText(), label);
         assertJsonTextOrNull((String) quote.get("terms_snapshot"), invoice.get("terms_html"), label + " terms_html");
         for (String word : INVOICE_TO_WORDS) {
@@ -1962,7 +2357,7 @@ class QuoteInvoiceConversionControllerTest {
     /**
      * A refused Path A call: the mirror carries a non-null value first (so a write is visible), the call
      * returns the expected error envelope, and NOTHING changes (rows, stored files, files on disk, mirror,
-     * senders).
+     * senders: no invoice email of any outcome, no quote email, store notification or SMS).
      */
     private JsonNode assertRefused(long orderId, String body, int status, String code, String message, String label)
             throws Exception {
@@ -1977,11 +2372,13 @@ class QuoteInvoiceConversionControllerTest {
     /**
      * A 422 INVOICE_PRECONDITIONS_NOT_MET carrying exactly {@code expected} (order-insensitive), with nothing
      * written. Every caller's current invoice is absent or unsigned, so the workspace flag stays true on
-     * both sides: missing preconditions, blank frozen details and zero totals never feed eligibility.
+     * both sides: missing preconditions, blank frozen details and zero totals never feed eligibility. The
+     * request carries the valid 16G PR 3 body, so only the preconditions can refuse it.
      */
     private void assertPreconditionsRefused(long orderId, String label, Detail... expected) throws Exception {
         Assertions.assertTrue(invoiceEligible(orderId), label + ": preconditions never feed invoice_eligible");
-        JsonNode error = assertRefused(orderId, "{}", 422, "INVOICE_PRECONDITIONS_NOT_MET", PRECONDITIONS_MESSAGE, label);
+        JsonNode error = assertRefused(orderId, versionBody(orderId), 422, "INVOICE_PRECONDITIONS_NOT_MET",
+                PRECONDITIONS_MESSAGE, label);
         List<Detail> actual = details(error);
         Assertions.assertEquals(expected.length, actual.size(), () -> label + ": exactly the failing items: " + actual);
         Assertions.assertEquals(Set.of(expected), new HashSet<>(actual), label + ": section / field / message");
@@ -2085,7 +2482,8 @@ class QuoteInvoiceConversionControllerTest {
                 invoiceEmailSender.sentEmails().size(), invoiceEmailSender.failedEmails().size(),
                 quoteEmailSender.sentEmails().size(), quoteEmailSender.failedEmails().size(),
                 acceptanceNotificationSender.sentNotifications().size(),
-                acceptanceNotificationSender.failedNotifications().size());
+                acceptanceNotificationSender.failedNotifications().size(),
+                smsSender.sentMessages().size(), smsSender.failedMessages().size());
     }
 
     // ================================================================
@@ -2095,6 +2493,15 @@ class QuoteInvoiceConversionControllerTest {
     private Map<String, Object> quoteVersionRow(long orderId, int versionNumber) {
         return jdbcTemplate.queryForMap(
                 "SELECT * FROM quote_version WHERE order_id = ? AND version_number = ?", orderId, versionNumber);
+    }
+
+    /** The order's latest ACCEPTED quote version id (highest version_number among ACCEPTED), from the DB. */
+    private long latestAcceptedQuoteVersionId(long orderId) {
+        List<Long> ids = jdbcTemplate.queryForList(
+                "SELECT quote_version_id FROM quote_version WHERE order_id = ? AND status = 'ACCEPTED' "
+                        + "ORDER BY version_number DESC LIMIT 1", Long.class, orderId);
+        Assertions.assertEquals(1, ids.size(), () -> "fixture: order " + orderId + " has an ACCEPTED quote version");
+        return ids.get(0);
     }
 
     private String versionStatus(long orderId, int versionNumber) {
@@ -2128,6 +2535,20 @@ class QuoteInvoiceConversionControllerTest {
 
     private int invoiceCount(long orderId) {
         return jdbcTemplate.queryForObject("SELECT COUNT(*) FROM invoice WHERE order_id = ?", Integer.class, orderId);
+    }
+
+    /** The order's current (highest) invoice version_number; the order must have an invoice. */
+    private int currentInvoiceVersion(long orderId) {
+        Integer current = jdbcTemplate.queryForObject(
+                "SELECT MAX(version_number) FROM invoice WHERE order_id = ?", Integer.class, orderId);
+        Assertions.assertNotNull(current, () -> "fixture: order " + orderId + " has a current invoice");
+        return current;
+    }
+
+    /** The saved {@code order_customer.email}, exactly as stored (null when NULL). */
+    private String savedCustomerEmail(long orderId) {
+        return jdbcTemplate.queryForObject(
+                "SELECT email FROM order_customer WHERE order_id = ?", String.class, orderId);
     }
 
     /** Every invoice version's PDF bytes, read from disk through its stored_file row. */
@@ -2479,13 +2900,30 @@ class QuoteInvoiceConversionControllerTest {
     private record Detail(String section, String field, String message) {
     }
 
-    /** Recorded-message counts of the three senders (equality = nothing sent). */
+    /** Recorded-message counts of the four senders (equality = nothing sent). */
     private record SenderCounts(int invoiceSent, int invoiceFailed, int quoteSent, int quoteFailed,
-                                int notificationsSent, int notificationsFailed) {
+                                int notificationsSent, int notificationsFailed, int smsSent, int smsFailed) {
     }
 
-    /** A 201 Path A call: its result plus the local dates read immediately before and after the request. */
-    private record Conversion(MvcResult result, LocalDate dayBefore, LocalDate dayAfter) {
+    /** The post-commit signed-PDF email outcome a Path A conversion reports (16G contract section 6.1). */
+    private enum EmailOutcome {
+        DELIVERED(CREATED_EMAILED_MESSAGE),
+        FAILED(CREATED_EMAIL_FAILED_MESSAGE),
+        SKIPPED(CREATED_EMAIL_SKIPPED_MESSAGE);
+
+        private final String message;
+
+        EmailOutcome(String message) {
+            this.message = message;
+        }
+    }
+
+    /**
+     * A 201 Path A call: its result, the local dates read immediately before and after the request, the
+     * post-commit email outcome it was asserted with and the one WARN line it logged (null when none).
+     */
+    private record Conversion(MvcResult result, LocalDate dayBefore, LocalDate dayAfter, EmailOutcome emailOutcome,
+                              String warning) {
     }
 
     /** One image XObject found in a PDF page's resources: its declared size and its decoded pixels. */

@@ -38,9 +38,9 @@ import type { ApiSuccess } from './types'
 // an unaccepted invoice has accepted_at / accepted_customer_name /
 // accepted_signature_download_path / last_emailed_at all null and accepted_signature_present
 // false. accepted_signature_download_path is the backend-built relative URL of the D.10
-// signature stream, consumed verbatim by fetchCurrentInvoiceSignature. last_emailed_at is a
-// delivery marker: null = this invoice version has never been emailed (including when an
-// Accept's auto-email failed — Re-send retries it).
+// signature stream, consumed verbatim by fetchCurrentInvoiceSignature. last_emailed_at is the
+// RECORDED delivery marker: null = no delivery of this version has been recorded (its signed-PDF
+// email failed or was skipped, or was delivered but the success stamp failed — Re-send retries it).
 //
 // Phase 16F PR2 (decision D7) terms fields, ALWAYS present on every InvoiceDetail response. Since
 // 16G PR 2 (#125) terms_html is the version's own stored terms, verbatim, the same terms its PDF
@@ -82,8 +82,8 @@ export type InvoiceDetail = {
 // invoice under an `invoice` key inside the standard ApiSuccess `data` envelope. Create/Rewrite
 // include a top-level message ("Invoice created." / "Invoice rewritten."); Accept/Resend include
 // the Phase 13 messages (see acceptCurrentInvoice / resendCurrentInvoice); Read current does not.
-// The Phase 16F Path A conversion (orderQuoteApi.createInvoiceFromQuote) returns the same shape
-// with the message "Invoice created from accepted quote.".
+// The Phase 16F Path A conversion (orderQuoteApi.createInvoiceFromQuote) returns the same shape;
+// since 16G PR 3 its message also reports the signed-PDF email (see createInvoiceFromQuote).
 export type InvoiceResponse = {
   invoice: InvoiceDetail
 }
@@ -125,37 +125,36 @@ export function rewriteInvoice(
   )
 }
 
-// Matches the backend D.8 accept request check (trim + length; a trimmed name longer than this
-// is a 400 VALIDATION_FAILED, not a 422). Since V19 the stored column is TEXT, so a name an
-// invoice INHERITS from an accepted quote (Path A) can be longer: that name is display-only
-// and never passes through this request gate.
-export const ACCEPTED_NAME_MAX_LENGTH = 150
-
 // POST /api/v1/{slug}/orders/{orderId}/invoices/current/accept — Phase 13 D.8. Accept/sign the
-// CURRENT invoice: appends a new current version carrying the sale snapshot forward, stores the
-// signature, regenerates the signed PDF, and auto-emails it to the customer.
+// CURRENT invoice: appends a new current version carrying the version forward (its sale snapshot,
+// words and invoice date), stores the signature, regenerates the signed PDF, and auto-emails it
+// to the customer.
 //
-// The body is multipart/form-data with EXACTLY two parts — text field `accepted_customer_name`
-// (trimmed here; non-blank; max 150 chars) and file part `signature` (declared content type must
-// be exactly `image/png` — canvas.toBlob('image/png') produces it — non-empty, max 2 MB). Any
-// other or duplicated part -> 400 VALIDATION_FAILED. The request client passes FormData through
+// The body is multipart/form-data with EXACTLY two parts (16G PR 3) — text field
+// `expected_version_number` (the version_number of the invoice ON SCREEN, which the customer
+// reviewed; mandatory, exactly once, a positive integer) and file part `signature` (declared
+// content type must be exactly `image/png` — canvas.toBlob('image/png') produces it — non-empty,
+// max 2 MB). No name is sent: the server takes the accepted name from that version's frozen
+// customer_name_snapshot, in full. Any other or duplicated part (including the former
+// accepted_customer_name) -> 400 VALIDATION_FAILED. The request client passes FormData through
 // raw, so the browser sets the multipart Content-Type + boundary; never set Content-Type manually.
 //
-// Returns 201 in BOTH email outcomes (the auto-email is best-effort and never fails the call):
-// email sent -> message "Invoice accepted and emailed to the customer." with last_emailed_at set;
-// email failed -> message "Invoice accepted. The invoice could not be emailed — use Re-send
-// Invoice to try again." with last_emailed_at null. Surface the message VERBATIM and derive email
-// state from last_emailed_at, never from the message text. Errors: 409 INVOICE_ALREADY_ACCEPTED;
-// 422 INVOICE_REQUIRED / ACCEPTED_CUSTOMER_NAME_REQUIRED / SIGNATURE_REQUIRED /
-// CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID; 400 SIGNATURE_INVALID / VALIDATION_FAILED.
-// Never 502. Allowed when LAID.
+// Returns 201 whatever happens to the post-commit email (it never fails the call): delivered ->
+// message "Invoice accepted and emailed to the customer."; not delivered -> "Invoice accepted. The
+// invoice could not be emailed — use Re-send Invoice to try again." with last_emailed_at null. A
+// delivered email whose success stamp failed keeps the emailed message with last_emailed_at null.
+// Surface the message VERBATIM and derive email state from last_emailed_at, never from the message
+// text. Errors: 409 INVOICE_VERSION_STALE ("Invoice updated, please refresh": another version is
+// current now) / INVOICE_ALREADY_ACCEPTED; 422 INVOICE_REQUIRED / ACCEPTED_CUSTOMER_NAME_REQUIRED
+// (the version's frozen name is blank) / SIGNATURE_REQUIRED / CUSTOMER_EMAIL_REQUIRED /
+// CUSTOMER_EMAIL_INVALID; 400 SIGNATURE_INVALID / VALIDATION_FAILED. Never 502. Allowed when LAID.
 export function acceptCurrentInvoice(
   orderId: number,
-  acceptedCustomerName: string,
+  expectedVersionNumber: number,
   signatureBlob: Blob,
 ): Promise<ApiSuccess<InvoiceResponse>> {
   const formData = new FormData()
-  formData.append('accepted_customer_name', acceptedCustomerName.trim())
+  formData.append('expected_version_number', String(expectedVersionNumber))
   // The explicit filename marks this as a FILE part (not a form field); the part's Content-Type
   // comes from the Blob's own type, which must be exactly image/png.
   formData.append('signature', signatureBlob, 'signature.png')
@@ -172,7 +171,8 @@ export function acceptCurrentInvoice(
 // CURRENT accepted invoice PDF. The body MUST be {} (any field -> 400 VALIDATION_FAILED). No new
 // signature, no new invoice version, no PDF regeneration — on success only last_emailed_at is
 // stamped in place. Availability is gated on the invoice being ACCEPTED only (it works when
-// last_emailed_at is still null because the Accept auto-email failed). 200 with message "Invoice
+// last_emailed_at is still null because the signed-PDF email of D.8 or Path A failed, was skipped
+// or was not recorded). 200 with message "Invoice
 // re-sent to the customer." Errors: 422 INVOICE_REQUIRED / INVOICE_NOT_ACCEPTED /
 // CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID; 502 EMAIL_SEND_FAILED on provider failure
 // (fatal HERE only — nothing is written, the invoice state is unchanged, the user may retry).

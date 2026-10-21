@@ -130,6 +130,12 @@ public class InvoiceRepository {
             + "ORDER BY version_number DESC\n"
             + "LIMIT 1";
 
+    // One invoice version by id (Phase 16G PR 3): Path A's success response describes the version it
+    // appended even when another version became current before its email stamp. Same E.2 projection.
+    private static final String FIND_BY_ID_SQL = "SELECT\n" + RETURN_COLUMNS
+            + "FROM invoice\n"
+            + "WHERE invoice_id = :invoiceId";
+
     // Current invoice's linked stored_file metadata, for binary streaming (D.4). storage_path is
     // server-internal — used only to read the bytes, never returned in any response.
     private static final String FIND_CURRENT_FILE_SQL = """
@@ -150,8 +156,8 @@ public class InvoiceRepository {
             """;
 
     // In-place delivery stamp (Phase 13 §4: last_emailed_at is a mutable delivery marker, NOT part of
-    // the immutable acceptance snapshot). Used by the post-commit email-success update on D.8 Accept
-    // and by D.9 Resend — the only writes that touch an existing invoice row.
+    // the immutable acceptance snapshot). Used by the post-commit email-success stamp of D.8 Accept and,
+    // since 16G PR 3, Path A, and by D.9 Resend — the only writes that touch an existing invoice row.
     private static final String UPDATE_INVOICE_LAST_EMAILED_SQL = """
             UPDATE invoice
             SET last_emailed_at = :lastEmailedAt
@@ -291,6 +297,15 @@ public class InvoiceRepository {
         return jdbc.query(FIND_CURRENT_SQL, params, ROW_MAPPER).stream().findFirst();
     }
 
+    /**
+     * One invoice version's E.2 columns by {@code invoice_id}, or empty (Phase 16G PR 3: Path A's success
+     * response re-reads the version it appended, inside its email-stamp transaction).
+     */
+    public Optional<InvoiceRow> findByInvoiceId(long invoiceId) {
+        MapSqlParameterSource params = new MapSqlParameterSource().addValue("invoiceId", invoiceId);
+        return jdbc.query(FIND_BY_ID_SQL, params, ROW_MAPPER).stream().findFirst();
+    }
+
     /** The current invoice's linked {@code stored_file} metadata for streaming, or empty if none (D.4). */
     public Optional<InvoiceFile> findCurrentFileByOrderId(long orderId) {
         MapSqlParameterSource params = new MapSqlParameterSource().addValue("orderId", orderId);
@@ -316,7 +331,8 @@ public class InvoiceRepository {
     /**
      * Stamp {@code invoice.last_emailed_at} IN PLACE on one row (Phase 13 §4: the delivery marker is
      * the only mutable invoice column — the sale snapshot and acceptance fields stay append-only).
-     * Used by the post-commit email-success update (D.8 Accept) and by D.9 Resend; the caller updates
+     * Used by the post-commit email-success stamp (D.8 Accept and, since 16G PR 3, Path A) and by D.9
+     * Resend; the caller updates
      * the {@code sales_order} mirror to the CURRENT invoice's value in the same transaction
      * ({@link #updateSalesOrderLastEmailedAt}) so the §11.1 invariant holds.
      */

@@ -1008,12 +1008,27 @@ class QuoteAcceptanceConcurrencyIntegrationTest {
                 .contentType(MediaType.APPLICATION_JSON).content("{}");
     }
 
-    /** D.8 in-app invoice acceptance: signature part + accepted_customer_name field + session. */
+    /**
+     * D.8 in-app invoice acceptance (16G PR 3 request): the signature part plus the mandatory
+     * {@code expected_version_number} = the order's current invoice version, read from the committed
+     * database when this request is BUILT (each race builds it right before submitting it, while the
+     * holder holds the order row; a plain read of {@code invoice} is not blocked by that lock), and a
+     * session. No name part: the accepted name is the current version's frozen
+     * {@code customer_name_snapshot}, here the D.1-frozen {@value #CUSTOMER_NAME}.
+     */
     private RequestBuilder invoiceAccept(long orderId) {
         return multipart(orderUrl(orderId) + "/invoices/current/accept")
                 .file(signaturePart())
-                .param("accepted_customer_name", CUSTOMER_NAME)
+                .param("expected_version_number", String.valueOf(currentInvoiceVersion(orderId)))
                 .session(liamStore1Session());
+    }
+
+    /** The order's CURRENT invoice version (the highest version_number), read from committed state. */
+    private int currentInvoiceVersion(long orderId) {
+        Integer version = jdbcTemplate.queryForObject(
+                "SELECT MAX(version_number) FROM invoice WHERE order_id = ?", Integer.class, orderId);
+        Assertions.assertNotNull(version, "the order must have a current invoice to accept");
+        return version;
     }
 
     // ================================================================

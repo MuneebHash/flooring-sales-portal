@@ -102,12 +102,14 @@ public class OrderInvoiceController {
     }
 
     /**
-     * D.8 Accept (Phase 13 §5.1): the only multipart endpoint on this controller (file-binary
-     * exception, mirroring the attachment upload). The {@code MultipartHttpServletRequest} is also the
-     * {@code HttpServletRequest} the service guard reads the session from; the {@code signature} file
-     * part + {@code accepted_customer_name} form field are validated inside the service. 201 on
-     * acceptance regardless of the auto-email outcome (an email failure is reported via the message +
-     * {@code last_emailed_at = null}, never an error status).
+     * D.8 Accept (Phase 13 §5.1, as amended by 16G PR 3): the only multipart endpoint on this controller
+     * (file-binary exception, mirroring the attachment upload). The {@code MultipartHttpServletRequest}
+     * is also the {@code HttpServletRequest} the service guard reads the session from; the mandatory
+     * {@code expected_version_number} form field and the {@code signature} file part are validated
+     * inside the service, after its scope and current-invoice gates (nothing is bound here, so a missing
+     * or malformed part can never pre-empt them). 201 on acceptance regardless of the post-commit email
+     * and stamp outcome (a failure is reported via the message + {@code last_emailed_at = null}, never an
+     * error status).
      */
     @PostMapping(path = "/invoices/current/accept", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     @ResponseStatus(HttpStatus.CREATED)
