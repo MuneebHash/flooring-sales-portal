@@ -238,7 +238,9 @@ class QuoteInvoiceConversionControllerTest {
             "accepted_customer_name", "accepted_signature_present", "accepted_signature_download_path",
             "last_emailed_at", "terms_html", "terms_source",
             // 16G PR 2 (#125): the version's frozen Invoice To words, always present (nullable).
-            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot");
+            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot",
+            // 16G PR 4: the derived link field, always present (nullable; never on E.1 or a public payload).
+            "invoice_link_expires_at");
 
     // 16G PR 2 (#125): the Invoice To words, in Invoice To order. The same names on quote_version (V17),
     // invoice (V20) and InvoiceDetail: Path A copies them from the accepted version, verbatim.

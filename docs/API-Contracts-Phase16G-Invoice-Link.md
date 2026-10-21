@@ -11,7 +11,7 @@
 4. Phase 13 contract (invoice acceptance + signature + email)
 5. Phase 16B quotation contract
 6. **This Phase 16G contract**: authoritative for the rules listed above, which it amends in documents 1 to 5
-7. Locked DB schema: V1–V19 today, plus the two 16G migrations planned in PR 2 and PR 4 (numbers assigned when they are written; section 2)
+7. Locked DB schema: V1–V21 today, including the two 16G migrations, V20 in PR 2 and V21 in PR 4 (section 2)
 
 **Order number format (locked):** `{store_code}.{salesperson_code}.{order_sequence_number_padded_5}`, for example `SYD-CBD.LC1.00042`. It is the document number shown under `TAX INVOICE` and used in invoice and signature file names.
 
@@ -67,7 +67,7 @@
 | 6 | #120 polling (on server state) and the signing-draft reset when a refresh installs another invoice version, #121 financial refresh and an edit-gated Update Sale Price, #122 version-bound accepted quote reads, #124 provenance boolean and whole-second quote timestamps, and the derived `QuoteIssuedSummary.last_email_delivered` (section 13). |
 
 - PRs land in this order. The PR 3 client changes ship in PR 3 with the server change, not in PR 5, so no interval exists in which a deployed client and server disagree on a request shape.
-- **Migrations:** exactly two new migrations, one in PR 2 and one in PR 4. Their numbers are assigned when they are written (the next free numbers after V19). V1 to V19 are never edited. Both are outside the CI guard (V1–V13) and fold into the Phase 17 schema-only squash/baseline.
+- **Migrations:** exactly two new migrations, V20 in PR 2 and V21 in PR 4. V1 to V20 are never edited. Both are outside the CI guard (V1–V13) and fold into the Phase 17 schema-only squash/baseline.
 - PRs 2 to 6 may make narrowly scoped corrections to this contract, the other contracts, the UX lock, `CLAUDE.md` and `docs/openapi.yaml` where implementation shows PR 1 got a detail wrong. Each such correction is called out in that PR's report.
 
 ---
@@ -154,7 +154,7 @@ The PR 2 migration adds three nullable columns to `invoice`:
 
 ### 4.5 InvoiceDetail (E.2) changes (PR 2, PR 4)
 
-InvoiceDetail carries three always-present nullable frozen identity fields beyond 16F (implemented in PR 2), and gains a fourth always-present nullable field, the derived link field, in PR 4 (not yet implemented). E.1 `current_invoice_summary` is unchanged. The source quote version id is still never exposed.
+InvoiceDetail carries three always-present nullable frozen identity fields beyond 16F (implemented in PR 2), and a fourth always-present nullable field, the derived link field (implemented in PR 4). E.1 `current_invoice_summary` is unchanged. The source quote version id is still never exposed.
 
 | Field | Type | PR | Content |
 |---|---|---|---|
@@ -172,7 +172,7 @@ InvoiceDetail carries three always-present nullable frozen identity fields beyon
 - The Invoice tab uses it only to decide whether to poll (section 13.2). It is never displayed: no link status line, no expiry display, no cancel control.
 - It is not part of E.1 `current_invoice_summary` (the payment and void responses) or of any public invoice payload (the public view carries the presented token's own `expires_at`, section 9.3).
 
-Target shape (the three `customer_*_snapshot` fields are returned since PR 2; `invoice_link_expires_at` arrives in PR 4 and is absent until it merges):
+Shape (the three `customer_*_snapshot` fields are returned since PR 2; `invoice_link_expires_at` is returned since PR 4):
 
 ```json
 {
@@ -355,7 +355,7 @@ These are the only invoice dead reasons. The quote reasons `CANCELLED`, `SUPERSE
 - Mint: 32 bytes from a CSPRNG, encoded as unpadded URL-safe Base64 (43 characters), on every send.
 - Store only the SHA-256 lowercase-hex hash. Look up by hash, then compare in constant time.
 - Shape gate before any database access: a token that does not match `^[A-Za-z0-9_-]{43,128}$` is treated exactly like an unknown token (section 9.2).
-- **PR 3** adds one shared token hash helper. The two existing quote copies (`QuoteSendService`, `PublicQuoteService`) use it with unchanged behaviour, and the invoice code uses it in PR 4. The "duplicate, don't extract" code comments were never a recorded decision. The separate notification sender interfaces (16F D3) stay separate.
+- **PR 3** adds one shared token hash helper. The two existing quote copies (`QuoteSendService`, `PublicQuoteService`) use it with unchanged behaviour, and the invoice code uses it since PR 4. The "duplicate, don't extract" code comments were never a recorded decision. The separate notification sender interfaces (16F D3) stay separate.
 - The plaintext exists only in method scope and in the delivered email body. It is never persisted, never returned by any protected or public response, and never logged at INFO or above.
 
 ### 7.4 Binding
@@ -453,7 +453,7 @@ The response's `expires_at` is informational. The Invoice tab never starts or ti
 
 - Page: the top-level, slugless route `/i/{token}`, a sibling of `/q/{token}` in `App.tsx`. The link in the email is `{app.public-base-url}/i/{token}`.
 - API: slugless `/api/v1/public/invoices/{token}`. Spring Security already permits every path and CORS already covers `/api/v1/**`, so no security change is needed.
-- **Reserved slug `i` (PR 4):** the PR 4 migration drops and re-adds `chk_business_slug_reserved` with all 16 `V18` words plus `i`: `admin`, `api`, `login`, `static`, `auth`, `health`, `dashboard`, `orders`, `select-store`, `assets`, `new`, `logout`, `account`, `settings`, `public`, `q`, `i`. `V18` is never edited. PR 4 also adds `i` to `RESERVED_BUSINESS_SLUGS` in `frontend/src/lib/tenant.ts`.
+- **Reserved slug `i` (PR 4):** the PR 4 migration drops and re-adds `chk_business_slug_reserved` with all 16 `V18` words plus `i`: `admin`, `api`, `login`, `static`, `auth`, `health`, `dashboard`, `orders`, `select-store`, `assets`, `new`, `logout`, `account`, `settings`, `public`, `q`, `i`. `V18` is never edited. PR 4 also added `i` to `RESERVED_BUSINESS_SLUGS` in `frontend/src/lib/tenant.ts`.
 
 ### 9.2 Rules for every public invoice endpoint
 
@@ -670,7 +670,7 @@ As section 6: the signed PDF of the appended version to the saved customer email
 
 ### 10.5 Quote links (D5(c) extended)
 
-In the same transaction and under the same lock, remote invoice acceptance cancels the order's `ISSUED` quote version, if one exists, and its `ACTIVE` quote token (both `CANCELLED`), exactly as D.8 does today (16F D5(c)). With no `ISSUED` quote it is a no-op. An `ACCEPTED` quote is never revoked and never blocks signing (D5(d)). Quote acceptance still never creates an invoice, and quote sends, acceptance and cancellation never touch invoice links. Path A keeps its rule that it never changes a quote version or quote token; its 16G side effects are the customer PDF email (section 6) and, once PR 4 exists, killing an `ACTIVE` invoice token as `SIGNED` (section 7.5).
+In the same transaction and under the same lock, remote invoice acceptance cancels the order's `ISSUED` quote version, if one exists, and its `ACTIVE` quote token (both `CANCELLED`), exactly as D.8 does today (16F D5(c)). With no `ISSUED` quote it is a no-op. An `ACCEPTED` quote is never revoked and never blocks signing (D5(d)). Quote acceptance still never creates an invoice, and quote sends, acceptance and cancellation never touch invoice links. Path A keeps its rule that it never changes a quote version or quote token; its 16G side effects are the customer PDF email (section 6) and, since PR 4, killing an `ACTIVE` invoice token as `SIGNED` (section 7.5).
 
 A remote invoice signature sets `accepted_at` at signing time, so the 16F D5(b) comparison applies unchanged: a quote signed earlier can no longer be converted; a quote signed strictly later still can.
 

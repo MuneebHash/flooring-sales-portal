@@ -176,6 +176,19 @@ class PublicBusinessControllerTest {
     }
 
     @Test
+    void reservedSlug_i_returns404() throws Exception {
+        // 'i' is reserved since V21 (16G PR 4: the slugless public invoice page /i/{token}), beside V18's 'q';
+        // neither can ever be a real business → clean 404. The constraint itself is covered by
+        // V21MigrationUpgradeTest.
+        mockMvc.perform(get("/api/v1/public/businesses/i"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+        mockMvc.perform(get("/api/v1/public/businesses/q"))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"));
+    }
+
+    @Test
     void inactiveBusiness_returns404() throws Exception {
         jdbcTemplate.update("UPDATE business SET is_active = FALSE WHERE business_id = ?", BUSINESS_AUSSIE);
 

@@ -239,7 +239,9 @@ class QuoteInvoiceConversionSnapshotTest {
             "accepted_signature_present", "accepted_signature_download_path", "last_emailed_at",
             "terms_html", "terms_source",
             // 16G PR 2 (#125): the version's frozen Invoice To words, always present (nullable).
-            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot");
+            "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot",
+            // 16G PR 4: the derived link field, always present (nullable; never on E.1 or a public payload).
+            "invoice_link_expires_at");
 
     // The plaintext token inside the delivered link .../q/{token} (URL-safe Base64).
     private static final Pattern PUBLIC_LINK_TOKEN = Pattern.compile("/q/([A-Za-z0-9_-]{43,128})");
@@ -604,6 +606,17 @@ class QuoteInvoiceConversionSnapshotTest {
                 .file(signaturePart(ONE_PIXEL_PNG))
                 .param("expected_version_number", String.valueOf(currentInvoiceVersion(orderId)))
                 .session(liamStore1Session()), 201, "D.8 accept");
+    }
+
+    /** 16G PR 4 send-link (empty body): returns the 201's data.invoice_link.expires_at. */
+    private String sendInvoiceLink(long orderId) throws Exception {
+        MvcResult result = perform(post(invoicesUrl(orderId) + "/current/send-link").session(liamStore1Session())
+                .contentType(MediaType.APPLICATION_JSON).content("{}"), 201, "send-link");
+        JsonNode json = readJson(result);
+        Assertions.assertEquals("Invoice link emailed to the customer.", json.path("message").asText());
+        JsonNode expiresAt = json.path("data").path("invoice_link").path("expires_at");
+        Assertions.assertTrue(expiresAt.isTextual(), () -> "send-link: data.invoice_link.expires_at: " + json);
+        return expiresAt.asText();
     }
 
     /** D.9 resend (empty body). */
@@ -1976,7 +1989,9 @@ class QuoteInvoiceConversionSnapshotTest {
      * resend (all BUSINESS, with terms_html = the version's stored terms_snapshot: frozen by D.1 / D.2,
      * copied by D.8; 16G PR 2, #125), and Path A (QUOTE, after a quote signed strictly later than the
      * in-app invoice signature). Editing the live terms after the quote signature never changes the
-     * Path A terms.
+     * Path A terms. 16G PR 4: every response also carries invoice_link_expires_at - null on D.1 and D.2, the
+     * expires_at of the link sent for v2 on D.3, and null from D.8 on (D.8 kills that link as SIGNED; D.9,
+     * Path A and the later D.3 describe signed versions).
      */
     @Test
     void everyInvoiceDetailResponse_carriesTermsHtmlAndTermsSource_d1_d2_d3_d8_d9_andPathA() throws Exception {
@@ -1990,6 +2005,7 @@ class QuoteInvoiceConversionSnapshotTest {
                 assertInvoiceDetail(createInvoice(orderId), 1, "BUSINESS", businessTerms, "D.1 create"));
         responses.put("D.2 rewrite",
                 assertInvoiceDetail(rewriteInvoice(orderId), 2, "BUSINESS", businessTerms, "D.2 rewrite"));
+        String linkExpiresAt = sendInvoiceLink(orderId);   // 16G PR 4: an ACTIVE link for v2
         responses.put("D.3 get current",
                 assertInvoiceDetail(getCurrentInvoice(orderId), 2, "BUSINESS", businessTerms, "D.3 get current"));
         JsonNode accepted = assertInvoiceDetail(acceptInvoiceInApp(orderId), 3, "BUSINESS", businessTerms, "D.8 accept");
@@ -2032,6 +2048,22 @@ class QuoteInvoiceConversionSnapshotTest {
             assertInvoiceToWords(response.getValue(), SNAPSHOT_NAME, ORIGINAL_BILLING_LINE1, BILLING_LINE2,
                     response.getKey());
         }
+
+        // 16G PR 4: the derived link field on every response (the key set above already requires it): only D.3,
+        // read while the link sent for v2 was ACTIVE and unexpired, reports that link's expires_at.
+        for (Map.Entry<String, JsonNode> response : responses.entrySet()) {
+            JsonNode linkField = response.getValue().get("invoice_link_expires_at");
+            if (response.getKey().equals("D.3 get current")) {
+                Assertions.assertEquals(linkExpiresAt, linkField.asText(),
+                        "D.3 get current: the ACTIVE link's expires_at");
+            } else {
+                Assertions.assertTrue(linkField.isNull(),
+                        () -> response.getKey() + ": invoice_link_expires_at must be null but was " + linkField);
+            }
+        }
+        Assertions.assertEquals(List.of("SIGNED"), jdbcTemplate.queryForList(
+                        "SELECT status FROM invoice_token WHERE order_id = ?", String.class, orderId),
+                "D.8 killed the only link as SIGNED");
     }
 
     /** Populated frozen terms survive a payment and its void, after the live terms are edited. */

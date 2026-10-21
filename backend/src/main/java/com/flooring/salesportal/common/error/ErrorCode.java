@@ -46,10 +46,12 @@ public enum ErrorCode {
     CUSTOMER_EMAIL_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "A valid customer email is required before this action."),
     CUSTOMER_EMAIL_INVALID(HttpStatus.UNPROCESSABLE_ENTITY, "Customer email is not a valid email address."),
     // Phase 13 Accept / Resend / signature codes (contract §12). EMAIL_SEND_FAILED (502) is raised by
-    // D.9 Resend ONLY: the non-fatal D.8 accept-send (and the later D.7 payment-after-accepted send)
-    // surface an email failure via last_emailed_at = null + a success message, never via this code;
-    // so does the 16G PR 3 Path A signed-PDF send. Since 16G PR 3, ACCEPTED_CUSTOMER_NAME_REQUIRED on
-    // D.8 means the current version's FROZEN customer_name_snapshot is blank (no name part is read).
+    // D.9 Resend and, since 16G PR 4, the invoice send-link (with its own message): the non-fatal D.8
+    // accept-send (and the later D.7 payment-after-accepted send) surface an email failure via
+    // last_emailed_at = null + a success message, never via this code; so do the 16G Path A and remote
+    // accept signed-PDF sends. Since 16G PR 3, ACCEPTED_CUSTOMER_NAME_REQUIRED on D.8 means the current
+    // version's FROZEN customer_name_snapshot is blank (no name part is read); the 16G PR 4 remote accept
+    // uses it for the same cause with a customer-neutral message.
     ACCEPTED_CUSTOMER_NAME_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "Accepted customer name is required."),
     SIGNATURE_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "A customer signature is required to accept the invoice."),
     SIGNATURE_INVALID(HttpStatus.BAD_REQUEST, "Signature must be a PNG image no larger than 2 MB."),
@@ -97,10 +99,21 @@ public enum ErrorCode {
     // Phase 16G PR 3 (#69, #123) version preconditions (16G contract §5): the mandatory expected value
     // is only COMPARED with the row read under the order lock, never used to select a row, so an old,
     // forged or foreign value can only produce these 409s. INVOICE_VERSION_STALE: D.8 in-store accept
-    // (and, from PR 4, the public invoice accept and pdf). QUOTE_VERSION_STALE: Path A
+    // and, since 16G PR 4, the public invoice accept and pdf. QUOTE_VERSION_STALE: Path A
     // (POST .../quote/create-invoice).
     INVOICE_VERSION_STALE(HttpStatus.CONFLICT, "Invoice updated, please refresh"),
     QUOTE_VERSION_STALE(HttpStatus.CONFLICT, "The accepted quote changed while the confirmation was open. Review the accepted quote before creating an invoice."),
+    // Phase 16G PR 4 public invoice-link codes (16G contract §7.2, §9, §14): the token-only public
+    // invoice surface. INVOICE_TOKEN_NOT_FOUND (404) covers BOTH an unknown and a malformed token (and a
+    // quote token presented here) - identical status, code and message. The four INVOICE_LINK_* codes
+    // are 410 Gone for a FOUND but dead link, raised only by the public accept and pdf actions; the
+    // public GET instead returns 200 with the dead state and the same per-state message. These are the
+    // only invoice dead reasons: the quote reasons CANCELLED / SUPERSEDED / INACTIVE never apply here.
+    INVOICE_TOKEN_NOT_FOUND(HttpStatus.NOT_FOUND, "Invoice not found."),
+    INVOICE_LINK_REPLACED(HttpStatus.GONE, "This invoice link has been replaced. Please use the latest invoice link."),
+    INVOICE_LINK_REWRITTEN(HttpStatus.GONE, "This invoice has been revised. Please contact the store for the updated invoice."),
+    INVOICE_LINK_SIGNED(HttpStatus.GONE, "This invoice has already been signed. Please contact the store if you need a copy."),
+    INVOICE_LINK_EXPIRED(HttpStatus.GONE, "This invoice link has expired. Please contact the store."),
     INTERNAL_SERVER_ERROR(HttpStatus.INTERNAL_SERVER_ERROR, "An unexpected error occurred.");
 
     private final HttpStatus status;

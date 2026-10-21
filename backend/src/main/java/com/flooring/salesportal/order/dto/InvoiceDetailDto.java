@@ -42,6 +42,12 @@ import java.time.LocalDateTime;
  * and {@code customer_address_line2_snapshot} are ALWAYS present (nullable, serialized as JSON
  * {@code null}): the Invoice To name and billing lines stored on this version, mapped straight from the
  * row. They are never read from the live customer or address.
+ *
+ * <p>Phase 16G PR 4 - {@code invoice_link_expires_at} is ALWAYS present (nullable): derived response
+ * metadata about the ORDER's invoice link, not a frozen word and not an invoice column - the
+ * {@code expires_at} of the order's {@code ACTIVE}, unexpired link, else null. The route computes it after
+ * its own writes (the routes that kill the link return null) and the mapping passes it through; reading it
+ * never expires a link. It is not part of E.1 {@code current_invoice_summary} or of any public payload.
  */
 public record InvoiceDetailDto(
         long invoiceId,
@@ -66,6 +72,7 @@ public record InvoiceDetailDto(
         @JsonInclude(JsonInclude.Include.ALWAYS) String acceptedSignatureDownloadPath,
         @JsonInclude(JsonInclude.Include.ALWAYS) @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss") LocalDateTime lastEmailedAt,
         @JsonInclude(JsonInclude.Include.ALWAYS) String termsHtml,
-        @JsonInclude(JsonInclude.Include.ALWAYS) String termsSource
+        @JsonInclude(JsonInclude.Include.ALWAYS) String termsSource,
+        @JsonInclude(JsonInclude.Include.ALWAYS) @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss") LocalDateTime invoiceLinkExpiresAt
 ) {
 }

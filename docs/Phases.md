@@ -221,8 +221,8 @@ Private invoice/legal (ABN, bank, T&Cs, Stripe link, quick-adds): AUTHENTICATED 
                  deliberate exception: an ACTIVE secret link token returns the documented
                  presentation fields for its single document. Quote token (16E-C /q/{token}):
                  business name/logo/accent, ABN, direct-deposit bank details, Stripe payment link,
-                 and the quote's frozen terms snapshot. Invoice token (16G PR 4/5, planned,
-                 /i/{token}): the same business fields plus the order's current invoice version
+                 and the quote's frozen terms snapshot. Invoice token (16G: API since PR 4; page
+                 /i/{token} planned in PR 5): the same business fields plus the order's current invoice version
                  (frozen Invoice To, details, totals, Payment Made, Balance Due, dates, stored terms;
                  contract §9.3). A dead token shows only its message. Quick-adds and other config
                  are never public.
@@ -243,13 +243,12 @@ Current migrations are V1 to V20. Never edit any committed migration; any schema
       customer_address_line1_snapshot, customer_address_line2_snapshot) + backfill
 Phase 16A added NO migration (invoice tab + PDF logo path + Aire Compact PDF were app/template only).
 Phase 16 quote migrations are V16 (16C), V17 and V18 (16E-C), and V19 (16F PR1); 16G PR 2 added V20.
-16G plans exactly one more migration, numbered when it is written (the next free number after
-  V20): PR 4 (invoice_token table + chk_business_slug_reserved replaced with the 16 V18 words plus
-  'i'). V1 to V19 were unchanged by V20.
+16G added exactly one more migration, V21: PR 4 (invoice_token table + chk_business_slug_reserved
+  replaced with the 16 V18 words plus 'i'). V1 to V19 were unchanged by V20.
 CI "Locked migration protection" guards V1–V13 only (.github/workflows/ci.yml). V14 to V20 are on main
   but OUTSIDE the guard; they are still never edited — the rule applies regardless of guard
   coverage. Do not casually expand or rewrite the guard: the Phase 17 squash/baseline folds
-  V1 to V20 (and the PR 4 migration once merged) into one baseline and re-locks CI. Verify the
+  V1 to V21 into one baseline and re-locks CI. Verify the
   live CI guard range if it matters.
 Schema = Flyway migration. Demo/dev data = db/dev-seed (manual, idempotent, never auto-runs).
   New tests must self-seed and must NOT depend on the V4 legacy seed.
@@ -264,8 +263,8 @@ The URL slug identifies the tenant namespace; security is enforced by backend
 session/business/store checks. Changing the slug in the URL must not grant access.
 Backend is source of truth for: valid slug, reserved-slug rejection, tenant isolation,
 store access, order scoping. Frontend reserved-slug guard is UX/routing only, not security.
-Reserved slugs = V18 chk_business_slug_reserved (the V11 list plus 'q' for /q/{token}).
-  16G PR 4 (planned) replaces the constraint with the 16 V18 words plus 'i' for /i/{token},
+Reserved slugs = V21 chk_business_slug_reserved (the V11 list plus 'q' for /q/{token} and 'i').
+  16G PR 4 (V21) replaces the constraint with the 16 V18 words plus 'i' for /i/{token},
   and adds 'i' to RESERVED_BUSINESS_SLUGS. V18 is never edited.
 Cross-business / cross-store access must not leak existence (404, not 403).
 ```
@@ -368,7 +367,8 @@ Footguns — must not break:
   Do NOT touch this model. (NOTE: the 16E-C public tokenized quote link — page /q/{token}, API
   /api/v1/public/quotes/{token} — is a separate, slugless, token-only unauthenticated surface; it
   never reuses or weakens this session model. The 16G invoice link — page /i/{token}, API
-  /api/v1/public/invoices/{token}, planned in PR 4/5 — follows the same rule, with its own tokens.)
+  /api/v1/public/invoices/{token}, the API since PR 4 and the page planned in PR 5 — follows the
+  same rule, with its own tokens.)
 - Use apiPath(slug, …) for tenant-scoped endpoints; bypass only for genuinely public endpoints.
 - Accepted customer name (invoice acceptance) is never typed. Today the Invoice tab derives it from
   the SAVED customer record and sends it as the D.8 accepted_customer_name part (150-character request
@@ -446,7 +446,7 @@ The 16F read-only verify gate ran on 1 October 2026, and its decisions (D1 to D1
 - both public pages show the specific dead-link reason ([#126](https://github.com/MuneebHash/flooring-sales-portal/issues/126), in 16G);
 - send link and remote signing are allowed when LAID; no CANCELLED rule.
 
-The six 16G PRs (in order; two new migrations: V20 in PR 2, and one in PR 4, numbered when written):
+The six 16G PRs (in order; two new migrations: V20 in PR 2 and V21 in PR 4):
 
 | PR | Scope |
 |---|---|
@@ -557,7 +557,7 @@ Batch A or Batch B, placement undecided: [#135](https://github.com/MuneebHash/fl
 - [#29](https://github.com/MuneebHash/flooring-sales-portal/issues/29) CSRF protection before production → Phase 17
 - [#30](https://github.com/MuneebHash/flooring-sales-portal/issues/30) production CORS origins → Phase 17
 - [#34](https://github.com/MuneebHash/flooring-sales-portal/issues/34) app/database timezone before production → Phase 17
-- [#69](https://github.com/MuneebHash/flooring-sales-portal/issues/69) backend version precondition on invoice accept → **required for 16G** (16G PR 3 for in-app D.8, PR 4 for remote signing; mandatory `expected_version_number`, 409 `INVOICE_VERSION_STALE`)
+- [#69](https://github.com/MuneebHash/flooring-sales-portal/issues/69) backend version precondition on invoice accept → **implemented in 16G** (16G PR 3 for in-app D.8, PR 4 for remote signing; mandatory `expected_version_number`, 409 `INVOICE_VERSION_STALE`)
 - [#55](https://github.com/MuneebHash/flooring-sales-portal/issues/55) financial summary versioning (concurrent mutations) → deferred-hardening (post-pilot)
 - Batch A and Batch B issues: see §7.
 

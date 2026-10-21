@@ -211,7 +211,9 @@ class InvoiceFrozenWordsTest {
             "created_at", "pdf_download_path",
             "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot",
             "accepted_at", "accepted_customer_name", "accepted_signature_present",
-            "accepted_signature_download_path", "last_emailed_at", "terms_html", "terms_source");
+            "accepted_signature_download_path", "last_emailed_at", "terms_html", "terms_source",
+            // 16G PR 4: the derived link field, always present (nullable; never on E.1 or a public payload).
+            "invoice_link_expires_at");
 
     /** Internal provenance and storage values that no InvoiceDetail body may contain. */
     private static final List<String> DETAIL_LEAK_MARKERS = List.of(

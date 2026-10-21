@@ -197,8 +197,8 @@ class QuoteInvoiceFrozenWordsTest {
             "Invoice created from accepted quote and emailed to the customer.";
 
     /**
-     * The InvoiceDetail keys PR 2 returns, ALWAYS present: the 20 Phase 12 / 13 / 16F keys plus the three
-     * frozen identity keys (the derived invoice_link_expires_at is PR 4 and absent until then, contract 4.5).
+     * The InvoiceDetail keys, ALWAYS present: the 20 Phase 12 / 13 / 16F keys, the three PR 2 frozen identity
+     * keys and the derived invoice_link_expires_at (PR 4, contract 4.5).
      */
     private static final Set<String> INVOICE_DETAIL_KEYS = Set.of(
             "invoice_id", "order_id", "version_number", "invoice_date", "due_date",
@@ -206,7 +206,9 @@ class QuoteInvoiceFrozenWordsTest {
             "created_by_user_id", "created_at", "pdf_download_path",
             "customer_name_snapshot", "customer_address_line1_snapshot", "customer_address_line2_snapshot",
             "accepted_at", "accepted_customer_name", "accepted_signature_present",
-            "accepted_signature_download_path", "last_emailed_at", "terms_html", "terms_source");
+            "accepted_signature_download_path", "last_emailed_at", "terms_html", "terms_source",
+            // 16G PR 4: the derived link field, always present (nullable; never on E.1 or a public payload).
+            "invoice_link_expires_at");
 
     /** E.1 CurrentInvoiceSummary (payment / void responses): UNCHANGED by PR 2 - no identity, no terms. */
     private static final Set<String> CURRENT_INVOICE_SUMMARY_KEYS = Set.of(
