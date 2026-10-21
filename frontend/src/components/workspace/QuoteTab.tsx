@@ -61,8 +61,9 @@ import type { FlooringType } from '../../lib/flooring'
 //     (verbatim, credentialed blob); Preview signed PDF streams the STORED signed
 //     PDF (no flush, no regeneration); Create Invoice (Path A) is enabled by the
 //     server's invoice_eligible only (never LAID, a draft, a newer issued quote or
-//     any client-side date comparison), confirms first, posts exactly {} and then
-//     re-reads the snapshots and switches to the Invoice tab.
+//     any client-side date comparison), confirms first, posts
+//     {"quote_version_id": N} (the accepted version the confirmation shows; 16G
+//     PR 3) and then re-reads the snapshots and switches to the Invoice tab.
 //   - Issued/accepted refresh: the tab re-reads the workspace snapshots when the
 //     top-level tab becomes active, on a sub-tab change and before the Send
 //     confirmation opens (the D9 warning needs the current accepted state). ONE
@@ -727,10 +728,11 @@ type CurrentInvoiceLookup =
   | { status: 'ready'; key: number; invoice: InvoiceDetail | null }
   | { status: 'error'; key: number }
 
-// The accepted version a Create Invoice confirmation was opened for. The POST
-// itself carries no selector (the server converts the latest accepted quote);
-// this binding only lets the frontend invalidate a confirmation that no longer
-// matches what is on screen.
+// The accepted version a Create Invoice confirmation was opened for. Since 16G
+// PR 3 its quoteVersionId is the POST body ({"quote_version_id": N}): the server
+// still converts its own latest accepted quote and only compares N with it (409
+// QUOTE_VERSION_STALE on a mismatch). The binding also lets the frontend
+// invalidate a confirmation that no longer matches what is on screen.
 type ConvertTarget = {
   key: number
   orderId: number
@@ -2346,7 +2348,9 @@ export function QuoteTab({
         setConvertErrorDetails(parsePreconditionFailures(err.details))
       }
       // Drift (the signature precedence or the accepted version changed since
-      // this tab last read them): refresh eligibility, keeping the error shown.
+      // this tab last read them - including 409 QUOTE_VERSION_STALE, whose
+      // message equals ACCEPTED_CHANGED_MESSAGE): refresh eligibility, keeping
+      // the error shown. Never retried.
       if (err.status === 409 || err.code === 'QUOTE_NOT_ACCEPTED') {
         void refreshSnapshots()
       }
@@ -2355,9 +2359,12 @@ export function QuoteTab({
     setConvertError(fallback)
   }
 
-  // Confirmed Create Invoice (Path A). POSTs exactly {} - the server converts the
-  // LATEST accepted quote (no version selector, price, terms or signature
-  // reference is ever sent). Single-flight; never overlaps a send or a cancel.
+  // Confirmed Create Invoice (Path A). POSTs exactly {"quote_version_id": N} with
+  // the accepted version this confirmation was opened for (16G PR 3): the server
+  // still converts its own LATEST accepted quote and only compares N with it,
+  // refusing a mismatch with 409 QUOTE_VERSION_STALE (no price, terms or
+  // signature reference is ever sent). Single-flight; never overlaps a send or a
+  // cancel.
   async function handleConfirmCreateInvoice() {
     if (convertingRef.current || sendingRef.current || cancellingRef.current) {
       return
@@ -2430,7 +2437,10 @@ export function QuoteTab({
       raiseSnapshotFloor()
       let message = 'Invoice created from accepted quote.'
       try {
-        const res = await createInvoiceFromQuote(requestOrderId)
+        const res = await createInvoiceFromQuote(
+          requestOrderId,
+          target.quoteVersionId,
+        )
         if (res && typeof res.message === 'string' && res.message.length > 0) {
           message = res.message
         }
@@ -4088,7 +4098,8 @@ export function QuoteTab({
           version it was opened for (a refresh that changes it closes this). The
           wording comes from a current-invoice read: no invoice / unsigned /
           signed. A failed read never counts as "no invoice", so confirming waits
-          for a successful read. The POST body is exactly {}. */}
+          for a successful read. The POST body is exactly
+          {"quote_version_id": N}, the version this confirmation shows. */}
       <Modal
         open={convertModalOpen}
         onClose={() => {

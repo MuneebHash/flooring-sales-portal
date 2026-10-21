@@ -4,7 +4,6 @@ import { Button } from '../ui/Button'
 import { SignaturePad, type SignaturePadHandle } from './SignaturePad'
 import { ApiError } from '../../lib/api/ApiError'
 import {
-  ACCEPTED_NAME_MAX_LENGTH,
   acceptCurrentInvoice,
   fetchCurrentInvoice,
   fetchCurrentInvoicePdf,
@@ -12,27 +11,22 @@ import {
   resendCurrentInvoice,
   type InvoiceDetail,
 } from '../../lib/api/orderInvoicesApi'
-import type {
-  DetailsOfSaleFields,
-  OrderCustomer,
-} from '../../lib/api/orderWorkspaceApi'
+import type { DetailsOfSaleFields } from '../../lib/api/orderWorkspaceApi'
 import { fetchPublicBusiness } from '../../lib/api/tenantApi'
 import { getActiveSlug } from '../../lib/tenant'
 
 type Props = {
   orderId: number
   // Phase 16F PR3 - a one-shot success notice handed over when the workspace opens this
-  // tab right after an action elsewhere (the Path A "Invoice created from accepted quote."
-  // message from the Quote tab). Shown above the invoice until the next invoice action.
+  // tab right after an action elsewhere (the Path A response message from the Quote tab,
+  // which since 16G PR 3 also says whether the signed PDF was emailed). Shown above the
+  // invoice until the next invoice action.
   notice?: string | null
   // View/download + Phase 13 acceptance (sign / accept / re-send). Create + Rewrite
   // live in the Details of Sale tab now. NOTE: LAID/`locked` is deliberately NOT a
   // prop here — Accept, Re-send and the signature download are all allowed when
   // LAID (acceptance parallels payment, not rewrite), so the lock never gates this tab.
   orderNumber?: string
-  // The saved customer, used ONLY to derive the name the in-store Accept (D.8) submits until 16G
-  // PR 3. Invoice To never reads it: it comes from the InvoiceDetail's frozen snapshot fields.
-  customer?: OrderCustomer | null
   saleDetails?: DetailsOfSaleFields | null
   // Order-bound salesperson name (sales_order.user_id -> app_user first/last), the same
   // source the PDF uses — NOT the session user. Rendered in the document meta; hidden
@@ -86,13 +80,6 @@ function formatTimestamp(iso: string): string {
   return `${day} ${name} ${year}, ${hours}:${minutes}`
 }
 
-function composeFullName(customer: OrderCustomer | null | undefined): string {
-  if (!customer) return ''
-  return [customer.first_name, customer.middle_name, customer.last_name]
-    .filter((part) => part && part.trim().length > 0)
-    .join(' ')
-}
-
 // Download filename mirrors the backend Content-Disposition pattern
 // (invoice-{order_number}-v{version}.pdf). A blob object URL does not carry the
 // server's Content-Disposition, so the anchor sets the name explicitly.
@@ -118,6 +105,20 @@ const ACCEPTANCE_LINES: string[] = [
   'I agree that no floor preparation costs are included unless otherwise stated above.',
 ]
 
+// Phase 16G PR 3 - the D.8 stale-version 409 (INVOICE_VERSION_STALE) default message, shown when
+// the response carries none (the backend message is otherwise surfaced verbatim).
+const INVOICE_STALE_MESSAGE = 'Invoice updated, please refresh'
+
+// Phase 16G PR 3 - the frozen accepted name: D.8 records the version's own customer_name_snapshot
+// (no name is sent), so a blank one disables Accept. Blankness only: no length cap.
+function hasFrozenAcceptedName(invoice: InvoiceDetail | null): boolean {
+  return (
+    invoice !== null &&
+    invoice.customer_name_snapshot !== null &&
+    invoice.customer_name_snapshot.trim().length > 0
+  )
+}
+
 // Phase 16F PR3 - the plain terms-source label. It reports the API's own terms_source
 // (QUOTE = the terms frozen on the signed quote; BUSINESS, since 16G PR 2 = the business's
 // terms, frozen into this version when it was created or rewritten). No wording promises a
@@ -140,7 +141,6 @@ export function InvoiceTab({
   orderId,
   notice,
   orderNumber,
-  customer,
   saleDetails,
   onGoToCustomer,
 }: Props) {
@@ -180,15 +180,15 @@ export function InvoiceTab({
   const [logoFailed, setLogoFailed] = useState(false)
 
   // Acceptance draft (unaccepted invoice only): whether the pad has at least one
-  // drawn stroke. The accepted customer name is NOT typed — it is derived from the
-  // order's saved customer (see derivedAcceptedName below).
+  // drawn stroke. The accepted customer name is NOT typed — it is the displayed
+  // version's frozen customer_name_snapshot (see frozenAcceptedName below).
   const [hasInk, setHasInk] = useState(false)
   const padRef = useRef<SignaturePadHandle | null>(null)
 
   // Phase 16A PR1 — acceptance checkboxes (frontend-only gate; NEVER sent to the backend —
-  // the accept contract stays exactly { accepted_customer_name, signature }). One boolean per
-  // ACCEPTANCE_LINES entry. Reset structurally on invoice identity/version change (effect
-  // below) so a tick never leaks across a reload, rewrite, or payment/void regeneration.
+  // the accept contract is exactly { expected_version_number, signature } since 16G PR 3). One
+  // boolean per ACCEPTANCE_LINES entry. Reset structurally on invoice identity/version change
+  // (effect below) so a tick never leaks across a reload, rewrite, or payment/void regeneration.
   const [acceptanceChecked, setAcceptanceChecked] = useState<boolean[]>(() =>
     Array(ACCEPTANCE_LINES.length).fill(false),
   )
@@ -393,6 +393,21 @@ export function InvoiceTab({
   async function applyAcceptResendError(err: unknown, fallback: string) {
     if (err instanceof ApiError) {
       const message = err.message.length > 0 ? err.message : fallback
+      if (err.code === 'INVOICE_VERSION_STALE') {
+        // Phase 16G PR 3 - the server's authoritative version check (D.8 only) refused the
+        // signature: another invoice version is current now. Invalidate the signing draft FIRST
+        // (the ink and both ticks), so it is dropped even if the re-read below fails, keep the
+        // message, and re-read the current invoice. Never retry: a fresh review, both ticks and a
+        // fresh signature are needed before Accept is enabled again.
+        padRef.current?.clear()
+        setHasInk(false)
+        setAcceptanceChecked(Array(ACCEPTANCE_LINES.length).fill(false))
+        setActionError(
+          err.message.length > 0 ? err.message : INVOICE_STALE_MESSAGE,
+        )
+        await resyncCurrentInvoice()
+        return
+      }
       if (err.code === 'INVOICE_ALREADY_ACCEPTED') {
         // Drift: this invoice was accepted elsewhere. Surface the backend message
         // and pull the accepted state.
@@ -438,17 +453,14 @@ export function InvoiceTab({
       !acceptanceChecked.every(Boolean)
     )
       return
+    // The version the customer reviewed and signed: the POST below carries ITS
+    // version_number (never one adopted from a later read).
     const displayed = invoice
-    // accepted_customer_name is auto-derived from the order's saved customer —
-    // the customer never types it. A blank or over-length name disables Accept
-    // in the render; these guards keep a stray call from POSTing an invalid part
-    // (over-length is blocked outright, never silently truncated).
-    const name = derivedAcceptedName
-    if (
-      name.length === 0 ||
-      name.length > ACCEPTED_NAME_MAX_LENGTH ||
-      !hasInk
-    ) {
+    // The accepted name is the displayed version's frozen customer_name_snapshot
+    // (16G PR 3): never typed, never the live customer, and no name is sent. A blank
+    // frozen name disables Accept in the render; this guard keeps a stray call from
+    // POSTing a signature the server would refuse.
+    if (!hasFrozenAcceptedName(displayed) || !hasInk) {
       return
     }
     setAccepting(true)
@@ -457,15 +469,17 @@ export function InvoiceTab({
     setHandoverNotice(null)
     setEmailFixNeeded(false)
     try {
-      // BEST-EFFORT STALE-TAB GUARD: the accept endpoint targets /current, but
+      // BEST-EFFORT STALE-TAB HINT: the accept endpoint targets /current, but
       // another session may have recorded a payment or rewritten the invoice
       // after this tab loaded — the customer would have reviewed/signed an
       // invoice that is no longer /current. Refetch and compare the version
       // identity (invoice_id + version_number) BEFORE accepting; on mismatch,
       // show the fresh invoice and require a re-sign instead of silently
-      // accepting a different version. This is best-effort only: a
-      // millisecond-level race window remains between this check and the accept
-      // POST because the backend has no version precondition on accept.
+      // accepting a different version. This is an early hint only: since 16G
+      // PR 3 the authority is the server, which compares expected_version_number
+      // (the displayed version, below) under the order lock and answers 409
+      // INVOICE_VERSION_STALE (handled in applyAcceptResendError) when a version
+      // was committed between this check and the POST.
       let fresh: InvoiceDetail
       try {
         const check = await fetchCurrentInvoice(orderId)
@@ -510,10 +524,16 @@ export function InvoiceTab({
         setActionError('Could not read the signature. Please sign again.')
         return
       }
-      const res = await acceptCurrentInvoice(orderId, name, blob)
+      const res = await acceptCurrentInvoice(
+        orderId,
+        displayed.version_number,
+        blob,
+      )
       if (!mountedRef.current) return
-      // The 201 body is the FINAL post-email state (accepted_at set;
-      // last_emailed_at set iff the auto-email succeeded) — no follow-up GET.
+      // The 201 body is the post-email state as recorded (accepted_at set;
+      // last_emailed_at non-null only when the delivery's success stamp was
+      // recorded — a delivered email whose stamp failed keeps the emailed message
+      // with last_emailed_at null, and the tab follows the marker) — no follow-up GET.
       setInvoice(res.data.invoice)
       setActionMessage(
         res.message && res.message.length > 0 ? res.message : 'Invoice accepted.',
@@ -607,19 +627,18 @@ export function InvoiceTab({
     }
   }
 
-  // accepted_customer_name sent on Accept — auto-derived from the order's saved
-  // customer, trimmed, never typed by the customer. Blank (no saved customer) or
-  // over-length (> 150 chars) blocks Accept with an inline notice — the name is
-  // never silently truncated. The ACCEPTED state renders
-  // invoice.accepted_customer_name (the immutable response snapshot), not this
-  // live value. (Until 16G PR 3, which takes the name from the frozen version.)
-  const derivedAcceptedName = composeFullName(customer).trim()
-  const derivedNameTooLong =
-    derivedAcceptedName.length > ACCEPTED_NAME_MAX_LENGTH
+  // Phase 16G PR 3 - the name under the signature pad is the one D.8 records: the
+  // displayed version's frozen customer_name_snapshot, never typed and never the live
+  // customer. A blank frozen name blocks Accept with an inline notice (the fix is a saved
+  // name plus a Rewrite); there is no length limit, so a long name simply wraps. The
+  // ACCEPTED state renders invoice.accepted_customer_name (the stored acceptance), not this.
+  const frozenAcceptedName = hasFrozenAcceptedName(invoice)
+    ? invoice?.customer_name_snapshot ?? null
+    : null
   // Phase 16G PR 2 (#125) - Invoice To is the version's FROZEN words only (InvoiceDetail's
   // customer_*_snapshot fields), on signed and unsigned invoices alike: never the live
   // customer or billing address, and a null name or line is simply not shown (no sample or
-  // placeholder). It is a separate value from the D.8 signing name above.
+  // placeholder).
   const invoiceToName = nonBlank(invoice?.customer_name_snapshot)
   const invoiceToLine1 = nonBlank(invoice?.customer_address_line1_snapshot)
   const invoiceToLine2 = nonBlank(invoice?.customer_address_line2_snapshot)
@@ -1021,8 +1040,9 @@ export function InvoiceTab({
                       </p>
                     )}
                   </div>
-                  {/* Display-only and never truncated: an inherited (Path A) name can be
-                      longer than the D.8 request limit, so it must wrap, not overflow. */}
+                  {/* Display-only and never truncated: an accepted name (the version's frozen
+                      name, or one inherited by Path A) has no length limit, so it must wrap,
+                      not overflow. */}
                   <div className="mt-1.5 w-full break-words text-sm font-medium text-slate-800">
                     {invoice.accepted_customer_name || '—'}
                   </div>
@@ -1044,8 +1064,8 @@ export function InvoiceTab({
               ) : (
                 <div className="mt-2 w-full max-w-[380px]">
                   {/* Unaccepted — capture a real signature (pointer events: touch, pen and
-                      mouse). Shallow pad with a light border; the derived customer name sits
-                      directly below it (the customer never types it). */}
+                      mouse). Shallow pad with a light border; the version's frozen customer
+                      name sits directly below it (the customer never types it). */}
                   <div className="invoice-signature-pad rounded-md border border-slate-200 bg-white px-1.5 pt-1.5 pb-1">
                     <SignaturePad
                       ref={padRef}
@@ -1054,8 +1074,9 @@ export function InvoiceTab({
                     />
                   </div>
                   <div className="mt-1 flex items-center justify-between gap-3">
-                    <span className="text-sm font-medium text-slate-800">
-                      {derivedAcceptedName || '—'}
+                    {/* Never truncated: a long frozen name wraps instead of overflowing. */}
+                    <span className="min-w-0 break-words text-sm font-medium text-slate-800">
+                      {frozenAcceptedName ?? '—'}
                     </span>
                     <Button
                       type="button"
@@ -1063,33 +1084,19 @@ export function InvoiceTab({
                       size="sm"
                       onClick={handleClearSignature}
                       disabled={accepting || !hasInk}
+                      // The name beside it takes all the shrink, so a long frozen name never
+                      // squeezes this label onto two lines.
+                      className="shrink-0 whitespace-nowrap"
                     >
                       Clear signature
                     </Button>
                   </div>
-                  {derivedAcceptedName.length === 0 ? (
+                  {frozenAcceptedName === null ? (
                     <div className="mt-2 flex flex-col items-center gap-2 text-center">
                       <p className="text-[11px] font-medium text-amber-700">
-                        Save the customer's name on the Customer tab before
-                        accepting this invoice.
-                      </p>
-                      {onGoToCustomer && (
-                        <Button
-                          type="button"
-                          variant="secondary"
-                          size="sm"
-                          onClick={onGoToCustomer}
-                        >
-                          Go to Customer tab
-                        </Button>
-                      )}
-                    </div>
-                  ) : derivedNameTooLong ? (
-                    <div className="mt-2 flex flex-col items-center gap-2 text-center">
-                      <p className="text-[11px] font-medium text-amber-700">
-                        The customer name is longer than{' '}
-                        {ACCEPTED_NAME_MAX_LENGTH} characters, so the invoice
-                        cannot be accepted. Shorten it on the Customer tab.
+                        This invoice has no customer name. Save the customer's
+                        name on the Customer tab, then rewrite the invoice before
+                        accepting it.
                       </p>
                       {onGoToCustomer && (
                         <Button
@@ -1142,8 +1149,7 @@ export function InvoiceTab({
                   resending ||
                   !hasInk ||
                   !allAcceptanceChecked ||
-                  derivedAcceptedName.length === 0 ||
-                  derivedNameTooLong ||
+                  frozenAcceptedName === null ||
                   !invoiceReadyForAcceptance
                 }
                 className="flex w-full items-center justify-center rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"

@@ -463,7 +463,12 @@ class QuoteAcceptedReadsTest {
         return orderId;
     }
 
-    /** Minimal UNSIGNED current invoice (v1) for the order — D.8 never reads the previous PDF bytes. */
+    /**
+     * Minimal UNSIGNED current invoice (v1) for the order — D.8 never reads the previous PDF bytes. It
+     * carries the Invoice To words a D.1 Create freezes from the seeded customer and BILLING row (16G
+     * PR 2), because D.8 copies them and, since 16G PR 3, takes its accepted name from the frozen
+     * {@code customer_name_snapshot} (a NULL one is refused with 422).
+     */
     private void insertUnsignedInvoice(long orderId) {
         long storedFileId = jdbcTemplate.queryForObject(
                 "INSERT INTO stored_file (file_name, storage_path, mime_type, file_size) "
@@ -474,19 +479,33 @@ class QuoteAcceptedReadsTest {
         jdbcTemplate.update(
                 "INSERT INTO invoice (order_id, version_number, invoice_date, due_date, "
                         + "details_of_sale_snapshot, sale_price_ex_gst, sale_price_inc_gst, total_paid, "
-                        + "balance_due, stored_file_id, created_by_user_id) "
+                        + "balance_due, stored_file_id, created_by_user_id, customer_name_snapshot, "
+                        + "customer_address_line1_snapshot, customer_address_line2_snapshot) "
                         + "VALUES (?, 1, CURRENT_DATE, CURRENT_DATE, 'Supply and lay carpet', "
-                        + "250.00, 275.00, 0.00, 275.00, ?, ?)",
-                orderId, storedFileId, USER_LIAM);
+                        + "250.00, 275.00, 0.00, 275.00, ?, ?, ?, '12 Test Street', 'Sydney NSW 2000')",
+                orderId, storedFileId, USER_LIAM, SNAPSHOT_NAME);
         clearJpaCache();
     }
 
-    /** The in-app invoice acceptance (D.8): signature + typed name, protected session. */
+    /** The order's CURRENT invoice version (the highest version_number), read from the database. */
+    private int currentInvoiceVersion(long orderId) {
+        Integer version = jdbcTemplate.queryForObject(
+                "SELECT MAX(version_number) FROM invoice WHERE order_id = ?", Integer.class, orderId);
+        Assertions.assertNotNull(version, "the order must have a current invoice to accept");
+        return version;
+    }
+
+    /**
+     * The in-app invoice acceptance (D.8, 16G PR 3 request): the signature part plus the mandatory
+     * {@code expected_version_number} = the order's current invoice version, read from the database when
+     * the request is built (state-derived); protected session. No name part: the accepted name is the
+     * current version's frozen {@code customer_name_snapshot} (the saved "Quote Tester" here).
+     */
     private void acceptInvoiceInApp(long orderId) throws Exception {
         clearJpaCache();
         mockMvc.perform(multipart(invoiceAcceptUrl(orderId))
                         .file(signaturePart(ONE_PIXEL_PNG))
-                        .param("accepted_customer_name", SNAPSHOT_NAME)
+                        .param("expected_version_number", String.valueOf(currentInvoiceVersion(orderId)))
                         .session(liamStore1Session()))
                 .andExpect(status().isCreated());
         clearJpaCache();

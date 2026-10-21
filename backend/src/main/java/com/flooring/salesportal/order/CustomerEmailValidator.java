@@ -43,6 +43,18 @@ public class CustomerEmailValidator {
     }
 
     /**
+     * Non-throwing form of {@link #requireValidCustomerEmail} (Phase 16G PR 3): {@code true} exactly
+     * when that gate would pass - the same null/blank check, the same trim and the same format rule.
+     * Path A has no email gate and uses this to decide whether its post-commit signed-PDF email can be
+     * addressed (otherwise the send is skipped); the throwing gate above is unchanged for D.1, D.2, D.8
+     * and D.9.
+     */
+    public boolean hasValidCustomerEmail(OrderCustomer customer) {
+        String email = customer == null ? null : customer.getEmail();
+        return email != null && !email.isBlank() && isPlausibleEmail(email.trim());
+    }
+
+    /**
      * Conservative format check on a trimmed, non-blank value: rejects a missing/duplicated {@code @},
      * a missing local part, a missing domain, a domain without an interior dot, and any interior
      * whitespace or control character.

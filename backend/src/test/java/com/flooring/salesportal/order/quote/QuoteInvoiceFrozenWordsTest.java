@@ -8,6 +8,7 @@ import com.flooring.salesportal.common.email.QuoteEmailRequest;
 import com.flooring.salesportal.common.email.RecordingInvoiceEmailSender;
 import com.flooring.salesportal.common.email.RecordingQuoteAcceptanceNotificationSender;
 import com.flooring.salesportal.common.email.RecordingQuoteEmailSender;
+import com.flooring.salesportal.common.sms.RecordingSmsSender;
 import com.flooring.salesportal.order.InvoiceRepository;
 import com.flooring.salesportal.order.InvoiceRepository.InvoiceRow;
 import com.flooring.salesportal.order.InvoiceTermsSanitizer;
@@ -49,7 +50,10 @@ import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.sql.Timestamp;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
@@ -110,6 +114,14 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  * services' rollback hooks delete the files they wrote under the storage root this class shares with the
  * other quote suites (inside this test's own business and order directories). The recording
  * senders are singletons, so they are reset before AND after every test.
+ *
+ * <p><b>Amended for Phase 16G PR 3</b> (#123; contract sections 5.5 and 6): every Path A request carries the
+ * mandatory {@code {"quote_version_id": N}} (N = the order's latest ACCEPTED quote version id, read from the
+ * database), and every successful Path A emails the signed PDF of the version it appended after the
+ * conversion: the delivered message, exactly one invoice email whose attachment is that version's stored
+ * PDF byte for byte (so it carries exactly the frozen words checked here), no quote email, store
+ * notification or SMS, and (in this transactional context) the success stamp on that version and the
+ * dashboard mirror. Payment and void still never email.
  */
 @ExtendWith(SpringExtension.class)
 // The SAME storage property as the other quote suites, so this class joins their cached Spring context
@@ -180,7 +192,9 @@ class QuoteInvoiceFrozenWordsTest {
     private static final String INVOICE_TO_HEADING = "INVOICE TO";
     private static final String NEXT_COLUMN_HEADING = "ISSUED / DUE";
 
-    private static final String CREATED_FROM_QUOTE_MESSAGE = "Invoice created from accepted quote.";
+    // 16G PR 3 (contract 6.1): the Path A 201 message when the post-commit signed-PDF email was delivered.
+    private static final String CREATED_FROM_QUOTE_MESSAGE =
+            "Invoice created from accepted quote and emailed to the customer.";
 
     /**
      * The InvoiceDetail keys PR 2 returns, ALWAYS present: the 20 Phase 12 / 13 / 16F keys plus the three
@@ -234,6 +248,10 @@ class QuoteInvoiceFrozenWordsTest {
     @Autowired
     private RecordingQuoteAcceptanceNotificationSender acceptanceNotificationSender;
 
+    // Path A never sends an SMS (16G PR 3 keeps it email only); SMS is dormant and recording-only.
+    @Autowired
+    private RecordingSmsSender smsSender;
+
     @PersistenceContext
     private EntityManager entityManager;
 
@@ -267,6 +285,7 @@ class QuoteInvoiceFrozenWordsTest {
         invoiceEmailSender.reset();
         quoteEmailSender.reset();
         acceptanceNotificationSender.reset();
+        smsSender.reset();
     }
 
     // ================================================================
@@ -566,12 +585,104 @@ class QuoteInvoiceFrozenWordsTest {
         return accepted;
     }
 
-    /** Path A: 201 with the exact message. */
+    /**
+     * Path A (16G PR 3): POST the mandatory {@code {"quote_version_id": N}}, N = the id of the order's latest
+     * ACCEPTED quote version read from the database (never hard-coded); 201 with the exact delivered message.
+     * The post-commit email is proven on every call: exactly ONE more invoice email - the appended version's
+     * stored PDF byte for byte (so exactly the words the tests check in that PDF), to the trimmed saved
+     * customer email - and no failed attempt, no quote email, no store notification and no SMS; and (this
+     * transactional context) the success stamp on the appended version, the dashboard mirror and the
+     * response.
+     */
     private MvcResult createInvoiceFromQuote(long orderId) throws Exception {
+        long acceptedQuoteVersionId = latestAcceptedQuoteVersionId(orderId);
+        SenderCounts before = senderCounts();
         MvcResult result = perform(post(quoteUrl(orderId, "create-invoice")).session(tenant.session())
-                .contentType(MediaType.APPLICATION_JSON).content("{}"), 201, "Path A create-invoice");
-        Assertions.assertEquals(CREATED_FROM_QUOTE_MESSAGE, readJson(result).path("message").asText());
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"quote_version_id\": " + acceptedQuoteVersionId + "}"),
+                201, "Path A create-invoice");
+        JsonNode json = readJson(result);
+        Assertions.assertEquals(CREATED_FROM_QUOTE_MESSAGE, json.path("message").asText());
+        int versionNumber = json.path("data").path("invoice").path("version_number").asInt();
+        Assertions.assertEquals(before.plusOneInvoiceEmail(), senderCounts(),
+                "Path A sends exactly one invoice email (its signed PDF) and nothing else");
+        List<InvoiceEmailRequest> sent = invoiceEmailSender.sentEmails();
+        assertSignedPdfEmail(orderId, versionNumber, sent.get(sent.size() - 1), "Path A");
+        assertBothMarkersStamped(orderId, versionNumber, result, "Path A");
         return result;
+    }
+
+    /** The id of the order's LATEST ACCEPTED quote version (highest version_number among ACCEPTED). */
+    private long latestAcceptedQuoteVersionId(long orderId) {
+        Long id = jdbcTemplate.queryForObject(
+                "SELECT quote_version_id FROM quote_version WHERE order_id = ? AND status = 'ACCEPTED' "
+                        + "ORDER BY version_number DESC LIMIT 1", Long.class, orderId);
+        Assertions.assertNotNull(id, "precondition: the order has an ACCEPTED quote version");
+        return id;
+    }
+
+    /** How many messages every recording sender holds (sent and failed): what one request sent is the difference. */
+    private record SenderCounts(int invoiceSent, int invoiceFailed, int quoteSent, int quoteFailed,
+                                int notificationsSent, int notificationsFailed, int smsSent, int smsFailed) {
+
+        /** The same counts plus exactly one more delivered invoice email. */
+        SenderCounts plusOneInvoiceEmail() {
+            return new SenderCounts(invoiceSent + 1, invoiceFailed, quoteSent, quoteFailed,
+                    notificationsSent, notificationsFailed, smsSent, smsFailed);
+        }
+    }
+
+    private SenderCounts senderCounts() {
+        return new SenderCounts(
+                invoiceEmailSender.sentEmails().size(), invoiceEmailSender.failedEmails().size(),
+                quoteEmailSender.sentEmails().size(), quoteEmailSender.failedEmails().size(),
+                acceptanceNotificationSender.sentNotifications().size(),
+                acceptanceNotificationSender.failedNotifications().size(),
+                smsSender.sentMessages().size(), smsSender.failedMessages().size());
+    }
+
+    /**
+     * One signed-PDF invoice email (16G contract 6.1): to the trimmed saved customer email, the standard
+     * subject and body for this tenant, and the stored PDF of invoice v{@code versionNumber} attached byte
+     * for byte under its own file name.
+     */
+    private void assertSignedPdfEmail(long orderId, int versionNumber, InvoiceEmailRequest email, String label)
+            throws IOException {
+        String orderNumber = jdbcTemplate.queryForObject(
+                "SELECT order_number FROM sales_order WHERE order_id = ?", String.class, orderId);
+        String savedEmail = jdbcTemplate.queryForObject(
+                "SELECT email FROM order_customer WHERE order_id = ?", String.class, orderId);
+        Assertions.assertNotNull(savedEmail, "precondition: a saved customer email");
+        Assertions.assertEquals(savedEmail.trim(), email.recipientEmail(), label + ": the trimmed saved customer email");
+        Assertions.assertEquals("Your invoice from " + BUSINESS_NAME, email.subject(), label + ": email subject");
+        Assertions.assertEquals("Hi,\n\nPlease find your invoice " + orderNumber + " from " + BUSINESS_NAME
+                + " attached.\n\nThank you.", email.bodyText(), label + ": email body");
+        Assertions.assertArrayEquals(invoicePdfFromDisk(orderId, versionNumber), email.pdfBytes(),
+                label + ": the attachment is invoice v" + versionNumber + "'s stored PDF, byte for byte");
+        Assertions.assertEquals("invoice-" + orderNumber + "-v" + versionNumber + ".pdf", email.pdfFileName(),
+                label + ": attachment file name");
+        Assertions.assertEquals(orderId, email.orderId(), label + ": email order id");
+        Assertions.assertEquals(versionNumber, email.invoiceVersionNumber(), label + ": email invoice version");
+    }
+
+    /**
+     * Delivered and stamped (this transactional context): invoice v{@code versionNumber}'s last_emailed_at
+     * is set, the sales_order mirror carries the SAME value (section 11.1), and the response's
+     * last_emailed_at shows it (formatted to the second).
+     */
+    private void assertBothMarkersStamped(long orderId, int versionNumber, MvcResult result, String label)
+            throws IOException {
+        Object stamp = invoiceRow(orderId, versionNumber).get("last_emailed_at");
+        Assertions.assertNotNull(stamp, label + ": the appended version's last_emailed_at is stamped");
+        Timestamp invoiceStamp = (Timestamp) stamp;
+        Assertions.assertEquals(invoiceStamp, jdbcTemplate.queryForObject(
+                        "SELECT last_emailed_at FROM sales_order WHERE order_id = ?", Timestamp.class, orderId),
+                label + ": the dashboard mirror carries the same stamp");
+        JsonNode responseStamp = readJson(result).path("data").path("invoice").path("last_emailed_at");
+        Assertions.assertTrue(responseStamp.isTextual(),
+                () -> label + ": the response's last_emailed_at must be the stamp but was " + responseStamp);
+        Assertions.assertEquals(invoiceStamp.toLocalDateTime().truncatedTo(ChronoUnit.SECONDS),
+                LocalDateTime.parse(responseStamp.asText()), label + ": the response's last_emailed_at");
     }
 
     /** D.1 Create (empty body). */
@@ -1168,7 +1279,8 @@ class QuoteInvoiceFrozenWordsTest {
      * inherited acceptance (accepted_at, accepted name, the SAME signature stored_file), report them on D.3
      * (QUOTE) and render them in their own stored PDFs: Invoice To, the frozen hard terms on page 2, the
      * inherited caption and the quote's signature pixels. The payment and void responses keep the unchanged
-     * E.1 shape. A D.9 resend then answers with v3's words and emails v3's stored PDF verbatim. The Path A
+     * E.1 shape, and neither emails (16G PR 3: Path A's own signed-PDF email is the only one before the
+     * resend). A D.9 resend then answers with v3's words and emails v3's stored PDF verbatim. The Path A
      * row and its PDF never change, and no live or later word appears in any row, body or PDF.
      *
      * <p>Fails on 16F: payment and void re-rendered Invoice To from the live customer and BILLING address
@@ -1192,6 +1304,12 @@ class QuoteInvoiceFrozenWordsTest {
         Map<String, Object> pathARow = invoiceRow(orderId, 1);
         Assertions.assertEquals(pathAWords, wordsOfInvoiceRow(pathARow), "precondition: Path A froze the quote's words");
         byte[] pathAPdf = invoicePdfFromDisk(orderId, 1);
+        // 16G PR 3: Path A emailed v1's signed PDF (proven in full by createInvoiceFromQuote); from here on the
+        // payment and the void add no email and the resend exactly one.
+        List<InvoiceEmailRequest> emailsAfterPathA = invoiceEmailSender.sentEmails();
+        Assertions.assertEquals(1, emailsAfterPathA.size(), "precondition: Path A's one signed-PDF email");
+        Assertions.assertArrayEquals(pathAPdf, emailsAfterPathA.get(0).pdfBytes(),
+                "precondition: Path A emailed the PDF carrying its frozen words");
 
         // Further live edits AFTER the conversion.
         saveLiveIdentity(orderId, LIVE_LATER);
@@ -1209,7 +1327,9 @@ class QuoteInvoiceFrozenWordsTest {
         MvcResult voided = voidPayment(orderId, latestPaymentId(orderId));
         assertCurrentInvoiceSummaryUnchanged(voided, 3, "void");
         assertCopiedPathAVersion(orderId, 3, pathARow, pathAWords, storedSignature, forbidden, "void v3");
-        Assertions.assertTrue(invoiceEmailSender.sentEmails().isEmpty(), "payment and void never email");
+        Assertions.assertEquals(emailsAfterPathA, invoiceEmailSender.sentEmails(),
+                "payment and void never email (the only invoice email is Path A's own)");
+        Assertions.assertTrue(invoiceEmailSender.failedEmails().isEmpty(), "payment and void never attempt an email");
 
         // ---- D.9 resend: v3's words in the response; v3's stored PDF emailed verbatim ----
         MvcResult resent = resendInvoice(orderId);
@@ -1217,8 +1337,8 @@ class QuoteInvoiceFrozenWordsTest {
         Assertions.assertEquals(pathAWords, wordsOfDetail(resentDetail), "D.9: the copied words");
         assertNoneOf(body(resent), forbidden, "D.9 response");
         List<InvoiceEmailRequest> sent = invoiceEmailSender.sentEmails();
-        Assertions.assertEquals(1, sent.size(), "D.9 emails exactly once");
-        Assertions.assertArrayEquals(invoicePdfFromDisk(orderId, 3), sent.get(0).pdfBytes(),
+        Assertions.assertEquals(emailsAfterPathA.size() + 1, sent.size(), "D.9 emails exactly once");
+        Assertions.assertArrayEquals(invoicePdfFromDisk(orderId, 3), sent.get(sent.size() - 1).pdfBytes(),
                 "D.9 attaches v3's stored PDF verbatim");
 
         // ---- Append-only: earlier rows and PDFs never change ----

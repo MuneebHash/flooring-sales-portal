@@ -11,6 +11,7 @@ import com.flooring.salesportal.common.error.MalformedJsonException;
 import com.flooring.salesportal.common.error.NotFoundException;
 import com.flooring.salesportal.common.error.ValidationException;
 import com.flooring.salesportal.common.storage.FileStorageService;
+import com.flooring.salesportal.common.token.TokenHash;
 import com.flooring.salesportal.order.SalesOrder;
 import com.flooring.salesportal.order.SalesOrderRepository;
 import com.flooring.salesportal.order.quote.QuoteVersionRepository.QuoteFile;
@@ -29,10 +30,8 @@ import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
-import java.util.HexFormat;
 import java.util.Iterator;
 import java.util.List;
 import java.util.regex.Pattern;
@@ -237,7 +236,7 @@ public class PublicQuoteService {
         if (token == null || !TOKEN_SHAPE.matcher(token).matches()) {
             throw tokenNotFound();
         }
-        String presentedHash = sha256Hex(token);
+        String presentedHash = TokenHash.sha256Hex(token);
 
         ResolvedToken resolved = inTx(() -> {
             QuoteTokenRow row = quoteVersionRepository.findTokenByHash(presentedHash).orElse(null);
@@ -457,16 +456,6 @@ public class PublicQuoteService {
 
     private <T> T inTx(java.util.function.Supplier<T> work) {
         return transactionTemplate.execute(status -> work.get());
-    }
-
-    /** SHA-256 hex of the presented token — matches QuoteSendService's stored-hash derivation. */
-    private static String sha256Hex(String plainToken) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            return HexFormat.of().formatHex(digest.digest(plainToken.getBytes(StandardCharsets.UTF_8)));
-        } catch (NoSuchAlgorithmException e) {
-            throw new IllegalStateException("SHA-256 unavailable", e);
-        }
     }
 
     private static BigDecimal money(BigDecimal value) {

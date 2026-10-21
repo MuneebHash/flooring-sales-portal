@@ -534,22 +534,32 @@ export async function fetchAcceptedQuoteSignature(
 // POST /api/v1/{slug}/orders/{orderId}/quote/create-invoice - Phase 16F Path A:
 // create an invoice version from the order's LATEST accepted quote, inheriting
 // its signature (the customer does not sign again) and carrying the recorded
-// payments. The body MUST be exactly {}: the SERVER selects the quote version, so
-// no version selector, price, terms or signature reference is ever sent (any
-// field is a 400 VALIDATION_FAILED). Distinct name from
-// orderInvoicesApi.createInvoice (the Details of Sale Path B create).
-// 201; `data.invoice` is the new InvoiceDetail (accepted, terms_source QUOTE)
-// and `message` is "Invoice created from accepted quote.". No email is sent.
-// Allowed when LAID.
-// Errors: 404 ORDER_NOT_FOUND; 409 INVOICE_ALREADY_ACCEPTED (the current invoice
-// was signed at the same time or later than the quote); 422 QUOTE_NOT_ACCEPTED /
-// INVOICE_PRECONDITIONS_NOT_MET (details[] of {section, field, message}) /
-// BUSINESS_RULE_VIOLATION (recorded payments exceed the accepted quote total).
+// payments. The SERVER selects the quote version. Since 16G PR 3 the body is
+// exactly {"quote_version_id": N}: the accepted version the open confirmation
+// shows, which the server only COMPARES with the latest accepted version (409
+// QUOTE_VERSION_STALE when another version is the latest accepted now). No other
+// field (price, terms, signature reference) is ever sent - any is a 400
+// VALIDATION_FAILED, as is a missing or non-positive-integer id. Distinct name
+// from orderInvoicesApi.createInvoice (the Details of Sale Path B create).
+// 201; `data.invoice` is the new InvoiceDetail (accepted, terms_source QUOTE).
+// After commit the server emails the signed PDF to the saved customer email (no
+// email gate), and `message` says what happened: "Invoice created from accepted
+// quote and emailed to the customer.", or that it could not be emailed, or that
+// it was not emailed because the customer has no valid email address (Re-send
+// Invoice retries either). Show it verbatim; the email state itself comes from
+// last_emailed_at. Allowed when LAID.
+// Errors: 404 ORDER_NOT_FOUND; 409 QUOTE_VERSION_STALE ("The accepted quote
+// changed while the confirmation was open. ...") / INVOICE_ALREADY_ACCEPTED (the
+// current invoice was signed at the same time or later than the quote); 422
+// QUOTE_NOT_ACCEPTED / INVOICE_PRECONDITIONS_NOT_MET (details[] of {section,
+// field, message}) / BUSINESS_RULE_VIOLATION (recorded payments exceed the
+// accepted quote total); 400 VALIDATION_FAILED / MALFORMED_JSON.
 export function createInvoiceFromQuote(
   orderId: number,
+  quoteVersionId: number,
 ): Promise<ApiSuccess<InvoiceResponse>> {
   return post<ApiSuccess<InvoiceResponse>>(
     apiPath(getActiveSlug(), `/orders/${orderId}/quote/create-invoice`),
-    {},
+    { quote_version_id: quoteVersionId },
   )
 }

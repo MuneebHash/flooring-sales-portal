@@ -54,6 +54,7 @@ import java.sql.SQLException;
 import java.sql.Statement;
 import java.sql.Timestamp;
 import java.time.LocalDate;
+import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -123,12 +124,30 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  * always shut down (try-with-resources {@link Race}); a straggler is cancelled as a last resort, and
  * only if it is a request backend this race observed queued on its own order row.
  *
+ * <p><b>16G PR 3.</b> Every request carries its mandatory version precondition, captured from committed
+ * state BEFORE the race (what its client saw): Path A the body {@code {"quote_version_id": N}} (the latest
+ * ACCEPTED quote version, v1 here), D.8 the multipart field {@code expected_version_number} (no name part:
+ * D.8's accepted name is the current version's frozen {@code customer_name_snapshot}). The server only
+ * COMPARES them with the rows it reads under the order lock, so the D.8 queued behind a winning Path A and
+ * still carrying v1 is now refused with 409 {@code INVOICE_VERSION_STALE}. (D.8's already-accepted check under
+ * the lock - D.8 carrying the version Path A appends - is proven on a self-seeded tenant by
+ * {@code InvoiceVersionPreconditionConcurrencyIntegrationTest
+ * #d8_pathAQueuedAheadAppendsTheVersionD8Carries_passesTheStaleCheckUnderTheLock_409InvoiceAlreadyAccepted_writesNothing}.)
+ * A successful Path A now emails the PDF of the version it appended after its commit, exactly like D.8, and
+ * its 201 message says so; the success stamp ({@code invoice.last_emailed_at} + the {@code sales_order} mirror)
+ * runs in a short follow-up transaction that re-takes the order lock. In the Path-A-first payment race that
+ * stamp therefore competes with the queued payment, but whichever commits first, the Path A 201 describes the
+ * version Path A appended - re-read in the stamp transaction, with its own {@code last_emailed_at} (16G contract
+ * §6.2) - while the mirror follows the current version.
+ *
  * <p>Every race asserts the HTTP outcomes, the committed invoice versions (consecutive, exactly the
  * expected new rows), the V19 source / frozen terms and the inherited acceptance on every Path A row,
  * the words every writer froze or copied (16G PR 2: the Invoice To and the terms, on the row and in
  * its InvoiceDetail), the untouched quote / order / content rows, the payment row, the stored_file
  * rows against the files on disk (exactly the expected set, no orphan, none missing, sizes equal), the
- * invoice PDF content, the recorded emails and the workspace {@code invoice_eligible} read.
+ * invoice PDF content, the email markers, the recorded emails (16G PR 3: exactly one signed-PDF email per
+ * race, from its winning signer or converter, never from a payment or a refused request) and the workspace
+ * {@code invoice_eligible} read.
  */
 @ExtendWith(SpringExtension.class)
 @SpringBootTest(properties = "app.storage.base-dir=target/test-storage/quote-acceptance")
@@ -185,7 +204,11 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
     private static final String CHANGED_NON_ITEMISED_DRAFT =
             "{\"itemised\": false, \"final_total_inc_gst\": 330.00, \"lines\": []}";
 
-    private static final String PATH_A_CREATED_MESSAGE = "Invoice created from accepted quote.";
+    // 16G PR 3: a converted Path A emails the version it appended after its commit; the 201 reports delivery.
+    private static final String PATH_A_EMAILED_MESSAGE =
+            "Invoice created from accepted quote and emailed to the customer.";
+    // 16G PR 3 (contract §5.1): the D.8 stale refusal, exactly.
+    private static final String INVOICE_VERSION_STALE_MESSAGE = "Invoice updated, please refresh";
     private static final String PATH_A_SIGNATURE_PRECEDENCE_MESSAGE =
             "The current invoice was signed at the same time or later than this quote. "
                     + "A newer signed quote is required to create an invoice from a quote.";
@@ -349,14 +372,21 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         ConvertibleOrder order = seedConvertibleOrder(true);
         OrderState before = orderState(order.orderId());
         Map<String, Object> invoiceV1 = invoiceRow(order.orderId(), 1);
+        // 16G PR 3: each request carries what its client saw BEFORE the race - D.8 the current invoice version,
+        // Path A the latest ACCEPTED quote version id - and the server only compares them under the order lock.
+        // D.8 (queue head) finds v1 still current; it never changes the accepted quote, so Path A's id still
+        // matches when Path A takes the lock after it.
+        int seenInvoiceVersion = currentInvoiceVersion(order.orderId());
+        LocalDateTime raceStart = LocalDateTime.now();
 
         MvcResult invoiceAcceptResult;
         MvcResult pathAResult;
         try (Race race = new Race(order.orderId())) {
-            Future<MvcResult> invoiceAccept = race.submit(invoiceAccept(order.orderId()));
+            Future<MvcResult> invoiceAccept = race.submit(invoiceAccept(order.orderId(), seenInvoiceVersion));
             int invoiceAcceptPid = awaitWaiterBlockedBy(race, race.holderPid(), "in-app invoice accept (D.8)",
                     invoiceAccept);
-            Future<MvcResult> pathA = race.submit(createInvoiceFromQuote(order.orderId()));
+            Future<MvcResult> pathA = race.submit(
+                    createInvoiceFromQuote(order.orderId(), order.acceptedQuoteVersionId()));
             int pathAPid = awaitWaiterBlockedBy(race, invoiceAcceptPid, "create invoice from quote (Path A)", pathA,
                     invoiceAccept);
             assertQueuedInOrder(race.holderPid(), invoiceAcceptPid, pathAPid, invoiceAccept, pathA);
@@ -380,7 +410,8 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         Assertions.assertEquals(CUSTOMER_NAME, signedInvoice.path("accepted_customer_name").asText());
         Assertions.assertEquals("BUSINESS", signedInvoice.path("terms_source").asText(),
                 "a D.8 version of a Path B invoice has no quote source, so its terms source is BUSINESS");
-        // Path A ran only after D.8 committed: the current invoice is signed LATER than the quote -> 409.
+        // Path A ran only after D.8 committed: its quote version id still matched the latest ACCEPTED v1, but the
+        // current invoice is now signed LATER than the quote -> the Path A signature-precedence 409.
         assertPathARefused(pathAResult, "Path A (queued behind D.8)");
 
         // Exactly ONE new invoice version (D.8's v2); v1 is never rewritten.
@@ -393,12 +424,16 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         Assertions.assertTrue(invoiceAcceptedAt.after(order.quoteAcceptedAt()),
                 () -> "the D.8 signature time " + invoiceAcceptedAt
                         + " must be strictly later than the quote signature time " + order.quoteAcceptedAt());
+        // 16G PR 3: the accepted name is v1's FROZEN Invoice To name (no name part is sent any more).
         Assertions.assertEquals(CUSTOMER_NAME, invoiceV2.get("accepted_customer_name"), "D.8 accepted name");
+        Assertions.assertEquals(invoiceV1.get("customer_name_snapshot"), invoiceV2.get("accepted_customer_name"),
+                "D.8's accepted name IS the current version's frozen customer_name_snapshot");
         Assertions.assertNull(invoiceV2.get("source_quote_version_id"), "D.8 carries v1's null quote source");
         // 16G PR 2: D.8 also copies v1's words verbatim - the Invoice To and the business terms D.1 froze
-        // (null when the business set none) - never the quote's V17 snapshot or frozen terms.
-        for (String carried : List.of("details_of_sale_snapshot", "sale_price_ex_gst", "sale_price_inc_gst",
-                "total_paid", "balance_due", "due_date", "customer_name_snapshot",
+        // (null when the business set none) - never the quote's V17 snapshot or frozen terms. 16G PR 3: and
+        // v1's invoice_date (the signing time lives in accepted_at only).
+        for (String carried : List.of("invoice_date", "details_of_sale_snapshot", "sale_price_ex_gst",
+                "sale_price_inc_gst", "total_paid", "balance_due", "due_date", "customer_name_snapshot",
                 "customer_address_line1_snapshot", "customer_address_line2_snapshot", "terms_snapshot")) {
             Assertions.assertEquals(invoiceV1.get(carried), invoiceV2.get(carried),
                     "D.8 carries v1's " + carried + " forward (never the quote snapshot)");
@@ -416,10 +451,11 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         Assertions.assertArrayEquals(ONE_PIXEL_PNG,
                 Files.readAllBytes(physicalPath((String) d8Signature.get("storage_path"))),
                 "D.8 stores the uploaded signature bytes on disk");
-        Timestamp emailedAt = (Timestamp) invoiceV2.get("last_emailed_at");
-        Assertions.assertNotNull(emailedAt, "D.8's post-commit auto-email succeeded and stamped v2");
-        Assertions.assertEquals(emailedAt, orderLastEmailedAt(order.orderId()),
-                "the sales_order mirror equals the current invoice's last_emailed_at");
+        // D.8's post-commit email succeeded and was stamped on v2 and the sales_order mirror; its 201 carries
+        // the stamp (the refused Path A wrote nothing, so the stamp's re-read current row is v2).
+        Timestamp emailedAt = assertOnlyVersionEmailed(order.orderId(), 2, true, raceStart);
+        Assertions.assertEquals(JSON_TIMESTAMP.format(emailedAt.toLocalDateTime()),
+                signedInvoice.path("last_emailed_at").asText(), "D.8's 201 carries its stamped last_emailed_at");
 
         // D5(c): D.8 cancelled the ISSUED quote v2 and its ACTIVE token at the invoice acceptance instant.
         // Nothing else on the quote / order layer moved (Path A wrote nothing at all).
@@ -454,18 +490,8 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
                 invoicePdfName(order.orderNumber(), 2));
         assertStoredFileDiskParity(order.orderId());
 
-        // Emails: exactly D.8's auto-email of its own signed v2 (Path A never emails).
-        Assertions.assertTrue(invoiceEmailSender.failedEmails().isEmpty(), "no failed invoice email");
-        List<InvoiceEmailRequest> invoiceEmails = invoiceEmailSender.sentEmails();
-        Assertions.assertEquals(1, invoiceEmails.size(), "only D.8's post-commit auto-email was sent");
-        InvoiceEmailRequest email = invoiceEmails.get(0);
-        Assertions.assertEquals(2, email.invoiceVersionNumber(), "D.8 emailed its v2");
-        Assertions.assertEquals(order.orderId(), email.orderId());
-        Assertions.assertEquals(CUSTOMER_EMAIL, email.recipientEmail());
-        Assertions.assertEquals(invoicePdfName(order.orderNumber(), 2), email.pdfFileName());
-        Assertions.assertArrayEquals(invoicePdfBytes(order, 2), email.pdfBytes(),
-                "the emailed PDF is the stored v2 PDF");
-        assertNoQuoteEmailNotificationOrSms();
+        // Emails: exactly D.8's post-commit email of its own signed v2 (the refused Path A sent nothing).
+        assertExactlyOneSignedInvoiceEmail(order, 2, "D.8's post-commit email");
         assertInvoiceEligible(order.orderId(), false);
     }
 
@@ -473,55 +499,74 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
     // 2. Path A vs in-app invoice acceptance (D.8) - Path A locks first
     // ================================================================
 
+    /**
+     * 16G PR 3: D.8 carries the invoice version its client saw before the race - v1, the version Path A
+     * replaces while D.8 waits. Under the lock D.8 re-reads the current invoice (Path A's v2), so the stale
+     * check refuses it with 409 {@code INVOICE_VERSION_STALE} - BEFORE the already-accepted check (16G contract
+     * §5.4 steps 5 and 6) - and it writes nothing: no signature, invoice version, PDF, D5(c) cancel, marker or
+     * email. (Before PR 3 the same race gave D.8's already-accepted 409; that check under the lock - D.8
+     * carrying the version Path A appends - is proven on a self-seeded tenant by
+     * {@code InvoiceVersionPreconditionConcurrencyIntegrationTest
+     * #d8_pathAQueuedAheadAppendsTheVersionD8Carries_passesTheStaleCheckUnderTheLock_409InvoiceAlreadyAccepted_writesNothing}.)
+     */
     @Test
-    void pathAVsInvoiceAccept_pathALocksFirst_pathAConvertsAcceptedQuote_d8Gets409AlreadyAccepted_issuedQuoteUntouched_noD8Signature()
+    void pathAVsInvoiceAccept_pathALocksFirst_pathAConvertsAndEmails_d8CarryingThePreviousVersionGets409VersionStale_issuedQuoteUntouched_noD8Signature()
             throws Exception {
         ConvertibleOrder order = seedConvertibleOrder(true);
         OrderState before = orderState(order.orderId());
         Map<String, Object> invoiceV1 = invoiceRow(order.orderId(), 1);
+        // 16G PR 3: the invoice version the D.8 client saw before the race - v1, the version Path A replaces.
+        int seenInvoiceVersion = currentInvoiceVersion(order.orderId());
+        Assertions.assertEquals(1, seenInvoiceVersion, "setup: the D.8 client sees invoice v1");
         LocalDate dayBefore = LocalDate.now();
+        LocalDateTime raceStart = LocalDateTime.now();
+        String d8Label = "D.8 (queued behind Path A, carrying v1)";
 
         MvcResult pathAResult;
         MvcResult invoiceAcceptResult;
         try (Race race = new Race(order.orderId())) {
-            Future<MvcResult> pathA = race.submit(createInvoiceFromQuote(order.orderId()));
+            Future<MvcResult> pathA = race.submit(
+                    createInvoiceFromQuote(order.orderId(), order.acceptedQuoteVersionId()));
             int pathAPid = awaitWaiterBlockedBy(race, race.holderPid(), "create invoice from quote (Path A)", pathA);
-            Future<MvcResult> invoiceAccept = race.submit(invoiceAccept(order.orderId()));
-            int invoiceAcceptPid = awaitWaiterBlockedBy(race, pathAPid, "in-app invoice accept (D.8)", invoiceAccept,
-                    pathA);
+            Future<MvcResult> invoiceAccept = race.submit(invoiceAccept(order.orderId(), seenInvoiceVersion));
+            int invoiceAcceptPid = awaitWaiterBlockedBy(race, pathAPid, d8Label, invoiceAccept, pathA);
             assertQueuedInOrder(race.holderPid(), pathAPid, invoiceAcceptPid, pathA, invoiceAccept);
 
             race.rollbackHolder();
 
             pathAResult = awaitResponse(pathA, "create invoice from quote (Path A)");
-            invoiceAcceptResult = awaitResponse(invoiceAccept, "in-app invoice accept (D.8)");
+            invoiceAcceptResult = awaitResponse(invoiceAccept, d8Label);
         }
         LocalDate dayAfter = LocalDate.now();
 
-        // Path A (queue head) appended v2 from the accepted quote v1, inheriting its signature.
+        // Path A (queue head) appended v2 from the accepted quote v1, inheriting its signature, and emailed it.
         assertPathACreated(pathAResult, order, 2, "0.00", QUOTE_TOTAL_INC, "Path A (queue head)");
-        // D.8 re-read the current invoice under the lock: v2 is already signed -> its own default 409.
-        assertErrorResponse(invoiceAcceptResult, 409, ErrorCode.INVOICE_ALREADY_ACCEPTED, "D.8 (queued behind Path A)");
+        // D.8 re-read the current invoice under the lock (Path A's v2) and refused the v1 it carries.
+        assertErrorResponse(invoiceAcceptResult, 409, ErrorCode.INVOICE_VERSION_STALE, d8Label);
+        JsonNode d8Error = json(invoiceAcceptResult).path("error");
+        Assertions.assertEquals(INVOICE_VERSION_STALE_MESSAGE, d8Error.path("message").asText(),
+                d8Label + ": exact message");
+        Assertions.assertFalse(d8Error.has("details"), d8Label + ": a 409 carries no details");
 
         Assertions.assertEquals(List.of(1, 2), invoiceVersions(order.orderId()),
                 "exactly one new invoice version (Path A's); D.8 appended nothing");
         Assertions.assertEquals(invoiceV1, invoiceRow(order.orderId(), 1), "invoice v1 is never rewritten");
         assertQuoteBilledInvoiceRow(order, 2, "0.00", QUOTE_TOTAL_INC, dayBefore, dayAfter);
 
-        // Path A never touches the quote layer: the ISSUED v2 and its ACTIVE token stand (only a
-        // successful D.8 cancels a link, and D.8 lost). Nothing else on the order moved either.
+        // Path A never touches the quote layer and the refused D.8 never reached its D5(c) cancel: the ISSUED v2
+        // and its ACTIVE token stand (only a successful D.8 cancels a link). Nothing else on the order moved.
         OrderState after = orderState(order.orderId());
         assertNothingElseMoved(before, after, "after Path A won and D.8 was refused");
         Assertions.assertEquals("ISSUED", versionRow(order.orderId(), 2).get("status"),
-                "the newer ISSUED quote v2 is untouched by Path A");
+                "the newer ISSUED quote v2 is untouched by Path A and by the refused D.8");
         Map<String, Object> issuedToken = tokenRow(order.issuedToken());
         Assertions.assertEquals("ACTIVE", issuedToken.get("status"), "the v2 link stays ACTIVE");
         Assertions.assertNull(issuedToken.get("dead_at"), "the v2 link carries no dead_at");
         Assertions.assertTrue(after.payments().isEmpty(), "no payment exists");
-        Assertions.assertNull(orderLastEmailedAt(order.orderId()),
-                "the sales_order mirror is the unemailed Path A version's null");
+        // The markers are exactly Path A's post-commit stamp of v2 (the current version, so the mirror follows).
+        assertOnlyVersionEmailed(order.orderId(), 2, true, raceStart);
 
-        // The losing D.8 wrote nothing: no signature stored_file row and no file.
+        // The refused D.8 wrote nothing: no signature stored_file row and no file.
         Assertions.assertEquals(0, count("SELECT COUNT(*) FROM stored_file WHERE storage_path LIKE ? "
                         + "AND file_name LIKE 'signature-%'", orderStoragePrefix(order.orderId()) + "%"),
                 "the refused D.8 stored no signature row");
@@ -536,7 +581,8 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         assertStoredFileDiskParity(order.orderId());
         assertQuoteBilledInvoicePdf(order, 2, "0.00", QUOTE_TOTAL_INC);
 
-        assertNoEmailAtAll();
+        // Emails: exactly Path A's post-commit signed-PDF email of its v2; the refused D.8 sent nothing.
+        assertExactlyOneSignedInvoiceEmail(order, 2, "Path A's post-commit email");
         assertInvoiceEligible(order.orderId(), false);
     }
 
@@ -551,13 +597,17 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         OrderState before = orderState(order.orderId());
         Map<String, Object> invoiceV1 = invoiceRow(order.orderId(), 1);
         LocalDate dayBefore = LocalDate.now();
+        LocalDateTime raceStart = LocalDateTime.now();
 
         MvcResult paymentResult;
         MvcResult pathAResult;
         try (Race race = new Race(order.orderId())) {
             Future<MvcResult> payment = race.submit(recordPayment(order.orderId()));
             int paymentPid = awaitWaiterBlockedBy(race, race.holderPid(), "record payment (D.7)", payment);
-            Future<MvcResult> pathA = race.submit(createInvoiceFromQuote(order.orderId()));
+            // 16G PR 3: the accepted quote version id the Path A client saw; a payment never changes the accepted
+            // quote, so it still matches under the lock.
+            Future<MvcResult> pathA = race.submit(
+                    createInvoiceFromQuote(order.orderId(), order.acceptedQuoteVersionId()));
             int pathAPid = awaitWaiterBlockedBy(race, paymentPid, "create invoice from quote (Path A)", pathA, payment);
             assertQueuedInOrder(race.holderPid(), paymentPid, pathAPid, payment, pathA);
 
@@ -570,7 +620,8 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
 
         // The payment (queue head) receipts the unsigned Path B v1: v2 = 110.00 - 50.00 = 60.00 due.
         assertPaymentRecorded(paymentResult, 2, PAYMENT_AMOUNT, "60.00", false, "record payment (queue head)");
-        // Path A then bills the QUOTE total net of the committed payment: v3 = 275.00 - 50.00 = 225.00.
+        // Path A then bills the QUOTE total net of the committed payment: v3 = 275.00 - 50.00 = 225.00, emailed
+        // after its commit (nothing is queued behind it, so its 201 is the stamped v3).
         assertPathACreated(pathAResult, order, 3, PAYMENT_AMOUNT, "225.00", "Path A (queued behind the payment)");
 
         Assertions.assertEquals(List.of(1, 2, 3), invoiceVersions(order.orderId()), "consecutive versions 1..3");
@@ -593,7 +644,8 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         OrderState after = orderState(order.orderId());
         assertNothingElseMoved(before, after, "after the payment then Path A");
         assertSingleActivePayment(after);
-        Assertions.assertNull(orderLastEmailedAt(order.orderId()), "no version was ever emailed");
+        // Only Path A's v3 was emailed (a payment never emails); v3 is current, so the mirror follows it.
+        assertOnlyVersionEmailed(order.orderId(), 3, true, raceStart);
 
         assertSingleSignatureIsTheQuotes(order, List.of(3));
         assertStoredArtifacts(order.orderId(),
@@ -606,7 +658,7 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         assertStoredFileDiskParity(order.orderId());
         assertQuoteBilledInvoicePdf(order, 3, PAYMENT_AMOUNT, "225.00");
 
-        assertNoEmailAtAll();
+        assertExactlyOneSignedInvoiceEmail(order, 3, "Path A's post-commit email");
         assertInvoiceEligible(order.orderId(), false);
     }
 
@@ -621,11 +673,13 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         OrderState before = orderState(order.orderId());
         Map<String, Object> invoiceV1 = invoiceRow(order.orderId(), 1);
         LocalDate dayBefore = LocalDate.now();
+        LocalDateTime raceStart = LocalDateTime.now();
 
         MvcResult pathAResult;
         MvcResult paymentResult;
         try (Race race = new Race(order.orderId())) {
-            Future<MvcResult> pathA = race.submit(createInvoiceFromQuote(order.orderId()));
+            Future<MvcResult> pathA = race.submit(
+                    createInvoiceFromQuote(order.orderId(), order.acceptedQuoteVersionId()));
             int pathAPid = awaitWaiterBlockedBy(race, race.holderPid(), "create invoice from quote (Path A)", pathA);
             Future<MvcResult> payment = race.submit(recordPayment(order.orderId()));
             int paymentPid = awaitWaiterBlockedBy(race, pathAPid, "record payment (D.7)", payment, pathA);
@@ -638,7 +692,12 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         }
         LocalDate dayAfter = LocalDate.now();
 
-        // Path A (queue head) appended v2 from the quote with nothing paid yet.
+        // Path A (queue head) appended v2 from the quote with nothing paid yet and emailed v2 after its commit.
+        // 16G PR 3: the success stamp runs in its OWN short transaction that re-takes the order lock, so it
+        // competes with the payment already queued on that lock (usually the payment commits v3 first). Either
+        // way the 201 describes the version Path A appended: after the recorded delivery the stamp transaction
+        // re-reads v2 itself (16G contract §6.2), so the 201 carries v2 with v2's own last_emailed_at - never
+        // the payment's unemailed v3.
         assertPathACreated(pathAResult, order, 2, "0.00", QUOTE_TOTAL_INC, "Path A (queue head)");
         // The payment then receipts the Path A v2 (the latest official balance 275.00): 225.00 due.
         assertPaymentRecorded(paymentResult, 3, PAYMENT_AMOUNT, "225.00", true, "record payment (queued behind Path A)");
@@ -673,7 +732,9 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         OrderState after = orderState(order.orderId());
         assertNothingElseMoved(before, after, "after Path A then the payment");
         assertSingleActivePayment(after);
-        Assertions.assertNull(orderLastEmailedAt(order.orderId()), "no version was ever emailed");
+        // In both orders only Path A's v2 carries the stamp of the one delivered email, and the mirror is the
+        // current, unemailed payment v3's null (the payment reset it, or the stamp re-read v3 for it).
+        assertOnlyVersionEmailed(order.orderId(), 2, false, raceStart);
 
         assertSingleSignatureIsTheQuotes(order, List.of(2, 3));
         assertStoredArtifacts(order.orderId(),
@@ -688,7 +749,8 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         assertQuoteBilledInvoicePdf(order, 2, "0.00", QUOTE_TOTAL_INC);
         assertQuoteBilledInvoicePdf(order, 3, PAYMENT_AMOUNT, "225.00");
 
-        assertNoEmailAtAll();
+        // Exactly Path A's post-commit email of its own v2 (the payment never emails, even a signed version).
+        assertExactlyOneSignedInvoiceEmail(order, 2, "Path A's post-commit email");
         assertInvoiceEligible(order.orderId(), false);
     }
 
@@ -703,13 +765,17 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         OrderState before = orderState(order.orderId());
         Map<String, Object> invoiceV1 = invoiceRow(order.orderId(), 1);
         LocalDate dayBefore = LocalDate.now();
+        LocalDateTime raceStart = LocalDateTime.now();
 
         MvcResult firstResult;
         MvcResult secondResult;
         try (Race race = new Race(order.orderId())) {
-            Future<MvcResult> first = race.submit(createInvoiceFromQuote(order.orderId()));
+            // 16G PR 3: both clients saw the same latest ACCEPTED quote v1 and carry its id.
+            Future<MvcResult> first = race.submit(
+                    createInvoiceFromQuote(order.orderId(), order.acceptedQuoteVersionId()));
             int firstPid = awaitWaiterBlockedBy(race, race.holderPid(), "Path A request 1", first);
-            Future<MvcResult> second = race.submit(createInvoiceFromQuote(order.orderId()));
+            Future<MvcResult> second = race.submit(
+                    createInvoiceFromQuote(order.orderId(), order.acceptedQuoteVersionId()));
             int secondPid = awaitWaiterBlockedBy(race, firstPid, "Path A request 2", second, first);
             assertQueuedInOrder(race.holderPid(), firstPid, secondPid, first, second);
 
@@ -721,8 +787,9 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         LocalDate dayAfter = LocalDate.now();
 
         assertPathACreated(firstResult, order, 2, "0.00", QUOTE_TOTAL_INC, "Path A request 1 (queue head)");
-        // The duplicate re-read the current invoice under the lock: v2 carries the SAME signature time as
-        // the quote (Path A copies it), and a tie never replaces a signed invoice.
+        // The duplicate's quote version id still matches the latest ACCEPTED v1 under the lock (a conversion never
+        // changes the quote), but it re-read the current invoice there: v2 carries the SAME signature time as the
+        // quote (Path A copies it), and a tie never replaces a signed invoice.
         assertPathARefused(secondResult, "Path A request 2 (queued behind request 1)");
 
         Assertions.assertEquals(List.of(1, 2), invoiceVersions(order.orderId()),
@@ -733,7 +800,8 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         OrderState after = orderState(order.orderId());
         assertNothingElseMoved(before, after, "after two queued conversions");
         Assertions.assertTrue(after.payments().isEmpty(), "no payment exists");
-        Assertions.assertNull(orderLastEmailedAt(order.orderId()), "no version was ever emailed");
+        // Only request 1's v2 was emailed and stamped; the refused duplicate wrote no marker.
+        assertOnlyVersionEmailed(order.orderId(), 2, true, raceStart);
 
         assertSingleSignatureIsTheQuotes(order, List.of(2));
         assertStoredArtifacts(order.orderId(),
@@ -745,7 +813,8 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         assertStoredFileDiskParity(order.orderId());
         assertQuoteBilledInvoicePdf(order, 2, "0.00", QUOTE_TOTAL_INC);
 
-        assertNoEmailAtAll();
+        // Exactly ONE signed-PDF email for two conversion requests: request 1's v2.
+        assertExactlyOneSignedInvoiceEmail(order, 2, "Path A request 1's post-commit email");
         assertInvoiceEligible(order.orderId(), false);
     }
 
@@ -1040,17 +1109,26 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
         return new MockMultipartFile("signature", "signature.png", "image/png", ONE_PIXEL_PNG);
     }
 
-    /** Path A: protected, empty body (the server selects the latest accepted quote version). */
-    private RequestBuilder createInvoiceFromQuote(long orderId) {
+    /**
+     * Path A (16G PR 3): protected, body {@code {"quote_version_id": N}} = the latest ACCEPTED quote version id
+     * the client saw before the race. The server still selects the latest accepted version itself and only
+     * COMPARES this id with it under the order lock.
+     */
+    private RequestBuilder createInvoiceFromQuote(long orderId, long seenAcceptedQuoteVersionId) {
         return post(orderUrl(orderId) + "/quote/create-invoice").session(liamStore1Session())
-                .contentType(MediaType.APPLICATION_JSON).content("{}");
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"quote_version_id\": " + seenAcceptedQuoteVersionId + "}");
     }
 
-    /** D.8 in-app invoice acceptance: signature part + accepted_customer_name field + session. */
-    private RequestBuilder invoiceAccept(long orderId) {
+    /**
+     * D.8 in-app invoice acceptance (16G PR 3): the signature part + the mandatory {@code expected_version_number}
+     * field (the invoice version the client saw) + session. No name part: the accepted name is the current
+     * version's frozen {@code customer_name_snapshot} (here the D.1-frozen {@value #CUSTOMER_NAME}).
+     */
+    private RequestBuilder invoiceAccept(long orderId, int expectedVersionNumber) {
         return multipart(orderUrl(orderId) + "/invoices/current/accept")
                 .file(signaturePart())
-                .param("accepted_customer_name", CUSTOMER_NAME)
+                .param("expected_version_number", String.valueOf(expectedVersionNumber))
                 .session(liamStore1Session());
     }
 
@@ -1473,6 +1551,20 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
                 "SELECT last_emailed_at FROM sales_order WHERE order_id = ?", Timestamp.class, orderId);
     }
 
+    /** The order's CURRENT invoice version (the highest version_number) in committed state - what a client sees. */
+    private int currentInvoiceVersion(long orderId) {
+        Integer version = jdbcTemplate.queryForObject(
+                "SELECT MAX(version_number) FROM invoice WHERE order_id = ?", Integer.class, orderId);
+        Assertions.assertNotNull(version, "the order has a current invoice");
+        return version;
+    }
+
+    /** The seeded business's name (the signed-PDF email's subject and body carry it). */
+    private String businessName() {
+        return jdbcTemplate.queryForObject(
+                "SELECT name FROM business WHERE business_id = ?", String.class, BUSINESS_AUSSIE);
+    }
+
     private int count(String sql, Object... args) {
         Integer n = jdbcTemplate.queryForObject(sql, Integer.class, args);
         return n == null ? 0 : n;
@@ -1487,7 +1579,8 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
      * snapshot verbatim - details, ex / inc totals, frozen terms, the V17 Invoice To (16G PR 2), source
      * = the accepted v1, the inherited acceptance (accepted_at, name and the SAME signature stored_file)
      * - with today's invoice_date, the lay date minus 2 days, {@code totalPaid} active payments and
-     * {@code balanceDue} = quote inc - payments; never emailed; created by the session user.
+     * {@code balanceDue} = quote inc - payments; created by the session user. Its email marker is asserted by
+     * each race ({@link #assertOnlyVersionEmailed}): since 16G PR 3 a converted version is emailed after commit.
      */
     private void assertQuoteBilledInvoiceRow(ConvertibleOrder order, int versionNumber, String totalPaid,
                                              String balanceDue, LocalDate dayBefore, LocalDate dayAfter) {
@@ -1522,7 +1615,6 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
                 label + ": accepted_customer_name inherited verbatim");
         Assertions.assertEquals(order.quoteSignatureFileId(), longValue(invoice.get("accepted_signature_file_id")),
                 label + ": the SAME signature stored_file as the quote");
-        Assertions.assertNull(invoice.get("last_emailed_at"), label + ": never emailed");
         Assertions.assertEquals(USER_LIAM, longValue(invoice.get("created_by_user_id")), label + ": session user");
         Assertions.assertEquals(EXPECTED_DUE_DATE, ((Date) invoice.get("due_date")).toLocalDate(),
                 label + ": due_date = proposed lay date - 2 days");
@@ -1635,14 +1727,20 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
     // Assertions: responses
     // ================================================================
 
-    /** Path A 201: the exact envelope, every InvoiceDetail key, the quote snapshot and no internal id. */
+    /**
+     * Path A 201: the exact envelope, the 16G PR 3 delivered-email message, every InvoiceDetail key, the quote
+     * snapshot and no internal id. {@code versionNumber} is the version Path A appended - always the one its 201
+     * describes (16G contract §6.2), even when another request commits a newer version before the email stamp -
+     * and the body's {@code last_emailed_at} is that row's stored marker.
+     */
     private void assertPathACreated(MvcResult result, ConvertibleOrder order, int versionNumber,
                                     String totalPaid, String balanceDue, String label) throws Exception {
         assertStatus(result, 201, label);
         String raw = body(result);
         JsonNode root = json(result);
         Assertions.assertEquals(new TreeSet<>(Set.of("data", "message")), fieldNames(root), label + ": envelope keys");
-        Assertions.assertEquals(PATH_A_CREATED_MESSAGE, root.path("message").asText(), label + ": message");
+        Assertions.assertEquals(PATH_A_EMAILED_MESSAGE, root.path("message").asText(),
+                label + ": message (the post-commit email was delivered)");
         Assertions.assertEquals(new TreeSet<>(Set.of("invoice")), fieldNames(root.path("data")), label + ": data keys");
         JsonNode invoice = root.path("data").path("invoice");
         Assertions.assertEquals(new TreeSet<>(INVOICE_DETAIL_KEYS), fieldNames(invoice),
@@ -1671,7 +1769,15 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
                 && invoice.path("accepted_signature_present").booleanValue(), label + ": inherited signature present");
         Assertions.assertEquals(orderUrl(order.orderId()) + "/invoices/current/signature",
                 invoice.path("accepted_signature_download_path").asText(), label + ": signature download path");
-        Assertions.assertTrue(invoice.path("last_emailed_at").isNull(), label + ": Path A never emails");
+        // 16G PR 3: the described row's own marker - the post-commit stamp when it was recorded there, else null.
+        Timestamp lastEmailedAt = (Timestamp) row.get("last_emailed_at");
+        if (lastEmailedAt == null) {
+            Assertions.assertTrue(invoice.path("last_emailed_at").isNull(),
+                    label + ": last_emailed_at is the described row's null");
+        } else {
+            Assertions.assertEquals(JSON_TIMESTAMP.format(lastEmailedAt.toLocalDateTime()),
+                    invoice.path("last_emailed_at").asText(), label + ": last_emailed_at is the described row's stamp");
+        }
         Assertions.assertEquals("QUOTE", invoice.path("terms_source").asText(), label + ": terms_source");
         Assertions.assertEquals(FROZEN_QUOTE_TERMS, invoice.path("terms_html").asText(),
                 label + ": terms_html = the frozen quote terms verbatim");
@@ -1781,10 +1887,61 @@ class QuoteInvoiceConversionConcurrencyIntegrationTest {
                 "no SMS was sent or attempted during the race");
     }
 
-    private void assertNoEmailAtAll() {
-        Assertions.assertTrue(invoiceEmailSender.sentEmails().isEmpty() && invoiceEmailSender.failedEmails().isEmpty(),
-                "neither Path A nor a payment ever emails an invoice");
+    /**
+     * Exactly ONE invoice email was sent during the race and none failed: the post-commit signed-PDF email of
+     * invoice version {@code versionNumber} (16G contract §6.1 - D.8, and since 16G PR 3 Path A; a payment and
+     * a refused request never email). No quote email, store notification or SMS either.
+     */
+    private void assertExactlyOneSignedInvoiceEmail(ConvertibleOrder order, int versionNumber, String label)
+            throws IOException {
+        Assertions.assertTrue(invoiceEmailSender.failedEmails().isEmpty(), label + ": no failed invoice email");
+        List<InvoiceEmailRequest> sent = invoiceEmailSender.sentEmails();
+        Assertions.assertEquals(1, sent.size(), label + ": exactly one invoice email was sent");
+        InvoiceEmailRequest email = sent.get(0);
+        String businessName = businessName();
+        Assertions.assertEquals(CUSTOMER_EMAIL, email.recipientEmail(), label + ": the saved customer email");
+        Assertions.assertEquals("Your invoice from " + businessName, email.subject(), label + ": subject");
+        Assertions.assertEquals("Hi,\n\nPlease find your invoice " + order.orderNumber() + " from " + businessName
+                + " attached.\n\nThank you.", email.bodyText(), label + ": body");
+        Assertions.assertEquals(invoicePdfName(order.orderNumber(), versionNumber), email.pdfFileName(),
+                label + ": attachment name");
+        Assertions.assertArrayEquals(invoicePdfBytes(order, versionNumber), email.pdfBytes(),
+                label + ": the attachment is the stored PDF of invoice v" + versionNumber);
+        Assertions.assertEquals(order.orderId(), email.orderId(), label + ": order id");
+        Assertions.assertEquals(versionNumber, email.invoiceVersionNumber(), label + ": invoice version");
         assertNoQuoteEmailNotificationOrSms();
+    }
+
+    /**
+     * The email markers after a race: ONLY invoice version {@code emailedVersion} carries a
+     * {@code last_emailed_at} - the stamp of the one delivered signed-PDF email, taken during the race - and
+     * every other version's is null; the {@code sales_order} mirror equals that stamp when
+     * {@code mirrorStamped} (the emailed version is current), else it is null (the current version is a
+     * later, unemailed one). Returns the stamp.
+     */
+    private Timestamp assertOnlyVersionEmailed(long orderId, int emailedVersion, boolean mirrorStamped,
+                                               LocalDateTime raceStart) {
+        Timestamp stamp = null;
+        for (Map<String, Object> row : jdbcTemplate.queryForList(
+                "SELECT version_number, last_emailed_at FROM invoice WHERE order_id = ? ORDER BY version_number",
+                orderId)) {
+            int version = intValue(row.get("version_number"));
+            Timestamp value = (Timestamp) row.get("last_emailed_at");
+            if (version == emailedVersion) {
+                Assertions.assertNotNull(value, "invoice v" + version + " carries the delivered email's stamp");
+                stamp = value;
+            } else {
+                Assertions.assertNull(value, "invoice v" + version + " was never emailed");
+            }
+        }
+        Assertions.assertNotNull(stamp, "invoice v" + emailedVersion + " must exist");
+        LocalDateTime stamped = stamp.toLocalDateTime();
+        Assertions.assertFalse(stamped.isBefore(raceStart.minusSeconds(1)) || stamped.isAfter(LocalDateTime.now()),
+                "the stamp " + stamped + " was taken during the race (started " + raceStart + ")");
+        Assertions.assertEquals(mirrorStamped ? stamp : null, orderLastEmailedAt(orderId),
+                mirrorStamped ? "the sales_order mirror equals the current (emailed) version's stamp"
+                        : "the sales_order mirror is the current, unemailed version's null");
+        return stamp;
     }
 
     // ================================================================

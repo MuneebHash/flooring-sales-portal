@@ -1395,47 +1395,44 @@ paths:
       summary: Accept current invoice
       operationId: acceptCurrentInvoice
       description: >
-        Accepts/signs the current invoice (Phase 13). Captures the customer signature
-        (image/png, max 2 MB) and accepted customer name, appends a new signed current invoice
-        version, regenerates the signed PDF, and automatically emails the accepted PDF to the
-        order customer's email, updating last_emailed_at. Requires a current invoice that is not
-        already accepted and a valid customer email. Allowed when order_status is LAID. If the
-        email send fails the acceptance is still persisted (201) with last_emailed_at null; use
-        Resend to retry. Phase 16F PR1 (decision D5(c)): the same transaction also cancels the
-        order's ISSUED quote version, if any, and its ACTIVE public-link token (both CANCELLED; the
-        public quote link then reports CANCELLED); with no ISSUED quote this is a silent no-op.
-        Only the version ISSUED at that moment is affected: a quote sent later can still be signed,
-        and because its signature is then strictly newer than this invoice's, createInvoiceFromQuote
-        (Path A, 16F PR2) may convert it by appending a new invoice version, with this signed
-        version kept in history (decision D5(b) as amended on 8 October 2026; quotation contract
-        section 13). An ACCEPTED quote never blocks this endpoint and is never touched (D5(d)).
-        TODAY the request carries accepted_customer_name (1-150 characters, not blank) and
-        signature; the request schema below is the 16G PR 3 target.
-        16G PR 3 (planned, #69; docs/API-Contracts-Phase16G-Invoice-Link.md section 5.4): the
-        parts are exactly expected_version_number and signature. Order of checks: transport (400
-        FILE_TOO_LARGE, 415); standard guard and positive orderId; the order scoped and locked
-        (404 ORDER_NOT_FOUND); the current invoice read under the lock (none: 422
-        INVOICE_REQUIRED); expected_version_number validation (400 VALIDATION_FAILED); the stale
-        comparison with the current version_number (409 INVOICE_VERSION_STALE "Invoice updated,
-        please refresh"); already accepted (409 INVOICE_ALREADY_ACCEPTED, unchanged); the part
-        allowlist (any other part, including accepted_customer_name: 400 VALIDATION_FAILED); the
+        Accepts/signs the current invoice (Phase 13, with the request and checks of 16G PR 3,
+        implemented, #69; docs/API-Contracts-Phase16G-Invoice-Link.md section 5.4). The
+        multipart parts are exactly expected_version_number (the version_number of the invoice on
+        screen) and the customer signature (image/png, max 2 MB); no name is sent. Appends a new
+        signed current invoice version, regenerates the signed PDF, and automatically emails it
+        to the order customer's saved email, updating last_emailed_at. Allowed when order_status
+        is LAID. Order of checks: transport (400 FILE_TOO_LARGE, 415); standard guard and
+        positive orderId; the order scoped and locked (404 ORDER_NOT_FOUND); the current invoice
+        read under the lock (none: 422 INVOICE_REQUIRED); expected_version_number validation (400
+        VALIDATION_FAILED; only the multipart form field counts, never a URL query-string copy);
+        the stale comparison with the current version_number (409 INVOICE_VERSION_STALE "Invoice
+        updated, please refresh"; the value is only compared, never used to look up a row); already accepted (409 INVOICE_ALREADY_ACCEPTED); the part
+        allowlist (any other part, including the former accepted_customer_name, and any URL
+        query-string parameter: 400 VALIDATION_FAILED "Not allowed."; a repeated signature: "Must
+        appear at most once."); the
         current version's frozen customer_name_snapshot null or blank (422
-        ACCEPTED_CUSTOMER_NAME_REQUIRED; the accepted name is that stored value, verbatim, full
-        length, with no 150-character limit); the signature (422 SIGNATURE_REQUIRED / 400
-        SIGNATURE_INVALID); the customer email gate (422 CUSTOMER_EMAIL_REQUIRED / INVALID,
-        unchanged); persist; then post-commit email and stamp. From PR 3 no post-commit step can
-        turn the committed acceptance into an error, and the message reports the delivery
-        outcome. A failed delivery, including any sender runtime failure, is logged at WARN;
-        last_emailed_at and the mirror stay null and the response is 201 with the not-emailed
-        message. A stamp failure after a successful delivery is logged at WARN only; the
-        response is 201 with the emailed message, and last_emailed_at and the mirror stay null,
-        so Re-send Invoice stays available. Today only the transport failure is caught: another
-        sender failure or a stamp failure returns 500 after commit. The version is appended with
-        the copied frozen words (16G PR 2) and, from 16G PR 3, the current version's
-        invoice_date, so the signed PDF shows the date of the invoice the customer was shown;
-        accepted_at records the signing time. Today the appended version is dated the signing day
-        (LocalDate.now(), as every invoice writer dates its version). From 16G PR 4 the same
-        transaction marks an ACTIVE invoice link SIGNED.
+        ACCEPTED_CUSTOMER_NAME_REQUIRED; otherwise the accepted name is that stored value,
+        verbatim and full length, with no 150-character limit); the signature (422
+        SIGNATURE_REQUIRED / 400 SIGNATURE_INVALID); the customer email gate (422
+        CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID); persist; then the post-commit email and
+        stamp. A refused request writes no file and no row. The version is appended with the
+        copied frozen words (16G PR 2) and the current version's invoice_date (16G PR 3), so the
+        signed PDF shows the date of the invoice the customer was shown; accepted_at records the
+        signing time. No post-commit step turns the committed acceptance into an error, and the
+        message reports the delivery outcome. A failed delivery, including any sender runtime
+        failure, is logged at WARN; last_emailed_at and the mirror stay null and the response is
+        201 with the not-emailed message. A stamp failure after a successful delivery is logged
+        at WARN only; the response is 201 with the emailed message, and last_emailed_at and the
+        mirror stay null, so Re-send Invoice stays available. Phase 16F PR1 (decision D5(c)): the
+        same transaction also cancels the order's ISSUED quote version, if any, and its ACTIVE
+        public-link token (both CANCELLED; the public quote link then reports CANCELLED); with no
+        ISSUED quote this is a silent no-op. Only the version ISSUED at that moment is affected:
+        a quote sent later can still be signed, and because its signature is then strictly newer
+        than this invoice's, createInvoiceFromQuote (Path A, 16F PR2) may convert it by appending
+        a new invoice version, with this signed version kept in history (decision D5(b) as
+        amended on 8 October 2026; quotation contract section 13). An ACCEPTED quote never blocks
+        this endpoint and is never touched (D5(d)). From 16G PR 4 the same transaction marks an
+        ACTIVE invoice link SIGNED.
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -2067,18 +2064,24 @@ paths:
       summary: Create invoice from accepted quote (Path A)
       operationId: createInvoiceFromQuote
       description: >
-        IMPLEMENTED 16F PR2 (backend; the Accepted Quote Create Invoice button implemented 16F PR3).
-        Creates an invoice version from the order's LATEST ACCEPTED quote version (highest
-        version_number with status ACCEPTED; a newer draft or ISSUED, SUPERSEDED, CANCELLED or
-        EXPIRED version never replaces it), inheriting its signature so the customer does not
-        re-sign. The request body must be an empty JSON object, as for the other invoice actions
-        (the server also accepts an absent body); any field (for example a quote-version
-        selector, price, terms, signature id or due date) returns 400 VALIDATION_FAILED and an
-        unparseable body 400 MALFORMED_JSON. Checks run in this order: standard guard, positive
-        orderId, then the order scoped to the session business and store, which takes the order
-        row lock (404 ORDER_NOT_FOUND); every later check, the PDF and file work, the insert and
-        the mirror reset run under that lock: empty body, the latest accepted version (none: 422
-        QUOTE_NOT_ACCEPTED "This quote has not been accepted yet."), then
+        IMPLEMENTED 16F PR2 (backend; the Accepted Quote Create Invoice button implemented 16F PR3),
+        with the request body, stale check and signed-PDF email of 16G PR 3 (implemented, #123;
+        docs/API-Contracts-Phase16G-Invoice-Link.md sections 5.5 and 6). Creates an invoice
+        version from the order's LATEST ACCEPTED quote version (highest version_number with
+        status ACCEPTED; a newer draft or ISSUED, SUPERSEDED, CANCELLED or EXPIRED version never
+        replaces it), inheriting its signature so the customer does not re-sign. The body is
+        mandatory: {"quote_version_id": N}, the accepted version shown in the open confirmation
+        (CreateInvoiceFromQuoteRequest; an absent or empty body is 400 VALIDATION_FAILED
+        "Required."; any other field, for example a price, terms, signature id or due date, is
+        "Not allowed."; an unparseable body is 400 MALFORMED_JSON). The value is only compared,
+        never used to select a row. Checks run in this order: standard guard, positive orderId,
+        then the order scoped to the session business and store, which takes the order row lock
+        (404 ORDER_NOT_FOUND); every later check, the PDF and file work, the insert and the
+        mirror reset run under that lock: the latest accepted version (none: 422
+        QUOTE_NOT_ACCEPTED "This quote has not been accepted yet."), body validation, the stale
+        comparison with the latest accepted version's id (409 QUOTE_VERSION_STALE "The accepted
+        quote changed while the confirmation was open. Review the accepted quote before creating
+        an invoice."), then
         signature precedence against the current invoice (decision D5(b) as amended on 8 October
         2026): allowed when there is no invoice (new version 1), when the current invoice is
         unsigned, or when the quote's accepted_at is strictly later than the current invoice's
@@ -2108,35 +2111,23 @@ paths:
         (sales_order.last_emailed_at is reset to null). The signed invoice PDF is stored; the
         invoice has no lines. The order status, working price, lines,
         quote draft, quote versions and tokens (an ISSUED quote stays live), customer data and
-        payments are not changed, and no email or notification is sent. Any failure rolls back
-        every write and deletes only the new invoice PDF. 201 returns the InvoiceDetail (accepted,
-        terms_source QUOTE) with the message "Invoice created from accepted quote."
-        The paragraph above describes the behaviour TODAY (an empty body). The request schema
-        below is the 16G PR 3 target. 16G amendments (planned;
-        docs/API-Contracts-Phase16G-Invoice-Link.md sections 5.5 and 6):
-        16G PR 3 (#123): the body is mandatory, {"quote_version_id": N}, the accepted version
-        shown in the open confirmation (CreateInvoiceFromQuoteRequest; an absent or empty body
-        is 400 "Required."). Order of checks: guard and positive orderId; the order scoped and
-        locked (404 ORDER_NOT_FOUND); the latest ACCEPTED version read under the lock (none: 422
-        QUOTE_NOT_ACCEPTED); body validation (400 VALIDATION_FAILED / MALFORMED_JSON); the stale
-        comparison with the latest accepted version's id (409 QUOTE_VERSION_STALE "The accepted
-        quote changed while the confirmation was open. Review the accepted quote before creating
-        an invoice."); then signature precedence (409 INVOICE_ALREADY_ACCEPTED, unchanged), the
-        preconditions and the overpayment check (unchanged), the inherited signature read and
-        persist. The value is only compared, never used to select a row. 16G PR 3 also replaces
-        "no email": after commit the signed invoice PDF is emailed to the saved customer email
-        (the InvoiceEmailSender D.8 uses), with NO email gate before creation - a missing or
-        invalid saved email skips the send with a WARN log; a delivery, sender or stamp failure
-        is non-fatal (WARN, 201); success stamps last_emailed_at and the mirror. The message
-        reports the delivery outcome: a stamp failure after a successful delivery keeps the
-        delivered message, with last_emailed_at and the mirror null. Messages:
+        payments are not changed, and no store notification is sent. Any failure before commit
+        rolls back every write, deletes only the new invoice PDF and sends no email. After
+        commit (16G PR 3, replacing 16F "no email") the signed invoice PDF of the new version is
+        emailed to the saved customer email (the InvoiceEmailSender D.8 uses), with NO email gate
+        before creation: a missing or invalid saved email skips the send with a WARN log; a
+        delivery, sender or stamp failure is non-fatal (WARN, 201); success stamps the appended
+        version's last_emailed_at and sets the mirror to the current version's value. 201 returns the InvoiceDetail (accepted, terms_source
+        QUOTE) of the version this conversion appended, even when another request committed a
+        newer version before the email stamp; the message reports the delivery outcome, so a stamp failure after a successful
+        delivery keeps the delivered message, with last_emailed_at and the mirror null. Messages:
         "Invoice created from accepted quote and emailed to the customer." (delivered);
         "Invoice created from accepted quote. The invoice could not be emailed — use Re-send
         Invoice to try again." (failed); "Invoice created from accepted quote. It was not emailed
         because the customer has no valid email address — add one on the Customer tab, then use
-        Re-send Invoice." (skipped). No store notification.
-        16G PR 4: the same transaction marks an ACTIVE invoice link SIGNED. Path A still never
-        changes a quote version or quote token.
+        Re-send Invoice." (skipped).
+        16G PR 4 (planned): the same transaction marks an ACTIVE invoice link SIGNED. Path A
+        still never changes a quote version or quote token.
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -3905,12 +3896,12 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        In-store invoice acceptance (D.8) multipart parts, as the TARGET contract from 16G PR 3
-        (#69): exactly one expected_version_number form field and one signature file; anything
-        else, including accepted_customer_name, is 400 VALIDATION_FAILED ("Not allowed."). UNTIL
-        16G PR 3 MERGES the server takes accepted_customer_name (form field, 1-150 characters, not
-        blank; the Invoice tab derives it from the saved customer) plus signature, and has no
-        expected_version_number part. From PR 3 the accepted name is the current version's frozen
+        In-store invoice acceptance (D.8) multipart parts since 16G PR 3 (implemented, #69):
+        exactly one expected_version_number form field and one signature file; anything else,
+        including the former accepted_customer_name and any URL query-string parameter (a
+        query-string copy of expected_version_number is not the carrier), is 400
+        VALIDATION_FAILED ("Not allowed.").
+        No name is sent: the accepted name is the current version's frozen
         customer_name_snapshot, with no 150-character limit.
       required:
         - expected_version_number
@@ -3920,8 +3911,8 @@ components:
           type: integer
           minimum: 1
           description: >-
-            16G PR 3 (planned, #69). Mandatory form field, exactly once: the version_number of the
-            invoice on screen. Compared under the order lock with the current invoice's
+            16G PR 3 (implemented, #69). Mandatory form field, exactly once: the version_number of
+            the invoice on screen. Compared under the order lock with the current invoice's
             version_number; never used to look up a row. Missing: 400 VALIDATION_FAILED
             "Required."; not a positive integer: "Must be a positive integer."; repeated: "Must
             appear at most once."; a mismatch: 409 INVOICE_VERSION_STALE "Invoice updated, please
@@ -5163,13 +5154,14 @@ components:
           type: string
           description: >-
             Machine-readable error code, a free-form string (deliberately not enumerated here; the
-            contracts list the codes). 16G adds, as target contract not implemented until the named
-            PR merges (docs/API-Contracts-Phase16G-Invoice-Link.md section 14):
-            INVOICE_VERSION_STALE (409; acceptCurrentInvoice from PR 3, acceptPublicInvoice and
-            downloadPublicInvoicePdf from PR 4); QUOTE_VERSION_STALE (409; createInvoiceFromQuote,
-            PR 3); INVOICE_TOKEN_NOT_FOUND (404; the public invoice endpoints, PR 4);
-            INVOICE_LINK_REPLACED, INVOICE_LINK_REWRITTEN, INVOICE_LINK_SIGNED and
-            INVOICE_LINK_EXPIRED (410; acceptPublicInvoice and downloadPublicInvoicePdf, PR 4).
+            contracts list the codes). 16G adds (docs/API-Contracts-Phase16G-Invoice-Link.md
+            section 14): INVOICE_VERSION_STALE (409; acceptCurrentInvoice, implemented in PR 3;
+            acceptPublicInvoice and downloadPublicInvoicePdf from PR 4, not implemented until it
+            merges); QUOTE_VERSION_STALE (409; createInvoiceFromQuote, implemented in PR 3); and,
+            as target contract not implemented until PR 4 merges: INVOICE_TOKEN_NOT_FOUND (404; the
+            public invoice endpoints); INVOICE_LINK_REPLACED, INVOICE_LINK_REWRITTEN,
+            INVOICE_LINK_SIGNED and INVOICE_LINK_EXPIRED (410; acceptPublicInvoice and
+            downloadPublicInvoicePdf).
         message:
           type: string
         details:
@@ -5994,12 +5986,15 @@ components:
       type: object
       additionalProperties: false
       description: >-
-        16G PR 3 (planned, #123; replaces EmptyObjectRequest on createInvoiceFromQuote only). A
-        JSON object with exactly one field. An absent or blank body, or a missing or null
-        quote_version_id: 400 VALIDATION_FAILED "Required."; not a positive integer: "Must be a
-        positive integer."; any other field: "Not allowed." (one detail per field); a non-object
-        body: 400 VALIDATION_FAILED on body "Must be an object."; unparseable JSON: 400
-        MALFORMED_JSON.
+        16G PR 3 (implemented, #123; replaced EmptyObjectRequest on createInvoiceFromQuote
+        only). A JSON object with exactly one field, validated only after the order scope and
+        accepted-quote checks. An absent or blank body, or a
+        missing or null quote_version_id: 400 VALIDATION_FAILED "Required."; the key given more
+        than once: "Must appear at most once."; not a positive integer: "Must be a positive
+        integer."; any other field: "Not allowed." (one detail per
+        field, in the same 400 as any quote_version_id detail, which comes last); a non-object
+        body (a JSON null is a non-object body): 400 VALIDATION_FAILED on body
+        "Must be an object."; unparseable JSON: 400 MALFORMED_JSON.
       required:
         - quote_version_id
       properties:

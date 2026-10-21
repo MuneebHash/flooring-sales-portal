@@ -1,6 +1,8 @@
 package com.flooring.salesportal.order;
 
+import com.fasterxml.jackson.core.JsonParser;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.JsonToken;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.flooring.salesportal.common.api.ApiResponse;
@@ -45,12 +47,17 @@ import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Enumeration;
 import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -95,6 +102,17 @@ import java.util.Optional;
  * version's words verbatim (payment / void do the same in {@code OrderPaymentService}). InvoiceDetail
  * maps the stored values straight from the row; nothing customer-facing is read live at render or read
  * time.
+ *
+ * <p>Phase 16G PR 3 (#69, #123; 16G contract §5 and §6): D.8 and Path A each carry a MANDATORY version
+ * precondition - D.8 the multipart field {@code expected_version_number}, Path A the JSON body
+ * {@code {"quote_version_id": N}} - that is only ever COMPARED with the row this service reads under the
+ * order lock, never used to select or load one, so a stale, forged or foreign value can only produce a 409
+ * ({@code INVOICE_VERSION_STALE} / {@code QUOTE_VERSION_STALE}) with nothing written. D.8 takes the
+ * accepted name from the current version's frozen {@code customer_name_snapshot} (no name part) and dates
+ * its signing version with the current version's {@code invoice_date}. Both routes email the signed PDF of
+ * the version they appended, strictly after their own commit, and no post-commit failure - a delivery
+ * failure, any other sender failure or a failure of the success stamp - turns a committed signing or
+ * conversion into an error.
  */
 @Service
 public class OrderInvoiceService {
@@ -113,27 +131,36 @@ public class OrderInvoiceService {
     private static final String QUOTE_VERSION_CANCELLED = "CANCELLED";
     private static final String QUOTE_TOKEN_CANCELLED = "CANCELLED";
 
-    // Phase 13 D.8 Accept multipart contract (§5.1): exactly two parts, any other part name -> 400.
+    // Phase 13 D.8 Accept multipart contract (§5.1) as amended by 16G PR 3 (16G contract §5.4): exactly
+    // two parts - the form field expected_version_number and the file part signature. Any other part,
+    // including the former accepted_customer_name, -> 400 (the accepted name is the frozen one).
     private static final String SIGNATURE_PART = "signature";
-    private static final String ACCEPTED_NAME_FIELD = "accepted_customer_name";
+    private static final String EXPECTED_VERSION_FIELD = "expected_version_number";
     private static final String SIGNATURE_MIME = "image/png";
     private static final String SIGNATURE_EXTENSION = "png";
     // Exactly 2 MB. size > this -> 400 SIGNATURE_INVALID; size == this is allowed.
     private static final long MAX_SIGNATURE_SIZE_BYTES = 2_097_152L;
-    // The D.8 REQUEST rule (Phase 13 §5.1: max 150 chars), a clean 400 that mirrors the
-    // payment_reference length guard. The column itself is TEXT since V19 (16F PR1 — remotely signed
-    // quotes inherit untruncated frozen names); widening storage does not widen this request rule.
-    private static final int MAX_ACCEPTED_NAME_LENGTH = 150;
+    // Phase 16G PR 3: the one field of the Path A body (CreateInvoiceFromQuoteRequest).
+    private static final String QUOTE_VERSION_ID_FIELD = "quote_version_id";
 
-    // Locked Phase 13 response messages (§5.1 / §5.2).
+    // Locked Phase 13 response messages (§5.1 / §5.2). Since 16G PR 3 the D.8 message reports the
+    // delivery outcome only: a delivered email whose success stamp then fails keeps the emailed message.
     private static final String ACCEPT_EMAILED_MESSAGE = "Invoice accepted and emailed to the customer.";
     private static final String ACCEPT_EMAIL_FAILED_MESSAGE =
             "Invoice accepted. The invoice could not be emailed — use Re-send Invoice to try again.";
     private static final String RESEND_MESSAGE = "Invoice re-sent to the customer.";
 
     // Phase 16F PR2 Path A (create invoice from the accepted quote) messages. The 409 reuses
-    // INVOICE_ALREADY_ACCEPTED with this Path A wording; D.8's default message is unchanged.
-    private static final String CREATED_FROM_ACCEPTED_QUOTE_MESSAGE = "Invoice created from accepted quote.";
+    // INVOICE_ALREADY_ACCEPTED with this Path A wording; D.8's default message is unchanged. Since 16G
+    // PR 3 (16G contract §6.1) the 201 message reports the post-commit email: delivered, failed (any
+    // sender failure) or skipped (no valid saved customer email); a failed stamp keeps the delivered one.
+    private static final String CREATED_FROM_QUOTE_EMAILED_MESSAGE =
+            "Invoice created from accepted quote and emailed to the customer.";
+    private static final String CREATED_FROM_QUOTE_EMAIL_FAILED_MESSAGE =
+            "Invoice created from accepted quote. The invoice could not be emailed — use Re-send Invoice to try again.";
+    private static final String CREATED_FROM_QUOTE_EMAIL_SKIPPED_MESSAGE =
+            "Invoice created from accepted quote. It was not emailed because the customer has no valid email "
+                    + "address — add one on the Customer tab, then use Re-send Invoice.";
     private static final String QUOTE_NOT_NEWER_THAN_SIGNED_INVOICE_MESSAGE =
             "The current invoice was signed at the same time or later than this quote. "
                     + "A newer signed quote is required to create an invoice from a quote.";
@@ -158,10 +185,11 @@ public class OrderInvoiceService {
     private final InvoiceEmailSender invoiceEmailSender;
     private final QuoteVersionRepository quoteVersionRepository;
     private final ObjectMapper objectMapper;
-    // Programmatic transactions for the Phase 13 accept/resend flows: the email send must run AFTER
-    // the acceptance commit (and the email-success stamp in its own follow-up transaction), so those
-    // public methods cannot be @Transactional. Spring's proxy ignores self-invocation, so a private
-    // @Transactional helper would not work either — TransactionTemplate is the supported alternative.
+    // Programmatic transactions for the Phase 13 accept/resend flows and, since 16G PR 3, Path A: the
+    // email send must run AFTER the acceptance / conversion commit (and the email-success stamp in its
+    // own follow-up transaction), so those public methods cannot be @Transactional. Spring's proxy
+    // ignores self-invocation, so a private @Transactional helper would not work either —
+    // TransactionTemplate is the supported alternative.
     private final TransactionTemplate transactionTemplate;
 
     public OrderInvoiceService(RequestContextGuard requestContextGuard,
@@ -429,31 +457,41 @@ public class OrderInvoiceService {
      * decisions D4, D5(a) and D5(b) as amended on 8 October 2026, D6, D7). The quote's signature is
      * inherited, so the customer does not re-sign.
      *
-     * <p><b>Order of checks</b> (all under the order row lock, which is held through the checks, the PDF
-     * and file work, the insert and the mirror reset): standard-protected guard → positive
-     * {@code orderId} (400) → scoped {@code FOR UPDATE} order lookup (404 {@code ORDER_NOT_FOUND}; no
-     * existence leak) → empty body only ({@code {}} / blank; any field, including a quote-version
-     * selector, price, terms, signature id or due date → 400 {@code VALIDATION_FAILED}; unparseable →
-     * 400 {@code MALFORMED_JSON}) → the latest ACCEPTED quote version, selected by the server (none → 422
-     * {@code QUOTE_NOT_ACCEPTED}; a newer draft / ISSUED / CANCELLED / EXPIRED version never replaces it)
-     * → signature precedence against the CURRENT invoice ({@link AcceptedQuoteInvoiceEligibility}: no
+     * <p><b>Order of checks</b> (16G contract §5.5; everything after the guard and the {@code orderId}
+     * parse runs under the order row lock, which is held through the checks, the PDF and file work, the
+     * insert and the mirror reset): standard-protected guard → positive {@code orderId} (400) → scoped
+     * {@code FOR UPDATE} order lookup (404 {@code ORDER_NOT_FOUND}; no existence leak) → the latest
+     * ACCEPTED quote version, selected by the server (none → 422 {@code QUOTE_NOT_ACCEPTED}; a newer draft
+     * / ISSUED / CANCELLED / EXPIRED version never replaces it) → the mandatory body
+     * {@code {"quote_version_id": N}} (16G PR 3, {@link #parseCreateInvoiceFromQuoteBody}: 400
+     * {@code VALIDATION_FAILED} / {@code MALFORMED_JSON}) → that id compared with the selected version's id
+     * (mismatch → 409 {@code QUOTE_VERSION_STALE}; the id is never used to select or load a version) →
+     * signature precedence against the CURRENT invoice ({@link AcceptedQuoteInvoiceEligibility}: no
      * invoice, an unsigned invoice, or a STRICTLY newer quote signature is allowed; an equal or older
      * quote signature → 409 {@code INVOICE_ALREADY_ACCEPTED} with the Path A message) → the collected
      * Path A preconditions (422 {@code INVOICE_PRECONDITIONS_NOT_MET}, every failing item) → active
      * payments must not exceed the signed inc-GST total (422 {@code BUSINESS_RULE_VIOLATION}) → read the
-     * inherited signature → persist.
+     * inherited signature → persist → after commit, the signed-PDF email. Every refusal happens before the
+     * first file write.
      *
      * <p><b>No LAID gate in any branch</b> ({@code requireNotLaid} is never called): Path A follows the
      * D.1 / D4 rule and appends with rewrite / payment version mechanics, not the D.2 LAID block.
-     * <b>No customer-email gate and no email</b>: a missing or invalid customer email never blocks this
-     * endpoint, and nothing is sent (manual Re-send stays the only invoice email path).
+     * <b>No customer-email gate</b>: a missing or invalid customer email never blocks this endpoint. Since
+     * 16G PR 3 (16G contract §6, amending 16F D6 "no email") the signed PDF of the appended version is
+     * emailed to the saved customer email after the conversion commits: a missing or invalid saved email
+     * skips the send with a WARN, and a delivery failure, any other sender failure or a failure of the
+     * success stamp is WARN-logged and non-fatal. The response is 201 in every committed case; its message
+     * reports the delivery outcome and Re-send (D.9) is the retry route. No store notification is sent.
+     * The 201 InvoiceDetail is always the version this conversion appended (after a recorded delivery
+     * re-read in the stamp transaction, with its stamp), never a version another request committed after
+     * it.
      *
      * <p><b>Fields - the signed snapshot only, never the live sale:</b> details of sale and the ex / inc
      * totals verbatim from the accepted version (each copied independently, never recomputed); its frozen
      * {@code terms_snapshot} verbatim, including null; {@code source_quote_version_id} = the selected
      * version; {@code accepted_at} / {@code accepted_customer_name} / {@code accepted_signature_file_id}
      * inherited verbatim (the SAME signature {@code stored_file} row: no upload, copy, re-normalisation or
-     * new file, and no D.8 name-length gate). {@code invoice_date} = today; {@code due_date} = the
+     * new file, and no D.8 name check). {@code invoice_date} = today; {@code due_date} = the
      * order's current {@code proposed_lay_date} minus 2 days; Invoice To (Phase 16G PR 2, #125) = the
      * accepted version's {@code V17} {@code customer_name_snapshot} / {@code customer_address_line1_snapshot}
      * / {@code customer_address_line2_snapshot}, verbatim, including null - never the live saved
@@ -466,17 +504,18 @@ public class OrderInvoiceService {
      * {@code afterCompletion} hook), then its {@code stored_file} row, the invoice row (both {@code V19}
      * columns set; source ownership verified by {@link InvoiceRepository#insertInvoice}) and the section 11.1
      * mirror reset ({@code sales_order.last_emailed_at} = null - the only order write). Any render,
-     * storage, insert or commit failure rolls every write back and deletes only this request's PDF;
-     * the inherited signature and every pre-existing PDF are never registered for deletion. The order's
-     * status, working price / override, GP / cost / header financials, product and charge lines, the
+     * storage, insert or commit failure rolls every write back, deletes only this request's PDF and sends
+     * no email; the inherited signature and every pre-existing PDF are never registered for deletion. The
+     * order's status, working price / override, GP / cost / header financials, product and charge lines, the
      * quote draft / versions / tokens (an ISSUED version and its ACTIVE token stay untouched - only a
      * successful D.8 cancels a link, D5(c)), customer / address rows and payments are never written; the
-     * D6b price write happened at quote acceptance and is not rerun here.
+     * D6b price write happened at quote acceptance and is not rerun here. After commit, only the success
+     * stamp ({@code invoice.last_emailed_at} + the mirror) may be written.
      *
-     * <p>{@code @Transactional} is real here: {@code QuoteController} calls this public method through
-     * the Spring proxy (no self-invocation).
+     * <p>Deliberately NOT {@code @Transactional} (16G PR 3): the checks and the persist run in ONE
+     * programmatic transaction (the D.8 pattern), so the conversion has COMMITTED before the email is
+     * attempted, and no enclosing transaction holds the email inside the conversion's commit.
      */
-    @Transactional
     public ApiResponse<InvoiceResponse> createInvoiceFromAcceptedQuote(String slug,
                                                                        String orderIdRaw,
                                                                        String body,
@@ -484,20 +523,46 @@ public class OrderInvoiceService {
         RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
         long orderId = parsePositiveLong(orderIdRaw, "order_id");
 
-        // 1. Scope + lock FIRST. Every price / payment / version / quote input below is read after this,
-        // so it serialises with D.8, payment / void, rewrite and the public quote accept.
+        CommittedSignedInvoice converted = transactionTemplate.execute(
+                status -> validateAndPersistConversion(orderId, ctx, body));
+
+        // Post-commit signed-PDF email (16G contract §6): never throws; the conversion above is durable.
+        // The 201 always describes the version this conversion appended (respondWithAppendedVersion).
+        PostCommitEmail email = emailSignedInvoiceAfterCommit(ctx, orderId, converted, true);
+        String message = switch (email.outcome()) {
+            case DELIVERED -> CREATED_FROM_QUOTE_EMAILED_MESSAGE;
+            case FAILED -> CREATED_FROM_QUOTE_EMAIL_FAILED_MESSAGE;
+            case SKIPPED -> CREATED_FROM_QUOTE_EMAIL_SKIPPED_MESSAGE;
+        };
+        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, email.responseRow())), message);
+    }
+
+    /**
+     * The Path A check chain (16G contract §5.5, exact order) + single-transaction persist. Runs inside
+     * {@code transactionTemplate.execute}, so the order row is held {@code FOR UPDATE} for the whole block
+     * and every read below - the accepted quote, the current invoice, the customer, the payments - is
+     * serialised with D.8, payment / void, rewrite and the public quote accept.
+     */
+    private CommittedSignedInvoice validateAndPersistConversion(long orderId, RequestContext ctx, String body) {
+        // 1. Scope + lock FIRST. Every price / payment / version / quote input below is read after this.
         SalesOrder order = salesOrderRepository
                 .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
 
-        // 2. Empty body only - the server selects the quote version; clients send no fields.
-        rejectNonEmptyBody(body);
-
-        // 3. The LATEST ACCEPTED version (max version_number among ACCEPTED) - not the newest version.
+        // 2. The LATEST ACCEPTED version (max version_number among ACCEPTED) - not the newest version.
+        // Selected by the server alone; the body below can only be compared with it.
         AcceptedQuoteVersionRow accepted = quoteVersionRepository.findLatestAcceptedByOrderId(orderId)
                 .orElseThrow(() -> new BusinessRuleException(
                         ErrorCode.QUOTE_NOT_ACCEPTED, ErrorCode.QUOTE_NOT_ACCEPTED.defaultMessage()));
         QuoteVersionRow quote = accepted.version();
+
+        // 3. Phase 16G PR 3 (#123): the mandatory {"quote_version_id": N}, validated only now (after the
+        // scope and accepted-quote gates), then COMPARED with the version selected above - never used
+        // to look one up, so an old, forged or foreign id can only mismatch.
+        long expectedQuoteVersionId = parseCreateInvoiceFromQuoteBody(body);
+        if (expectedQuoteVersionId != quote.quoteVersionId()) {
+            throw new ConflictException(ErrorCode.QUOTE_VERSION_STALE, ErrorCode.QUOTE_VERSION_STALE.defaultMessage());
+        }
 
         // 4. D5(b) signature precedence vs the CURRENT invoice (max version_number), by signature time.
         Optional<InvoiceRow> current = invoiceRepository.findCurrentByOrderId(orderId);
@@ -582,8 +647,13 @@ public class OrderInvoiceService {
             // sales_order mirror is reset to its null last_emailed_at in the same transaction.
             invoiceRepository.updateSalesOrderLastEmailedAt(orderId, row.lastEmailedAt());
 
-            InvoiceDetailDto dto = toDto(slug, orderId, row);
-            return ApiResponse.ok(new InvoiceResponse(dto), CREATED_FROM_ACCEPTED_QUOTE_MESSAGE);
+            // Phase 16G PR 3: everything the post-commit email needs, captured here, in the committing
+            // transaction - this version's own PDF bytes and the saved customer email read under the lock
+            // (trimmed; null when missing or invalid, which skips the send: there is no email gate).
+            String recipientEmail = customerEmailValidator.hasValidCustomerEmail(customer)
+                    ? customer.getEmail().trim()
+                    : null;
+            return new CommittedSignedInvoice(row, order.getOrderNumber(), recipientEmail, pdfBytes, fileName);
         } catch (RuntimeException ex) {
             fileStorageService.deleteQuietly(storagePath);
             throw ex;
@@ -674,27 +744,41 @@ public class OrderInvoiceService {
     // ------------------------------------------------------------------
 
     /**
-     * Accept the current invoice (Phase 13 §5.1): capture the customer signature + accepted name,
-     * APPEND a new current version (max + 1) carrying the sale snapshot forward unchanged, generate
-     * the signed PDF, then auto-email it to the customer. ALLOWED when LAID (parallels payment, not
-     * rewrite — Chunk 4 F.8): acceptance carries the snapshot forward and never makes unsent live
-     * edits official, so {@code requireNotLaid} is deliberately not called.
+     * Accept the current invoice (Phase 13 §5.1, as amended by 16G PR 3): capture the customer signature,
+     * APPEND a new current version (max + 1) carrying the current version forward unchanged - its sale
+     * snapshot, money, words and {@code invoice_date} - generate the signed PDF, then email it to the
+     * customer. ALLOWED when LAID (parallels payment, not rewrite — Chunk 4 F.8): acceptance carries the
+     * snapshot forward and never makes unsent live edits official, so {@code requireNotLaid} is
+     * deliberately not called.
+     *
+     * <p><b>Order of checks</b> (16G contract §5.4; transport rejections - the multipart limit and a
+     * non-multipart request - happen earlier, in the framework): standard-protected guard → positive
+     * {@code orderId} (400) → scoped {@code FOR UPDATE} order lookup (404 {@code ORDER_NOT_FOUND}) → the
+     * current invoice read under that lock (none → 422 {@code INVOICE_REQUIRED}, before the version value
+     * is looked at) → the mandatory form field {@code expected_version_number} (400
+     * {@code VALIDATION_FAILED}) → compared with that current version's {@code version_number} (mismatch →
+     * 409 {@code INVOICE_VERSION_STALE}; the value is never used to select a row) → already accepted (409
+     * {@code INVOICE_ALREADY_ACCEPTED}) → part allowlist (400; the former {@code accepted_customer_name}
+     * part is refused like any other) → the current version's frozen {@code customer_name_snapshot} (null
+     * or blank → 422 {@code ACCEPTED_CUSTOMER_NAME_REQUIRED}; otherwise it IS the accepted name, verbatim
+     * and in full) → signature (422 / 400) → the saved customer email gate (422) → persist → post-commit
+     * email and stamp. Every refusal happens before the first file write.
      *
      * <p>Deliberately NOT {@code @Transactional}: the persist runs in ONE programmatic transaction
      * (signature {@code stored_file} + signed-PDF {@code stored_file} + appended {@code invoice} row +
-     * §11.1 mirror reset — any failure rolls all of it back and the rollback hooks remove both
-     * just-written files), the email is sent strictly AFTER that commit, and on send success the
-     * delivery timestamp is stamped in a short follow-up transaction. An email failure NEVER rolls
-     * back acceptance and never errors this endpoint: the response is still 201 with
-     * {@code last_emailed_at = null} and a message pointing at Re-send (contract §13 — D.9 Resend is
-     * the only path that surfaces {@code EMAIL_SEND_FAILED}). The response DTO is built from the FINAL
-     * post-email state, so {@code last_emailed_at} reflects the actual send outcome.
+     * §11.1 mirror reset + the D5(c) quote-link cancellation — any failure rolls all of it back and the
+     * rollback hooks remove both just-written files), the email is sent strictly AFTER that commit, and
+     * on delivery success the timestamp is stamped in a short follow-up transaction. Since 16G PR 3 no
+     * post-commit step can fail this endpoint (16G contract §6.2): a delivery failure, any other sender
+     * failure and a failure of the stamp transaction are WARN-logged and the response is still 201. The
+     * message reports the delivery outcome and the markers report what was recorded, so a delivered email
+     * whose stamp failed returns the emailed message with {@code last_emailed_at = null}, and Re-send
+     * stays available (D.9 Resend is the only path that surfaces {@code EMAIL_SEND_FAILED}).
      *
      * <p>Phase 16F PR1 (decision D5(c)/(d)): the same persist transaction also cancels the order's
      * ISSUED quote version + its ACTIVE token, if one exists, so a quote link can no longer be signed
      * once the invoice is signed in-app. An accepted quote never blocks this endpoint and is never
-     * revoked by it; the request contract, validation order, LAID allowance and email behaviour are
-     * unchanged.
+     * revoked by it; the LAID allowance is unchanged.
      */
     public ApiResponse<InvoiceResponse> acceptCurrentInvoice(String slug,
                                                              String orderIdRaw,
@@ -702,61 +786,72 @@ public class OrderInvoiceService {
         RequestContext ctx = requestContextGuard.requireStandardProtected(slug, request);
         long orderId = parsePositiveLong(orderIdRaw, "order_id");
 
-        AcceptedInvoice accepted = transactionTemplate.execute(
+        CommittedSignedInvoice accepted = transactionTemplate.execute(
                 status -> validateAndPersistAcceptance(orderId, ctx, request));
 
-        // Post-commit auto-email (non-fatal). The acceptance above is durable regardless of outcome.
-        boolean emailed = sendInvoiceEmailQuietly(ctx, orderId, accepted);
+        // Post-commit auto-email (16G contract §6): never throws; the acceptance above is durable. The
+        // response row after a recorded delivery is the stamp's re-read current row, as before PR 3.
+        PostCommitEmail email = emailSignedInvoiceAfterCommit(ctx, orderId, accepted, false);
 
-        InvoiceRow finalRow = emailed
-                ? transactionTemplate.execute(status ->
-                        stampEmailSuccess(orderId, ctx, accepted.row().invoiceId(), LocalDateTime.now()))
-                : accepted.row();
-
-        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, finalRow)),
-                emailed ? ACCEPT_EMAILED_MESSAGE : ACCEPT_EMAIL_FAILED_MESSAGE);
+        return ApiResponse.ok(new InvoiceResponse(toDto(slug, orderId, email.responseRow())),
+                email.outcome() == SignedEmailOutcome.DELIVERED ? ACCEPT_EMAILED_MESSAGE : ACCEPT_EMAIL_FAILED_MESSAGE);
     }
 
     /**
-     * The D.8 validation chain (contract §5.1, exact order) + single-transaction persist. Runs inside
+     * The D.8 check chain (16G contract §5.4, exact order) + single-transaction persist. Runs inside
      * {@code transactionTemplate.execute}, so the order row is held {@code FOR UPDATE} for the whole
-     * block — version allocation and the already-accepted check are serialised against a concurrent
-     * accept / rewrite / payment (the race loser gets 409 here, not a constraint violation).
+     * block — the current-invoice read, the stale comparison, the already-accepted check and version
+     * allocation are serialised against a concurrent accept / rewrite / payment / void / Path A (a
+     * version committed while this request waited for the lock is the one read here, so the race loser
+     * gets a 409, never a constraint violation).
      */
-    private AcceptedInvoice validateAndPersistAcceptance(long orderId,
-                                                         RequestContext ctx,
-                                                         MultipartHttpServletRequest request) {
+    private CommittedSignedInvoice validateAndPersistAcceptance(long orderId,
+                                                                RequestContext ctx,
+                                                                MultipartHttpServletRequest request) {
         // 1. Scope. FOR UPDATE — see method javadoc. No LAID gate (accept is LAID-allowed).
         SalesOrder order = salesOrderRepository
                 .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
 
-        // 2. A current invoice must exist (accept the FIRST invoice via D.1 Create before signing).
+        // 2. A current invoice must exist (accept the FIRST invoice via D.1 Create before signing). Read
+        // under the lock; checked BEFORE the version value (no invoice → 422 whatever the request holds).
         InvoiceRow current = invoiceRepository.findCurrentByOrderId(orderId)
                 .orElseThrow(() -> new BusinessRuleException(
                         ErrorCode.INVOICE_REQUIRED, ErrorCode.INVOICE_REQUIRED.defaultMessage()));
 
-        // 3. Not already accepted — checked under the order lock (double-submit / race -> 409).
+        // 3-4. Phase 16G PR 3 (#69): the mandatory expected_version_number, COMPARED with the current
+        // version read above - never used as a lookup key - so an old, forged or foreign value can only
+        // mismatch (409 before any later check and before any write).
+        long expectedVersionNumber = parseExpectedVersionNumber(request);
+        if (expectedVersionNumber != current.versionNumber()) {
+            throw new ConflictException(ErrorCode.INVOICE_VERSION_STALE,
+                    ErrorCode.INVOICE_VERSION_STALE.defaultMessage());
+        }
+
+        // 5. Not already accepted — checked under the order lock (double-submit / race -> 409).
         if (current.acceptedAt() != null) {
             throw new ConflictException(ErrorCode.INVOICE_ALREADY_ACCEPTED,
                     ErrorCode.INVOICE_ALREADY_ACCEPTED.defaultMessage());
         }
 
-        // 4-6. Multipart shape: unknown parts first (400, mirrors the attachment-upload structural
-        // check), then the name (422), then the signature (422 missing/empty; 400 bad MIME/oversize).
+        // 6-8. Multipart shape: unknown or repeated parts first (400, mirrors the attachment-upload
+        // structural check), then the FROZEN name (422), then the signature (422 missing/empty; 400 bad
+        // MIME/oversize).
         rejectUnexpectedAcceptParts(request);
-        String acceptedCustomerName = validateAcceptedCustomerName(request.getParameter(ACCEPTED_NAME_FIELD));
+        String acceptedCustomerName = requireFrozenAcceptedName(current);
         byte[] signatureBytes = validateSignature(request.getFile(SIGNATURE_PART));
 
-        // 7. Email gate LAST (contract §5.1 order — contrast D.1/D.2 where it runs first).
+        // 9. Email gate LAST (contract §5.1 order — contrast D.1/D.2 where it runs first).
         OrderCustomer customer = orderCustomerRepository.findByOrderId(orderId).orElse(null);
         customerEmailValidator.requireValidCustomerEmail(customer);
 
-        // 8. Persist in THIS transaction. Both files are written before their rows with a rollback
-        // hook each + in-method cleanup (the established file-write-first pattern, here twice).
+        // 10. Persist in THIS transaction. Both files are written before their rows with a rollback
+        // hook each + in-method cleanup (the established file-write-first pattern, here twice). Phase 16G
+        // PR 3: the signing version keeps the current version's invoice_date (the date of the invoice
+        // the customer reviewed and the stale check matched); accepted_at is the signing time.
         int versionNumber = current.versionNumber() + 1;
         LocalDateTime acceptedAt = LocalDateTime.now();
-        LocalDate invoiceDate = LocalDate.now();
+        LocalDate invoiceDate = current.invoiceDate();
 
         String signatureFileName = "signature-" + order.getOrderNumber() + "-v" + versionNumber
                 + "." + SIGNATURE_EXTENSION;
@@ -773,8 +868,8 @@ public class OrderInvoiceService {
             // current row (defensive - a Path A row is already accepted, so it is refused above).
             // Phase 16G PR 2 (#125): the words - Invoice To name, both billing lines and the terms -
             // are the current version's stored values, copied verbatim (nulls too) into both the PDF
-            // and the row; the live customer and address are never read for them. (The accepted name
-            // is still the submitted part until 16G PR 3.)
+            // and the row; the live customer and address are never read for them. Phase 16G PR 3: so
+            // is the accepted name (the frozen customer_name_snapshot) and the invoice date.
             String pdfFileName = "invoice-" + order.getOrderNumber() + "-v" + versionNumber + "." + PDF_EXTENSION;
             byte[] pdfBytes = invoicePdfGenerator.render(invoicePdfModelAssembler.assemble(new Inputs(
                     ctx.business(),
@@ -820,7 +915,9 @@ public class OrderInvoiceService {
                 // ACCEPTED quote is never touched and never blocks D.8; no ISSUED version → no-op.
                 cancelActiveQuoteLink(orderId, acceptedAt);
 
-                return new AcceptedInvoice(row, order.getOrderNumber(),
+                // The post-commit email's inputs, captured in this transaction: this version's own PDF
+                // and the saved customer email the gate above just passed (trimmed).
+                return new CommittedSignedInvoice(row, order.getOrderNumber(),
                         customer.getEmail().trim(), pdfBytes, pdfFileName);
             } catch (RuntimeException ex) {
                 fileStorageService.deleteQuietly(pdfPath);
@@ -975,27 +1072,74 @@ public class OrderInvoiceService {
     // ------------------------------------------------------------------
 
     /**
-     * Attempt the D.8 post-commit auto-email; report success/failure WITHOUT throwing. Only the
-     * transport failure ({@link InvoiceEmailException}) is non-fatal by contract — anything else is a
-     * real bug and propagates as 500.
+     * The post-commit signed-PDF email shared by D.8 and Path A (16G contract §6). Called only after the
+     * signing / conversion transaction has COMMITTED, with what that transaction captured: the appended
+     * row, this version's own PDF bytes and file name, the order number and the trimmed saved customer
+     * email (null for a Path A customer with no valid email). Nothing here re-reads the recipient or the
+     * attachment, and NOTHING here throws (16G contract §6.2):
+     * <ul>
+     *   <li>no recipient → the send is skipped with a WARN ({@link SignedEmailOutcome#SKIPPED}; Path A only,
+     *       D.8 gates the email before persisting);</li>
+     *   <li>any sender failure - the transport's {@link InvoiceEmailException} or any other runtime
+     *       failure - is WARN-logged ({@link SignedEmailOutcome#FAILED});</li>
+     *   <li>after a delivery the existing short stamp transaction ({@link #stampEmailSuccess}) records
+     *       {@code last_emailed_at} + the §11.1 mirror; ANY failure of that transaction, its commit
+     *       included, is WARN-logged and the committed row is returned instead (both markers stay null,
+     *       Re-send stays available) - the outcome is still {@link SignedEmailOutcome#DELIVERED}.</li>
+     * </ul>
+     * Each WARN carries the order id and the version number only - never the recipient, the body, the
+     * exception or its text. The returned row is the response basis. After a recorded delivery it is read
+     * in the stamp transaction: for D.8 the stamp's re-read CURRENT row (its existing behaviour, the F49
+     * window of contract §6.3, not changed here); with {@code respondWithAppendedVersion} (Path A) the
+     * version this request appended, so a version committed by another request between the commit and
+     * the stamp never becomes Path A's response. Without a recorded delivery it is the committed row
+     * itself (no further database read).
      */
-    private boolean sendInvoiceEmailQuietly(RequestContext ctx, long orderId, AcceptedInvoice accepted) {
+    private PostCommitEmail emailSignedInvoiceAfterCommit(RequestContext ctx, long orderId,
+                                                          CommittedSignedInvoice committed,
+                                                          boolean respondWithAppendedVersion) {
+        int versionNumber = committed.row().versionNumber();
+        if (committed.recipientEmail() == null) {
+            log.warn("Signed invoice email skipped for order {} invoice v{}: no valid saved customer email "
+                    + "(non-fatal; markers stay null)", orderId, versionNumber);
+            return new PostCommitEmail(SignedEmailOutcome.SKIPPED, committed.row());
+        }
         try {
             invoiceEmailSender.send(new InvoiceEmailRequest(
-                    accepted.recipientEmail(),
+                    committed.recipientEmail(),
                     emailSubject(ctx.business().getName()),
-                    emailBody(accepted.orderNumber(), ctx.business().getName()),
-                    accepted.pdfBytes(),
-                    accepted.pdfFileName(),
+                    emailBody(committed.orderNumber(), ctx.business().getName()),
+                    committed.pdfBytes(),
+                    committed.pdfFileName(),
                     orderId,
-                    accepted.row().versionNumber()));
-            return true;
-        } catch (InvoiceEmailException ex) {
-            // Acceptance is already committed and durable; last_emailed_at stays null on BOTH the
+                    versionNumber));
+        } catch (Exception ex) {
+            // The signing / conversion is committed and durable; last_emailed_at stays null on BOTH the
             // invoice and the sales_order mirror, and the 201 message points the user at Re-send.
-            log.warn("Accept auto-email failed for order {} invoice v{} (non-fatal; acceptance persisted)",
-                    orderId, accepted.row().versionNumber(), ex);
-            return false;
+            log.warn("Signed invoice email failed for order {} invoice v{} (non-fatal; the committed invoice "
+                    + "stands, markers stay null)", orderId, versionNumber);
+            return new PostCommitEmail(SignedEmailOutcome.FAILED, committed.row());
+        }
+        try {
+            long appendedInvoiceId = committed.row().invoiceId();
+            InvoiceRow stamped = transactionTemplate.execute(status -> {
+                InvoiceRow current = stampEmailSuccess(orderId, ctx, appendedInvoiceId, LocalDateTime.now());
+                if (!respondWithAppendedVersion || current.invoiceId() == appendedInvoiceId) {
+                    return current;
+                }
+                // Path A: another version became current after the conversion committed. The response
+                // still describes the version this request created, as stamped just now.
+                return invoiceRepository.findByInvoiceId(appendedInvoiceId)
+                        .orElseThrow(() -> new IllegalStateException(
+                                "Appended invoice disappeared while stamping last_emailed_at for order " + orderId));
+            });
+            return new PostCommitEmail(SignedEmailOutcome.DELIVERED, stamped != null ? stamped : committed.row());
+        } catch (Exception ex) {
+            // Delivered but not recorded: the stamp transaction rolled back as a whole, so both markers
+            // stay null and the Invoice tab offers Re-send; the response keeps the delivered message.
+            log.warn("Email-success stamp failed for order {} invoice v{} after delivery (non-fatal; markers "
+                    + "stay null)", orderId, versionNumber);
+            return new PostCommitEmail(SignedEmailOutcome.DELIVERED, committed.row());
         }
     }
 
@@ -1005,7 +1149,8 @@ public class OrderInvoiceService {
      * carry the SAME timestamp. The scoped order row is taken {@code FOR UPDATE} FIRST (the same lock
      * every version-creating transaction holds from its first statement), so the current-invoice
      * re-read cannot race a concurrent rewrite/payment and overwrite the mirror with a stale value.
-     * Returns the current row, from which the response DTO is built.
+     * Returns the current row (the D.8 and D.9 response basis; Path A responds with the version it
+     * appended, see {@link #emailSignedInvoiceAfterCommit}).
      */
     private InvoiceRow stampEmailSuccess(long orderId, RequestContext ctx, long invoiceId, LocalDateTime sentAt) {
         salesOrderRepository
@@ -1031,16 +1176,89 @@ public class OrderInvoiceService {
     }
 
     // ------------------------------------------------------------------
-    // D.8 multipart validation (contract §5.1 rules 4-6)
+    // D.8 multipart validation (contract §5.1, as amended by 16G contract §5.4 steps 4-9)
     // ------------------------------------------------------------------
 
     /**
-     * Multipart shape check (contract §5.1): any part / form field other than {@code signature} and
-     * {@code accepted_customer_name} -> one 400 {@code VALIDATION_FAILED} naming every offending part
-     * (mirrors the attachment upload). The two allowed parts must also appear AT MOST ONCE — a
-     * duplicated part would otherwise be silently collapsed by {@code getFile}/{@code getParameter}
-     * picking one value, so a repeated {@code signature} or {@code accepted_customer_name} is rejected
-     * here too (presence/required-ness stays with the later 422 checks).
+     * Phase 16G PR 3 (16G contract §5.3): the mandatory D.8 form field {@code expected_version_number},
+     * exactly once, holding a positive integer (the {@code orderId} rule). Missing → {@code Required.};
+     * repeated → {@code Must appear at most once.}; any other value that is not a positive integer, blank
+     * included → {@code Must be a positive integer.} (400 {@code VALIDATION_FAILED}, field
+     * {@code expected_version_number}). Only multipart FORM-FIELD values count ({@link #formFieldValues}):
+     * a URL query-string {@code expected_version_number} is not the precondition, and the allowlist
+     * refuses it. The parsed value is only compared, never used as a selector.
+     */
+    private static long parseExpectedVersionNumber(MultipartHttpServletRequest request) {
+        List<String> values = formFieldValues(request, EXPECTED_VERSION_FIELD);
+        if (values.isEmpty()) {
+            throw fieldValidation(EXPECTED_VERSION_FIELD, "Required.");
+        }
+        if (values.size() > 1) {
+            throw fieldValidation(EXPECTED_VERSION_FIELD, "Must appear at most once.");
+        }
+        return parsePositiveLong(values.get(0), EXPECTED_VERSION_FIELD);
+    }
+
+    /**
+     * The values a multipart request carries for {@code name} as FORM FIELDS. The servlet container
+     * reports URL query-string parameters through the same {@code getParameterValues} lists, so each
+     * query-string occurrence of the name is taken out again (contract §5.3 wants a form field; the
+     * conventions take no query-string data on a mutation).
+     */
+    private static List<String> formFieldValues(MultipartHttpServletRequest request, String name) {
+        String[] merged = request.getParameterValues(name);
+        if (merged == null) {
+            return List.of();
+        }
+        List<String> values = new ArrayList<>(Arrays.asList(merged));
+        for (String queryValue : queryStringParameters(request).getOrDefault(name, List.of())) {
+            values.remove(queryValue);
+        }
+        return values;
+    }
+
+    /**
+     * The request's URL query-string parameters, decoded as the container decodes parameters (UTF-8,
+     * {@code +} as a space); a component that cannot be decoded is kept as it was sent.
+     */
+    private static Map<String, List<String>> queryStringParameters(HttpServletRequest request) {
+        Map<String, List<String>> parameters = new LinkedHashMap<>();
+        String query = request.getQueryString();
+        if (query == null || query.isEmpty()) {
+            return parameters;
+        }
+        for (String pair : query.split("&")) {
+            if (pair.isEmpty()) {
+                continue;
+            }
+            int equals = pair.indexOf('=');
+            String rawName = equals < 0 ? pair : pair.substring(0, equals);
+            String rawValue = equals < 0 ? "" : pair.substring(equals + 1);
+            parameters.computeIfAbsent(decodeQueryComponent(rawName), key -> new ArrayList<>())
+                    .add(decodeQueryComponent(rawValue));
+        }
+        return parameters;
+    }
+
+    private static String decodeQueryComponent(String raw) {
+        try {
+            return URLDecoder.decode(raw, StandardCharsets.UTF_8);
+        } catch (IllegalArgumentException undecodable) {
+            return raw;
+        }
+    }
+
+    /**
+     * Multipart shape check (contract §5.1 as amended by 16G PR 3, §5.4 step 7): any file part other than
+     * {@code signature} and any form field other than {@code expected_version_number} -> one 400
+     * {@code VALIDATION_FAILED} naming every offending part (mirrors the attachment upload). The former
+     * {@code accepted_customer_name} part is refused here like any other, whatever its value. URL
+     * query-string parameters arrive through the same parameter names and are refused too, including a
+     * query-string {@code expected_version_number} next to the form field (only the form field is the
+     * precondition). The {@code signature} part must also appear AT MOST ONCE — a duplicated part would
+     * otherwise be silently collapsed by {@code getFile} picking one value (a repeated
+     * {@code expected_version_number} form field was already refused by
+     * {@link #parseExpectedVersionNumber}); presence/required-ness stays with the later 422 checks.
      */
     private static void rejectUnexpectedAcceptParts(MultipartHttpServletRequest request) {
         List<ErrorDetail> errors = new ArrayList<>();
@@ -1050,36 +1268,35 @@ public class OrderInvoiceService {
                 errors.add(new ErrorDetail(null, name, "Not allowed."));
             }
         }
+        Map<String, List<String>> queryParameters = queryStringParameters(request);
         for (Enumeration<String> paramNames = request.getParameterNames(); paramNames.hasMoreElements();) {
             String name = paramNames.nextElement();
-            if (!ACCEPTED_NAME_FIELD.equals(name)) {
+            if (!EXPECTED_VERSION_FIELD.equals(name) || queryParameters.containsKey(name)) {
                 errors.add(new ErrorDetail(null, name, "Not allowed."));
             }
         }
         if (request.getFiles(SIGNATURE_PART).size() > 1) {
             errors.add(new ErrorDetail(null, SIGNATURE_PART, "Must appear at most once."));
         }
-        String[] nameValues = request.getParameterValues(ACCEPTED_NAME_FIELD);
-        if (nameValues != null && nameValues.length > 1) {
-            errors.add(new ErrorDetail(null, ACCEPTED_NAME_FIELD, "Must appear at most once."));
-        }
         if (!errors.isEmpty()) {
             throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
         }
     }
 
-    /** Missing/blank -> 422 ACCEPTED_CUSTOMER_NAME_REQUIRED; over 150 chars after trim -> 400. */
-    private static String validateAcceptedCustomerName(String raw) {
-        if (raw == null || raw.isBlank()) {
+    /**
+     * Phase 16G PR 3 (16G contract §5.4 step 8): the accepted name is the current version's FROZEN
+     * {@code customer_name_snapshot} - never typed, never the live customer. Null or blank → 422
+     * {@code ACCEPTED_CUSTOMER_NAME_REQUIRED} (the fix is a saved name plus a Rewrite). Otherwise the
+     * stored value is returned VERBATIM: full length (the part and its 150-character request limit are
+     * gone), never trimmed or truncated.
+     */
+    private static String requireFrozenAcceptedName(InvoiceRow current) {
+        String frozenName = current.customerNameSnapshot();
+        if (frozenName == null || frozenName.isBlank()) {
             throw new BusinessRuleException(ErrorCode.ACCEPTED_CUSTOMER_NAME_REQUIRED,
                     ErrorCode.ACCEPTED_CUSTOMER_NAME_REQUIRED.defaultMessage());
         }
-        String trimmed = raw.trim();
-        if (trimmed.length() > MAX_ACCEPTED_NAME_LENGTH) {
-            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(),
-                    List.of(new ErrorDetail(null, ACCEPTED_NAME_FIELD, "Must be at most 150 characters.")));
-        }
-        return trimmed;
+        return frozenName;
     }
 
     /**
@@ -1163,6 +1380,87 @@ public class OrderInvoiceService {
         if (!errors.isEmpty()) {
             throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
         }
+    }
+
+    /**
+     * Phase 16G PR 3 (16G contract §5.3) - the Path A body, {@code CreateInvoiceFromQuoteRequest}: a JSON
+     * object with exactly one field, {@code quote_version_id}, a positive integer (the accepted quote
+     * version the client's confirmation shows). An absent or blank body, {@code {}} or a missing / null
+     * field → {@code Required.}; the key given more than once → {@code Must appear at most once.} (the D.8
+     * rule for a repeated carrier; a tree read alone would silently keep the last value); a value that is
+     * not a positive integer (a string, a fraction, a boolean, zero, a negative, or beyond the 64-bit range)
+     * → {@code Must be a positive integer.}; every other field → {@code Not allowed.} (one detail per field,
+     * in body order, in the same 400 as any {@code quote_version_id} detail, which comes last); a non-object
+     * body → {@code body} {@code Must be an object.} (a JSON {@code null} is a non-object body, not an absent
+     * one); unparseable → 400 {@code MALFORMED_JSON}. Parsed only after the scope and accepted-quote gates;
+     * the value is only compared, never used to select a version.
+     * {@code EmptyObjectRequest} / {@link #rejectNonEmptyBody} stay as they are for the other endpoints.
+     */
+    private long parseCreateInvoiceFromQuoteBody(String body) {
+        if (body == null || body.isBlank()) {
+            throw fieldValidation(QUOTE_VERSION_ID_FIELD, "Required.");
+        }
+        JsonNode node;
+        try {
+            node = objectMapper.readTree(body);
+        } catch (JsonProcessingException ex) {
+            throw new MalformedJsonException();
+        }
+        if (node == null || node.isMissingNode()) {
+            throw fieldValidation(QUOTE_VERSION_ID_FIELD, "Required.");
+        }
+        if (!node.isObject()) {
+            throw fieldValidation("body", "Must be an object.");
+        }
+        List<ErrorDetail> errors = new ArrayList<>();
+        Iterator<String> names = node.fieldNames();
+        while (names.hasNext()) {
+            String name = names.next();
+            if (!QUOTE_VERSION_ID_FIELD.equals(name)) {
+                errors.add(new ErrorDetail(null, name, "Not allowed."));
+            }
+        }
+        JsonNode value = node.get(QUOTE_VERSION_ID_FIELD);
+        if (topLevelKeyOccurrences(body, QUOTE_VERSION_ID_FIELD) > 1) {
+            errors.add(new ErrorDetail(null, QUOTE_VERSION_ID_FIELD, "Must appear at most once."));
+        } else if (value == null || value.isNull()) {
+            errors.add(new ErrorDetail(null, QUOTE_VERSION_ID_FIELD, "Required."));
+        } else if (!value.isIntegralNumber() || !value.canConvertToLong() || value.longValue() <= 0) {
+            errors.add(new ErrorDetail(null, QUOTE_VERSION_ID_FIELD, "Must be a positive integer."));
+        }
+        if (!errors.isEmpty()) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
+        }
+        return value.longValue();
+    }
+
+    /**
+     * How many times {@code key} names a member of the top-level JSON object in {@code body} (already
+     * parsed as an object by the caller). A tree read keeps only the last of repeated keys, so the body is
+     * streamed once more to count them; nested values are skipped.
+     */
+    private int topLevelKeyOccurrences(String body, String key) {
+        try (JsonParser parser = objectMapper.getFactory().createParser(body)) {
+            if (parser.nextToken() != JsonToken.START_OBJECT) {
+                return 0;
+            }
+            int occurrences = 0;
+            while (parser.nextToken() == JsonToken.FIELD_NAME) {
+                if (key.equals(parser.currentName())) {
+                    occurrences++;
+                }
+                parser.nextToken();
+                parser.skipChildren();
+            }
+            return occurrences;
+        } catch (IOException ex) {
+            throw new MalformedJsonException();
+        }
+    }
+
+    private static ValidationException fieldValidation(String field, String message) {
+        return new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(),
+                List.of(new ErrorDetail(null, field, message)));
     }
 
     private static long parsePositiveLong(String raw, String field) {
@@ -1319,9 +1617,21 @@ public class OrderInvoiceService {
     public record InvoiceFileDownload(byte[] bytes, String mimeType, String fileName, long fileSize) {
     }
 
-    /** Committed D.8 acceptance + what the post-commit auto-email needs (never serialized). */
-    private record AcceptedInvoice(InvoiceRow row, String orderNumber,
-                                   String recipientEmail, byte[] pdfBytes, String pdfFileName) {
+    /**
+     * A committed D.8 signing or Path A conversion and everything its post-commit email needs, captured
+     * inside the committing transaction (never serialized): the appended row, the order number, the
+     * trimmed saved customer email (null = no valid email, so Path A skips the send) and this version's
+     * own PDF bytes and file name.
+     */
+    private record CommittedSignedInvoice(InvoiceRow row, String orderNumber,
+                                          String recipientEmail, byte[] pdfBytes, String pdfFileName) {
+    }
+
+    /** The post-commit email outcome (16G contract §6.1); each route's 201 message is chosen from it. */
+    private enum SignedEmailOutcome { DELIVERED, FAILED, SKIPPED }
+
+    /** A post-commit email outcome + the row the response is built from (stamped current, or committed). */
+    private record PostCommitEmail(SignedEmailOutcome outcome, InvoiceRow responseRow) {
     }
 
     /** Validated D.9 resend input: the current accepted invoice + its stored PDF (never serialized). */

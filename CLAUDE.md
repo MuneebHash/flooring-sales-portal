@@ -98,7 +98,8 @@ Post-16F docs reconciliation: done (#137, merged 13 October 2026).
   Muneeb's 16G decisions done (13 October 2026, amended before PR 1). Target contract:
   docs/API-Contracts-Phase16G-Invoice-Link.md (UX: docs/Phase16D-Quotation-UX-Lock.md §20).
   16G PR 1 = docs + OpenAPI amendments only. NOTHING 16G is implemented until its PR merges:
-  PR 2 #125 frozen invoice words (implemented, V20) · PR 3 #69/#123 stale checks + Path A signed-PDF email ·
+  PR 2 #125 frozen invoice words (implemented, V20) · PR 3 #69/#123 stale checks + Path A signed-PDF email
+  (implemented for in-app D.8 + Path A, server + Invoice/Quote tabs, no migration; remote signing's check is PR 4) ·
   PR 4 remote invoice backend · PR 5 remote invoice frontend · PR 6 #120 #121 #122 #124.
 
 Next development step: the 16G implementation PRs 2 to 6, in order (docs/Phases.md §7).
@@ -423,18 +424,18 @@ Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-
   (e.g. &#183;), NOT named HTML entities (&middot; / &nbsp; / &hellip;). Old stored PDFs do NOT
   auto-update on template change — rewrite/regenerate to see changes.
 - Quick-adds: DetailsOfSaleTab reads the tenant list; EMPTY if none — no hardcoded fallback.
-- Accepted customer name (invoice acceptance) is never typed. TODAY the Invoice tab derives it from
-  the SAVED customer record and sends it as the D.8 accepted_customer_name part (150-character
-  request limit). From 16G PR 3 the server takes it from the current invoice VERSION's frozen
-  customer_name_snapshot: the part and its 150 limit are removed (sending it = 400 VALIDATION_FAILED),
-  a blank frozen name = 422 ACCEPTED_CUSTOMER_NAME_REQUIRED, the stored name is full length. Remote
-  invoice signing (16G PR 4) uses the same frozen name. Remote quote acceptance takes the issued V17
-  customer_name_snapshot (D1), never typed, never truncated (see Quotation above). Both columns are
-  TEXT since V19.
-- 16G version preconditions (planned; #69/#123): D.8 and remote invoice accept carry a mandatory
-  expected_version_number (409 INVOICE_VERSION_STALE "Invoice updated, please refresh"); Path A
-  carries {"quote_version_id": N} (409 QUOTE_VERSION_STALE). Compared under the order lock with the
-  row read there, NEVER used as a lookup key. Rewrite/payment/void get no precondition in 16G.
+- Accepted customer name (invoice acceptance) is never typed. Since 16G PR 3 (implemented) D.8 takes it
+  on the server from the current invoice VERSION's frozen customer_name_snapshot, verbatim and full
+  length: there is no accepted_customer_name part (sending one = 400 VALIDATION_FAILED "Not allowed.")
+  and no 150 limit; a blank frozen name = 422 ACCEPTED_CUSTOMER_NAME_REQUIRED (fix: save the name, then
+  Rewrite). The Invoice tab shows that frozen name under the pad. Remote invoice signing (16G PR 4)
+  will use the same frozen name. Remote quote acceptance takes the issued V17 customer_name_snapshot
+  (D1), never typed, never truncated (see Quotation above). Both columns are TEXT since V19.
+- 16G version preconditions (#69/#123; D.8 + Path A implemented in PR 3, remote invoice accept in PR 4):
+  D.8 and remote invoice accept carry a mandatory expected_version_number (409 INVOICE_VERSION_STALE
+  "Invoice updated, please refresh"); Path A carries {"quote_version_id": N} (409 QUOTE_VERSION_STALE).
+  Compared under the order lock with the row read there, NEVER used as a lookup key.
+  Rewrite/payment/void get no precondition in 16G.
 - Never leave follow-ups untracked — file a GitHub issue (the PR #71 lesson).
 - business_quick_description column is `description`, NOT `text` (Postgres type-name footgun);
   its FK to business has no ON DELETE — wipe child rows before the business row.
