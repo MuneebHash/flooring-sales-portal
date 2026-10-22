@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import DOMPurify from 'dompurify'
 import { Button } from '../ui/Button'
 import { SignaturePad, type SignaturePadHandle } from './SignaturePad'
+import { MailIcon } from '../icons'
 import { ApiError } from '../../lib/api/ApiError'
 import {
   acceptCurrentInvoice,
@@ -9,6 +10,7 @@ import {
   fetchCurrentInvoicePdf,
   fetchCurrentInvoiceSignature,
   resendCurrentInvoice,
+  sendInvoiceLink,
   type InvoiceDetail,
 } from '../../lib/api/orderInvoicesApi'
 import type { DetailsOfSaleFields } from '../../lib/api/orderWorkspaceApi'
@@ -22,17 +24,18 @@ type Props = {
   // which since 16G PR 3 also says whether the signed PDF was emailed). Shown above the
   // invoice until the next invoice action.
   notice?: string | null
-  // View/download + Phase 13 acceptance (sign / accept / re-send). Create + Rewrite
+  // View/preview + Phase 13 acceptance (sign / accept / re-send). Create + Rewrite
   // live in the Details of Sale tab now. NOTE: LAID/`locked` is deliberately NOT a
-  // prop here — Accept, Re-send and the signature download are all allowed when
-  // LAID (acceptance parallels payment, not rewrite), so the lock never gates this tab.
+  // prop here — Accept, Re-send, the signature download and (16G PR 5) Accept Remotely
+  // are all allowed when LAID (acceptance parallels payment, not rewrite), so the lock
+  // never gates this tab.
   orderNumber?: string
   saleDetails?: DetailsOfSaleFields | null
   // Order-bound salesperson name (sales_order.user_id -> app_user first/last), the same
   // source the PDF uses — NOT the session user. Rendered in the document meta; hidden
   // (fail-soft) when null/blank, like every other optional tenant/store field.
   salespersonName?: string | null
-  // Switches the workspace to the Customer tab when an accept/resend fails with
+  // Switches the workspace to the Customer tab when an accept / resend / send-link fails with
   // CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID so the salesperson can fix the
   // email where it lives.
   onGoToCustomer?: () => void
@@ -80,9 +83,11 @@ function formatTimestamp(iso: string): string {
   return `${day} ${name} ${year}, ${hours}:${minutes}`
 }
 
-// Download filename mirrors the backend Content-Disposition pattern
-// (invoice-{order_number}-v{version}.pdf). A blob object URL does not carry the
-// server's Content-Disposition, so the anchor sets the name explicitly.
+// Fallback name for the Preview PDF download that replaces a blocked popup, used
+// only when the server's Content-Disposition name is absent or unreadable. It
+// mirrors the backend pattern (invoice-{order_number}-v{version}.pdf); a blob
+// object URL does not carry the server's Content-Disposition, so the anchor sets
+// the name explicitly.
 function pdfFileName(
   orderNumber: string | undefined,
   versionNumber: number,
@@ -149,7 +154,7 @@ export function InvoiceTab({
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
-  // Backend success messages (accept / resend) surfaced VERBATIM.
+  // Backend success messages (accept / resend / send-link) surfaced VERBATIM.
   const [actionMessage, setActionMessage] = useState<string | null>(null)
   // Phase 16F PR3 - the handed-over success notice (see Props.notice), captured once at
   // mount (the workspace remounts this tab on every open and on every handover). Cleared
@@ -157,13 +162,24 @@ export function InvoiceTab({
   const [handoverNotice, setHandoverNotice] = useState<string | null>(
     notice ?? null,
   )
-  // True when the last accept/resend failed on the customer-email gate, so the
+  // True when the last accept / resend / send-link failed on the customer-email gate, so the
   // error banner can point the salesperson at the Customer tab.
   const [emailFixNeeded, setEmailFixNeeded] = useState(false)
-  const [downloading, setDownloading] = useState(false)
+  const [previewingPdf, setPreviewingPdf] = useState(false)
   const [accepting, setAccepting] = useState(false)
   const [resending, setResending] = useState(false)
+  // 16G PR 5 - Accept Remotely (send-link) in flight.
+  const [sendingLink, setSendingLink] = useState(false)
   const [reloadToken, setReloadToken] = useState(0)
+  // 16G PR 5 - ONE synchronous in-flight rule for the three mutations (Accept Invoice,
+  // Re-send Invoice, Accept Remotely): taken before a handler's first await and released in
+  // its finally, after any error recovery, so a rapid second tap can never start a second or
+  // conflicting mutation (the accepting / resending / sendingLink state only drives labels
+  // and disabled buttons, one render later).
+  const mutationInFlightRef = useRef(false)
+  // Object URLs handed to the Preview PDF tab. Revoking immediately can blank the tab
+  // mid-load, so they are revoked on unmount only (the QuoteTab registry).
+  const previewUrlsRef = useRef<string[]>([])
 
   // Business name + logo for the document header, from the fail-soft public-business lookup
   // in a SEPARATE, order-independent effect below: a failure hides the brand, never blocks
@@ -201,12 +217,15 @@ export function InvoiceTab({
 
   // Tracks whether THIS tab is still mounted so async action handlers never
   // setState after the tab unmounts on a tab switch. The mount fetch below uses
-  // its own per-run `cancelled` guard.
+  // its own per-run `cancelled` guard. Unmount also revokes the Preview PDF URLs.
   const mountedRef = useRef(true)
   useEffect(() => {
     mountedRef.current = true
+    const previewUrls = previewUrlsRef.current
     return () => {
       mountedRef.current = false
+      for (const url of previewUrls) URL.revokeObjectURL(url)
+      previewUrls.length = 0
     }
   }, [])
 
@@ -388,8 +407,9 @@ export function InvoiceTab({
     }
   }
 
-  // Shared accept/resend error handling. Backend messages are surfaced VERBATIM
-  // whenever present; the per-code branches only add the right recovery behaviour.
+  // Shared accept / resend / send-link (Accept Remotely, 16G PR 5) error handling.
+  // Backend messages are surfaced VERBATIM whenever present; the per-code branches
+  // only add the right recovery behaviour.
   async function applyAcceptResendError(err: unknown, fallback: string) {
     if (err instanceof ApiError) {
       const message = err.message.length > 0 ? err.message : fallback
@@ -434,8 +454,9 @@ export function InvoiceTab({
         await resyncCurrentInvoice()
         return
       }
-      // Everything else — including 502 EMAIL_SEND_FAILED on resend, where the
-      // backend wrote NOTHING, so the invoice state must stay untouched.
+      // Everything else — including 502 EMAIL_SEND_FAILED. On resend the backend
+      // wrote NOTHING; on send-link it kept the new link ACTIVE (undelivered) but
+      // wrote no invoice row. Either way the invoice state must stay untouched.
       setActionError(message)
       return
     }
@@ -446,8 +467,10 @@ export function InvoiceTab({
     // Stray-call guard: never accept while the current invoice (and with it the terms it
     // is accepted under) is not safely loaded (Codex P1).
     if (
+      mutationInFlightRef.current ||
       accepting ||
       resending ||
+      sendingLink ||
       invoice === null ||
       !invoiceReadyForAcceptance ||
       !acceptanceChecked.every(Boolean)
@@ -463,6 +486,7 @@ export function InvoiceTab({
     if (!hasFrozenAcceptedName(displayed) || !hasInk) {
       return
     }
+    mutationInFlightRef.current = true
     setAccepting(true)
     setActionError(null)
     setActionMessage(null)
@@ -547,12 +571,21 @@ export function InvoiceTab({
         'Could not accept the invoice. Please try again.',
       )
     } finally {
+      mutationInFlightRef.current = false
       if (mountedRef.current) setAccepting(false)
     }
   }
 
   async function handleResend() {
-    if (accepting || resending || invoice === null) return
+    if (
+      mutationInFlightRef.current ||
+      accepting ||
+      resending ||
+      sendingLink ||
+      invoice === null
+    )
+      return
+    mutationInFlightRef.current = true
     setResending(true)
     setActionError(null)
     setActionMessage(null)
@@ -575,7 +608,53 @@ export function InvoiceTab({
         'Could not re-send the invoice. Please try again.',
       )
     } finally {
+      mutationInFlightRef.current = false
       if (mountedRef.current) setResending(false)
+    }
+  }
+
+  // 16G PR 5 - Accept Remotely: email the customer a link to review and sign the CURRENT
+  // invoice (POST …/invoices/current/send-link, to the SAVED customer email). It needs no ink,
+  // no ticks and no version value, is allowed on a LAID order, and only for an unsigned,
+  // safely loaded invoice. It never touches the signing draft: success and ordinary failures
+  // keep the ink and ticks. Success shows the response message; there is no re-read, link
+  // status, expiry display or cancel. Failures share the accept/resend recovery: the 502
+  // message verbatim with the invoice state untouched, the customer-email pointer, and the
+  // existing drift resync for 409 INVOICE_ALREADY_ACCEPTED / 422 INVOICE_REQUIRED.
+  async function handleSendLink() {
+    if (
+      mutationInFlightRef.current ||
+      accepting ||
+      resending ||
+      sendingLink ||
+      invoice === null ||
+      !invoiceReadyForAcceptance ||
+      invoice.accepted_at !== null
+    )
+      return
+    mutationInFlightRef.current = true
+    setSendingLink(true)
+    setActionError(null)
+    setActionMessage(null)
+    setHandoverNotice(null)
+    setEmailFixNeeded(false)
+    try {
+      const res = await sendInvoiceLink(orderId)
+      if (!mountedRef.current) return
+      setActionMessage(
+        res.message && res.message.length > 0
+          ? res.message
+          : 'Invoice link emailed to the customer.',
+      )
+    } catch (err) {
+      if (!mountedRef.current) return
+      await applyAcceptResendError(
+        err,
+        'Could not email the invoice link. Please try again.',
+      )
+    } finally {
+      mutationInFlightRef.current = false
+      if (mountedRef.current) setSendingLink(false)
     }
   }
 
@@ -585,31 +664,57 @@ export function InvoiceTab({
     padRef.current?.clear()
   }
 
-  async function handleDownload() {
-    if (downloading || invoice === null) return
+  // 16G PR 5 - Preview PDF: open the current version's STORED PDF (the unchanged D.4 read,
+  // …/invoices/current/file; never regenerated, nothing flushed) in a new tab. Popup-safe
+  // order (the QuoteTab previews): open a blank tab synchronously in the click handler, fetch
+  // the credentialed blob, then point the tab at the object URL; download instead only when
+  // the popup was blocked; close the blank tab on any failure.
+  async function handlePreviewPdf() {
+    if (previewingPdf || invoice === null) return
     const current = invoice
-    setDownloading(true)
     setActionError(null)
     setActionMessage(null)
     setHandoverNotice(null)
     setEmailFixNeeded(false)
+    // tab === null right here means a popup blocker intervened; a tab that exists now but is
+    // CLOSED by the time the blob is ready means the user deliberately closed it (a cancel).
+    const tab = window.open('', '_blank')
+    setPreviewingPdf(true)
     try {
       const { blob, fileName } = await fetchCurrentInvoicePdf(orderId)
-      if (!mountedRef.current) return
-      // One-shot object URL: create, trigger the download, revoke immediately. Prefer the server
-      // file name from the D.4 Content-Disposition (authoritative for the CURRENT invoice the
-      // backend just streamed, so it stays correct even if the invoice changed since the last
-      // read); fall back to the client-side name only when the header is absent/unreadable.
+      if (!mountedRef.current) {
+        tab?.close()
+        return
+      }
       const url = URL.createObjectURL(blob)
-      const anchor = document.createElement('a')
-      anchor.href = url
-      anchor.download =
-        fileName ?? pdfFileName(orderNumber, current.version_number)
-      document.body.appendChild(anchor)
-      anchor.click()
-      anchor.remove()
-      URL.revokeObjectURL(url)
+      if (tab && !tab.closed) {
+        // Revoked on unmount only — revoking now could blank the loading tab.
+        previewUrlsRef.current.push(url)
+        tab.location.href = url
+      } else if (tab === null) {
+        // Popup blocked — fall back to a normal download. One-shot URL: consumed by the
+        // click, revoke now. Prefer the server file name from the D.4 Content-Disposition
+        // (authoritative for the CURRENT invoice the backend just streamed, so it stays correct
+        // even if the invoice changed since the last read); fall back to the client-side name
+        // only when the header is absent/unreadable.
+        const anchor = document.createElement('a')
+        anchor.href = url
+        anchor.download =
+          fileName ?? pdfFileName(orderNumber, current.version_number)
+        document.body.appendChild(anchor)
+        anchor.click()
+        anchor.remove()
+        URL.revokeObjectURL(url)
+        setActionError(
+          'The preview tab was blocked by the browser, so the PDF was downloaded instead.',
+        )
+      } else {
+        // The user closed the blank tab while the PDF was being fetched — treat it as a
+        // cancel: no forced download, no error banner.
+        URL.revokeObjectURL(url)
+      }
     } catch (err) {
+      tab?.close()
       if (!mountedRef.current) return
       // The invoice vanished server-side — show a message and refetch state.
       if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
@@ -620,10 +725,10 @@ export function InvoiceTab({
       setActionError(
         err instanceof ApiError && err.message.length > 0
           ? err.message
-          : 'Could not download the invoice PDF. Please try again.',
+          : 'Could not open the invoice PDF. Please try again.',
       )
     } finally {
-      if (mountedRef.current) setDownloading(false)
+      if (mountedRef.current) setPreviewingPdf(false)
     }
   }
 
@@ -747,14 +852,16 @@ export function InvoiceTab({
               type="button"
               variant="secondary"
               size="md"
-              onClick={handleDownload}
-              disabled={downloading}
+              onClick={handlePreviewPdf}
+              disabled={previewingPdf}
             >
-              {downloading ? 'Preparing…' : 'Download PDF'}
+              {previewingPdf ? 'Opening PDF…' : 'Preview PDF'}
             </Button>
-            {/* Phase 16A PR1 — the top action area holds ONLY Download PDF. Re-send is no
-                longer duplicated here; it lives solely in the accepted signature block below
-                (near the signature), matching the CarpetCall layout. */}
+            {/* Phase 16A PR1 — the top action area holds ONLY the PDF action (Preview PDF
+                since 16G PR 5; it opens the stored PDF in a new tab, and the browser's
+                viewer downloads it). Re-send is no longer duplicated here; it lives solely in
+                the accepted signature block below (near the signature), matching the
+                CarpetCall layout. */}
           </div>
         )}
       </div>
@@ -1120,14 +1227,16 @@ export function InvoiceTab({
           </div>
 
           {/* Full-width bottom action bar — anchors the document (CarpetCall-style). Unaccepted
-              => Accept Invoice (same handler/gates as before); accepted => Re-send Invoice (the
-              ONLY Re-send; the top one was removed). Native button for precise full-width sizing. */}
+              => Accept Invoice (same handler/gates as before) | Accept Remotely (16G PR 5: emails
+              the customer the invoice link; no ink or ticks needed); accepted => Re-send Invoice
+              only (the ONLY Re-send; the top one was removed; Accept Remotely is never offered
+              for a signed invoice). Native buttons for precise full-width sizing. */}
           <div className="mt-3">
             {invoiceAccepted ? (
               <button
                 type="button"
                 onClick={handleResend}
-                disabled={resending || accepting}
+                disabled={resending || accepting || sendingLink}
                 className="flex w-full items-center justify-center gap-2 rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"
               >
                 <svg
@@ -1141,21 +1250,38 @@ export function InvoiceTab({
                 {resending ? 'Re-sending…' : 'Re-send Invoice'}
               </button>
             ) : (
-              <button
-                type="button"
-                onClick={handleAccept}
-                disabled={
-                  accepting ||
-                  resending ||
-                  !hasInk ||
-                  !allAcceptanceChecked ||
-                  frozenAcceptedName === null ||
-                  !invoiceReadyForAcceptance
-                }
-                className="flex w-full items-center justify-center rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                {accepting ? 'Accepting…' : 'Accept Invoice'}
-              </button>
+              <div className="flex flex-col gap-2 sm:flex-row">
+                <button
+                  type="button"
+                  onClick={handleAccept}
+                  disabled={
+                    accepting ||
+                    resending ||
+                    sendingLink ||
+                    !hasInk ||
+                    !allAcceptanceChecked ||
+                    frozenAcceptedName === null ||
+                    !invoiceReadyForAcceptance
+                  }
+                  className="flex w-full items-center justify-center rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50 sm:flex-1"
+                >
+                  {accepting ? 'Accepting…' : 'Accept Invoice'}
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSendLink}
+                  disabled={
+                    accepting ||
+                    resending ||
+                    sendingLink ||
+                    !invoiceReadyForAcceptance
+                  }
+                  className="flex w-full items-center justify-center gap-2 rounded-md bg-teal-600 px-6 py-3.5 text-sm font-semibold text-white shadow-sm transition-colors hover:bg-teal-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50 sm:flex-1"
+                >
+                  <MailIcon aria-hidden="true" className="h-4 w-4" />
+                  {sendingLink ? 'Sending link…' : 'Accept Remotely'}
+                </button>
+              </div>
             )}
           </div>
         </article>

@@ -16,6 +16,7 @@ import {
 import { DashboardPage } from './components/DashboardPage'
 import { Login } from './components/Login'
 import { OrderWorkspace } from './components/OrderWorkspace'
+import { PublicInvoicePage } from './components/PublicInvoicePage'
 import { PublicQuotePage } from './components/PublicQuotePage'
 import { StoreSelection } from './components/StoreSelection'
 
@@ -78,6 +79,13 @@ function App() {
               page itself makes no authenticated call (publicQuoteApi fetches
               WITHOUT credentials); AuthProvider around it is inert state. */}
           <Route path="q/:token" element={<PublicQuotePage />} />
+          {/* Phase 16G PR 5 — PUBLIC customer invoice page, the sibling of
+              /q/{token}: top-level, SLUGLESS, token-only, no login/store-selection/
+              app shell. The static "i" segment outranks the dynamic :slug route,
+              so /i/{token} can never be routed as a tenant ("i" is also a
+              reserved business slug). The page reads no auth state and makes no
+              authenticated call (publicInvoiceApi fetches WITHOUT credentials). */}
+          <Route path="i/:token" element={<PublicInvoicePage />} />
           <Route path=":slug" element={<TenantGuard />}>
             <Route path="login" element={<Login />} />
             <Route

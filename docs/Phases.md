@@ -222,7 +222,7 @@ Private invoice/legal (ABN, bank, T&Cs, Stripe link, quick-adds): AUTHENTICATED 
                  presentation fields for its single document. Quote token (16E-C /q/{token}):
                  business name/logo/accent, ABN, direct-deposit bank details, Stripe payment link,
                  and the quote's frozen terms snapshot. Invoice token (16G: API since PR 4; page
-                 /i/{token} planned in PR 5): the same business fields plus the order's current invoice version
+                 /i/{token} since PR 5): the same business fields plus the order's current invoice version
                  (frozen Invoice To, details, totals, Payment Made, Balance Due, dates, stored terms;
                  contract §9.3). A dead token shows only its message. Quick-adds and other config
                  are never public.
@@ -367,7 +367,7 @@ Footguns — must not break:
   Do NOT touch this model. (NOTE: the 16E-C public tokenized quote link — page /q/{token}, API
   /api/v1/public/quotes/{token} — is a separate, slugless, token-only unauthenticated surface; it
   never reuses or weakens this session model. The 16G invoice link — page /i/{token}, API
-  /api/v1/public/invoices/{token}, the API since PR 4 and the page planned in PR 5 — follows the
+  /api/v1/public/invoices/{token}, the API since PR 4 and the page since PR 5 — follows the
   same rule, with its own tokens.)
 - Use apiPath(slug, …) for tenant-scoped endpoints; bypass only for genuinely public endpoints.
 - Accepted customer name (invoice acceptance) is never typed. Today the Invoice tab derives it from
@@ -454,7 +454,7 @@ The six 16G PRs (in order; two new migrations: V20 in PR 2 and V21 in PR 4):
 | 2 | #125: freeze invoice name, billing lines and terms (one migration, every backend writer, Invoice To from InvoiceDetail, `terms_source` `LIVE` → `BUSINESS`, tests) |
 | 3 | #69 + #123: mandatory stale checks on the server **and** in the Invoice tab and Quote tab (so no broken client/server interval); D.8 name from the frozen version, name part removed; D.8 post-commit work non-throwing; Path A automatic signed-PDF email; one shared token hash helper |
 | 4 | Remote invoice backend: `invoice_token` migration (also reserves the slug `i`), protected send-link, public API and signing, link and customer emails, store notification, quote-link cancellation on remote signing, plus the derived InvoiceDetail `invoice_link_expires_at` (no migration of its own) |
-| 5 | Remote invoice frontend: `/i/{token}`, Accept Remotely, Preview PDF label, #126 on both public pages |
+| 5 | Remote invoice frontend (implemented): `/i/{token}`, Accept Remotely, Preview PDF label, #126 on both public pages |
 | 6 | [#120](https://github.com/MuneebHash/flooring-sales-portal/issues/120) polling (on server state; the Invoice tab polls while `invoice_link_expires_at` is non-null) and signing-draft invalidation when a refresh installs another invoice version, [#121](https://github.com/MuneebHash/flooring-sales-portal/issues/121) financial refresh and an edit-gated Update Sale Price, [#122](https://github.com/MuneebHash/flooring-sales-portal/issues/122) version-bound accepted quote reads, [#124](https://github.com/MuneebHash/flooring-sales-portal/issues/124) provenance boolean and whole-second quote timestamps, plus the derived `QuoteIssuedSummary.last_email_delivered` for the Not delivered badge |
 
 16G issues: #120, #121, #122, #123 (with #69) and #124; #125 and #126 (in); [#69](https://github.com/MuneebHash/flooring-sales-portal/issues/69) (PR 3, with PR 4 for remote signing); [#138](https://github.com/MuneebHash/flooring-sales-portal/issues/138) OpenAPI drift (folded into PR 1). Each code PR carries the mandatory test list in the 16G contract §16; no frontend test runner is added (build plus manual smoke test). Muneeb reviews the Invoice tab result in the smoke test.
@@ -476,7 +476,7 @@ Boundaries: #104 seeds only at first quote creation and does not re-couple quote
 
 - [#111](https://github.com/MuneebHash/flooring-sales-portal/issues/111) Lead Enquiry: Preview PDF for printing.
 - [#112](https://github.com/MuneebHash/flooring-sales-portal/issues/112) Payments tab deposit display; deposit % becomes a per-business setting.
-- [#113](https://github.com/MuneebHash/flooring-sales-portal/issues/113) Invoice tab: replace "Download PDF" with "Preview PDF". 16G PR 5 renames the button and opens the stored PDF as a preview (UX lock §20.1), which meets #113's criteria; whether #113 then closes is Muneeb's call after the PR 5 smoke test.
+- [#113](https://github.com/MuneebHash/flooring-sales-portal/issues/113) Invoice tab: replace "Download PDF" with "Preview PDF". 16G PR 5 renamed the button and opens the stored PDF as a preview (UX lock §20.1), which meets #113's criteria; whether #113 closes is still Muneeb's call after the PR 5 smoke test.
 - [#114](https://github.com/MuneebHash/flooring-sales-portal/issues/114) Invoice tab: "Last emailed invoice" button.
 
 Boundaries: #112 adds a per-business deposit percentage (default 40%, set by SQL until an Operations surface exists), frozen on quote issue and preserved through acceptance/conversion; existing issued/accepted quotes keep 40%. Today 40% is hardcoded in two places (`QuotePdfGenerator`, `PublicQuoteService`) — configurable deposit is not implemented. #114 previews the exact stored PDF of the invoice version with the latest successful signed-PDF email (including the 16G emails after a Path A conversion or a remote signing), labelled "Last emailed invoice: Version N"; it never claims the customer received it and adds no invoice history list. 16G invoice **link** sends never count: they stamp only the `invoice_token` markers, never `invoice.last_emailed_at` or the dashboard mirror. Versions already have stored PDFs and per-version `last_emailed_at`; storage/schema reuse is checked during implementation. #114 also takes the Invoice tab PDF/signature read binding (audit F53, an edit to the issue proposed after 16G PR 1).

@@ -1353,7 +1353,7 @@ paths:
         to the session business/store. This read endpoint is allowed when order_status is
         LAID. Returns 404 when no invoice exists yet. The backend sets Content-Disposition
         filename as invoice-{order_number}-v{version_number}.pdf. Downloading older versions
-        is deferred post-MVP. From 16G PR 5 the Invoice tab's Download PDF button is relabelled
+        is deferred post-MVP. Since 16G PR 5 the Invoice tab's Download PDF button is relabelled
         Preview PDF and opens this endpoint's current stored PDF in a new tab (endpoint
         unchanged). Binding this read to the version on screen is #114 (Batch B), not 16G.
       parameters:
@@ -1522,7 +1522,7 @@ paths:
       description: >
         16G PR 4
         (docs/API-Contracts-Phase16G-Invoice-Link.md section 8). The Invoice tab's Accept Remotely
-        button calls it (PR 5). Standard
+        button calls it (since PR 5). Standard
         protected. The request body is an empty JSON object (EmptyObjectRequest); no signature,
         name or declaration is sent. Order of checks: standard guard and positive orderId; the
         order scoped and locked (404 ORDER_NOT_FOUND); empty-body validation (400); the current
@@ -2413,7 +2413,7 @@ paths:
         in-app invoice acceptance, 16F decision D5(c)), or INACTIVE (signed; link dead, not a
         viewable signed copy). An unknown token returns 404 (QUOTE_TOKEN_NOT_FOUND). Only an ACTIVE token on an
         ISSUED quote can lazily expire on access. A dead state carries its per-state message in
-        data.message; from 16G PR 5 (#126) the public page shows that message (and the 404
+        data.message; since 16G PR 5 (#126) the public page shows that message (and the 404
         message) instead of a generic sentence - the API is unchanged. An invoice token presented
         here is indistinguishable from an unknown token (404). Rate limiting against rapid
         repeated access by token/IP is required by the contract (§8) before production but is NOT
@@ -2627,7 +2627,7 @@ paths:
       operationId: getPublicInvoice
       security: []
       description: >
-        16G PR 4 (the /i/{token} page is PR 5;
+        16G PR 4 (the /i/{token} page since PR 5;
         docs/API-Contracts-Phase16G-Invoice-Link.md section 9). Public, slugless, token-only: no
         session is read or created, no Set-Cookie, no RequestContextGuard; the secret token is the
         only credential and only the single order's current invoice behind it is readable. The
@@ -5810,7 +5810,7 @@ components:
           type: string
           nullable: true
           description: >-
-            Customer-facing message for non-ACTIVE states. From 16G PR 5 (#126) the public page
+            Customer-facing message for non-ACTIVE states. Since 16G PR 5 (#126) the public page
             shows this message for a dead state instead of a generic sentence (API unchanged).
 
     PublicQuoteViewWrapper:

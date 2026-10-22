@@ -39,13 +39,16 @@ import { toBoundedSignaturePng } from '../lib/signaturePng'
 // the link state ONCE before another accept is offered and never re-posts on
 // its own.
 //
-// Dead links on an ordinary load: EVERY failure (dead state EXPIRED /
-// SUPERSEDED / CANCELLED / INACTIVE, unknown/malformed token, any fetch error)
-// shows exactly ONE generic message (locked 16E-C decision; no state-specific
-// wording). The accept response is the exception: its 410/422 messages are shown
-// verbatim.
+// Dead links (16G PR 5, #126): every known answer shows its own wording. A dead
+// state on load (EXPIRED / SUPERSEDED / CANCELLED / INACTIVE) shows that
+// payload's data.message (the per-state text); a 404 shows the backend message
+// ("Quote not found."); a PDF 404/410 shows that response's message; the accept
+// response's 410/422 messages are shown verbatim (unchanged). The one generic
+// sentence below remains only for a load that gets no readable answer, and as the
+// fallback when a dead answer carries no readable message.
 const DEAD_LINK_MESSAGE =
   'This quote link is no longer available. Please contact the store.'
+const QUOTE_NOT_FOUND_MESSAGE = 'Quote not found.'
 
 const ACCEPTED_FALLBACK_MESSAGE = 'Quote accepted.'
 const ACCEPT_FAILED_FALLBACK_MESSAGE =
@@ -86,8 +89,22 @@ function flooringLabel(flooringType: string | null): string | null {
 
 type LoadState =
   | { phase: 'loading' }
-  | { phase: 'dead' }
+  | { phase: 'dead'; message: string }
   | { phase: 'active'; quote: PublicQuoteView }
+
+// The message a dead answer shows (#126): a dead payload's own data.message, or
+// a 404 / 410 error's backend message (readable when its envelope carried a
+// code), otherwise the given fallback.
+function deadPayloadMessage(view: PublicQuoteView): string {
+  const message = typeof view.message === 'string' ? view.message.trim() : ''
+  return message.length > 0 ? message : DEAD_LINK_MESSAGE
+}
+
+function deadErrorMessage(err: ApiError, fallback: string): string {
+  return err.code !== null && err.message.trim().length > 0
+    ? err.message
+    : fallback
+}
 
 // The accept flow on an ACTIVE page.
 //   idle        - signing open.
@@ -178,13 +195,15 @@ function PublicQuoteDocument({ token }: { token: string }) {
   // (fire-and-forget and its result is IGNORED: the backend stamps viewed_at
   // write-once, so repeat visits and StrictMode double-effects are harmless
   // no-ops, a marking failure never disturbs the rendered page, and a late
-  // answer can never restore ACTIVE after an acceptance). ANY other outcome -
-  // dead state, 404, 410, network failure — is the one generic dead-link view.
-  // A fresh load of an INACTIVE (signed) link is therefore the dead-link view;
-  // the local confirmation exists only for the session that signed.
+  // answer can never restore ACTIVE after an acceptance). A dead state shows its
+  // own data.message and a 404 the backend message ("Quote not found."); only a
+  // load with no readable answer (a network failure, an unreadable body, any
+  // other status) shows the generic sentence. A fresh load of an INACTIVE
+  // (signed) link is therefore the dead-link view with its per-state text; the
+  // local confirmation exists only for the session that signed.
   useEffect(() => {
     if (!token) {
-      setState({ phase: 'dead' })
+      setState({ phase: 'dead', message: QUOTE_NOT_FOUND_MESSAGE })
       return
     }
     let cancelled = false
@@ -198,11 +217,18 @@ function PublicQuoteDocument({ token }: { token: string }) {
             // First-view marking is best-effort; the page stays rendered.
           })
         } else {
-          setState({ phase: 'dead' })
+          setState({ phase: 'dead', message: deadPayloadMessage(quote) })
         }
       })
-      .catch(() => {
-        if (!cancelled && !finalRef.current) setState({ phase: 'dead' })
+      .catch((err: unknown) => {
+        if (cancelled || finalRef.current) return
+        setState({
+          phase: 'dead',
+          message:
+            err instanceof ApiError && err.status === 404
+              ? deadErrorMessage(err, QUOTE_NOT_FOUND_MESSAGE)
+              : DEAD_LINK_MESSAGE,
+        })
       })
     return () => {
       cancelled = true
@@ -312,13 +338,12 @@ function PublicQuoteDocument({ token }: { token: string }) {
       tab?.close()
       if (!mountedRef.current || finalRef.current) return
       // A 404/410 means the link died after the page rendered (cancelled /
-      // replaced / expired mid-visit). The locked rule is ONE generic customer
-      // message with no state-specific wording, so the backend's per-state
-      // error text is never surfaced here; other failures get a neutral retry.
-      const status = err instanceof ApiError ? err.status : 0
+      // replaced / expired mid-visit). Since 16G PR 5 (#126) that response's own
+      // message is shown verbatim (the generic sentence only when it carried
+      // none); other failures get a neutral retry.
       setPdfError(
-        status === 404 || status === 410
-          ? DEAD_LINK_MESSAGE
+        err instanceof ApiError && (err.status === 404 || err.status === 410)
+          ? deadErrorMessage(err, DEAD_LINK_MESSAGE)
           : 'Could not open the quote PDF. Please try again.',
       )
     } finally {
@@ -332,10 +357,10 @@ function PublicQuoteDocument({ token }: { token: string }) {
     setAcceptState({ kind: 'accepted', message })
   }
 
-  function markDeadLink() {
+  function markDeadLink(message: string) {
     finalRef.current = true
     setPdfError(null)
-    setState({ phase: 'dead' })
+    setState({ phase: 'dead', message })
   }
 
   // One status re-read of this same token after an ambiguous accept failure (or
@@ -348,8 +373,9 @@ function PublicQuoteDocument({ token }: { token: string }) {
   //                        lost: after a gateway timeout the first request can
   //                        still commit later, and a retry then gets its 410
   //                        message verbatim.
-  //   EXPIRED / SUPERSEDED / CANCELLED, or 404 - the existing dead-link view; no
-  //                        success claim, no signing retry.
+  //   EXPIRED / SUPERSEDED / CANCELLED, or 404 - the dead-link view with that
+  //                        state's data.message or the 404's backend message
+  //                        (#126); no success claim, no signing retry.
   //   re-read failed     - state unknown: neutral "Check status" only.
   async function reconcileAcceptance() {
     if (reconcilingRef.current) return
@@ -362,7 +388,7 @@ function PublicQuoteDocument({ token }: { token: string }) {
       } catch (err) {
         if (!mountedRef.current) return
         if (err instanceof ApiError && err.status === 404) {
-          markDeadLink()
+          markDeadLink(deadErrorMessage(err, QUOTE_NOT_FOUND_MESSAGE))
           return
         }
         setAcceptState({ kind: 'unknown' })
@@ -378,7 +404,7 @@ function PublicQuoteDocument({ token }: { token: string }) {
         setAcceptState({ kind: 'retry', message: NOT_CONFIRMED_MESSAGE })
         return
       }
-      markDeadLink()
+      markDeadLink(deadPayloadMessage(view))
     } finally {
       reconcilingRef.current = false
     }
@@ -462,7 +488,9 @@ function PublicQuoteDocument({ token }: { token: string }) {
     return (
       <div className="min-h-screen bg-slate-100 flex items-center justify-center px-4">
         <div className="max-w-md w-full rounded-lg border border-slate-200 bg-white shadow-sm px-6 py-8 text-center">
-          <p className="text-sm text-slate-700">{DEAD_LINK_MESSAGE}</p>
+          <p className="text-sm text-slate-700">
+            {state.phase === 'dead' ? state.message : DEAD_LINK_MESSAGE}
+          </p>
         </div>
       </div>
     )

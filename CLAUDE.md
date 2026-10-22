@@ -102,9 +102,9 @@ Post-16F docs reconciliation: done (#137, merged 13 October 2026).
   (implemented for in-app D.8 + Path A, server + Invoice/Quote tabs, no migration; remote signing's check is PR 4) ·
   PR 4 remote invoice backend (implemented, V21: invoice link + send-link, public invoice API, remote signing
   with its signed-PDF email and store notification, link kills in D.2/D.8/Path A, slug 'i') ·
-  PR 5 remote invoice frontend · PR 6 #120 #121 #122 #124.
+  PR 5 remote invoice frontend (implemented: /i/{token}, Accept Remotely, Preview PDF, #126) · PR 6 #120 #121 #122 #124.
 
-Next development step: the 16G implementation PRs 5 and 6, in order (docs/Phases.md §7).
+Next development step: the 16G implementation PR 6 (docs/Phases.md §7).
 
 Approved sequence (details: docs/Phases.md §7/§9):
   GitHub cleanup (done) -> post-16E docs reconciliation (done) -> 16F verify gate (done) -> 16F (done)
@@ -162,7 +162,7 @@ Tenant app URLs use the business slug as the first path segment; API calls use t
 API:  /api/v1/{slug}/...
 Application site:  floorxtack.com/{business-slug}      Marketing site:  tradextack.com
 Public quote (16E-C, slugless, token-only):  page /q/{token} · API /api/v1/public/quotes/{token}
-Public invoice (16G, API since PR 4 / page PR 5; slugless, token-only):  page /i/{token} ·
+Public invoice (16G, API since PR 4 / page since PR 5; slugless, token-only):  page /i/{token} ·
   API /api/v1/public/invoices/{token} (GET view · POST /accept · GET /pdf?version_number=N)
 ```
 
@@ -509,7 +509,7 @@ Issue base: https://github.com/MuneebHash/flooring-sales-portal/issues/
 - [#34](https://github.com/MuneebHash/flooring-sales-portal/issues/34) app/database timezone before production → Phase 17
 - [#69](https://github.com/MuneebHash/flooring-sales-portal/issues/69) backend version precondition on invoice accept → **16G PR 3** (in-app D.8, server + Invoice tab) and **16G PR 4** (remote invoice signing): one mandatory `expected_version_number` contract
 - [#55](https://github.com/MuneebHash/flooring-sales-portal/issues/55) financial summary versioning (concurrent mutations) → deferred-hardening (post-pilot)
-- 16G (all IN, decided 13 October 2026; PR placement in `docs/Phases.md` §7): PR 1 [#138](https://github.com/MuneebHash/flooring-sales-portal/issues/138) OpenAPI drift · PR 2 [#125](https://github.com/MuneebHash/flooring-sales-portal/issues/125) Freeze Path B terms and Invoice To across payment and void · PR 3 [#123](https://github.com/MuneebHash/flooring-sales-portal/issues/123) Server-side quote-version precondition on POST quote/create-invoice (with #69) · PR 5 [#126](https://github.com/MuneebHash/flooring-sales-portal/issues/126) Public accept 410 message: align with the generic dead-link rule or confirm verbatim (decided: specific dead-link messages on both public pages) · PR 6 [#120](https://github.com/MuneebHash/flooring-sales-portal/issues/120) Quote tab: poll issued/accepted state while an active link waits for a signature · [#121](https://github.com/MuneebHash/flooring-sales-portal/issues/121) Refresh order financials after a remote quote acceptance · [#122](https://github.com/MuneebHash/flooring-sales-portal/issues/122) Bind Accepted Quote reads to the displayed version (signed PDF, signature) · [#124](https://github.com/MuneebHash/flooring-sales-portal/issues/124) Replace the 19-character accepted_at comparison with a server provenance field
+- 16G (all IN, decided 13 October 2026; PR placement in `docs/Phases.md` §7): PR 1 [#138](https://github.com/MuneebHash/flooring-sales-portal/issues/138) OpenAPI drift · PR 2 [#125](https://github.com/MuneebHash/flooring-sales-portal/issues/125) Freeze Path B terms and Invoice To across payment and void · PR 3 [#123](https://github.com/MuneebHash/flooring-sales-portal/issues/123) Server-side quote-version precondition on POST quote/create-invoice (with #69) · PR 5 [#126](https://github.com/MuneebHash/flooring-sales-portal/issues/126) Public accept 410 message: align with the generic dead-link rule or confirm verbatim (decided: specific dead-link messages on both public pages; implemented in PR 5) · PR 6 [#120](https://github.com/MuneebHash/flooring-sales-portal/issues/120) Quote tab: poll issued/accepted state while an active link waits for a signature · [#121](https://github.com/MuneebHash/flooring-sales-portal/issues/121) Refresh order financials after a remote quote acceptance · [#122](https://github.com/MuneebHash/flooring-sales-portal/issues/122) Bind Accepted Quote reads to the displayed version (signed PDF, signature) · [#124](https://github.com/MuneebHash/flooring-sales-portal/issues/124) Replace the 19-character accepted_at comparison with a server provenance field
 - 16G proposed follow-ups, NOT yet filed (Muneeb files them after PR 1): see `docs/API-Contracts-Phase16G-Invoice-Link.md` §17 and `docs/Phases.md` §8
 - Phase 17: [#127](https://github.com/MuneebHash/flooring-sales-portal/issues/127) Restore the login session on page reload · [#128](https://github.com/MuneebHash/flooring-sales-portal/issues/128) Rate limiting on public quote endpoints and a decode concurrency cap (to be widened to the 16G public invoice endpoints) · [#129](https://github.com/MuneebHash/flooring-sales-portal/issues/129) Tenant-independent test fixtures · [#130](https://github.com/MuneebHash/flooring-sales-portal/issues/130) Terms per store
 - Phase 18: [#131](https://github.com/MuneebHash/flooring-sales-portal/issues/131) Shared Modal: focus trap and inert background · [#132](https://github.com/MuneebHash/flooring-sales-portal/issues/132) AppHeader overflow on narrow screens · [#133](https://github.com/MuneebHash/flooring-sales-portal/issues/133) Disabled Send by Phone/SMS button wording
