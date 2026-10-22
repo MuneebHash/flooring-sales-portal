@@ -42,8 +42,9 @@ export type PublicQuoteLine = {
 // the full document payload (frozen issued snapshot body + live presentation
 // context); every dead state (EXPIRED / SUPERSEDED / CANCELLED / INACTIVE) is
 // the minimal payload — state, business_name, message, all document fields
-// null. The page shows ONE generic dead-link message regardless of which dead
-// state arrives (locked 16E-C decision — no state-specific customer wording).
+// null. Since 16G PR 5 (#126) the page shows a dead state's own message (the
+// per-state text); its generic dead-link sentence is only the fallback for a
+// blank message and for a load that gets no readable answer.
 export type PublicQuoteView = {
   state: PublicQuoteState
   business_name: string | null

@@ -175,7 +175,8 @@ export function acceptCurrentInvoice(
 // or was not recorded). 200 with message "Invoice
 // re-sent to the customer." Errors: 422 INVOICE_REQUIRED / INVOICE_NOT_ACCEPTED /
 // CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID; 502 EMAIL_SEND_FAILED on provider failure
-// (fatal HERE only — nothing is written, the invoice state is unchanged, the user may retry).
+// (fatal, like send-link's 502 and unlike D.8; on resend nothing is written and the invoice
+// state is unchanged, so the user may retry).
 // Allowed when LAID.
 export function resendCurrentInvoice(
   orderId: number,
@@ -184,6 +185,39 @@ export function resendCurrentInvoice(
     apiPath(
       getActiveSlug(),
       `/orders/${orderId}/invoices/current/resend`,
+    ),
+    {},
+  )
+}
+
+// The data of a successful send-link (openapi InvoiceLinkSendResult): the new link's send and expiry
+// times only — never the token, the link, its hash or the recipient. expires_at is informational: the
+// Invoice tab neither stores nor displays it and never times anything from it.
+export type InvoiceLinkSendResult = {
+  invoice_link: {
+    sent_at: string
+    expires_at: string
+  }
+}
+
+// POST /api/v1/{slug}/orders/{orderId}/invoices/current/send-link — 16G (backend PR 4), called by the
+// Invoice tab's Accept Remotely button (PR 5). Emails the customer a link (/i/{token}) to review and
+// sign the CURRENT invoice remotely: one link-only email to the SAVED customer email, no PDF attached.
+// The body MUST be {} (any field -> 400 VALIDATION_FAILED); no signature, declaration ticks, name or
+// version value is sent or required (the link follows the order's latest version). Each send replaces
+// any ACTIVE link (the old one becomes REPLACED). 201 with message "Invoice link emailed to the
+// customer." Errors: 422 INVOICE_REQUIRED; 409 INVOICE_ALREADY_ACCEPTED (the current invoice is
+// signed: no link is created); 422 CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID; 502
+// EMAIL_SEND_FAILED ("The invoice link could not be emailed. Please try again.") — the new link stays
+// ACTIVE (undelivered) and no invoice row changes; a retry is another send. A link send never touches
+// any invoice version or its last_emailed_at. Allowed when LAID.
+export function sendInvoiceLink(
+  orderId: number,
+): Promise<ApiSuccess<InvoiceLinkSendResult>> {
+  return post<ApiSuccess<InvoiceLinkSendResult>>(
+    apiPath(
+      getActiveSlug(),
+      `/orders/${orderId}/invoices/current/send-link`,
     ),
     {},
   )
@@ -308,7 +342,8 @@ function parseContentDispositionFilename(header: string | null): string | null {
 // bytes PLUS the server file name from Content-Disposition. This canNOT use request<T>: the file
 // endpoint returns RAW BINARY (application/pdf) while request<T>/parseBody always JSON-parses the
 // body. It is also session-protected, so a bare href would not carry the session cookie — hence a
-// credentialed fetch -> Blob (-> one-shot object URL in the component). Mirrors
+// credentialed fetch -> Blob (-> an object URL in the component; the Invoice tab's Preview PDF since 16G
+// PR 5). Mirrors
 // orderAttachmentsApi.fetchAttachmentBlob. The fixed /current/file path is assembled here so the
 // download always targets the CURRENT invoice (pdf_download_path is neither relied on nor exposed).
 // The returned fileName is the authoritative name the backend just streamed for the CURRENT invoice,

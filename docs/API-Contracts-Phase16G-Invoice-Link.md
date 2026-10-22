@@ -279,7 +279,7 @@ See section 9.4. The token gate, body validation and PNG pre-validation run befo
 
 - **Invoice tab (PR 3, implemented):** D.8 sends `expected_version_number` = the `version_number` of the invoice on screen, and no longer sends `accepted_customer_name`. On 409 `INVOICE_VERSION_STALE` it clears the signature pad and the declaration ticks (even if the re-read then fails), shows the message, re-reads the current invoice and requires a fresh user action. It never retries on its own. Its existing best-effort pre-check before posting stays as an early hint (unchanged wording), as do its single-flight, unmount and order-change guards.
 - **Quote tab (PR 3, implemented):** Create Invoice sends `{"quote_version_id": N}` with the accepted version shown in the open confirmation. A 409 `QUOTE_VERSION_STALE` shows its message (the same text as the existing changed-quote notice) and refreshes the issued/accepted state, as every 409 does. No automatic retry. The existing refresh and confirmation safeguards and the Path A notice stay.
-- **Public invoice page (PR 5):** sends `expected_version_number` = the `version_number` of the invoice shown. On 409 `INVOICE_VERSION_STALE` it re-reads the link in place, clears the pad and the ticks, shows the message and waits for a fresh signature (section 9.4).
+- **Public invoice page (PR 5, implemented):** sends `expected_version_number` = the `version_number` of the invoice shown. On 409 `INVOICE_VERSION_STALE` it re-reads the link in place, clears the pad and the ticks, shows the message and waits for a fresh signature (section 9.4).
 
 ---
 
@@ -402,7 +402,7 @@ Staff reads never flip expiry. InvoiceDetail's `invoice_link_expires_at` (sectio
 
 ## 8. Protected send link
 
-**PR 4.** `POST /api/v1/{slug}/orders/{orderId}/invoices/current/send-link` (operation `sendInvoiceLink`). The Invoice tab's **Accept Remotely** button calls it (PR 5).
+**PR 4.** `POST /api/v1/{slug}/orders/{orderId}/invoices/current/send-link` (operation `sendInvoiceLink`). The Invoice tab's **Accept Remotely** button calls it (since PR 5).
 
 **Request:** an empty JSON object `{}` (`EmptyObjectRequest`; any field gives 400 `VALIDATION_FAILED` "Not allowed.", a non-object 400 on `body`, unparseable 400 `MALFORMED_JSON`). No signature, name or declaration is sent.
 
@@ -447,7 +447,7 @@ The response's `expires_at` is informational. The Invoice tab never starts or ti
 
 ## 9. Public invoice surface
 
-**PR 4** (backend) and **PR 5** (page).
+**PR 4** (backend) and **PR 5** (page), both implemented.
 
 ### 9.1 Route and reserved slug
 
@@ -721,7 +721,7 @@ A status change never kills an invoice link. API-Conventions §16 lists the two 
 
 ## 13. 16G quote changes (#120, #121, #122, #124, #126)
 
-### 13.1 Specific dead-link messages on both public pages (#126, PR 5)
+### 13.1 Specific dead-link messages on both public pages (#126, PR 5, implemented)
 
 - **Quote page:** a dead GET state shows `data.message` (the existing per-state text, 16B §7.2). A 404 shows the backend message (`Quote not found.`). A PDF 410 or 404 shows that response's message. The accept path keeps showing 410 and 422 messages verbatim. The per-state texts are unchanged. A load that gets no readable answer keeps the existing generic sentence.
 - **Invoice page:** a dead GET state shows `data.message` (section 7.2). A 404 shows `Invoice not found.`. A PDF or accept 410 shows its message. A load that gets no readable answer shows `We could not load this invoice. Please try again.` with a retry. The only invoice dead reasons are the four in section 7.2.
@@ -816,10 +816,10 @@ Public invoice endpoints never return staff wording: the only messages a custome
 
 The detailed UX is in the UX lock §20 (Invoice tab and public invoice page) and §13–§14 (quote pages). In short:
 
-- **Invoice tab:** Invoice To from InvoiceDetail and the terms-source wording for `BUSINESS` (PR 2); D.8 sends `expected_version_number`, drops the name part and handles the stale 409; the frozen-name gate (PR 3); the unsigned bottom bar becomes **Accept Invoice | Accept Remotely**, Accept Remotely sends the link and shows success or failure, and Download PDF becomes **Preview PDF** (PR 5); polling on the server field `invoice_link_expires_at` (never displayed) and the signing-draft reset when a refresh installs another version (PR 6).
+- **Invoice tab:** Invoice To from InvoiceDetail and the terms-source wording for `BUSINESS` (PR 2); D.8 sends `expected_version_number`, drops the name part and handles the stale 409; the frozen-name gate (PR 3); the unsigned bottom bar became **Accept Invoice | Accept Remotely**, Accept Remotely sends the link and shows success or failure, and Download PDF became **Preview PDF** (PR 5, implemented); polling on the server field `invoice_link_expires_at` (never displayed) and the signing-draft reset when a refresh installs another version (PR 6).
 - **Quote tab:** `{"quote_version_id": N}` and the stale 409 (PR 3); #120, #122 and #124, and the Not delivered badge from `last_email_delivered` (PR 6).
 - **Details of Sale:** #121 (PR 6).
-- **Public pages:** `/i/{token}` (PR 5); specific dead-link messages on both pages (PR 5).
+- **Public pages:** `/i/{token}` (PR 5, implemented); specific dead-link messages on both pages (PR 5, implemented).
 - Muneeb reviews the Invoice tab result in the implementation smoke test.
 
 ---
