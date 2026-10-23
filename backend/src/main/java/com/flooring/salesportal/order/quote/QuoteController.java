@@ -182,10 +182,10 @@ public class QuoteController {
     }
 
     /**
-     * GET .../quote/pdf?type=issued|accepted — stream a STORED quote PDF (salesperson download;
-     * LAID read allowed). type=issued → the active issued version's stored PDF; type=accepted →
-     * the latest accepted version's stored SIGNED PDF (16F PR1; portal-only). Missing artifact →
-     * 404 QUOTE_PDF_NOT_FOUND. Raw binary like the preview.
+     * GET .../quote/pdf?type=issued — stream the active issued version's STORED quote PDF (salesperson
+     * download; LAID read allowed). No active issued version → 404 QUOTE_PDF_NOT_FOUND; any other type,
+     * {@code accepted} included (removed in 16G PR 6), → 400 VALIDATION_FAILED. Raw binary like the
+     * preview.
      */
     @GetMapping("/pdf")
     public ResponseEntity<byte[]> downloadStoredPdf(
@@ -207,18 +207,50 @@ public class QuoteController {
     }
 
     /**
-     * GET .../quote/accepted/signature — stream the LATEST accepted quote version's stored signature
-     * image (16F PR1; the quote analogue of the invoice signature download). Raw {@code image/png}
-     * bytes, inline, backend-built file name {@code quote-signature-{order_number}-v{n}.png}. LAID read
-     * allowed. No accepted version / no stored signature → 404 QUOTE_SIGNATURE_NOT_FOUND; errors use
-     * the standard JSON wrapper. The workspace {@code accepted.signature_download_path} points here.
+     * GET .../quote/accepted/{quoteVersionId}/pdf (16G PR 6, #122) — stream the stored SIGNED PDF of
+     * the accepted version the Accepted Quote view displays (portal-only; LAID read allowed). The
+     * version must belong to the order in scope and be ACCEPTED, else 404 QUOTE_PDF_NOT_FOUND (order
+     * scope 404 first). {@code quoteVersionId} is captured as a String, like {@code orderId}, so a
+     * malformed value reaches the service's validation (400 VALIDATION_FAILED, field
+     * {@code quote_version_id}) only after the scoped order lookup.
      */
-    @GetMapping("/accepted/signature")
-    public ResponseEntity<byte[]> downloadAcceptedSignature(
+    @GetMapping("/accepted/{quoteVersionId}/pdf")
+    public ResponseEntity<byte[]> downloadAcceptedQuoteVersionPdf(
             @PathVariable String slug,
             @PathVariable("orderId") String orderId,
+            @PathVariable("quoteVersionId") String quoteVersionId,
             HttpServletRequest httpRequest) {
-        QuoteSignatureImage signature = quoteSendService.downloadAcceptedSignature(slug, orderId, httpRequest);
+        QuoteStoredPdf pdf = quoteSendService.downloadAcceptedQuoteVersionPdf(
+                slug, orderId, quoteVersionId, httpRequest);
+
+        String contentDisposition = ContentDisposition.inline()
+                .filename(pdf.fileName(), StandardCharsets.UTF_8)
+                .build()
+                .toString();
+        return ResponseEntity.ok()
+                .contentType(MediaType.APPLICATION_PDF)
+                .contentLength(pdf.bytes().length)
+                .header(HttpHeaders.CONTENT_DISPOSITION, contentDisposition)
+                .body(pdf.bytes());
+    }
+
+    /**
+     * GET .../quote/accepted/{quoteVersionId}/signature (16G PR 6, #122) — stream the stored signature
+     * image of the accepted version the Accepted Quote view displays (the quote analogue of the invoice
+     * signature download). Raw {@code image/png} bytes, inline, backend-built file name
+     * {@code quote-signature-{order_number}-v{n}.png}. LAID read allowed. A version that is not this
+     * order's, not ACCEPTED or without a stored signature → 404 QUOTE_SIGNATURE_NOT_FOUND (order scope
+     * 404 first; a malformed {@code quoteVersionId} → 400 after it); errors use the standard JSON
+     * wrapper. The workspace {@code accepted.signature_download_path} carries this versioned path.
+     */
+    @GetMapping("/accepted/{quoteVersionId}/signature")
+    public ResponseEntity<byte[]> downloadAcceptedQuoteVersionSignature(
+            @PathVariable String slug,
+            @PathVariable("orderId") String orderId,
+            @PathVariable("quoteVersionId") String quoteVersionId,
+            HttpServletRequest httpRequest) {
+        QuoteSignatureImage signature = quoteSendService.downloadAcceptedQuoteVersionSignature(
+                slug, orderId, quoteVersionId, httpRequest);
 
         String contentDisposition = ContentDisposition.inline()
                 .filename(signature.fileName(), StandardCharsets.UTF_8)

@@ -1179,6 +1179,8 @@ class InvoiceQuoteSourceLifecycleTest {
                 "precondition: the Path A row carries the quote's V17 Invoice To");
         setTenantTerms(LIVE_SOFT_TERMS_RAW, LIVE_HARD_TERMS_RAW);
         moveSavedCustomerOn(orderId);
+        // 16G PR 6 (#124): the current invoice (the Path A v1) was created from this accepted version.
+        assertProvenance(orderId, true, false, "after Path A");
 
         JsonNode paid = recordCashPayment(orderId, "50.00");
         assertCurrentInvoiceSummaryUnchanged(paid, "payment");
@@ -1188,6 +1190,7 @@ class InvoiceQuoteSourceLifecycleTest {
         assertSameInvoiceTo(pathA, v2, "payment v2");
         assertMoney("50.00", v2.get("total_paid"), "v2.total_paid");
         assertMoney("225.00", v2.get("balance_due"), "v2.balance_due");
+        assertProvenance(orderId, true, false, "the payment version carried from the Path A row");
 
         JsonNode voided = voidPayment(orderId, latestPaymentId(orderId));
         assertCurrentInvoiceSummaryUnchanged(voided, "void");
@@ -1197,6 +1200,7 @@ class InvoiceQuoteSourceLifecycleTest {
         assertSameInvoiceTo(pathA, v3, "void v3");
         assertMoney("0.00", v3.get("total_paid"), "v3.total_paid");
         assertMoney("275.00", v3.get("balance_due"), "v3.balance_due");
+        assertProvenance(orderId, true, false, "the void version carried from the Path A row");
 
         for (Map<String, Object> version : List.of(v2, v3)) {
             String label = "regenerated v" + version.get("version_number") + " PDF";
@@ -1258,6 +1262,8 @@ class InvoiceQuoteSourceLifecycleTest {
                 "D.1 freezes the sanitised SOFT business terms, never the quote's terms");
         assertRowInvoiceTo(row, MOVED_NAME, MOVED_LINE1, MOVED_LINE2, "D.1 row: the saved customer, frozen");
         Assertions.assertNull(row.get("accepted_at"));
+        // 16G PR 6 (#124): a Create is never created from the accepted quote (unsigned, so still eligible).
+        assertProvenance(orderId, false, true, "after D.1 Create");
 
         byte[] pdf = storedFileBytes(row.get("stored_file_id"));
         assertTermsOnPageTwo(pdf, LIVE_SOFT_TERMS_TEXT, "D.1 PDF", QUOTE_TERMS_TEXT, LIVE_HARD_TERMS_TEXT);
@@ -1317,6 +1323,44 @@ class InvoiceQuoteSourceLifecycleTest {
         assertTermsOnPageTwo(pdf, LIVE_SOFT_TERMS_TEXT, "rewrite v2 PDF", QUOTE_TERMS_TEXT, LIVE_HARD_TERMS_TEXT);
         assertPdfInvoiceTo(pdf, MOVED_NAME, MOVED_LINE1, MOVED_LINE2, "rewrite v2 PDF",
                 SNAPSHOT_NAME, SNAPSHOT_LINE1);
+    }
+
+    /**
+     * 16G PR 6 (#124) provenance across Path A, a Rewrite and a LATER in-store signing (contract §13.5):
+     * accepted.invoice_created_from_this_version is true while the current invoice is the Path A row (its
+     * source quote version is this version), false once a Rewrite appends an invoice of another origin (NULL
+     * source; unsigned, so eligible again), and still false after that invoice is signed in store (D.8 carries
+     * the NULL source; signed after the quote, so ineligible) — the "newer signed quote is required"
+     * explanation, never "already created from this quote". The accepted quote itself never changes.
+     */
+    @Test
+    void provenance_pathAThenRewriteThenLaterInStoreSigning_trueThenFalseThenFalse() throws Exception {
+        long orderId = pathAOrder(QUOTE_TERMS_RAW);
+        Map<String, Object> quoteV1 = quoteVersionRow(orderId, 1);
+        Assertions.assertEquals(quoteV1.get("quote_version_id"), invoiceRow(orderId, 1).get("source_quote_version_id"),
+                "precondition: the Path A invoice is sourced from the accepted v1");
+        assertProvenance(orderId, true, false, "Path A");
+
+        clearJpaCache();
+        mockMvc.perform(post(invoicesUrl(orderId) + "/rewrite").session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(INVOICE_REWRITTEN_MESSAGE));
+        clearJpaCache();
+        Assertions.assertNull(invoiceRow(orderId, 2).get("source_quote_version_id"), "precondition: NULL source");
+        assertProvenance(orderId, false, true, "after the Rewrite");
+
+        clearJpaCache();
+        mockMvc.perform(signInvoice(orderId).session(liamStore1Session()))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.message").value(ACCEPT_EMAILED_MESSAGE));
+        clearJpaCache();
+        Map<String, Object> signed = invoiceRow(orderId, 3);
+        Assertions.assertNotNull(signed.get("accepted_at"), "precondition: the in-store signing appended signed v3");
+        Assertions.assertNull(signed.get("source_quote_version_id"), "D.8 carries the rewrite's NULL source");
+        assertProvenance(orderId, false, false, "after the later in-store signing");
+
+        Assertions.assertEquals(quoteV1, quoteVersionRow(orderId, 1), "the accepted quote row never changes");
     }
 
     // ================================================================
@@ -1755,16 +1799,22 @@ class InvoiceQuoteSourceLifecycleTest {
 
     /**
      * After Path A: the workspace still surfaces the SAME accepted version, now invoice_eligible false
-     * (the invoice carries the quote's own signature time); type=accepted still streams the stored signed
-     * quote PDF; the quote signature download streams the same bytes as the invoice signature download.
+     * (the invoice carries the quote's own signature time) and, 16G PR 6 (#124), invoice_created_from_this_version
+     * true (false before the conversion); the version-addressed read of that version (16G PR 6, #122) still
+     * streams the stored signed quote PDF; the quote signature download — through the backend-built,
+     * version-addressed signature_download_path — streams the same bytes as the invoice signature download.
      */
     @Test
     void acceptedQuoteReads_afterPathA_sameVersionNowIneligible_signedPdfAndSignatureStillStream() throws Exception {
         long orderId = acceptedQuoteOrder(QUOTE_TERMS_RAW);
         String orderNumber = orderNumber(orderId);
         Map<String, Object> quoteV1 = quoteVersionRow(orderId, 1);
+        long quoteV1Id = longValue(quoteV1, "quote_version_id");
         JsonNode before = workspaceAccepted(orderId);
         Assertions.assertTrue(before.get("invoice_eligible").booleanValue(), "precondition: no invoice -> eligible");
+        Assertions.assertTrue(before.get("invoice_created_from_this_version").isBoolean());
+        Assertions.assertFalse(before.get("invoice_created_from_this_version").booleanValue(),
+                "no invoice -> not created from this quote");
 
         createInvoiceFromQuote(orderId);
         Assertions.assertEquals(quoteV1, quoteVersionRow(orderId, 1), "Path A never writes the quote version");
@@ -1772,26 +1822,34 @@ class InvoiceQuoteSourceLifecycleTest {
                 "precondition: Path A copied the quote's signature time");
 
         JsonNode accepted = workspaceAccepted(orderId);
-        Assertions.assertEquals(longValue(quoteV1, "quote_version_id"), accepted.get("quote_version_id").asLong());
+        Assertions.assertEquals(quoteV1Id, accepted.get("quote_version_id").asLong());
         Assertions.assertEquals(1, accepted.get("version_number").asInt());
-        Assertions.assertEquals(((Timestamp) quoteV1.get("accepted_at")).toLocalDateTime(),
+        // 16G PR 6 (#124): accepted_at in whole seconds (the stored value keeps its precision).
+        Assertions.assertEquals(((Timestamp) quoteV1.get("accepted_at")).toLocalDateTime().truncatedTo(ChronoUnit.SECONDS),
                 LocalDateTime.parse(accepted.get("accepted_at").asText()));
         Assertions.assertEquals(SNAPSHOT_NAME, accepted.get("accepted_customer_name").asText());
         Assertions.assertTrue(accepted.get("invoice_eligible").isBoolean());
         Assertions.assertFalse(accepted.get("invoice_eligible").booleanValue(),
                 "the converted quote is no longer newer than the current invoice's signature");
+        Assertions.assertTrue(accepted.get("invoice_created_from_this_version").booleanValue(),
+                "the current invoice was created from this accepted version (Path A)");
 
         clearJpaCache();
-        MvcResult signedPdf = mockMvc.perform(get(quoteUrl(orderId, "pdf?type=accepted")).session(liamStore1Session()))
+        MvcResult signedPdf = mockMvc.perform(get(quoteUrl(orderId, "accepted/" + quoteV1Id + "/pdf"))
+                        .session(liamStore1Session()))
                 .andExpect(status().isOk())
                 .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "application/pdf"))
                 .andReturn();
         Assertions.assertArrayEquals(storedFileBytes(quoteV1.get("signed_pdf_file_id")),
-                signedPdf.getResponse().getContentAsByteArray(), "type=accepted streams the stored signed quote PDF");
+                signedPdf.getResponse().getContentAsByteArray(),
+                "the version-addressed read streams v1's stored signed quote PDF");
         assertInlineFilename(signedPdf, "quote-" + orderNumber + "-v1-signed.pdf");
 
+        String signaturePath = accepted.get("signature_download_path").asText();
+        Assertions.assertEquals("/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/quote/accepted/" + quoteV1Id
+                + "/signature", signaturePath, "the backend-built path addresses v1");
         clearJpaCache();
-        MvcResult quoteSignature = mockMvc.perform(get(quoteUrl(orderId, "accepted/signature"))
+        MvcResult quoteSignature = mockMvc.perform(get(signaturePath)
                         .session(liamStore1Session()))
                 .andExpect(status().isOk())
                 .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "image/png"))
@@ -1816,5 +1874,21 @@ class InvoiceQuoteSourceLifecycleTest {
         JsonNode accepted = readJson(result).path("data").path("accepted");
         Assertions.assertTrue(accepted.isObject(), () -> "data.accepted must be populated: " + accepted);
         return accepted;
+    }
+
+    /**
+     * 16G PR 6 (#124): the workspace's accepted.invoice_created_from_this_version and invoice_eligible, both
+     * present JSON booleans (never null), read from ONE workspace response.
+     */
+    private void assertProvenance(long orderId, boolean createdFromThisVersion, boolean eligible, String label)
+            throws Exception {
+        JsonNode accepted = workspaceAccepted(orderId);
+        JsonNode provenance = accepted.get("invoice_created_from_this_version");
+        Assertions.assertTrue(provenance != null && provenance.isBoolean(),
+                () -> label + ": invoice_created_from_this_version must be a JSON boolean but was " + provenance);
+        Assertions.assertEquals(createdFromThisVersion, provenance.booleanValue(),
+                label + ": invoice_created_from_this_version");
+        Assertions.assertEquals(eligible, accepted.get("invoice_eligible").booleanValue(), label + ": invoice_eligible");
+        Assertions.assertFalse(accepted.has("source_quote_version_id"), label + ": the source id is never exposed");
     }
 }

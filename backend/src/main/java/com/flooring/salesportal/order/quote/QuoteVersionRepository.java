@@ -34,9 +34,11 @@ import java.util.Optional;
  *
  * <p>Phase 16F PR1 adds the accepted layer: the public accept takes the same order row lock, then
  * moves the version {@code ISSUED -> ACCEPTED} ({@link #acceptIssuedVersion}) and the presented
- * token {@code ACTIVE -> CONSUMED} ({@link #consumeActiveToken}) with status-guarded statements; the
- * protected reads resolve the latest accepted version ({@link #findLatestAcceptedByOrderId}) and its
- * stored signed PDF / signature. The acceptance stored_file ids ride only on the server-internal
+ * token {@code ACTIVE -> CONSUMED} ({@link #consumeActiveToken}) with status-guarded statements. The
+ * workspace and Path A resolve the latest accepted version ({@link #findLatestAcceptedByOrderId});
+ * since 16G PR 6 (#122) the protected signed-PDF / signature reads resolve the version they address
+ * ({@link #findAcceptedByOrderIdAndVersionId}, order scope and status in the query) and its stored
+ * file. The acceptance stored_file ids ride only on the server-internal
  * {@link AcceptedQuoteVersionRow}, never on a response.
  */
 @Repository
@@ -148,9 +150,15 @@ public class QuoteVersionRepository {
 
     // Success-only email stamp (mirrors invoice.last_emailed_at): the ONLY quote_version write that
     // happens outside the issuing transaction, in the short post-delivery follow-up transaction.
+    // ATTEMPT-BOUND (16G PR 6, #124): it writes only while last_sent_at still holds the marker THIS
+    // attempt stored before delivery, i.e. while this attempt is still the latest. A superseded
+    // attempt's late success matches 0 rows, so last_emailed_at is always the success of an attempt
+    // that was the latest when it completed.
     private static final String STAMP_LAST_EMAILED_SQL = """
-            UPDATE quote_version SET last_emailed_at = :emailedAt
+            UPDATE quote_version
+            SET last_emailed_at = :emailedAt
             WHERE quote_version_id = :quoteVersionId
+              AND last_sent_at = :thisAttemptSentAt
             """;
 
     private static final String INSERT_TOKEN_SQL = """
@@ -241,19 +249,33 @@ public class QuoteVersionRepository {
     // Phase 16F PR1 — the accepted layer (public accept + protected accepted reads)
     // ------------------------------------------------------------------
 
-    // The LATEST accepted version of an order (contract §4.3: latest accepted = max(version_number)
-    // WHERE status = 'ACCEPTED'), independent of any draft / ISSUED state. The two stored_file ids are
-    // selected ONLY onto the server-internal AcceptedQuoteVersionRow (never serialized) so the
-    // protected reads can derive "signature present" / "signed PDF available" and stream the bytes.
-    private static final String FIND_LATEST_ACCEPTED_SQL = "SELECT" + VERSION_COLUMNS + """
+    // The accepted projection: VERSION_COLUMNS plus the acceptance columns, shared by both accepted
+    // reads below (ACCEPTED_ROW_MAPPER reads it by name). The two stored_file ids are selected ONLY onto
+    // the server-internal AcceptedQuoteVersionRow (never serialized) so the protected reads can derive
+    // "signature present" / "signed PDF available" and stream the bytes.
+    private static final String ACCEPTED_COLUMNS = VERSION_COLUMNS + """
                 , accepted_at,
                 accepted_customer_name,
                 accepted_signature_file_id,
                 signed_pdf_file_id
+            """;
+
+    // The LATEST accepted version of an order (contract §4.3: latest accepted = max(version_number)
+    // WHERE status = 'ACCEPTED'), independent of any draft / ISSUED state.
+    private static final String FIND_LATEST_ACCEPTED_SQL = "SELECT" + ACCEPTED_COLUMNS + """
             FROM quote_version
             WHERE order_id = :orderId AND status = 'ACCEPTED'
             ORDER BY version_number DESC
             LIMIT 1
+            """;
+
+    // ONE accepted version addressed by id (16G PR 6, #122): the order scope and the ACCEPTED status are
+    // part of the query, so another order's version, or one that is ISSUED / SUPERSEDED / CANCELLED /
+    // EXPIRED, is simply absent (never loaded and then checked). An older version that is still ACCEPTED
+    // is found by its own id.
+    private static final String FIND_ACCEPTED_BY_ORDER_AND_VERSION_SQL = "SELECT" + ACCEPTED_COLUMNS + """
+            FROM quote_version
+            WHERE quote_version_id = :quoteVersionId AND order_id = :orderId AND status = 'ACCEPTED'
             """;
 
     // ISSUED -> ACCEPTED with the frozen acceptance fields, guarded on the FROM status (the public
@@ -409,10 +431,18 @@ public class QuoteVersionRepository {
                 .addValue("sentAt", Timestamp.valueOf(sentAt)));
     }
 
-    /** Success-only email stamp, in place (never touches sales_order.last_emailed_at — invoice-only mirror). */
-    public void stampLastEmailedAt(long quoteVersionId, LocalDateTime emailedAt) {
-        jdbc.update(STAMP_LAST_EMAILED_SQL, new MapSqlParameterSource()
+    /**
+     * Success-only email stamp, in place and attempt-bound (16G PR 6): sets {@code last_emailed_at} to
+     * {@code emailedAt} only while {@code last_sent_at} still equals {@code thisAttemptSentAt}, the
+     * marker this attempt stored before delivery (pass the PERSISTED value read back after
+     * {@link #stampAttemptMarkers}, never an in-memory clock value). Returns the number of rows updated:
+     * 1 when this attempt is still the latest, 0 when a newer attempt superseded it. Never touches
+     * sales_order.last_emailed_at (the invoice-only mirror).
+     */
+    public int stampLastEmailedAt(long quoteVersionId, LocalDateTime thisAttemptSentAt, LocalDateTime emailedAt) {
+        return jdbc.update(STAMP_LAST_EMAILED_SQL, new MapSqlParameterSource()
                 .addValue("quoteVersionId", quoteVersionId)
+                .addValue("thisAttemptSentAt", Timestamp.valueOf(thisAttemptSentAt))
                 .addValue("emailedAt", Timestamp.valueOf(emailedAt)));
     }
 
@@ -527,6 +557,17 @@ public class QuoteVersionRepository {
      */
     public Optional<AcceptedQuoteVersionRow> findLatestAcceptedByOrderId(long orderId) {
         return jdbc.query(FIND_LATEST_ACCEPTED_SQL, new MapSqlParameterSource("orderId", orderId),
+                ACCEPTED_ROW_MAPPER).stream().findFirst();
+    }
+
+    /**
+     * The order's accepted version with the given id (16G PR 6, #122), or empty when that id is unknown,
+     * belongs to another order, or is not {@code ACCEPTED}. Both conditions are enforced in the query.
+     */
+    public Optional<AcceptedQuoteVersionRow> findAcceptedByOrderIdAndVersionId(long orderId, long quoteVersionId) {
+        return jdbc.query(FIND_ACCEPTED_BY_ORDER_AND_VERSION_SQL, new MapSqlParameterSource()
+                        .addValue("orderId", orderId)
+                        .addValue("quoteVersionId", quoteVersionId),
                 ACCEPTED_ROW_MAPPER).stream().findFirst();
     }
 
@@ -668,10 +709,11 @@ public class QuoteVersionRepository {
     }
 
     /**
-     * The latest ACCEPTED version (Phase 16F PR1): the frozen {@link QuoteVersionRow} plus the
-     * acceptance fields. SERVER-INTERNAL: {@code acceptedSignatureFileId} / {@code signedPdfFileId}
-     * ride here only so the protected reads can derive "signature present" / "signed PDF available"
-     * and resolve the stored bytes — they must never be serialized into any response.
+     * An ACCEPTED version (Phase 16F PR1; the latest one, or since 16G PR 6 one addressed by id): the
+     * frozen {@link QuoteVersionRow} plus the acceptance fields. SERVER-INTERNAL:
+     * {@code acceptedSignatureFileId} / {@code signedPdfFileId} ride here only so the protected reads
+     * can derive "signature present" / "signed PDF available" and resolve the stored bytes — they must
+     * never be serialized into any response.
      */
     public record AcceptedQuoteVersionRow(
             QuoteVersionRow version,

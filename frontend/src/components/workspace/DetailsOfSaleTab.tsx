@@ -515,9 +515,10 @@ export function DetailsOfSaleTab({
 
   // Seed the sale-price input from the live summary, but never overwrite an
   // active edit. After a successful override/reset we clear `salePriceDirty` and
-  // re-seed from the returned summary, so this also re-seeds then. When the order
-  // is not yet priced (summary null) the input is cleared and the panel shows a
-  // neutral empty state instead.
+  // re-seed from the returned summary, so this also re-seeds then, as it does when
+  // the workspace re-reads the summary (16G PR 6: on opening this tab, and after a
+  // remote quote acceptance). When the order is not yet priced (summary null) the
+  // input is cleared and the panel shows a neutral empty state instead.
   useEffect(() => {
     if (salePriceDirty) return
     if (financialSummary) {
@@ -601,6 +602,10 @@ export function DetailsOfSaleTab({
   }
 
   async function handleOverrideSalePrice() {
+    // 16G PR 6 (#121): only an EDITED input is ever submitted (the button is disabled
+    // until then), so a stale, unedited price can never overwrite one a remote quote
+    // acceptance wrote (D6b).
+    if (!salePriceDirty) return
     const parsed = parseSalePrice(salePriceInput)
     await submitSalePriceOverride(parsed ?? NaN)
   }
@@ -1009,8 +1014,11 @@ export function DetailsOfSaleTab({
   const priced = financialSummary !== null
   // Sale-price input + Update are disabled when locked, mid-request, or unpriced.
   // The in-flight flag comes from the parent so it survives this tab's remount.
+  // Update Sale Price is ALSO disabled until the input has been edited (16G PR 6,
+  // #121; see updateSalePriceDisabled below) — the input itself stays editable.
   const salePriceControlsDisabled =
     locked || salePriceMutationInFlight || !priced
+  const updateSalePriceDisabled = salePriceControlsDisabled || !salePriceDirty
   // Reset is idempotent on the backend (clearing an already-NULL adjustment is a
   // no-op), so it only depends on the order being editable and no request being
   // in flight — never on the input state or whether an adjustment exists.
@@ -1246,7 +1254,7 @@ export function DetailsOfSaleTab({
               variant="success"
               size="md"
               onClick={handleOverrideSalePrice}
-              disabled={salePriceControlsDisabled}
+              disabled={updateSalePriceDisabled}
             >
               {salePriceMutationInFlight ? 'Saving…' : 'Update Sale Price'}
             </Button>

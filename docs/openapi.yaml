@@ -1317,7 +1317,7 @@ paths:
         Returns 404 when no invoice exists yet for the order. 16G PR 4: the response
         carries invoice_link_expires_at, derived in this read from the order's ACTIVE, unexpired
         invoice link (null otherwise); the read writes nothing and never expires a token. 16G
-        PR 6 (planned, #120): the Invoice tab re-reads this endpoint every 15 seconds while the
+        PR 6 (#120): the Invoice tab re-reads this endpoint every 15 seconds while the
         last InvoiceDetail it applied shows invoice_link_expires_at non-null and the invoice
         unsigned, the browser tab is visible and the Invoice tab is active (reads only; failed
         polls are silent). Polling stops when a read shows the invoice signed or the field null,
@@ -1788,7 +1788,7 @@ paths:
         and of current_issued). The read runs in one read-only REPEATABLE_READ transaction (no row
         locks; never blocks a writer), so all members come from one consistent snapshot and the
         same version never appears as both current_issued and accepted. Cost/GP flags are present
-        on this protected view only. Allowed when order_status is LAID (read). 16G PR 6 (planned):
+        on this protected view only. Allowed when order_status is LAID (read). 16G PR 6:
         accepted gains invoice_created_from_this_version and a version-addressed
         signature_download_path (#124, #122), current_issued gains the derived
         last_email_delivered that Customer Quote's Not delivered badge reads, every quote
@@ -2165,17 +2165,14 @@ paths:
       summary: Download stored quote PDF (salesperson)
       operationId: downloadQuotePdf
       description: >
-        Streams a stored quote PDF for the salesperson (Phase 16B): type=issued returns the active
-        issued version's stored PDF (inline filename quote-{order_number}-v{n}.pdf); type=accepted
-        returns the latest ACCEPTED version's stored signed PDF (implemented 16F PR1 - the
-        immutable bytes stored at acceptance, never regenerated; inline filename
-        quote-{order_number}-v{n}-signed.pdf). The signed PDF is portal only and is never served on
-        the public surface. Missing requested artifact (no active issued version for type=issued;
-        no accepted version or no stored signed PDF for type=accepted) returns 404
-        (QUOTE_PDF_NOT_FOUND). Allowed when order_status is LAID (read).
-        type=accepted is DEPRECATED: 16G PR 6 (planned, #122) removes it in favour of the
-        version-addressed downloadAcceptedQuoteVersionPdf, so the PDF opened is always the
-        version on screen. type=issued is unchanged.
+        Streams the active issued quote version's stored PDF for the salesperson (Phase 16B;
+        inline filename quote-{order_number}-v{n}.pdf). type=issued is the only accepted value:
+        any other type, including accepted (the 16F PR1 read of the latest ACCEPTED version,
+        removed in 16G PR 6, #122), returns 400 VALIDATION_FAILED (field type, "Must be
+        issued.") after the order scope check. The signed PDF of an accepted version streams from
+        the version-addressed downloadAcceptedQuoteVersionPdf, so the PDF opened is always the
+        version on screen. No active issued version returns 404 (QUOTE_PDF_NOT_FOUND). Allowed
+        when order_status is LAID (read).
       parameters:
         - $ref: '#/components/parameters/OrderId'
         - name: type
@@ -2185,7 +2182,6 @@ paths:
             type: string
             enum:
               - issued
-              - accepted
       responses:
         '200':
           description: Quote PDF streamed
@@ -2210,62 +2206,6 @@ paths:
         '500':
           $ref: '#/components/responses/InternalServerError'
 
-  /orders/{orderId}/quote/accepted/signature:
-    get:
-      tags:
-        - Quotes
-      summary: Download accepted quote signature image
-      operationId: downloadAcceptedQuoteSignature
-      deprecated: true
-      description: >
-        DEPRECATED: 16G PR 6 (planned, #122) removes this latest-accepted read in favour of the
-        version-addressed downloadAcceptedQuoteVersionSignature, and
-        accepted.signature_download_path then carries the versioned path. Until PR 6 merges it is
-        the live endpoint, as described below.
-        Streams the customer signature image (image/png) stored when the order's latest ACCEPTED
-        quote version was signed on the public link (Phase 16F PR1; the quote analogue of
-        downloadCurrentInvoiceSignature). The bytes are the stored server-normalised PNG,
-        streamed verbatim: the upload's decoded pixels re-encoded at acceptance (same dimensions
-        and pixels; ancillary chunks and trailing bytes dropped), so they are not byte-identical
-        to the customer's upload. The workspace accepted.signature_download_path points
-        here; consume it verbatim. Inline filename quote-signature-{order_number}-v{n}.png. The
-        order is resolved within the session business/store first (an order outside them returns
-        404 ORDER_NOT_FOUND; existence is never leaked). No accepted quote version, or no stored
-        signature on the latest one, returns 404 (QUOTE_SIGNATURE_NOT_FOUND). A referenced file
-        missing from storage returns 500. Allowed when order_status is LAID (read). Portal only -
-        never served on the public surface. Not an old-version signature-history endpoint.
-      parameters:
-        - $ref: '#/components/parameters/OrderId'
-      responses:
-        '200':
-          description: Accepted quote signature image streamed
-          headers:
-            Content-Disposition:
-              description: Inline signature filename generated by backend.
-              schema:
-                type: string
-            Content-Length:
-              description: Signature file size in bytes.
-              schema:
-                type: integer
-                format: int64
-                minimum: 0
-          content:
-            image/png:
-              schema:
-                type: string
-                format: binary
-        '400':
-          $ref: '#/components/responses/BadRequest'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-        '403':
-          $ref: '#/components/responses/Forbidden'
-        '404':
-          $ref: '#/components/responses/NotFound'
-        '500':
-          $ref: '#/components/responses/InternalServerError'
-
   /orders/{orderId}/quote/accepted/{quoteVersionId}/pdf:
     get:
       tags:
@@ -2273,7 +2213,7 @@ paths:
       summary: Download the stored signed PDF of a given accepted quote version
       operationId: downloadAcceptedQuoteVersionPdf
       description: >
-        16G PR 6 (planned, #122; not implemented until PR 6 merges; replaces downloadQuotePdf
+        16G PR 6 (#122; replaces the removed downloadQuotePdf
         type=accepted). Streams the stored signed quote PDF of the quoteVersionId the Accepted
         Quote view displays (accepted.quote_version_id), so a newer acceptance landing while the
         view is open can never open a different version's PDF. Served only when the version
@@ -2319,9 +2259,9 @@ paths:
       summary: Download the stored signature image of a given accepted quote version
       operationId: downloadAcceptedQuoteVersionSignature
       description: >
-        16G PR 6 (planned, #122; replaces downloadAcceptedQuoteSignature). Streams the stored
+        16G PR 6 (#122; replaces the removed downloadAcceptedQuoteSignature). Streams the stored
         server-normalised signature PNG of the quoteVersionId the Accepted Quote view displays.
-        From PR 6 accepted.signature_download_path carries this versioned path; consume it
+        accepted.signature_download_path carries this versioned path; consume it
         verbatim. Served only when the version belongs to the order in scope and its status is
         ACCEPTED; otherwise 404 QUOTE_SIGNATURE_NOT_FOUND (order scope 404 first; existence never
         leaked). A malformed quoteVersionId returns 400 VALIDATION_FAILED. A referenced file
@@ -2535,7 +2475,7 @@ paths:
         email; skipped with a WARN log when blank; no attachment, link, token, cost or GP;
         recording-only in this build - no real email is sent). A notification failure is logged
         and never undoes the acceptance. The signed PDF is portal-only
-        (GET /orders/{orderId}/quote/pdf?type=accepted; from 16G PR 6 the version-addressed
+        (the version-addressed
         downloadAcceptedQuoteVersionPdf) and is never served on the public surface. Since 16G PR 4
         a remote invoice signing (acceptPublicInvoice) also cancels an ISSUED quote and its ACTIVE
         token, as the in-app invoice acceptance does (16F decision D5(c), extended), giving
@@ -2945,7 +2885,7 @@ components:
         format: int64
         minimum: 1
       description: >
-        16G PR 6 (planned, #122). The quote_version_id the Accepted Quote view displays
+        16G PR 6 (#122). The quote_version_id the Accepted Quote view displays
         (accepted.quote_version_id). Only an ACCEPTED version of the order in scope is served;
         anything else is 404.
 
@@ -3867,7 +3807,7 @@ components:
             public surface). Every InvoiceDetail response carries it, computed after the request's
             own writes: rewriteInvoice, acceptCurrentInvoice and createInvoiceFromQuote kill an
             ACTIVE link in their own transaction, so they return null, and a signed current
-            invoice always gives null. From 16G PR 6 (#120) the Invoice tab reads it only to decide
+            invoice always gives null. Since 16G PR 6 (#120) the Invoice tab reads it only to decide
             whether to poll getCurrentInvoice; it is never displayed (no link status line, expiry
             display or cancel). Not part of CurrentInvoiceSummary (the payment and void responses)
             or of any public invoice payload.
@@ -5097,12 +5037,12 @@ components:
       example: '2026-04-22T14:30:00'
       description: >-
         Server-local timestamp returned as YYYY-MM-DDTHH:mm:ss. Known drift: the quote timestamps
-        apply no whole-second format today, so they can carry fractional seconds; from 16G PR 6
+        applied no whole-second format before 16G PR 6 and could carry fractional seconds; since that PR
         (#124) every quote timestamp
         (QuoteAcceptedSummary.accepted_at; QuoteIssuedSummary first_sent_at, last_sent_at,
         last_emailed_at, viewed_at, token_expires_at; QuoteDraft.updated_at;
         PublicQuoteView.expires_at) is formatted to whole seconds. Stored values are unchanged.
-        Whole-second strings never decide quote email delivery; from 16G PR 6
+        Whole-second strings never decide quote email delivery;
         QuoteIssuedSummary.last_email_delivered does.
 
     Pagination:
@@ -5398,12 +5338,12 @@ components:
         last_email_delivered:
           type: boolean
           description: >-
-            16G PR 6 (planned; not returned until PR 6 merges). Always present once implemented,
+            16G PR 6. Always present,
             never null. Derived by the server from the stored markers at full precision, before
             whole-second formatting: true when last_emailed_at is non-null and is not before
             last_sent_at, otherwise false. The markers keep their roles (last_sent_at is the
             latest send attempt, stamped before delivery; last_emailed_at is the success marker,
-            which from PR 6 a successful delivery stamps only while its own attempt is still the
+            which a successful delivery stamps only while its own attempt is still the
             latest (last_sent_at unchanged), so a superseded attempt's late success writes nothing
             and never makes this true); no column and no migration. Customer Quote shows Not delivered when
             sent_channel is EMAIL and this is false; the dormant SMS channel never shows it. The
@@ -5472,7 +5412,7 @@ components:
           format: int64
           description: >-
             The accepted version's id. From 16G PR 3 the Quote tab sends it as quote_version_id on
-            createInvoiceFromQuote (#123); from 16G PR 6 it addresses the version-bound accepted
+            createInvoiceFromQuote (#123); since 16G PR 6 it addresses the version-bound accepted
             reads (#122).
         version_number:
           type: integer
@@ -5482,7 +5422,7 @@ components:
           allOf:
             - $ref: '#/components/schemas/Timestamp'
           description: >-
-            When the customer signed. From 16G PR 6 (#124) formatted to whole seconds, like every
+            When the customer signed. Formatted to whole seconds since 16G PR 6 (#124), like every
             quote timestamp the API returns (stored values unchanged).
         accepted_customer_name:
           type: string
@@ -5525,22 +5465,21 @@ components:
           type: string
           nullable: true
           description: >-
-            Backend-built protected path /api/v1/{slug}/orders/{orderId}/quote/accepted/signature
-            (downloadAcceptedQuoteSignature); consume verbatim. Null when no signature is stored.
-            From 16G PR 6 (#122) it carries the version-addressed path
+            Backend-built protected, version-addressed path (16G PR 6, #122)
             /api/v1/{slug}/orders/{orderId}/quote/accepted/{quoteVersionId}/signature
-            (downloadAcceptedQuoteVersionSignature) for this version.
+            (downloadAcceptedQuoteVersionSignature) for this version; consume verbatim. Null when no
+            signature is stored.
         signed_pdf_available:
           type: boolean
           description: >-
             True when the stored signed PDF exists; stream it via
-            GET /orders/{orderId}/quote/pdf?type=accepted (from 16G PR 6, #122:
+            downloadAcceptedQuoteVersionPdf (16G PR 6, #122:
             GET /orders/{orderId}/quote/accepted/{quoteVersionId}/pdf with this quote_version_id).
         invoice_created_from_this_version:
           type: boolean
           description: >-
-            16G PR 6 (planned, #124; not returned until PR 6 merges). Always present once
-            implemented, computed inside the one-snapshot workspace read. True when the order's
+            16G PR 6 (#124). Always present, never null,
+            computed inside the one-snapshot workspace read. True when the order's
             CURRENT invoice was created from this accepted quote version by createInvoiceFromQuote
             (Path A), including the payment and void versions carried from it (its source quote
             version is this version); false when there is no invoice or the current invoice has
@@ -5805,7 +5744,7 @@ components:
             - $ref: '#/components/schemas/Timestamp'
           nullable: true
           description: >-
-            The presented token's expiry. From 16G PR 6 (#124) formatted to whole seconds.
+            The presented token's expiry, formatted to whole seconds (16G PR 6, #124).
         message:
           type: string
           nullable: true
@@ -6032,7 +5971,7 @@ components:
                 - $ref: '#/components/schemas/Timestamp'
               description: >-
                 sent_at + 7 days. Informational: the Invoice tab never starts or times polling
-                from this value. From 16G PR 6 (#120) it polls on InvoiceDetail
+                from this value. Since 16G PR 6 (#120) it polls on InvoiceDetail
                 invoice_link_expires_at, read from getCurrentInvoice.
 
     InvoiceLinkSendResultWrapper:

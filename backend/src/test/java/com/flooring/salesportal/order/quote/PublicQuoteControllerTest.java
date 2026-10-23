@@ -76,6 +76,19 @@ class PublicQuoteControllerTest {
     // A well-formed (43-char URL-safe) token that was never minted.
     private static final String UNKNOWN_TOKEN = "A".repeat(43);
 
+    // The 25 keys of PublicQuoteViewDto, always present (nullable ones as JSON null), and the 4 public line
+    // keys. 16G PR 6 adds NO public key: last_email_delivered and invoice_created_from_this_version are
+    // protected response fields only.
+    private static final java.util.Set<String> PUBLIC_VIEW_KEYS = new java.util.TreeSet<>(java.util.List.of(
+            "state", "business_name", "business_logo_url", "accent_color", "business_abn",
+            "payment_account_name", "payment_bank_name", "payment_bsb", "payment_account_number",
+            "payment_stripe_link_url", "order_number", "flooring_type", "customer_name",
+            "customer_address_line1", "customer_address_line2", "details_of_sale", "itemised", "lines",
+            "quote_total_ex_gst", "gst_amount", "quote_total_inc_gst", "deposit_amount", "terms_html",
+            "expires_at", "message"));
+    private static final java.util.Set<String> PUBLIC_LINE_KEYS = new java.util.TreeSet<>(java.util.List.of(
+            "description", "quantity", "unit_price_ex_gst", "line_total_ex_gst"));
+
     @Autowired
     private WebApplicationContext context;
 
@@ -519,6 +532,59 @@ class PublicQuoteControllerTest {
         }
     }
 
+    /**
+     * 16G PR 6 (#124): the public view's expires_at is formatted to whole seconds on the GET and the viewed
+     * POST (the stored token expiry keeps its fraction), and the payload keeps its EXACT public key set — the
+     * two new protected booleans (last_email_delivered, invoice_created_from_this_version) never appear.
+     */
+    @Test
+    void getAndViewed_expiresAtWholeSeconds_exactPublicKeys_neverTheProtectedPr6Booleans() throws Exception {
+        long orderId = sendReadyOrder();
+        String token = issueAndExtractToken(orderId);
+        Assertions.assertEquals(1, jdbcTemplate.update(
+                "UPDATE quote_token SET expires_at = ? WHERE token_hash = ? AND status = 'ACTIVE'",
+                Timestamp.valueOf("2099-11-09 12:22:10.987654"), sha256Hex(token)));
+        clearJpaCache();
+
+        String getBody = mockMvc.perform(get(publicUrl(token)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.state").value("ACTIVE"))
+                .andExpect(jsonPath("$.data.expires_at").value("2099-11-09T12:22:10"))
+                .andReturn().getResponse().getContentAsString();
+        assertExactPublicKeys(getBody, "GET");
+
+        String viewedBody = mockMvc.perform(post(publicViewedUrl(token))
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.state").value("ACTIVE"))
+                .andExpect(jsonPath("$.data.expires_at").value("2099-11-09T12:22:10"))
+                .andReturn().getResponse().getContentAsString();
+        assertExactPublicKeys(viewedBody, "viewed POST");
+
+        Assertions.assertEquals(Timestamp.valueOf("2099-11-09 12:22:10.987654"), tokenRowByToken(token).get("expires_at"),
+                "formatting never touches the stored token expiry");
+    }
+
+    /** data carries exactly the 25 public keys (lines exactly the 4 line keys) and no PR 6 protected boolean. */
+    private static void assertExactPublicKeys(String body, String label) throws Exception {
+        com.fasterxml.jackson.databind.JsonNode data =
+                new com.fasterxml.jackson.databind.ObjectMapper().readTree(body).get("data");
+        java.util.Set<String> keys = new java.util.TreeSet<>();
+        data.fieldNames().forEachRemaining(keys::add);
+        Assertions.assertEquals(PUBLIC_VIEW_KEYS, keys, label + ": the exact PublicQuoteView keys");
+        for (com.fasterxml.jackson.databind.JsonNode line : data.get("lines")) {
+            java.util.Set<String> lineKeys = new java.util.TreeSet<>();
+            line.fieldNames().forEachRemaining(lineKeys::add);
+            Assertions.assertEquals(PUBLIC_LINE_KEYS, lineKeys, label + ": the exact public line keys");
+        }
+        java.util.Set<String> allKeys = new java.util.TreeSet<>();
+        collectJsonKeys(new com.fasterxml.jackson.databind.ObjectMapper().readTree(body), allKeys);
+        Assertions.assertFalse(allKeys.contains("last_email_delivered"),
+                label + ": last_email_delivered is a protected field only");
+        Assertions.assertFalse(allKeys.contains("invoice_created_from_this_version"),
+                label + ": invoice_created_from_this_version is a protected field only");
+    }
+
     @Test
     void getPublicQuote_deadToken_returnsMinimalPayload() throws Exception {
         long orderId = sendReadyOrder();
@@ -553,7 +619,10 @@ class PublicQuoteControllerTest {
                 .andExpect(jsonPath("$.data.lines").value(nullValue()))
                 .andExpect(jsonPath("$.data.quote_total_inc_gst").value(nullValue()))
                 .andExpect(jsonPath("$.data.deposit_amount").value(nullValue()))
-                .andExpect(jsonPath("$.data.terms_html").value(nullValue()));
+                .andExpect(jsonPath("$.data.terms_html").value(nullValue()))
+                // The nullable timestamp stays present as JSON null (16G PR 6 formats it, never omits it).
+                .andExpect(jsonPath("$.data.expires_at").hasJsonPath())
+                .andExpect(jsonPath("$.data.expires_at").value(nullValue()));
     }
 
     // ================================================================

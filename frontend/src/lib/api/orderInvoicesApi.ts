@@ -50,6 +50,12 @@ import type { ApiSuccess } from './types'
 // quote's frozen terms), BUSINESS otherwise (the business's terms, frozen when the invoice was
 // created or rewritten, and carried). Neither value means a live lookup. The Invoice tab renders
 // terms from these fields only.
+//
+// 16G PR 4 derived link field, ALWAYS present (nullable): invoice_link_expires_at is the expires_at of
+// the order's ACTIVE, unexpired invoice link (a timezone-free server-local timestamp,
+// YYYY-MM-DDTHH:mm:ss), else null - response metadata about the ORDER's link, not a frozen word of the
+// version. Since 16G PR 6 (#120) the Invoice tab reads it ONLY to decide whether to poll for a remote
+// signature; it is never displayed (no link status, no expiry display, no cancel).
 export type InvoiceTermsSource = 'QUOTE' | 'BUSINESS'
 
 export type InvoiceDetail = {
@@ -76,6 +82,7 @@ export type InvoiceDetail = {
   last_emailed_at: string | null
   terms_html: string | null
   terms_source: InvoiceTermsSource
+  invoice_link_expires_at: string | null
 }
 
 // Create (201) / Rewrite (201) / Read current (200) / Accept (201) / Resend (200) all wrap the

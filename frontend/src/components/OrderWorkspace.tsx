@@ -135,32 +135,44 @@ function WorkspaceShell({
   const [financialSummary, setFinancialSummary] =
     useState<OrderFinancialSummary | null>(null)
 
-  // Read-vs-mutation recency for order_financial_summary applies. KEY RULE: a
-  // read-only GET /lines must never make a mutation summary stale. A MUTATION
-  // response (sale-price override/reset, product/charge add/edit/delete) is the
-  // newest persisted state, so it ALWAYS applies and bumps the mutation version.
-  // A READ (seed / ProductsChargesTab load) captures the mutation version at issue
-  // time and applies only if no mutation has applied since — so a later read can
-  // neither overwrite a mutation nor cause an in-flight mutation response to be
-  // discarded. (True cross-surface mutation commit-ordering needs backend summary
-  // versioning and is intentionally out of scope here.) The ref survives tab
-  // remounts because this shell stays mounted across tab switches.
-  const financialSummaryMutationVersionRef = useRef(0)
+  // ONE shared order for every order_financial_summary apply. financialEventSeqRef
+  // is a monotonically increasing counter, advanced by every READ when it begins
+  // (the mount seed, the ProductsChargesTab load and refreshFinancialSummary all
+  // take their read seq from beginFinancialSummaryRead) and by every applied
+  // MUTATION (sale-price override/reset, product/charge add/edit/delete). A
+  // mutation response is the newest persisted state, so it ALWAYS applies and
+  // records its seq in lastMutationSeqRef. A read applies only when it was issued
+  // after the last applied mutation (a read can neither overwrite a mutation nor
+  // cause an in-flight mutation response to be discarded) and is newer than every
+  // read that already applied (appliedReadSeqRef), so a late read - whichever
+  // surface issued it - never re-installs an older summary over a newer one. A
+  // failed read touches neither floor, so an older read that succeeds still
+  // applies while no newer read has. Reads are never represented as mutations.
+  // (True cross-surface mutation commit-ordering needs backend summary versioning
+  // and is intentionally out of scope here.) The refs survive tab remounts because
+  // this shell stays mounted across tab switches.
+  const financialEventSeqRef = useRef(0)
+  const lastMutationSeqRef = useRef(0)
+  const appliedReadSeqRef = useRef(0)
   const applyMutationFinancialSummary = useCallback(
     (summary: OrderFinancialSummary) => {
-      financialSummaryMutationVersionRef.current += 1
+      financialEventSeqRef.current += 1
+      lastMutationSeqRef.current = financialEventSeqRef.current
       setFinancialSummary(summary)
     },
     [],
   )
-  const beginFinancialSummaryRead = useCallback(
-    () => financialSummaryMutationVersionRef.current,
-    [],
-  )
+  const beginFinancialSummaryRead = useCallback(() => {
+    financialEventSeqRef.current += 1
+    return financialEventSeqRef.current
+  }, [])
   const applyReadFinancialSummary = useCallback(
-    (readVersion: number, summary: OrderFinancialSummary) => {
-      // Discard the read if any mutation applied after this read began.
-      if (readVersion !== financialSummaryMutationVersionRef.current) return false
+    (readSeq: number, summary: OrderFinancialSummary) => {
+      // Discard a read issued before the last applied mutation, or one that is not
+      // newer than a read that already applied.
+      if (readSeq < lastMutationSeqRef.current) return false
+      if (readSeq <= appliedReadSeqRef.current) return false
+      appliedReadSeqRef.current = readSeq
       setFinancialSummary(summary)
       return true
     },
@@ -342,6 +354,7 @@ function WorkspaceShell({
   // workspace. The PUT itself still completes (the edit is persisted); only the
   // lift + status setState are skipped. A tab switch keeps the shell mounted, so
   // the lift still happens — which is the whole point of hoisting the lock here.
+  // (16G PR 6: the financial-summary refresh below uses the same shell flag.)
   const detailsShellMountedRef = useRef(true)
   useEffect(() => {
     detailsShellMountedRef.current = true
@@ -469,6 +482,39 @@ function WorkspaceShell({
       cancelled = true
     }
   }, [orderId, beginFinancialSummaryRead, applyReadFinancialSummary])
+
+  // 16G PR 6 (#121): a best-effort RE-read of the order financial summary, for when
+  // the price may have changed outside this workspace - a remote quote acceptance
+  // writes its accepted total as the order's sale-price override (D6b). It is a READ
+  // in the one shared order above, like the seed and the Products & Charges load: it
+  // is discarded if a mutation applied after it began, or if a newer read (another
+  // refresh, the seed or a Products & Charges load) has already applied, so a read
+  // issued before an acceptance can never overwrite one issued for it. It never
+  // clears the summary on screen while it reads; a failure keeps that summary and
+  // moves neither floor; a read that settles after the shell unmounted (an order
+  // switch: the shell is keyed by orderId) is dropped. Details of Sale re-seeds an
+  // UNEDITED sale-price input from the refreshed summary and keeps an active edit.
+  function refreshFinancialSummary() {
+    const readSeq = beginFinancialSummaryRead()
+    fetchOrderLines(orderId)
+      .then((res) => {
+        if (!detailsShellMountedRef.current) return
+        applyReadFinancialSummary(readSeq, res.data.order_financial_summary)
+      })
+      .catch(() => {
+        // Best-effort: keep the current summary.
+      })
+  }
+
+  // Refresh trigger: every time Details of Sale is opened (reopening included), so it
+  // never shows a price that a remote acceptance has since replaced. The other trigger
+  // is the Quote tab installing a new accepted version (onAcceptedVersionChanged).
+  useEffect(() => {
+    if (activeTab === 'details') refreshFinancialSummary()
+    // refreshFinancialSummary only reads stable callbacks, a ref and orderId (fixed for
+    // this keyed shell).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTab])
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
@@ -619,7 +665,9 @@ function WorkspaceShell({
                 Phase 16F PR3: `active` lets the tab re-read its issued/accepted
                 snapshots each time it becomes the visible tab (never the draft),
                 and onInvoiceReady switches to the Invoice tab after a Create
-                Invoice from the accepted quote. */}
+                Invoice from the accepted quote. 16G PR 6: `active` also gates the
+                tab's 15-second poll, and onAcceptedVersionChanged re-reads the
+                order financial summary when a new accepted version lands. */}
             {quoteTabVisible && (
               <div className={activeTab === 'quote' ? '' : 'hidden'}>
                 <QuoteTab
@@ -636,6 +684,7 @@ function WorkspaceShell({
                   initialIssued={quoteInitialIssued}
                   initialAccepted={quoteInitialAccepted}
                   onInvoiceReady={handleQuoteInvoiceReady}
+                  onAcceptedVersionChanged={refreshFinancialSummary}
                   // Codex P2: the quote preview PDF renders the PERSISTED
                   // sales_order.details_of_sale, so Preview must flush pending
                   // Details of Sale autosaves first — the same shell-owned

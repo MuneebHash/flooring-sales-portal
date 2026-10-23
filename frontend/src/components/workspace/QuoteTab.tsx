@@ -11,6 +11,7 @@ import {
   cancelQuote,
   createInvoiceFromQuote,
   fetchAcceptedQuoteSignature,
+  fetchAcceptedQuoteVersionPdf,
   fetchQuotePreviewPdf,
   fetchQuoteStoredPdf,
   fetchQuoteWorkspace,
@@ -45,6 +46,7 @@ import {
 import { fetchPublicBusiness } from '../../lib/api/tenantApi'
 import { getActiveSlug } from '../../lib/tenant'
 import type { FlooringType } from '../../lib/flooring'
+import { usePollWhileVisible } from '../../lib/usePollWhileVisible'
 
 // Phase 16D-B PR1 + PR2B + 16E-B + 16F PR3 - the salesperson Quote tab
 // (docs/Phase16D-Quotation-UX-Lock.md).
@@ -66,12 +68,16 @@ import type { FlooringType } from '../../lib/flooring'
 //     PR 3) and then re-reads the snapshots and switches to the Invoice tab.
 //   - Issued/accepted refresh: the tab re-reads the workspace snapshots when the
 //     top-level tab becomes active, on a sub-tab change and before the Send
-//     confirmation opens (the D9 warning needs the current accepted state). ONE
-//     recency mechanism covers every snapshot read and every send / cancel /
-//     conversion result (see refreshSnapshots), and a refresh only ever replaces
-//     `issued` + `accepted` together. It NEVER touches the draft rows, mode, total
-//     input, server-draft baseline, save queue or autosave status: the response's
-//     draft is ignored (#101 stays out of scope), so a refresh never causes a PUT.
+//     confirmation opens (the D9 warning needs the current accepted state), and
+//     (16G PR 6, #120) every 15 seconds while an issued quote waits for a
+//     signature and the tab is visible. ONE recency mechanism covers every
+//     snapshot read and every send / cancel / conversion result (see
+//     refreshSnapshots), and a refresh only ever replaces `issued` + `accepted`
+//     together. It NEVER touches the draft rows, mode, total input, server-draft
+//     baseline, save queue or autosave status: the response's draft is ignored
+//     (#101 stays out of scope), so a refresh never causes a PUT. A refresh that
+//     installs a new accepted version asks the workspace to re-read the order
+//     financial summary (16G PR 6, #121: the acceptance wrote the order price).
 //
 // 16E-B delivery rules (locked):
 //   - Send by Email goes through the confirmation modal ONLY (no one-click
@@ -118,8 +124,10 @@ import type { FlooringType } from '../../lib/flooring'
 // switch / page leave.
 //
 // 16D-A decoupling (locked): a quote save never changes order/header pricing, so
-// NOTHING here refreshes the workspace financial summary — the save response
-// updates quote draft state only.
+// a save never refreshes the workspace financial summary — the save response
+// updates quote draft state only. The one trigger here is a snapshot read that
+// installs a new accepted version (16G PR 6, #121: that remote acceptance wrote
+// its total as the order price), through onAcceptedVersionChanged.
 //
 // COST DISCIPLINE (locked): no cost value is ever displayed or sent. gp_percent
 // and below_cost are server-derived protected-surface signals and render OUTSIDE
@@ -151,7 +159,8 @@ type Props = {
   // disabled. Create Invoice from the accepted quote is NOT gated by it.
   locked: boolean
   // Phase 16F PR3: true while the top-level Quote tab is the visible tab. Each
-  // false -> true transition re-reads the issued/accepted snapshots.
+  // false -> true transition re-reads the issued/accepted snapshots; since 16G
+  // PR 6 it also gates the 15-second poll.
   active: boolean
   flooringType: FlooringType
   orderNumber?: string
@@ -173,6 +182,11 @@ type Props = {
   // Phase 16F PR3: called with the backend success message after Create Invoice
   // from the accepted quote succeeds; the workspace switches to the Invoice tab.
   onInvoiceReady: (message: string) => void
+  // 16G PR 6 (#121): called when a snapshot read installs an accepted version
+  // other than the one shown before (a remote acceptance wrote its total as the
+  // order price, D6b), so the workspace re-reads the order financial summary.
+  // Never called for the initialAccepted seed.
+  onAcceptedVersionChanged: () => void
   // Switches the workspace to the Customer tab when a send fails with
   // CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID so the salesperson can fix
   // the email where it lives (the InvoiceTab accept/resend precedent).
@@ -263,27 +277,15 @@ function channelLabel(channel: QuoteChannel | null): string {
   return '—'
 }
 
-// True when the LATEST email send attempt was not delivered (Codex P2 rounds
-// 1+3). last_emailed_at is the SUCCESS-ONLY stamp and on a successful send it
-// always lands strictly AFTER the attempt marker (last_sent_at: stamped in the
-// pre-delivery transaction; the success stamp in a follow-up transaction), so:
-//   - no success stamp at all            -> the only/first attempt failed;
-//   - success stamp OLDER than the latest -> a later resend failed: the stamp
-//     attempt marker                        belongs to a PRIOR attempt whose
-//                                           link the failed resend already
-//                                           replaced (token REPLACED), so the
-//                                           customer holds nothing usable;
-//   - success stamp equal-or-later       -> the latest attempt was delivered.
-// Both timestamps are backend LocalDateTime strings in the same clock, so the
-// Date comparison is sound. SMS has no success marker — never "not delivered".
+// True when the LATEST email send attempt was not delivered: the server's
+// last_email_delivered (16G PR 6, #124), derived from the stored markers at full
+// precision (a failed resend in the same second as an earlier successful send
+// reads false, although the whole-second timestamp strings are identical). Not
+// delivered then means the customer holds no usable link: a failed resend has
+// already replaced the delivered one. Email channel only - the dormant SMS
+// channel has no success marker and never shows Not delivered.
 function emailNotDelivered(issued: QuoteIssuedSummary): boolean {
-  if (issued.sent_channel !== 'EMAIL') return false
-  if (issued.last_emailed_at === null) return true
-  if (issued.last_sent_at === null) return false
-  return (
-    new Date(issued.last_emailed_at).getTime() <
-    new Date(issued.last_sent_at).getTime()
-  )
+  return issued.sent_channel === 'EMAIL' && !issued.last_email_delivered
 }
 
 function composeFullName(customer: OrderCustomer | null | undefined): string {
@@ -653,8 +655,9 @@ function previewFileName(orderNumber: string | undefined): string {
 
 // --- Phase 16F PR3: Accepted Quote helpers. ---
 
-// Explanation under a disabled Create Invoice (invoice_eligible false). The
-// second sentence is the backend's own Path A refusal wording.
+// Explanation under a disabled Create Invoice (invoice_eligible false), chosen
+// by the server's accepted.invoice_created_from_this_version (16G PR 6, #124).
+// The second sentence is the backend's own Path A refusal wording.
 const ALREADY_CONVERTED_MESSAGE =
   'An invoice has already been created from this quote.'
 const NEWER_SIGNATURE_REQUIRED_MESSAGE =
@@ -663,17 +666,6 @@ const ACCEPTED_CHANGED_MESSAGE =
   'The accepted quote changed while the confirmation was open. Review the accepted quote before creating an invoice.'
 const CONVERSION_UNKNOWN_MESSAGE =
   'The Create Invoice request did not complete, so its result is unknown. Check the Invoice tab before trying again.'
-
-// Same instant? The two backend timestamp strings are compared as STRINGS (no
-// Date arithmetic) at the precision both APIs share. accepted.accepted_at is
-// serialized with fractional seconds (no @JsonFormat on the accepted summary)
-// while InvoiceDetail.accepted_at is formatted to whole seconds, and a Path A
-// invoice copies the quote's accepted_at exactly - so the first 19 characters
-// (YYYY-MM-DDTHH:mm:ss) are the comparable form of both.
-function sameSecondTimestamp(a: string, b: string): boolean {
-  const left = a.slice(0, 19)
-  return left.length === 19 && left === b.slice(0, 19)
-}
 
 // INVOICE_PRECONDITIONS_NOT_MET details[] ({ section?, field?, message } or
 // plain strings) in the existing Details of Sale convention: "field: message",
@@ -718,10 +710,9 @@ function isAmbiguousFailure(err: unknown): boolean {
   )
 }
 
-// The current-invoice read that supports the conversion wording: the
-// confirmation text (no invoice / unsigned / signed) and the explanation under
-// a disabled Create Invoice. INVOICE_NOT_FOUND is the genuine no-invoice state
-// (invoice: null); any other failure is 'error' and never "no invoice".
+// The current-invoice read that supports the Create Invoice confirmation text
+// (no invoice / unsigned / signed). INVOICE_NOT_FOUND is the genuine no-invoice
+// state (invoice: null); any other failure is 'error' and never "no invoice".
 type CurrentInvoiceLookup =
   | { status: 'idle' }
   | { status: 'loading'; key: number }
@@ -762,6 +753,7 @@ export function QuoteTab({
   initialIssued,
   initialAccepted,
   onInvoiceReady,
+  onAcceptedVersionChanged,
   flushDetailsAutosave,
   onGoToCustomer,
 }: Props) {
@@ -862,9 +854,6 @@ export function QuoteTab({
   const [snapshotRefreshError, setSnapshotRefreshError] = useState<
     string | null
   >(null)
-  // Bumped on every APPLIED snapshot read, so reads that depend on the latest
-  // server state (the ineligibility explanation) re-run after each refresh.
-  const [snapshotApplyCount, setSnapshotApplyCount] = useState(0)
   // Pre-Send refresh (D9): the Send confirmation opens only after a successful
   // re-read of the snapshots; a failed read shows a retry instead.
   const [sendCheck, setSendCheck] = useState<'idle' | 'checking' | 'error'>(
@@ -903,12 +892,6 @@ export function QuoteTab({
   // invoice_eligible can never invite a duplicate conversion.
   const [conversionLock, setConversionLock] = useState<
     null | 'created' | 'unknown'
-  >(null)
-  // The explanation under a disabled Create Invoice needs the current invoice.
-  const [eligibilityLookup, setEligibilityLookup] = useState<
-    | { status: 'ready'; quoteVersionId: number; invoice: InvoiceDetail | null }
-    | { status: 'error'; quoteVersionId: number }
-    | null
   >(null)
 
   // Branding + per-type quote terms: two INDEPENDENT fail-soft fetch chains
@@ -950,6 +933,8 @@ export function QuoteTab({
   issuedRef.current = issued
   const acceptedRef = useRef(accepted)
   acceptedRef.current = accepted
+  const onAcceptedVersionChangedRef = useRef(onAcceptedVersionChanged)
+  onAcceptedVersionChangedRef.current = onAcceptedVersionChanged
   const conversionLockRef = useRef(conversionLock)
   conversionLockRef.current = conversionLock
   const cancelModalOpenRef = useRef(cancelModalOpen)
@@ -1673,15 +1658,22 @@ export function QuoteTab({
     setIssued(next)
   }
 
+  // Install a new accepted snapshot. A preview failure recorded against a
+  // DIFFERENT accepted version must not resurface against this one. 16G PR 6
+  // (#121): a newly installed accepted version (a null previous one included)
+  // was signed remotely, and that acceptance wrote its total as the order price
+  // (D6b), so the workspace is asked to re-read the order financial summary.
+  // The initialAccepted seed never passes through here.
   function installAccepted(next: QuoteAcceptedSummary | null) {
-    if (
-      (acceptedRef.current?.quote_version_id ?? null) !==
-      (next?.quote_version_id ?? null)
-    ) {
+    const previousVersionId = acceptedRef.current?.quote_version_id ?? null
+    if (previousVersionId !== (next?.quote_version_id ?? null)) {
       setAcceptedPreviewError(null)
     }
     acceptedRef.current = next
     setAccepted(next)
+    if (next !== null && next.quote_version_id !== previousVersionId) {
+      onAcceptedVersionChangedRef.current()
+    }
   }
 
   // A mutation (send / cancel / conversion) is starting or has applied its own
@@ -1724,7 +1716,6 @@ export function QuoteTab({
       snapshotFloorRef.current = seq
       installIssued(res.data.current_issued)
       installAccepted(res.data.accepted)
-      setSnapshotApplyCount((count) => count + 1)
       setSnapshotRefreshError(null)
       // A read issued after the conversion lock was taken reports the
       // post-conversion invoice_eligible: the server state takes over again.
@@ -1759,6 +1750,26 @@ export function QuoteTab({
     // refreshSnapshots reads everything through refs.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [active])
+
+  // Refresh trigger 4 (16G PR 6, #120): while a quote link waits for a
+  // signature (current_issued non-null), poll the snapshots every 15 seconds,
+  // only while the browser tab is visible and this is the active workspace tab.
+  // A tick is skipped while a snapshot read or a send / cancel / Create Invoice
+  // (or the pre-Send check) is in flight; otherwise it is the same guarded read
+  // as every other trigger, silent on failure (reportError: false), and never
+  // touches the draft, its rows, totals, save queue or autosave baseline.
+  usePollWhileVisible(issued !== null && active, () => {
+    if (
+      snapshotReadsInFlightRef.current > 0 ||
+      sendingRef.current ||
+      cancellingRef.current ||
+      convertingRef.current ||
+      sendCheckRef.current
+    ) {
+      return
+    }
+    void refreshSnapshots({ reportError: false })
+  })
 
   // Refresh trigger 2: a quote sub-tab change.
   function handleSubTabChange(next: QuoteSubTabId) {
@@ -1932,8 +1943,10 @@ export function QuoteTab({
       // the delivery failed. The local issued state is therefore stale (still
       // null on a first send), and the Customer Quote sub-tab would misreport
       // until a reload. Resync it from the workspace; the refetched summary
-      // carries no last_emailed_at, so the Not-delivered badge renders
-      // naturally. The modal stays open with the error either way, and the
+      // carries last_email_delivered false (16G PR 6: this failed attempt is the
+      // latest), so the Not-delivered badge renders naturally even when an
+      // earlier send of the same version succeeded in the same second. The
+      // modal stays open with the error either way, and the
       // in-flight guard (reset in finally, after this await) keeps a retry
       // from racing the resync. 16F PR3: the resync is a guarded snapshot read
       // (issued + accepted together; older reads can never land after it); it
@@ -2082,13 +2095,14 @@ export function QuoteTab({
   // --- Phase 16F PR3: Accepted Quote (signature, signed PDF, Create Invoice). ---
 
   // The stored accepted signature (credentialed blob of the VERBATIM backend
-  // path -> object URL). Keyed on the accepted VERSION as well as the path: the
-  // path is the same stable /quote/accepted/signature URL for every accepted
-  // version, so a newer accepted version must refetch even though the path did
-  // not change. The old image is cleared at once on any identity change; a late
-  // result after a change or unmount is discarded and its URL revoked (the
-  // InvoiceTab ownership pattern). A failure shows a small retry notice only.
-  // Loaded once the Accepted Quote sub-tab has been opened.
+  // path -> object URL). Since 16G PR 6 (#122) the path addresses the displayed
+  // accepted version (.../quote/accepted/{quoteVersionId}/signature), so it
+  // changes with the version; the version id stays in the key as well. The old
+  // image is cleared at once on any identity change; a late result after a
+  // change or unmount is discarded and its URL revoked (the InvoiceTab ownership
+  // pattern), so a version no longer displayed never shows its signature. A
+  // failure shows a small retry notice only. Loaded once the Accepted Quote
+  // sub-tab has been opened.
   const acceptedSignaturePath =
     acceptedSubTabSeen && accepted !== null
       ? accepted.signature_download_path
@@ -2124,66 +2138,36 @@ export function QuoteTab({
     }
   }, [acceptedSignaturePath, acceptedSignatureVersionId, acceptedSignatureReload])
 
-  // The current invoice behind a DISABLED Create Invoice (invoice_eligible
-  // false), to choose its explanation. Re-read after every applied snapshot
-  // refresh while the Accepted Quote sub-tab is in use; a result is used only for
-  // the accepted version it was read for, and a late result after a change or
-  // unmount is discarded.
-  const eligibilityLookupKey =
-    acceptedSubTabSeen && accepted !== null && !accepted.invoice_eligible
-      ? `${accepted.quote_version_id}:${snapshotApplyCount}`
-      : null
-  const eligibilityLookupVersionId =
-    accepted !== null ? accepted.quote_version_id : null
-  useEffect(() => {
-    if (eligibilityLookupKey === null || eligibilityLookupVersionId === null) {
-      setEligibilityLookup(null)
-      return
-    }
-    let cancelled = false
-    const quoteVersionId = eligibilityLookupVersionId
-    fetchCurrentInvoice(orderIdRef.current)
-      .then((res) => {
-        if (!cancelled) {
-          setEligibilityLookup({
-            status: 'ready',
-            quoteVersionId,
-            invoice: res.data.invoice,
-          })
-        }
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return
-        if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
-          setEligibilityLookup({ status: 'ready', quoteVersionId, invoice: null })
-          return
-        }
-        setEligibilityLookup({ status: 'error', quoteVersionId })
-      })
-    return () => {
-      cancelled = true
-    }
-    // eligibilityLookupVersionId is part of eligibilityLookupKey.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [eligibilityLookupKey])
-
-  // Preview the STORED signed PDF (GET quote/pdf?type=accepted) in a new tab -
-  // never the draft preview, never a regeneration, never an autosave flush. Same
+  // Preview the STORED signed PDF of the accepted version ON SCREEN (16G PR 6,
+  // #122: GET quote/accepted/{quoteVersionId}/pdf) in a new tab - never the
+  // draft preview, never a regeneration, never an autosave flush. Same
   // popup-safe order as the other previews: blank tab opened synchronously in
   // the click handler, then the blob; download fallback only when blocked. No
-  // separate download button. Allowed when LAID (read).
+  // separate download button. Allowed when LAID (read). The order and the
+  // accepted version are captured before the fetch: when the tab unmounted, the
+  // order changed or another accepted version is displayed by the time the
+  // response lands, the response (bytes or error) is discarded and the blank
+  // tab closed, so a PDF of a version no longer displayed is never opened.
   async function handleAcceptedPreviewPdf() {
     if (acceptedPreviewing) return
+    const target = acceptedRef.current
+    if (target === null) return
+    const requestOrderId = orderIdRef.current
+    const quoteVersionId = target.quote_version_id
+    const versionNumber = target.version_number
+    const stillDisplayed = () =>
+      mountedRef.current &&
+      orderIdRef.current === requestOrderId &&
+      acceptedRef.current?.quote_version_id === quoteVersionId
     setAcceptedPreviewError(null)
     const tab = window.open('', '_blank')
     setAcceptedPreviewing(true)
-    const versionNumber = acceptedRef.current?.version_number
     try {
-      const { blob, fileName } = await fetchQuoteStoredPdf(
-        orderIdRef.current,
-        'accepted',
+      const { blob, fileName } = await fetchAcceptedQuoteVersionPdf(
+        requestOrderId,
+        quoteVersionId,
       )
-      if (!mountedRef.current) {
+      if (!stillDisplayed()) {
         tab?.close()
         return
       }
@@ -2198,9 +2182,7 @@ export function QuoteTab({
         anchor.href = url
         anchor.download =
           fileName ??
-          `quote-${orderNumber && orderNumber.length > 0 ? orderNumber : 'order'}${
-            versionNumber !== undefined ? `-v${versionNumber}` : ''
-          }-signed.pdf`
+          `quote-${orderNumber && orderNumber.length > 0 ? orderNumber : 'order'}-v${versionNumber}-signed.pdf`
         document.body.appendChild(anchor)
         anchor.click()
         anchor.remove()
@@ -2214,7 +2196,8 @@ export function QuoteTab({
       }
     } catch (err) {
       tab?.close()
-      if (!mountedRef.current) return
+      // An error for a version no longer displayed is stale too: no banner.
+      if (!stillDisplayed()) return
       setAcceptedPreviewError(
         err instanceof ApiError && err.message.length > 0
           ? err.message
@@ -2624,10 +2607,11 @@ export function QuoteTab({
     sendCheck === 'checking'
   // The note under Create Invoice. A just-created invoice says so (the lock
   // holds until a fresh read confirms the new eligibility); an unknown outcome
-  // defers to the error above; an ineligible quote explains why, from the
-  // current invoice read for THIS accepted version (string comparison of the
-  // two backend timestamps, never Date arithmetic; a failed read gives the
-  // general sentence).
+  // defers to the error above; an ineligible quote explains why from the
+  // server's provenance flag on the same accepted summary (16G PR 6, #124): the
+  // current invoice was created from THIS version, or it has another origin and
+  // a newer signed quote is needed. No current-invoice read, no timestamp
+  // comparison.
   let createInvoiceNote: string | null = null
   if (accepted !== null) {
     if (conversionLock === 'created') {
@@ -2637,23 +2621,9 @@ export function QuoteTab({
         ? 'Checking the latest quote status…'
         : 'Load the latest quote status (Try again above) before creating an invoice.'
     } else if (!accepted.invoice_eligible) {
-      const lookup =
-        eligibilityLookup !== null &&
-        eligibilityLookup.quoteVersionId === accepted.quote_version_id
-          ? eligibilityLookup
-          : null
-      if (lookup === null) {
-        createInvoiceNote = 'Checking the current invoice…'
-      } else if (
-        lookup.status === 'ready' &&
-        lookup.invoice !== null &&
-        lookup.invoice.accepted_at !== null &&
-        sameSecondTimestamp(lookup.invoice.accepted_at, accepted.accepted_at)
-      ) {
-        createInvoiceNote = ALREADY_CONVERTED_MESSAGE
-      } else {
-        createInvoiceNote = NEWER_SIGNATURE_REQUIRED_MESSAGE
-      }
+      createInvoiceNote = accepted.invoice_created_from_this_version
+        ? ALREADY_CONVERTED_MESSAGE
+        : NEWER_SIGNATURE_REQUIRED_MESSAGE
     }
   }
   // The open confirmation's current-invoice read, only for its own key.
@@ -3478,9 +3448,9 @@ export function QuoteTab({
                     </div>
                     <div className="mt-1">
                       {emailNotDelivered(issued) ? (
-                        // The latest EMAIL attempt failed (see the
-                        // emailNotDelivered helper for the timestamp
-                        // reasoning) — "Sent" OR "Opened" would misreport it:
+                        // The latest EMAIL attempt failed (the server's
+                        // last_email_delivered, see the emailNotDelivered
+                        // helper) — "Sent" OR "Opened" would misreport it:
                         // an unchanged resend replaced the token, so a
                         // previously-opened link is dead and the failure is
                         // the actionable state; viewed_at is only settable

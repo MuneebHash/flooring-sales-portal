@@ -205,7 +205,7 @@ Shape (the three `customer_*_snapshot` fields are returned since PR 2; `invoice_
 
 ### 4.6 Invoice tab (PR 2)
 
-The Invoice tab builds Invoice To only from the three frozen identity fields, never from the live customer and billing props. The terms-source line follows section 4.4 (UX lock §20). `invoice_link_expires_at` is never displayed; from PR 6 the tab reads it only for polling (section 13.2).
+The Invoice tab builds Invoice To only from the three frozen identity fields, never from the live customer and billing props. The terms-source line follows section 4.4 (UX lock §20). `invoice_link_expires_at` is never displayed; since PR 6 the tab reads it only for polling (section 13.2).
 
 ---
 
@@ -437,7 +437,7 @@ Staff reads never flip expiry. InvoiceDetail's `invoice_link_expires_at` (sectio
 }
 ```
 
-The response's `expires_at` is informational. The Invoice tab never starts or times polling from it; from PR 6 it polls on InvoiceDetail's `invoice_link_expires_at` (section 13.2).
+The response's `expires_at` is informational. The Invoice tab never starts or times polling from it; since PR 6 it polls on InvoiceDetail's `invoice_link_expires_at` (section 13.2).
 
 **LAID:** allowed. There is no CANCELLED rule (section 12).
 
@@ -726,7 +726,7 @@ A status change never kills an invoice link. API-Conventions §16 lists the two 
 - **Quote page:** a dead GET state shows `data.message` (the existing per-state text, 16B §7.2). A 404 shows the backend message (`Quote not found.`). A PDF 410 or 404 shows that response's message. The accept path keeps showing 410 and 422 messages verbatim. The per-state texts are unchanged. A load that gets no readable answer keeps the existing generic sentence.
 - **Invoice page:** a dead GET state shows `data.message` (section 7.2). A 404 shows `Invoice not found.`. A PDF or accept 410 shows its message. A load that gets no readable answer shows `We could not load this invoice. Please try again.` with a retry. The only invoice dead reasons are the four in section 7.2.
 
-### 13.2 Polling and the invoice signing draft (#120, PR 6)
+### 13.2 Polling and the invoice signing draft (#120, PR 6, implemented)
 
 - **Quote tab:** while `current_issued` is non-null (a quote link waits for a signature), re-read the issued and accepted state every 15 seconds through `refreshSnapshots({ reportError: false })`, only while the browser tab is visible and the Quote tab is the active workspace tab. The 16F refresh guards stay (an older response never overwrites a newer one; pending reads are discarded on unmount or order change; draft rows, totals and the autosave baseline are never re-seeded). A failed poll changes nothing and shows no banner.
 - **Invoice tab:** re-read the current invoice (`GET …/invoices/current`) every 15 seconds while the last applied InvoiceDetail shows `invoice_link_expires_at` non-null (section 4.5) and the displayed invoice unsigned, only while the browser tab is visible and the Invoice tab is the active workspace tab. Polling stops when a read shows the invoice signed, `invoice_link_expires_at` null, or when the returned `invoice_link_expires_at` time passes.
@@ -735,18 +735,18 @@ A status change never kills an invoice link. API-Conventions §16 lists the two 
   - Failed polls are silent and keep the existing state and response guards. The field is never displayed: no link status line, no expiry display, no cancel.
 - **Signing draft (Invoice tab):** any refresh or poll that installs a different invoice version (another `version_number`, including a changed version found by the pre-accept re-read) clears the signature ink and both declaration ticks before Accept Invoice can be enabled for that version. A refresh or poll that installs the unchanged version keeps the existing ink and ticks.
   - The existing response-order, order-change, unmount and mutation (single-flight) guards stay. An ignored or failed response never installs an older version and never clears a valid draft.
-  - Today the pre-accept re-read already clears the ink on a changed version, and the ticks already reset on any version change. PR 6 applies the rule to every refresh and poll path, the ink included.
+  - Before PR 6 the pre-accept re-read already cleared the ink on a changed version, and the ticks already reset on any version change. Since PR 6 the rule applies to every refresh and poll path, the ink included.
   - The PR 3 stale-409 handling (section 5.7) is unchanged and stays in PR 3.
 - Polling only reads: it never writes and never flips an expiry. On the Quote tab it never touches draft rows, totals or the autosave baseline. On the Invoice tab, an installed version change invalidates the signing draft of the replaced version, as above; that is the only editing state a poll can change.
 
-### 13.3 Financial refresh and Update Sale Price (#121, PR 6)
+### 13.3 Financial refresh and Update Sale Price (#121, PR 6, implemented)
 
 - Re-read the order financial summary through the existing guarded reader when a quote refresh (any trigger, including a poll) installs a new accepted version (a different `accepted.quote_version_id`), and whenever Details of Sale is opened.
 - **Update Sale Price is disabled until the sale-price input has been edited**, so a stale, unedited value can never be re-submitted over the price that a remote acceptance wrote (D6b).
 
-### 13.4 Version-bound accepted quote reads (#122, PR 6)
+### 13.4 Version-bound accepted quote reads (#122, PR 6, implemented)
 
-| Today (removed in PR 6) | From PR 6 |
+| Removed in PR 6 | Since PR 6 |
 |---|---|
 | `GET …/orders/{orderId}/quote/pdf?type=accepted` (latest accepted) | `GET /api/v1/{slug}/orders/{orderId}/quote/accepted/{quoteVersionId}/pdf` (`downloadAcceptedQuoteVersionPdf`) |
 | `GET …/orders/{orderId}/quote/accepted/signature` (latest accepted) | `GET /api/v1/{slug}/orders/{orderId}/quote/accepted/{quoteVersionId}/signature` (`downloadAcceptedQuoteVersionSignature`) |
@@ -756,14 +756,14 @@ A status change never kills an invoice link. API-Conventions §16 lists the two 
 - File names, LAID allowance and portal-only rules are unchanged. `pdf?type=issued` is unchanged. There is still no list of older accepted quotes and no history UI.
 - These are quote reads only. Binding the protected Invoice tab PDF and signature reads stays with [#114](https://github.com/MuneebHash/flooring-sales-portal/issues/114) (follow-up F53).
 
-### 13.5 Provenance boolean, whole-second quote timestamps and the delivery outcome (#124, PR 6)
+### 13.5 Provenance boolean, whole-second quote timestamps and the delivery outcome (#124, PR 6, implemented)
 
 - `QuoteAcceptedSummary` gains one always-present boolean, **`invoice_created_from_this_version`**, computed inside the one-snapshot workspace read: `true` when the order's current invoice was created from this accepted quote version by Create Invoice (Path A), including the payment and void versions carried from it (its source quote version is this version); `false` when there is no invoice or the current invoice has another origin (Create, Rewrite, or a signing that was not this conversion). It reports the current invoice, because the Accepted Quote explanation describes the current invoice.
 - When `invoice_eligible` is false, the Accepted Quote explanation reads `An invoice has already been created from this quote.` if `invoice_created_from_this_version` is true, otherwise `The current invoice was signed at the same time or later than this quote. A newer signed quote is required to create an invoice from a quote.`. The 19-character timestamp comparison is removed. No provenance id is added to InvoiceDetail.
 - Every quote timestamp the API returns is formatted to whole seconds, `YYYY-MM-DDTHH:mm:ss` (API-Conventions §5): `QuoteAcceptedSummary.accepted_at`; `QuoteIssuedSummary.first_sent_at`, `last_sent_at`, `last_emailed_at`, `viewed_at` and `token_expires_at`; `QuoteDraft.updated_at`; `PublicQuoteView.expires_at`. Stored values are unchanged, and fractional seconds are not restored anywhere. Whole-second strings never decide delivery; `last_email_delivered` does (below).
 - `QuoteIssuedSummary` gains one always-present, non-null boolean, **`last_email_delivered`**. The server computes it from the stored markers at full precision, before whole-second formatting: `true` when `last_emailed_at` is non-null and is not before `last_sent_at`, otherwise `false`.
   - The markers keep their roles: `last_sent_at` is the latest send attempt, stamped before delivery; `last_emailed_at` is the success marker, written only by the attempt-bound stamp below.
-  - **Attempt-bound success stamp (PR 6).** After a successful delivery, the send's follow-up transaction stamps `last_emailed_at` only while this attempt is still the latest. Under the order lock the stamp already takes, it runs `UPDATE quote_version SET last_emailed_at = :emailedAt WHERE quote_version_id = :id AND last_sent_at = :thisAttemptSentAt`, where `:thisAttemptSentAt` is the `last_sent_at` value this attempt stored before delivery. A superseded attempt's late success writes nothing (0 rows, no error, logged at DEBUG). `last_emailed_at` therefore means the last successful email of an attempt that was still the latest when it completed, and the `last_email_delivered` predicate is unchanged. Today the stamp has no attempt check: an older attempt that succeeds after a newer attempt has failed still stamps `last_emailed_at`, later than the newer `last_sent_at`, so the history reads as delivered.
+  - **Attempt-bound success stamp (PR 6, implemented).** After a successful delivery, the send's follow-up transaction stamps `last_emailed_at` only while this attempt is still the latest. Under the order lock the stamp already takes, it runs `UPDATE quote_version SET last_emailed_at = :emailedAt WHERE quote_version_id = :id AND last_sent_at = :thisAttemptSentAt`, where `:thisAttemptSentAt` is the `last_sent_at` value this attempt stored before delivery. A superseded attempt's late success writes nothing (0 rows, no error, logged at DEBUG). `last_emailed_at` therefore means the last successful email of an attempt that was still the latest when it completed, and the `last_email_delivered` predicate is unchanged. Before PR 6 the stamp had no attempt check: an older attempt that succeeded after a newer attempt had failed still stamped `last_emailed_at`, later than the newer `last_sent_at`, so the history read as delivered.
   - It is a derived response field: no column and no migration.
   - It appears wherever `QuoteIssuedSummary` is returned (the workspace `current_issued` and the send and cancel responses), never on a public quote or invoice payload.
 - Customer Quote's existing **Not delivered** badge reads it: Not delivered when `sent_channel` is `EMAIL` and `last_email_delivered` is `false`. The email-channel applicability is unchanged, and the dormant SMS channel still never shows Not delivered. The client stops comparing the returned timestamp strings.
@@ -816,9 +816,9 @@ Public invoice endpoints never return staff wording: the only messages a custome
 
 The detailed UX is in the UX lock §20 (Invoice tab and public invoice page) and §13–§14 (quote pages). In short:
 
-- **Invoice tab:** Invoice To from InvoiceDetail and the terms-source wording for `BUSINESS` (PR 2); D.8 sends `expected_version_number`, drops the name part and handles the stale 409; the frozen-name gate (PR 3); the unsigned bottom bar became **Accept Invoice | Accept Remotely**, Accept Remotely sends the link and shows success or failure, and Download PDF became **Preview PDF** (PR 5, implemented); polling on the server field `invoice_link_expires_at` (never displayed) and the signing-draft reset when a refresh installs another version (PR 6).
-- **Quote tab:** `{"quote_version_id": N}` and the stale 409 (PR 3); #120, #122 and #124, and the Not delivered badge from `last_email_delivered` (PR 6).
-- **Details of Sale:** #121 (PR 6).
+- **Invoice tab:** Invoice To from InvoiceDetail and the terms-source wording for `BUSINESS` (PR 2); D.8 sends `expected_version_number`, drops the name part and handles the stale 409; the frozen-name gate (PR 3); the unsigned bottom bar became **Accept Invoice | Accept Remotely**, Accept Remotely sends the link and shows success or failure, and Download PDF became **Preview PDF** (PR 5, implemented); polling on the server field `invoice_link_expires_at` (never displayed) and the signing-draft reset when a refresh installs another version (PR 6, implemented).
+- **Quote tab:** `{"quote_version_id": N}` and the stale 409 (PR 3); #120, #122 and #124, and the Not delivered badge from `last_email_delivered` (PR 6, implemented).
+- **Details of Sale:** #121 (PR 6, implemented).
 - **Public pages:** `/i/{token}` (PR 5, implemented); specific dead-link messages on both pages (PR 5, implemented).
 - Muneeb reviews the Invoice tab result in the implementation smoke test.
 
@@ -857,7 +857,7 @@ Edits proposed to existing issues (Muneeb): #128 adds the invoice public endpoin
 `docs/openapi.yaml` is updated in PR 1 as the target contract. Every new or changed element carries its implementation PR in its description, and a path or field is not evidence of an implementation.
 
 - **New paths:** `POST /orders/{orderId}/invoices/current/send-link` (`sendInvoiceLink`, PR 4); `GET /public/invoices/{token}` (`getPublicInvoice`), `POST /public/invoices/{token}/accept` (`acceptPublicInvoice`) and `GET /public/invoices/{token}/pdf` (`downloadPublicInvoicePdf`), PR 4, each with a `/api/v1` server override, `security: []` and the new `InvoiceToken` path parameter; `GET /orders/{orderId}/quote/accepted/{quoteVersionId}/pdf` (`downloadAcceptedQuoteVersionPdf`) and `GET /orders/{orderId}/quote/accepted/{quoteVersionId}/signature` (`downloadAcceptedQuoteVersionSignature`), PR 6.
-- **Changed operations:** `acceptCurrentInvoice` (PR 3: expected version, no name part, stale 409, non-throwing post-commit; the message follows the delivery outcome, so a stamp failure after a successful delivery keeps the emailed message, section 6.2; the signing version copies `invoice_date` from the current version, where today it is the signing day, section 5.4); `createInvoiceFromQuote` (PR 3: `CreateInvoiceFromQuoteRequest`, stale 409, automatic email whose message follows the delivery outcome; PR 2: frozen identity); `createInvoice`, `rewriteInvoice` (PR 2 freeze; PR 4 Rewrite kills the link); `recordPayment`, `voidPayment` (PR 2 copy; link survives); `downloadQuotePdf` `type=accepted` and `downloadAcceptedQuoteSignature` (deprecated; removed in PR 6). Description notes only: `getCurrentInvoice` (the derived `invoice_link_expires_at`, PR 4; Invoice tab polling on it, PR 6), `getQuoteWorkspace` (PR 6, including `last_email_delivered`), `getPublicQuote` (#126 page behaviour, token-kind isolation), `acceptPublicQuote` (D5(c) on remote invoice signing, PR 4), `resendCurrentInvoice` (the retry route for the new signed-PDF emails) and `downloadCurrentInvoicePdf` (the Preview PDF label, PR 5).
+- **Changed operations:** `acceptCurrentInvoice` (PR 3: expected version, no name part, stale 409, non-throwing post-commit; the message follows the delivery outcome, so a stamp failure after a successful delivery keeps the emailed message, section 6.2; the signing version copies `invoice_date` from the current version, where today it is the signing day, section 5.4); `createInvoiceFromQuote` (PR 3: `CreateInvoiceFromQuoteRequest`, stale 409, automatic email whose message follows the delivery outcome; PR 2: frozen identity); `createInvoice`, `rewriteInvoice` (PR 2 freeze; PR 4 Rewrite kills the link); `recordPayment`, `voidPayment` (PR 2 copy; link survives); `downloadQuotePdf` `type=accepted` and `downloadAcceptedQuoteSignature` (deprecated in PR 1; removed in PR 6). Description notes only: `getCurrentInvoice` (the derived `invoice_link_expires_at`, PR 4; Invoice tab polling on it, PR 6), `getQuoteWorkspace` (PR 6, including `last_email_delivered`), `getPublicQuote` (#126 page behaviour, token-kind isolation), `acceptPublicQuote` (D5(c) on remote invoice signing, PR 4), `resendCurrentInvoice` (the retry route for the new signed-PDF emails) and `downloadCurrentInvoicePdf` (the Preview PDF label, PR 5).
 - **New schemas:** `CreateInvoiceFromQuoteRequest`; `InvoiceLinkSendResult` and its wrapper; `PublicInvoiceState`; `PublicInvoiceView` and its wrapper; `PublicInvoiceAcceptRequest`; `PublicInvoiceAcceptResult` and its wrapper. New shared response `InvoiceLinkGone` (410). New parameters `InvoiceToken` (PR 4) and `QuoteVersionId` (PR 6).
 - **Changed schemas:** `SignatureAcceptRequest` (`expected_version_number` + `signature`; no name part or 150-character limit); `InvoiceDetail` (three frozen identity fields, PR 2; the derived `invoice_link_expires_at`, PR 4; `terms_source` enum `QUOTE` / `BUSINESS`; an `invoice_date` description: who dates each version today, and the signing versions that copy it from PR 3 and PR 4); `QuoteIssuedSummary` (the derived `last_email_delivered`, PR 6); `QuoteAcceptedSummary` (`invoice_created_from_this_version`; versioned `signature_download_path`); `Timestamp`, `PublicQuoteView.expires_at` and `QuoteAcceptedSummary.accepted_at` (the whole-second note, PR 6; `Timestamp` also notes that whole-second strings never decide delivery); `PublicQuoteView.message` (shown by the page from PR 5); `StandardError.code` (a description listing the 16G codes; still a free-form string, not an enum); `DashboardOrderRow.last_emailed_at` (#138 item 1).
 - `EmptyObjectRequest` is unchanged and keeps its other eight consumers; `sendInvoiceLink` uses it too.

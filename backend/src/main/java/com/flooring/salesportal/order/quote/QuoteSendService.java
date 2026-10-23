@@ -68,10 +68,12 @@ import java.util.Optional;
  * downloads (contract §5/§7.1/§8/§9). Sits beside {@link QuoteService} (draft layer) and owns the
  * append-only issued layer ({@code quote_version} / {@code quote_version_line} /
  * {@code quote_token}) via {@link QuoteVersionRepository}. Phase 16F PR1: quote email is LINK-ONLY
- * (no PDF attachment — the issued PDF is still generated and stored on issue), and the protected
- * accepted reads stream the latest accepted version's stored signed PDF ({@code type=accepted}) and
- * signature image. Sending after an acceptance is allowed and issues a NEW version (decision D9);
- * a send never writes the order price (the D6b price write belongs to the public accept only).
+ * (no PDF attachment — the issued PDF is still generated and stored on issue). The protected accepted
+ * reads stream an accepted version's stored signed PDF and signature image; since 16G PR 6 (#122) they
+ * address that version by id ({@code .../quote/accepted/{quoteVersionId}/pdf|signature}) instead of
+ * resolving the latest accepted version at request time. Sending after an acceptance is allowed and
+ * issues a NEW version (decision D9); a send never writes the order price (the D6b price write belongs
+ * to the public accept only).
  *
  * <p><b>Send choreography (locked §7.1 send-failure rule; the {@code OrderInvoiceService}
  * TransactionTemplate pattern).</b> The send methods are deliberately NOT {@code @Transactional}:
@@ -88,8 +90,10 @@ import java.util.Optional;
  *       reuses the same version with a fresh token).</li>
  *   <li><b>Transaction 2</b> (email success only): stamp the success-only
  *       {@code quote_version.last_emailed_at} in place ({@link #stampEmailSuccess}; mirrors the
- *       invoice stamp). An SMS send never touches {@code last_emailed_at}. Neither path EVER
- *       touches {@code sales_order.last_emailed_at} — that dashboard mirror is invoice-only.</li>
+ *       invoice stamp), bound to this attempt since 16G PR 6: it writes only while this attempt's
+ *       {@code last_sent_at} marker is still the latest. An SMS send never touches
+ *       {@code last_emailed_at}. Neither path EVER touches {@code sales_order.last_emailed_at} — that
+ *       dashboard mirror is invoice-only.</li>
  * </ol>
  *
  * <p><b>Changed-detection (locked).</b> Content comparison only — never {@code updated_at} /
@@ -130,7 +134,6 @@ public class QuoteSendService {
     private static final String PDF_EXTENSION = "pdf";
 
     private static final String TYPE_ISSUED = "issued";
-    private static final String TYPE_ACCEPTED = "accepted";
 
     // Contract §8: token is ≥32 random bytes, URL-safe, expires 7 days after send.
     private static final int TOKEN_BYTES = 32;
@@ -228,7 +231,9 @@ public class QuoteSendService {
      * Issue (or resend) the quote and email it: public link + plain-text body, LINK-ONLY since 16F
      * PR1 (no PDF attachment; the issued PDF is still stored) (contract §7.1). Provider failure → 502 {@code EMAIL_SEND_FAILED} with the issued
      * version / PDF / token / attempt markers KEPT. On success the success-only
-     * {@code last_emailed_at} is stamped in a short follow-up transaction. 201 issued summary.
+     * {@code last_emailed_at} is stamped in a short follow-up transaction, only while this attempt is
+     * still the latest (16G PR 6); a superseded attempt's success still answers 201 with the summary of
+     * the current markers. 201 issued summary.
      */
     public ApiResponse<QuoteIssuedSummaryDto> sendEmail(String slug,
                                                         String orderIdRaw,
@@ -258,8 +263,11 @@ public class QuoteSendService {
             throw new EmailSendException("The quote could not be emailed. Please try again.");
         }
 
+        // The attempt marker is the PERSISTED last_sent_at, re-read in transaction 1 after the attempt
+        // markers were stamped (never the in-memory clock value: the column's precision can differ).
         QuoteIssuedSummaryDto dto = transactionTemplate.execute(status ->
-                stampEmailSuccess(ctx, orderId, prepared.row().quoteVersionId(), LocalDateTime.now()));
+                stampEmailSuccess(ctx, orderId, prepared.row().quoteVersionId(),
+                        prepared.row().lastSentAt(), LocalDateTime.now()));
         return ApiResponse.ok(dto, SENT_EMAIL_MESSAGE);
     }
 
@@ -357,17 +365,17 @@ public class QuoteSendService {
     }
 
     // ------------------------------------------------------------------
-    // GET /orders/{orderId}/quote/pdf?type=issued|accepted
+    // GET /orders/{orderId}/quote/pdf?type=issued
     // ------------------------------------------------------------------
 
     /**
-     * Salesperson download of a STORED quote PDF (contract §7.1). {@code type=issued} streams the
-     * active issued version's stored PDF; {@code type=accepted} (Phase 16F PR1) streams the LATEST
-     * accepted version's stored SIGNED PDF (portal-only — never served on the public surface). A
-     * missing requested artifact (no active issued version / no accepted version / no stored signed
-     * PDF) → 404 {@code QUOTE_PDF_NOT_FOUND}. Read-only; allowed when LAID. The type parameter is
-     * validated AFTER the scoped order lookup so a bad value can never 400 ahead of the 404 (no
-     * existence leak).
+     * Salesperson download of the STORED issued quote PDF (contract §7.1): {@code type=issued} streams
+     * the active issued version's stored PDF; no active issued version → 404
+     * {@code QUOTE_PDF_NOT_FOUND}. Read-only; allowed when LAID. {@code issued} is the only type: the
+     * signed PDF of an accepted version has its own version-addressed read since 16G PR 6
+     * ({@link #downloadAcceptedQuoteVersionPdf}), so any other value, {@code accepted} included, is
+     * 400 {@code VALIDATION_FAILED}. The type parameter is validated AFTER the scoped order lookup so a
+     * bad value can never 400 ahead of the 404 (no existence leak).
      */
     @Transactional(readOnly = true)
     public QuoteStoredPdf downloadStoredPdf(String slug,
@@ -381,25 +389,14 @@ public class QuoteSendService {
                 .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
 
-        if (!TYPE_ISSUED.equals(type) && !TYPE_ACCEPTED.equals(type)) {
+        if (!TYPE_ISSUED.equals(type)) {
             throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(),
-                    List.of(new ErrorDetail(null, "type", "Must be issued or accepted.")));
+                    List.of(new ErrorDetail(null, "type", "Must be issued.")));
         }
 
-        QuoteFile file;
-        if (TYPE_ACCEPTED.equals(type)) {
-            // The latest ACCEPTED version's stored signed PDF (16F PR1). Resolved strictly after the
-            // business/store-scoped order lookup above, so an out-of-scope order is a 404 first.
-            file = quoteVersionRepository.findLatestAcceptedByOrderId(orderId)
-                    .flatMap(accepted -> quoteVersionRepository
-                            .findSignedPdfFileByVersionId(accepted.version().quoteVersionId()))
-                    .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_PDF_NOT_FOUND,
-                            ErrorCode.QUOTE_PDF_NOT_FOUND.defaultMessage()));
-        } else {
-            file = quoteVersionRepository.findIssuedFileByOrderId(orderId)
-                    .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_PDF_NOT_FOUND,
-                            ErrorCode.QUOTE_PDF_NOT_FOUND.defaultMessage()));
-        }
+        QuoteFile file = quoteVersionRepository.findIssuedFileByOrderId(orderId)
+                .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_PDF_NOT_FOUND,
+                        ErrorCode.QUOTE_PDF_NOT_FOUND.defaultMessage()));
 
         // Missing-on-disk -> UncheckedIOException -> generic 500 via the standard JSON wrapper
         // (same posture as the invoice D.4 download). storage_path is never returned.
@@ -415,22 +412,67 @@ public class QuoteSendService {
     }
 
     // ------------------------------------------------------------------
-    // GET /orders/{orderId}/quote/accepted/signature (Phase 16F PR1)
+    // GET /orders/{orderId}/quote/accepted/{quoteVersionId}/pdf (16G PR 6, #122)
     // ------------------------------------------------------------------
 
     /**
-     * Stream the LATEST accepted quote version's stored signature image (the quote analogue of the
-     * invoice signature download). Protected portal read: scoped order lookup first (404
-     * {@code ORDER_NOT_FOUND}, never 403/leak), then no accepted version / no signature reference →
-     * 404 {@code QUOTE_SIGNATURE_NOT_FOUND}. Allowed when LAID (read). A referenced file missing on
+     * Stream the stored SIGNED PDF of the accepted version the client addresses (the version the
+     * Accepted Quote view displays), never the latest accepted version at request time. Portal-only;
+     * read-only; allowed when LAID. Gate order: standard guard → {@code orderId} → scoped order lookup
+     * (404 {@code ORDER_NOT_FOUND}, never 403/leak) → {@code quoteVersionId} a positive integer (400
+     * {@code VALIDATION_FAILED}, field {@code quote_version_id}, only after the scope check) → that
+     * version of THIS order with status {@code ACCEPTED} (scoped in the query) and a stored signed PDF,
+     * else 404 {@code QUOTE_PDF_NOT_FOUND}. The stored bytes stream verbatim under the stored file name
+     * ({@code quote-{order}-v{n}-signed.pdf}); a file missing on disk → generic 500, as before.
+     */
+    @Transactional(readOnly = true)
+    public QuoteStoredPdf downloadAcceptedQuoteVersionPdf(String slug,
+                                                          String orderIdRaw,
+                                                          String quoteVersionIdRaw,
+                                                          HttpServletRequest httpRequest) {
+        RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
+        long orderId = parseOrderId(orderIdRaw);
+
+        salesOrderRepository
+                .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
+                .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
+
+        long quoteVersionId = parseQuoteVersionId(quoteVersionIdRaw);
+
+        // The FK makes a missing stored_file row for a non-null reference impossible; the join keeps
+        // the 16F PR1 lookup, which answered that case with the same 404.
+        QuoteFile file = quoteVersionRepository.findAcceptedByOrderIdAndVersionId(orderId, quoteVersionId)
+                .filter(accepted -> accepted.signedPdfFileId() != null)
+                .flatMap(accepted -> quoteVersionRepository
+                        .findSignedPdfFileByVersionId(accepted.version().quoteVersionId()))
+                .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_PDF_NOT_FOUND,
+                        ErrorCode.QUOTE_PDF_NOT_FOUND.defaultMessage()));
+
+        // Missing-on-disk -> UncheckedIOException -> generic 500 (the D.4 posture). storage_path is
+        // never returned.
+        byte[] bytes = fileStorageService.read(file.storagePath());
+        return new QuoteStoredPdf(bytes, file.fileName());
+    }
+
+    // ------------------------------------------------------------------
+    // GET /orders/{orderId}/quote/accepted/{quoteVersionId}/signature (16G PR 6, #122)
+    // ------------------------------------------------------------------
+
+    /**
+     * Stream the stored signature image of the accepted version the client addresses (the quote
+     * analogue of the invoice signature download; the workspace {@code accepted.signature_download_path}
+     * carries this versioned path). Same gate order as {@link #downloadAcceptedQuoteVersionPdf}; a
+     * version that is unknown, of another order, not {@code ACCEPTED} or without a signature reference
+     * → 404 {@code QUOTE_SIGNATURE_NOT_FOUND}. Allowed when LAID (read). A referenced file missing on
      * disk → {@code UncheckedIOException} → generic 500 (the established invoice-signature posture).
-     * The download name is backend-built from the locked order number + the accepted version number;
+     * The download name is backend-built from the locked order number + the version number;
      * {@code storage_path} is never returned.
      */
     @Transactional(readOnly = true)
-    public QuoteSignatureImage downloadAcceptedSignature(String slug,
-                                                         String orderIdRaw,
-                                                         HttpServletRequest httpRequest) {
+    public QuoteSignatureImage downloadAcceptedQuoteVersionSignature(String slug,
+                                                                     String orderIdRaw,
+                                                                     String quoteVersionIdRaw,
+                                                                     HttpServletRequest httpRequest) {
         RequestContext ctx = requestContextGuard.requireStandardProtected(slug, httpRequest);
         long orderId = parseOrderId(orderIdRaw);
 
@@ -438,8 +480,10 @@ public class QuoteSendService {
                 .findByOrderIdAndBusinessIdAndStoreId(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
 
+        long quoteVersionId = parseQuoteVersionId(quoteVersionIdRaw);
+
         QuoteVersionRepository.AcceptedQuoteVersionRow accepted = quoteVersionRepository
-                .findLatestAcceptedByOrderId(orderId)
+                .findAcceptedByOrderIdAndVersionId(orderId, quoteVersionId)
                 .orElseThrow(() -> new NotFoundException(ErrorCode.QUOTE_SIGNATURE_NOT_FOUND,
                         ErrorCode.QUOTE_SIGNATURE_NOT_FOUND.defaultMessage()));
         if (accepted.acceptedSignatureFileId() == null) {
@@ -725,17 +769,29 @@ public class QuoteSendService {
      * {@code FOR UPDATE} first so the stamp serialises with any concurrent send/cancel, then the
      * row is re-read for the response. Deliberately NEVER touches
      * {@code sales_order.last_emailed_at} — that §11.1 dashboard mirror is invoice-only.
+     *
+     * <p>Attempt-bound (16G contract §13.5, PR 6): the stamp writes only while {@code last_sent_at}
+     * still equals {@code thisAttemptSentAt}, the marker this attempt persisted before delivery. When a
+     * newer send attempt on the same version moved {@code last_sent_at} on (it may have failed), this
+     * older success writes nothing (0 rows, no error) and the response is built from the current markers,
+     * so its {@code last_email_delivered} can be false. {@code emailedAt} is the delivery-success time.
      */
-    private QuoteIssuedSummaryDto stampEmailSuccess(RequestContext ctx, long orderId,
-                                                    long quoteVersionId, LocalDateTime sentAt) {
+    private QuoteIssuedSummaryDto stampEmailSuccess(RequestContext ctx, long orderId, long quoteVersionId,
+                                                    LocalDateTime thisAttemptSentAt, LocalDateTime emailedAt) {
         salesOrderRepository
                 .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new IllegalStateException(
                         "Order disappeared while stamping quote last_emailed_at: " + orderId));
-        quoteVersionRepository.stampLastEmailedAt(quoteVersionId, sentAt);
+        int stamped = quoteVersionRepository.stampLastEmailedAt(quoteVersionId, thisAttemptSentAt, emailedAt);
         QuoteVersionRow row = quoteVersionRepository.findById(quoteVersionId)
                 .orElseThrow(() -> new IllegalStateException(
                         "quote_version disappeared while stamping last_emailed_at: " + quoteVersionId));
+        if (stamped == 0) {
+            // A newer attempt superseded this one while it was delivering: nothing is written. Order id
+            // and version number only — never the recipient, the message or its bearer link.
+            log.debug("Quote email delivered for order {} quote v{}, but a newer send attempt superseded it;"
+                    + " last_emailed_at not stamped", orderId, row.versionNumber());
+        }
         LocalDateTime tokenExpiresAt = quoteVersionRepository
                 .findActiveTokenExpiry(quoteVersionId)
                 .orElse(null);
@@ -868,6 +924,27 @@ public class QuoteSendService {
         }
         throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(),
                 List.of(new ErrorDetail(null, "order_id", "Must be a positive integer.")));
+    }
+
+    /**
+     * The {@code quoteVersionId} path segment of the version-addressed accepted reads (16G PR 6),
+     * captured as a String like {@code orderId} so it is validated here, AFTER the scoped order lookup,
+     * and never by framework conversion ahead of it: a positive integer, else 400
+     * {@code VALIDATION_FAILED} on {@code quote_version_id}.
+     */
+    private static long parseQuoteVersionId(String raw) {
+        if (raw != null && !raw.isBlank()) {
+            try {
+                long parsed = Long.parseLong(raw);
+                if (parsed > 0) {
+                    return parsed;
+                }
+            } catch (NumberFormatException ignored) {
+                // fall through to a single VALIDATION_FAILED below
+            }
+        }
+        throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(),
+                List.of(new ErrorDetail(null, "quote_version_id", "Must be a positive integer.")));
     }
 
     /**

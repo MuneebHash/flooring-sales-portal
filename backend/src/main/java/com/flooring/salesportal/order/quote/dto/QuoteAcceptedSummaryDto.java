@@ -1,5 +1,6 @@
 package com.flooring.salesportal.order.quote.dto;
 
+import com.fasterxml.jackson.annotation.JsonFormat;
 import com.flooring.salesportal.order.quote.QuoteVersionRepository.AcceptedQuoteVersionRow;
 import com.flooring.salesportal.order.quote.QuoteVersionRepository.QuoteVersionLineRow;
 import com.flooring.salesportal.order.quote.QuoteVersionRepository.QuoteVersionRow;
@@ -23,8 +24,10 @@ import java.util.List;
  * <p><b>No internal references.</b> {@code acceptedSignaturePresent} / {@code signedPdfAvailable} are
  * DERIVED from the server-internal stored_file ids, which are never serialized; the signature is read
  * through the backend-built protected {@code signatureDownloadPath} (null when no signature is stored;
- * clients consume it verbatim) and the signed PDF through {@code GET .../quote/pdf?type=accepted}.
- * No storage path, stored_file id, token, hash, cost or GP field ever rides on this DTO.
+ * clients consume it verbatim) and the signed PDF through
+ * {@code GET .../quote/accepted/{quoteVersionId}/pdf} for this version (16G PR 6, #122; the signature
+ * path is version-addressed the same way). No storage path, stored_file id, token, hash, cost or GP
+ * field ever rides on this DTO.
  *
  * <p>{@code invoiceEligible} (Phase 16F PR2, decision D5(b) as amended on 8 October 2026) is the
  * signature-precedence rule the create-invoice endpoint (Path A) enforces, shared through
@@ -34,6 +37,13 @@ import java.util.List;
  * that rule only: LAID, a draft or newer issued quote, missing invoice preconditions, a blank details
  * of sale, a zero total or overpayment never make it false (the endpoint validates those itself).
  * Every field is always serialized (nullable ones as JSON null), matching {@link QuoteIssuedSummaryDto}.
+ *
+ * <p>Phase 16G PR 6 (#124): {@code invoiceCreatedFromThisVersion} is true exactly when the order's
+ * CURRENT invoice was created from this accepted version by Path A, or carried from such a version by a
+ * payment, void or signing version (its source quote version is this version); false with no invoice
+ * or another origin. It is computed from the same current-invoice row as {@code invoiceEligible}, and
+ * the source quote version id itself is never serialized. {@code acceptedAt} is formatted to whole
+ * seconds ({@code yyyy-MM-dd'T'HH:mm:ss}); the stored value keeps its full precision.
  */
 public record QuoteAcceptedSummaryDto(
         long quoteVersionId,
@@ -44,24 +54,26 @@ public record QuoteAcceptedSummaryDto(
         String flooringType,
         String detailsOfSale,
         List<QuoteIssuedSummaryDto.Line> lines,
-        LocalDateTime acceptedAt,
+        @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss") LocalDateTime acceptedAt,
         String acceptedCustomerName,
         boolean acceptedSignaturePresent,
         String signatureDownloadPath,
         boolean signedPdfAvailable,
-        boolean invoiceEligible
+        boolean invoiceEligible,
+        boolean invoiceCreatedFromThisVersion
 ) {
 
     /**
      * Build from the latest accepted row + its frozen snapshot lines (already in
      * {@code (sort_order, PK)} order from {@code QuoteVersionRepository.findVersionLines}) + the
-     * backend-built protected signature path for this order + the invoice-eligibility flag. The lines
-     * are re-gated on the frozen itemised flag (structurally empty for a non-itemised version).
+     * backend-built protected signature path for this version + the two current-invoice flags. The
+     * lines are re-gated on the frozen itemised flag (structurally empty for a non-itemised version).
      */
     public static QuoteAcceptedSummaryDto from(AcceptedQuoteVersionRow accepted,
                                                List<QuoteVersionLineRow> lines,
                                                String signatureDownloadPath,
-                                               boolean invoiceEligible) {
+                                               boolean invoiceEligible,
+                                               boolean invoiceCreatedFromThisVersion) {
         QuoteVersionRow version = accepted.version();
         boolean signaturePresent = accepted.acceptedSignatureFileId() != null;
         List<QuoteIssuedSummaryDto.Line> lineDtos = version.itemised()
@@ -81,6 +93,7 @@ public record QuoteAcceptedSummaryDto(
                 signaturePresent,
                 signaturePresent ? signatureDownloadPath : null,
                 accepted.signedPdfFileId() != null,
-                invoiceEligible);
+                invoiceEligible,
+                invoiceCreatedFromThisVersion);
     }
 }
