@@ -44,6 +44,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.sql.Timestamp;
 import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.HexFormat;
@@ -66,8 +67,11 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 
 /**
  * Phase 16F PR1 — the PROTECTED accepted-quote reads: the {@code accepted} member of
- * {@code GET .../quote/workspace}, {@code GET .../quote/pdf?type=accepted} (the stored SIGNED quote
- * PDF) and the new {@code GET .../quote/accepted/signature} (the stored signature PNG).
+ * {@code GET .../quote/workspace}, and — version-addressed since 16G PR 6 (#122), replacing the 16F
+ * latest-at-request-time {@code pdf?type=accepted} and {@code accepted/signature} — the stored SIGNED
+ * quote PDF ({@code GET .../quote/accepted/{quoteVersionId}/pdf}) and the stored signature PNG
+ * ({@code GET .../quote/accepted/{quoteVersionId}/signature}) of the version they address. 16G PR 6
+ * (#124) also adds {@code accepted.invoice_created_from_this_version} and whole-second {@code accepted_at}.
  *
  * <p>Every accepted version in this class is created through the REAL chain — protected draft save →
  * protected send-email (the plaintext token is read from the recorded email's public link) → the PUBLIC
@@ -127,7 +131,17 @@ class QuoteAcceptedReadsTest {
             "quote_version_id", "version_number", "quote_total_ex_gst", "quote_total_inc_gst",
             "itemised", "flooring_type", "details_of_sale", "lines", "accepted_at",
             "accepted_customer_name", "accepted_signature_present", "signature_download_path",
-            "signed_pdf_available", "invoice_eligible");
+            "signed_pdf_available", "invoice_eligible", "invoice_created_from_this_version");
+
+    // 16G PR 6 (#124): accepted_at (like every quote timestamp the API returns) is whole seconds.
+    private static final Pattern WHOLE_SECONDS = Pattern.compile("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$");
+
+    // A well-formed version id that no quote_version row ever gets in this test DB.
+    private static final long UNKNOWN_VERSION_ID = 9_999_999_999L;
+
+    private static final String QUOTE_PDF_NOT_FOUND_MESSAGE = "The requested quote PDF is not available.";
+    private static final String QUOTE_SIGNATURE_NOT_FOUND_MESSAGE =
+            "No accepted quote signature is available for this order.";
 
     // openapi QuoteIssuedLine — customer-facing snapshot line fields only.
     private static final Set<String> LINE_KEYS = Set.of(
@@ -241,12 +255,22 @@ class QuoteAcceptedReadsTest {
         return quoteUrl(slug, orderId, "pdf?type=" + type);
     }
 
-    private static String acceptedSignatureUrl(Object orderId) {
-        return acceptedSignatureUrl(SLUG_AUSSIE, orderId);
+    /** 16G PR 6 (#122): the signed PDF of the addressed accepted version. */
+    private static String acceptedPdfUrl(Object orderId, Object quoteVersionId) {
+        return acceptedPdfUrl(SLUG_AUSSIE, orderId, quoteVersionId);
     }
 
-    private static String acceptedSignatureUrl(String slug, Object orderId) {
-        return quoteUrl(slug, orderId, "accepted/signature");
+    private static String acceptedPdfUrl(String slug, Object orderId, Object quoteVersionId) {
+        return quoteUrl(slug, orderId, "accepted/" + quoteVersionId + "/pdf");
+    }
+
+    /** 16G PR 6 (#122): the stored signature of the addressed accepted version. */
+    private static String acceptedSignatureUrl(Object orderId, Object quoteVersionId) {
+        return acceptedSignatureUrl(SLUG_AUSSIE, orderId, quoteVersionId);
+    }
+
+    private static String acceptedSignatureUrl(String slug, Object orderId, Object quoteVersionId) {
+        return quoteUrl(slug, orderId, "accepted/" + quoteVersionId + "/signature");
     }
 
     private static String publicAcceptUrl(String token) {
@@ -765,13 +789,31 @@ class QuoteAcceptedReadsTest {
         return eligible.booleanValue();
     }
 
+    /**
+     * {@code data.accepted.invoice_created_from_this_version} (16G PR 6, #124) — asserted to be present and
+     * a JSON boolean (never null).
+     */
+    private boolean invoiceCreatedFromThisVersion(long orderId) throws Exception {
+        JsonNode provenance = workspaceData(orderId).get("accepted").get("invoice_created_from_this_version");
+        Assertions.assertTrue(provenance != null && provenance.isBoolean(),
+                () -> "invoice_created_from_this_version must be a JSON boolean but was " + provenance);
+        return provenance.booleanValue();
+    }
+
+    /** The quote_version_id of the order's version {@code versionNumber}. */
+    private long quoteVersionId(long orderId, int versionNumber) {
+        return longValue(versionRow(orderId, versionNumber), "quote_version_id");
+    }
+
     private static JsonNode readJson(MvcResult result) throws Exception {
         return JSON.readTree(result.getResponse().getContentAsString(StandardCharsets.UTF_8));
     }
 
-    private MvcResult downloadAcceptedPdf(long orderId) throws Exception {
+    /** The version-addressed signed PDF of the order's accepted version {@code versionNumber} (200). */
+    private MvcResult downloadAcceptedPdf(long orderId, int versionNumber) throws Exception {
+        long versionId = quoteVersionId(orderId, versionNumber);
         clearJpaCache();
-        return mockMvc.perform(get(pdfUrl(orderId, "accepted")).session(liamStore1Session()))
+        return mockMvc.perform(get(acceptedPdfUrl(orderId, versionId)).session(liamStore1Session()))
                 .andExpect(status().isOk())
                 .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "application/pdf"))
                 .andReturn();
@@ -785,12 +827,30 @@ class QuoteAcceptedReadsTest {
                 .andReturn();
     }
 
-    private MvcResult downloadAcceptedSignature(long orderId) throws Exception {
+    /** The version-addressed stored signature of the order's accepted version {@code versionNumber} (200). */
+    private MvcResult downloadAcceptedSignature(long orderId, int versionNumber) throws Exception {
+        long versionId = quoteVersionId(orderId, versionNumber);
         clearJpaCache();
-        return mockMvc.perform(get(acceptedSignatureUrl(orderId)).session(liamStore1Session()))
+        return mockMvc.perform(get(acceptedSignatureUrl(orderId, versionId)).session(liamStore1Session()))
                 .andExpect(status().isOk())
                 .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "image/png"))
                 .andReturn();
+    }
+
+    /** Both version-addressed reads of {@code quoteVersionId} miss with their own 404 code and message. */
+    private void assertBothAcceptedReads404(long orderId, Object quoteVersionId) throws Exception {
+        clearJpaCache();
+        mockMvc.perform(get(acceptedPdfUrl(orderId, quoteVersionId)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("QUOTE_PDF_NOT_FOUND"))
+                .andExpect(jsonPath("$.error.message").value(QUOTE_PDF_NOT_FOUND_MESSAGE))
+                .andExpect(jsonPath("$.data").doesNotExist());
+        clearJpaCache();
+        mockMvc.perform(get(acceptedSignatureUrl(orderId, quoteVersionId)).session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(jsonPath("$.error.code").value("QUOTE_SIGNATURE_NOT_FOUND"))
+                .andExpect(jsonPath("$.error.message").value(QUOTE_SIGNATURE_NOT_FOUND_MESSAGE))
+                .andExpect(jsonPath("$.data").doesNotExist());
     }
 
     private static Set<String> fieldNames(JsonNode node) {
@@ -968,17 +1028,26 @@ class QuoteAcceptedReadsTest {
         assertItemLine(lines.get(1), "Underlay", "1.00", "50.00", "50.00", 1);
         assertAdjustmentLine(lines.get(2), "Adjustment", "-10.00", 2);
 
+        // 16G PR 6 (#124): accepted_at is the stored signing time formatted to WHOLE seconds.
         LocalDateTime acceptedAtDb = ((Timestamp) v1.get("accepted_at")).toLocalDateTime();
-        Assertions.assertEquals(acceptedAtDb, LocalDateTime.parse(accepted.get("accepted_at").asText()));
+        String acceptedAtJson = accepted.get("accepted_at").asText();
+        Assertions.assertTrue(WHOLE_SECONDS.matcher(acceptedAtJson).matches(),
+                () -> "accepted_at must be formatted to whole seconds: " + acceptedAtJson);
+        Assertions.assertEquals(acceptedAtDb.truncatedTo(ChronoUnit.SECONDS), LocalDateTime.parse(acceptedAtJson));
         Assertions.assertEquals(SNAPSHOT_NAME, accepted.get("accepted_customer_name").asText(),
                 "the accepted name is the V17 issue snapshot, never the live (renamed) customer");
         Assertions.assertEquals(SNAPSHOT_NAME, v1.get("accepted_customer_name"));
         Assertions.assertTrue(accepted.get("accepted_signature_present").booleanValue());
+        // 16G PR 6 (#122): the backend-built path addresses THIS accepted version.
         Assertions.assertEquals(
-                "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/quote/accepted/signature",
+                "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/quote/accepted/"
+                        + longValue(v1, "quote_version_id") + "/signature",
                 accepted.get("signature_download_path").asText());
         Assertions.assertTrue(accepted.get("signed_pdf_available").booleanValue());
         Assertions.assertTrue(accepted.get("invoice_eligible").booleanValue(), "no invoice exists yet");
+        Assertions.assertTrue(accepted.get("invoice_created_from_this_version").isBoolean());
+        Assertions.assertFalse(accepted.get("invoice_created_from_this_version").booleanValue(),
+                "no invoice exists, so none was created from this version");
 
         // The live draft is independent of the accepted snapshot; v1 is no longer ISSUED, so no
         // version is active-issued.
@@ -1067,11 +1136,15 @@ class QuoteAcceptedReadsTest {
         assertItemLine(lines.get(0), "Carpet", "3.00", "100.00", "300.00", 0);
         assertItemLine(lines.get(1), "Underlay", "1.00", "50.00", "50.00", 1);
         assertItemLine(lines.get(2), "Labour", "2.00", "25.00", "50.00", 2);
-        Assertions.assertEquals(((Timestamp) v2.get("accepted_at")).toLocalDateTime(),
-                LocalDateTime.parse(accepted.get("accepted_at").asText()));
+        Assertions.assertEquals(((Timestamp) v2.get("accepted_at")).toLocalDateTime().truncatedTo(ChronoUnit.SECONDS),
+                LocalDateTime.parse(accepted.get("accepted_at").asText()), "v2's signing time, in whole seconds");
         Assertions.assertEquals(SNAPSHOT_NAME, accepted.get("accepted_customer_name").asText());
         Assertions.assertTrue(accepted.get("accepted_signature_present").booleanValue());
         Assertions.assertTrue(accepted.get("signed_pdf_available").booleanValue());
+        Assertions.assertEquals(
+                "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/quote/accepted/"
+                        + longValue(v2, "quote_version_id") + "/signature",
+                accepted.get("signature_download_path").asText(), "the path addresses the surfaced v2");
         Assertions.assertTrue(data.get("current_issued").isNull(), "no ISSUED version remains");
 
         // v1 stays signed history, untouched.
@@ -1120,27 +1193,36 @@ class QuoteAcceptedReadsTest {
         Assertions.assertTrue(accepted.get("invoice_eligible").booleanValue(),
                 "a newer unsigned issued quote never makes the accepted quote ineligible");
 
-        // The downloads stay type-specific: issued → the v2 issued artifact; accepted → v1's signed PDF.
+        // The downloads stay artifact-specific: issued → the v2 issued artifact; the version-addressed
+        // accepted reads of v1 → v1's signed PDF and signature; v2 is ISSUED, so its id serves neither.
         MvcResult issuedPdf = downloadIssuedPdf(orderId);
         Assertions.assertArrayEquals(diskBytes(storedFileRow(versionRow(orderId, 2).get("issued_pdf_file_id"))),
                 issuedPdf.getResponse().getContentAsByteArray(), "type=issued streams the ACTIVE issued v2 PDF");
         assertInlineFilename(issuedPdf, "quote-" + orderNumber + "-v2.pdf");
 
-        MvcResult acceptedPdf = downloadAcceptedPdf(orderId);
+        MvcResult acceptedPdf = downloadAcceptedPdf(orderId, 1);
         Assertions.assertArrayEquals(diskBytes(storedFileRow(versionRow(orderId, 1).get("signed_pdf_file_id"))),
-                acceptedPdf.getResponse().getContentAsByteArray(), "type=accepted streams v1's signed PDF");
+                acceptedPdf.getResponse().getContentAsByteArray(), "v1's id streams v1's signed PDF");
         assertInlineFilename(acceptedPdf, "quote-" + orderNumber + "-v1-signed.pdf");
 
-        MvcResult signature = downloadAcceptedSignature(orderId);
+        MvcResult signature = downloadAcceptedSignature(orderId, 1);
         assertStreamsStoredSignature(signature, orderId, 1, ONE_PIXEL_PNG, "accepted v1 signature");
         assertInlineFilename(signature, "quote-signature-" + orderNumber + "-v1.png");
+
+        // The newer ISSUED v2 is not accepted: its id serves neither accepted read.
+        assertBothAcceptedReads404(orderId, quoteVersionId(orderId, 2));
     }
 
     // ================================================================
     // 6. invoice_eligible
     // ================================================================
 
-    /** invoice_eligible: true with no invoice, true with an unsigned current invoice, false after D.8. */
+    /**
+     * invoice_eligible: true with no invoice, true with an unsigned current invoice, false after D.8. 16G PR 6
+     * (#124): invoice_created_from_this_version stays false throughout — no invoice, then an invoice of
+     * another origin (no source quote version), signed in store: false with invoice_eligible false is the
+     * "a newer signed quote is required" explanation, never "already created from this quote".
+     */
     @Test
     void workspace_invoiceEligible_noInvoice_unsignedInvoice_thenFalseAfterInAppInvoiceAcceptance() throws Exception {
         long orderId = acceptedItemisedOrder(ONE_PIXEL_PNG);
@@ -1148,11 +1230,14 @@ class QuoteAcceptedReadsTest {
         Assertions.assertEquals(0, invoiceCount(orderId));
         Assertions.assertTrue(workspaceData(orderId).get("accepted").get("invoice_eligible").booleanValue(),
                 "no invoice → eligible");
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId), "no invoice → not created from this quote");
 
         insertUnsignedInvoice(orderId);
         Assertions.assertNull(currentInvoiceAcceptedAt(orderId), "precondition: the current invoice is unsigned");
         Assertions.assertTrue(workspaceData(orderId).get("accepted").get("invoice_eligible").booleanValue(),
                 "an UNSIGNED current invoice keeps the accepted quote eligible");
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId),
+                "an invoice with no source quote version was not created from this quote");
 
         // The in-app invoice acceptance (D.8) signs the CURRENT invoice (appends an accepted version).
         acceptInvoiceInApp(orderId);
@@ -1161,6 +1246,8 @@ class QuoteAcceptedReadsTest {
         JsonNode accepted = workspaceData(orderId).get("accepted");
         Assertions.assertFalse(accepted.get("invoice_eligible").booleanValue(),
                 "a current invoice signed AFTER the quote was accepted makes the accepted quote ineligible");
+        Assertions.assertFalse(accepted.get("invoice_created_from_this_version").booleanValue(),
+                "an in-store signing of an invoice of another origin is not this quote's conversion");
         // D.8 never touches the accepted quote itself.
         Assertions.assertEquals(1, accepted.get("version_number").asInt());
         Assertions.assertEquals(SNAPSHOT_NAME, accepted.get("accepted_customer_name").asText());
@@ -1187,11 +1274,14 @@ class QuoteAcceptedReadsTest {
         Assertions.assertEquals("ACCEPTED", acceptedQuoteRow.get("status"));
         Assertions.assertEquals(0, invoiceCount(orderId));
         Assertions.assertTrue(invoiceEligible(orderId), "no invoice → eligible");
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId), "no invoice → provenance false");
 
         // D.1 Create: the unsigned current invoice keeps the accepted quote eligible.
         createInvoice(orderId);
         Assertions.assertNull(currentInvoiceAcceptedAt(orderId), "precondition: v1 is unsigned");
         Assertions.assertTrue(invoiceEligible(orderId), "an UNSIGNED current invoice → eligible");
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId),
+                "16G PR 6: a D.1 Create is never created from the quote");
 
         // D.8: the in-app signature appends the current v2, signed after the quote -> ineligible.
         acceptInvoiceInApp(orderId);
@@ -1200,6 +1290,8 @@ class QuoteAcceptedReadsTest {
         Assertions.assertNotNull(signed.get("accepted_at"), "precondition: the current v2 is signed");
         Assertions.assertFalse(invoiceEligible(orderId),
                 "a current invoice signed after the quote was accepted -> ineligible");
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId),
+                "16G PR 6: the later in-store signing of a Create-origin invoice -> provenance false");
 
         // (a) A payment appends v3 carrying the acceptance forward (the customer does not re-sign).
         recordCashPayment(orderId, "50.00");
@@ -1211,6 +1303,8 @@ class QuoteAcceptedReadsTest {
         Assertions.assertEquals(0, new BigDecimal("50.00").compareTo((BigDecimal) paid.get("total_paid")));
         Assertions.assertFalse(invoiceEligible(orderId),
                 "the payment version carries the same later signature time forward -> still ineligible");
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId),
+                "16G PR 6: the payment carries the NULL source -> provenance still false");
 
         // (b) A manual Rewrite appends an UNSIGNED v4 from the live order → eligible again.
         rewriteInvoice(orderId, 4);
@@ -1223,6 +1317,8 @@ class QuoteAcceptedReadsTest {
                 "the signed v2 + v3 stay in the invoice history");
         Assertions.assertTrue(invoiceEligible(orderId),
                 "invoice_eligible follows the CURRENT (unsigned, rewritten) invoice only");
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId),
+                "16G PR 6: a Rewrite is never created from the quote -> provenance false");
 
         // The invoice flow never touches the accepted quote.
         Assertions.assertEquals(acceptedQuoteRow, versionRow(orderId, 1), "the accepted quote row is unchanged");
@@ -1232,38 +1328,16 @@ class QuoteAcceptedReadsTest {
     }
 
     // ================================================================
-    // 7. GET .../quote/pdf?type=accepted
+    // 7. GET .../quote/accepted/{quoteVersionId}/pdf — the addressed version's signed PDF (16G PR 6)
     // ================================================================
 
-    /** No accepted version → 404 QUOTE_PDF_NOT_FOUND (draft-only, issued-only); type=issued still streams. */
-    @Test
-    void acceptedPdf_nothingAccepted_returns404QuotePdfNotFound_issuedTypeUnchanged() throws Exception {
-        long draftOnlyOrder = readyOrderWithItemisedDraft();
-        long issuedOrder = readyOrderWithItemisedDraft();
-        sendAndExtractToken(issuedOrder);
-
-        // type=issued is unchanged: the ACTIVE issued version's stored PDF, verbatim.
-        MvcResult issuedPdf = downloadIssuedPdf(issuedOrder);
-        Assertions.assertArrayEquals(
-                diskBytes(storedFileRow(versionRow(issuedOrder, 1).get("issued_pdf_file_id"))),
-                issuedPdf.getResponse().getContentAsByteArray());
-        assertInlineFilename(issuedPdf, "quote-" + orderNumber(issuedOrder) + "-v1.pdf");
-
-        for (long orderId : new long[] {draftOnlyOrder, issuedOrder}) {
-            clearJpaCache();
-            mockMvc.perform(get(pdfUrl(orderId, "accepted")).session(liamStore1Session()))
-                    .andExpect(status().isNotFound())
-                    .andExpect(jsonPath("$.error.code").value("QUOTE_PDF_NOT_FOUND"))
-                    .andExpect(jsonPath("$.error.message").value("The requested quote PDF is not available."));
-        }
-    }
-
     /**
-     * type=accepted streams the stored SIGNED PDF verbatim (bytes == the file on disk), inline as
-     * quote-{order}-v1-signed.pdf; after the acceptance type=issued has no ACTIVE issued version → 404.
+     * The version-addressed read streams the addressed version's stored SIGNED PDF verbatim (bytes == the
+     * file on disk), inline as quote-{order}-v1-signed.pdf; after the acceptance type=issued has no ACTIVE
+     * issued version → 404 (type=issued keeps its meaning).
      */
     @Test
-    void acceptedPdf_afterAcceptance_streamsStoredSignedPdfVerbatimInline() throws Exception {
+    void acceptedVersionPdf_afterAcceptance_streamsStoredSignedPdfVerbatimInline() throws Exception {
         long orderId = acceptedItemisedOrder(ONE_PIXEL_PNG);
         String orderNumber = orderNumber(orderId);
         Map<String, Object> v1 = versionRow(orderId, 1);
@@ -1277,7 +1351,7 @@ class QuoteAcceptedReadsTest {
         byte[] onDisk = diskBytes(signedFile);
         Assertions.assertEquals(longValue(signedFile, "file_size"), onDisk.length);
 
-        MvcResult result = downloadAcceptedPdf(orderId);
+        MvcResult result = downloadAcceptedPdf(orderId, 1);
         byte[] streamed = result.getResponse().getContentAsByteArray();
         Assertions.assertArrayEquals(onDisk, streamed, "the stored signed PDF is streamed verbatim");
         Assertions.assertEquals(streamed.length, result.getResponse().getContentLength());
@@ -1299,78 +1373,117 @@ class QuoteAcceptedReadsTest {
                 .andExpect(jsonPath("$.error.code").value("QUOTE_PDF_NOT_FOUND"));
     }
 
+    /**
+     * The 16F latest-at-request-time reads are gone (16G PR 6, #122): type=accepted is no longer a type (400
+     * VALIDATION_FAILED, "Must be issued."), and the unversioned GET .../quote/accepted/signature route serves
+     * no artifact (an unmapped route: 404 NOT_FOUND JSON, never image/png). type=issued is unchanged.
+     */
+    @Test
+    void removedLatestAcceptedReads_typeAcceptedIs400_unversionedSignatureRouteServesNothing_issuedUnchanged()
+            throws Exception {
+        long issuedOrder = readyOrderWithItemisedDraft();
+        sendAndExtractToken(issuedOrder);
+        MvcResult issuedPdf = downloadIssuedPdf(issuedOrder);
+        Assertions.assertArrayEquals(
+                diskBytes(storedFileRow(versionRow(issuedOrder, 1).get("issued_pdf_file_id"))),
+                issuedPdf.getResponse().getContentAsByteArray(), "type=issued streams the ACTIVE issued PDF");
+        assertInlineFilename(issuedPdf, "quote-" + orderNumber(issuedOrder) + "-v1.pdf");
+
+        long acceptedOrder = acceptedItemisedOrder(ONE_PIXEL_PNG);
+        clearJpaCache();
+        mockMvc.perform(get(pdfUrl(acceptedOrder, "accepted")).session(liamStore1Session()))
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details", org.hamcrest.Matchers.hasSize(1)))
+                .andExpect(jsonPath("$.error.details[0].field").value("type"))
+                .andExpect(jsonPath("$.error.details[0].message").value("Must be issued."));
+
+        clearJpaCache();
+        MvcResult removed = mockMvc.perform(get(quoteUrl(SLUG_AUSSIE, acceptedOrder, "accepted/signature"))
+                        .session(liamStore1Session()))
+                .andExpect(status().isNotFound())
+                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                .andExpect(jsonPath("$.error.code").value("NOT_FOUND"))
+                .andExpect(jsonPath("$.data").doesNotExist())
+                .andReturn();
+        Assertions.assertFalse(Arrays.equals(storedSignatureBytes(acceptedOrder, 1),
+                        removed.getResponse().getContentAsByteArray()),
+                "the removed unversioned route never streams the stored signature");
+    }
+
     // ================================================================
-    // 7 + 8. A newer acceptance moves both downloads to the newer version
+    // 8. Every accepted version is served by its OWN id — never "the latest at request time" (#122)
     // ================================================================
 
-    /** After v2 is accepted, type=accepted streams v2's signed PDF and the signature endpoint v2's PNG. */
+    /**
+     * After v2 is accepted too, v1's id STILL streams v1's signed PDF and signature (a view still showing v1
+     * can never open v2's artifacts), and v2's id streams v2's; the workspace surfaces v2, whose backend-built
+     * signature path addresses v2. Older accepted versions get no list or UI — only their own id reaches them.
+     */
     @Test
-    void acceptedDownloads_afterNewerAcceptance_streamNewerVersionPdfAndSignature() throws Exception {
+    void acceptedVersionReads_olderAcceptedVersionKeepsItsOwnArtifacts_newerServedByItsOwnId() throws Exception {
         long orderId = acceptedItemisedOrder(ONE_PIXEL_PNG);
         String orderNumber = orderNumber(orderId);
-        byte[] v1Signed = downloadAcceptedPdf(orderId).getResponse().getContentAsByteArray();
+        byte[] v1Signed = downloadAcceptedPdf(orderId, 1).getResponse().getContentAsByteArray();
         Assertions.assertArrayEquals(diskBytes(storedFileRow(versionRow(orderId, 1).get("signed_pdf_file_id"))),
                 v1Signed);
-        MvcResult v1SignatureDownload = downloadAcceptedSignature(orderId);
-        assertStreamsStoredSignature(v1SignatureDownload, orderId, 1, ONE_PIXEL_PNG, "v1 signature before v2");
-        byte[] v1Signature = v1SignatureDownload.getResponse().getContentAsByteArray();
+        byte[] v1Signature = downloadAcceptedSignature(orderId, 1).getResponse().getContentAsByteArray();
 
         saveItemisedThreeLineDraft(orderId);
         acceptPublicly(sendAndExtractToken(orderId), SECOND_SIGNATURE_PNG);
+        Assertions.assertEquals("ACCEPTED", versionStatus(orderId, 1), "v1 stays ACCEPTED (signed history)");
         Assertions.assertEquals("ACCEPTED", versionStatus(orderId, 2));
 
-        MvcResult pdf = downloadAcceptedPdf(orderId);
-        byte[] v2Streamed = pdf.getResponse().getContentAsByteArray();
+        // v1, by its own id: still v1's artifacts.
+        MvcResult v1Pdf = downloadAcceptedPdf(orderId, 1);
+        Assertions.assertArrayEquals(v1Signed, v1Pdf.getResponse().getContentAsByteArray(),
+                "v1's id keeps streaming v1's signed PDF after v2 was accepted");
+        assertInlineFilename(v1Pdf, "quote-" + orderNumber + "-v1-signed.pdf");
+        MvcResult v1Sig = downloadAcceptedSignature(orderId, 1);
+        assertStreamsStoredSignature(v1Sig, orderId, 1, ONE_PIXEL_PNG, "v1's own signature after v2");
+        Assertions.assertArrayEquals(v1Signature, v1Sig.getResponse().getContentAsByteArray());
+        assertInlineFilename(v1Sig, "quote-signature-" + orderNumber + "-v1.png");
+
+        // v2, by its own id.
+        MvcResult v2Pdf = downloadAcceptedPdf(orderId, 2);
+        byte[] v2Streamed = v2Pdf.getResponse().getContentAsByteArray();
         Assertions.assertArrayEquals(diskBytes(storedFileRow(versionRow(orderId, 2).get("signed_pdf_file_id"))),
-                v2Streamed, "the LATEST accepted version's signed PDF");
+                v2Streamed, "v2's id streams v2's signed PDF");
         Assertions.assertFalse(Arrays.equals(v1Signed, v2Streamed));
-        assertInlineFilename(pdf, "quote-" + orderNumber + "-v2-signed.pdf");
+        assertInlineFilename(v2Pdf, "quote-" + orderNumber + "-v2-signed.pdf");
+        MvcResult v2Sig = downloadAcceptedSignature(orderId, 2);
+        assertStreamsStoredSignature(v2Sig, orderId, 2, SECOND_SIGNATURE_PNG, "v2's own signature");
+        Assertions.assertFalse(Arrays.equals(v1Signature, v2Sig.getResponse().getContentAsByteArray()));
+        assertInlineFilename(v2Sig, "quote-signature-" + orderNumber + "-v2.png");
 
-        MvcResult signature = downloadAcceptedSignature(orderId);
-        assertStreamsStoredSignature(signature, orderId, 2, SECOND_SIGNATURE_PNG,
-                "the LATEST accepted version's signature");
-        Assertions.assertFalse(Arrays.equals(v1Signature, signature.getResponse().getContentAsByteArray()),
-                "the v1 signature is no longer the one streamed");
-        // v1 stays signed history: its stored signature file is untouched by the newer acceptance.
-        Assertions.assertArrayEquals(v1Signature, storedSignatureBytes(orderId, 1));
-        assertInlineFilename(signature, "quote-signature-" + orderNumber + "-v2.png");
+        // The workspace surfaces the latest (v2); its path, consumed VERBATIM, streams v2's signature.
+        JsonNode accepted = workspaceData(orderId).get("accepted");
+        Assertions.assertEquals(2, accepted.get("version_number").asInt());
+        String path = accepted.get("signature_download_path").asText();
+        Assertions.assertEquals(acceptedSignatureUrl(orderId, quoteVersionId(orderId, 2)), path);
+        clearJpaCache();
+        MvcResult viaPath = mockMvc.perform(get(path).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(header().string(HttpHeaders.CONTENT_TYPE, "image/png"))
+                .andReturn();
+        assertStreamsStoredSignature(viaPath, orderId, 2, SECOND_SIGNATURE_PNG, "signature_download_path (v2)");
     }
 
     // ================================================================
-    // 8. GET .../quote/accepted/signature
+    // 9. GET .../quote/accepted/{quoteVersionId}/signature — stored normalised PNG; missing files → 500
     // ================================================================
-
-    /** No accepted version (bare / draft-only / issued-only / cancelled) → 404 QUOTE_SIGNATURE_NOT_FOUND. */
-    @Test
-    void acceptedSignature_nothingAccepted_returns404QuoteSignatureNotFound() throws Exception {
-        long bareOrder = insertOrder("LEAD");
-        long draftOnlyOrder = readyOrderWithItemisedDraft();
-        long issuedOrder = readyOrderWithItemisedDraft();
-        sendAndExtractToken(issuedOrder);
-        long cancelledOrder = readyOrderWithItemisedDraft();
-        sendAndExtractToken(cancelledOrder);
-        cancelIssuedQuote(cancelledOrder);
-
-        for (long orderId : new long[] {bareOrder, draftOnlyOrder, issuedOrder, cancelledOrder}) {
-            clearJpaCache();
-            mockMvc.perform(get(acceptedSignatureUrl(orderId)).session(liamStore1Session()))
-                    .andExpect(status().isNotFound())
-                    .andExpect(jsonPath("$.error.code").value("QUOTE_SIGNATURE_NOT_FOUND"))
-                    .andExpect(jsonPath("$.error.message")
-                            .value("No accepted quote signature is available for this order."));
-        }
-    }
 
     /**
      * The signature streams the STORED, server-normalised PNG inline as quote-signature-{order}-v1.png. The
      * response is byte-identical to the file on disk, which is the re-encoding of the upload (same image),
-     * never the raw upload (spec §1 / §5). Once the referenced file is gone from disk the read is a generic
-     * 500 JSON envelope (no path leak).
+     * never the raw upload (spec §1 / §5). Once a referenced file is gone from disk either read is a generic
+     * 500 JSON envelope (no path leak) — the stored-file lookup and missing-on-disk behaviour are unchanged.
      */
     @Test
-    void acceptedSignature_afterAcceptance_streamsStoredNormalisedPngInline_missingFileIs500() throws Exception {
+    void acceptedVersionSignature_streamsStoredNormalisedPngInline_missingFilesAre500() throws Exception {
         long orderId = acceptedItemisedOrder(SECOND_SIGNATURE_PNG);
         String orderNumber = orderNumber(orderId);
+        long v1Id = quoteVersionId(orderId, 1);
 
         Map<String, Object> signatureFile = storedFileRow(versionRow(orderId, 1).get("accepted_signature_file_id"));
         Assertions.assertEquals("quote-signature-" + orderNumber + "-v1.png", signatureFile.get("file_name"));
@@ -1388,33 +1501,117 @@ class QuoteAcceptedReadsTest {
         Assertions.assertFalse(Arrays.equals(SECOND_SIGNATURE_PNG, stored),
                 "the stored signature is the server-normalised re-encoding, never the raw upload bytes");
 
-        MvcResult result = downloadAcceptedSignature(orderId);
+        MvcResult result = downloadAcceptedSignature(orderId, 1);
         byte[] streamed = result.getResponse().getContentAsByteArray();
         Assertions.assertArrayEquals(stored, streamed, "the streamed bytes are the stored file, verbatim");
         Assertions.assertEquals(streamed.length, result.getResponse().getContentLength());
         assertInlineFilename(result, "quote-signature-" + orderNumber + "-v1.png");
 
-        // The referenced file disappears from disk → generic 500 through the standard JSON wrapper.
+        // The referenced files disappear from disk → generic 500 through the standard JSON wrapper.
         Files.delete(onDisk);
-        clearJpaCache();
-        MvcResult failure = mockMvc.perform(get(acceptedSignatureUrl(orderId)).session(liamStore1Session()))
-                .andExpect(status().isInternalServerError())
-                .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
-                .andExpect(jsonPath("$.error.code").value("INTERNAL_SERVER_ERROR"))
-                .andExpect(jsonPath("$.error.message").value("An unexpected error occurred."))
-                .andReturn();
-        String failureBody = failure.getResponse().getContentAsString(StandardCharsets.UTF_8);
-        Assertions.assertFalse(failureBody.contains("/uploads/"), () -> "no storage path leak: " + failureBody);
-        Assertions.assertFalse(failureBody.contains("storage_path"), () -> "no storage path leak: " + failureBody);
+        Files.delete(diskPath((String) storedFileRow(versionRow(orderId, 1).get("signed_pdf_file_id"))
+                .get("storage_path")));
+        for (String url : List.of(acceptedSignatureUrl(orderId, v1Id), acceptedPdfUrl(orderId, v1Id))) {
+            clearJpaCache();
+            MvcResult failure = mockMvc.perform(get(url).session(liamStore1Session()))
+                    .andExpect(status().isInternalServerError())
+                    .andExpect(content().contentTypeCompatibleWith(MediaType.APPLICATION_JSON))
+                    .andExpect(jsonPath("$.error.code").value("INTERNAL_SERVER_ERROR"))
+                    .andExpect(jsonPath("$.error.message").value("An unexpected error occurred."))
+                    .andReturn();
+            String failureBody = failure.getResponse().getContentAsString(StandardCharsets.UTF_8);
+            Assertions.assertFalse(failureBody.contains("/uploads/"), () -> "no storage path leak: " + failureBody);
+            Assertions.assertFalse(failureBody.contains("storage_path"), () -> "no storage path leak: " + failureBody);
+        }
+    }
+
+    // ================================================================
+    // 10. Only an ACCEPTED version of THIS order is ever served (status + order scope in the query)
+    // ================================================================
+
+    /**
+     * The addressed version must be an ACCEPTED version of the order in the URL: an ISSUED, SUPERSEDED,
+     * CANCELLED or EXPIRED version of the same order, an unknown id, and another order's ACCEPTED version all
+     * miss with the artifact's own 404 (QUOTE_PDF_NOT_FOUND / QUOTE_SIGNATURE_NOT_FOUND). The cross-order miss
+     * is byte-identical to the unknown id's (no existence leak), and that version is still served through its
+     * own order. The accepted v1 keeps being served throughout, until its status alone is changed: with its
+     * stored signed PDF and signature references intact, any status but ACCEPTED misses too (the status is
+     * checked in the query, not inferred from the references).
+     */
+    @Test
+    void acceptedVersionReads_notAnAcceptedVersionOfThisOrder_404_noExistenceLeak() throws Exception {
+        long orderId = acceptedItemisedOrder(ONE_PIXEL_PNG);                // v1 ACCEPTED
+
+        saveNonItemisedDraft(orderId, "330.00");
+        sendAndExtractToken(orderId);                                       // v2 ISSUED
+        Assertions.assertEquals("ISSUED", versionStatus(orderId, 2));
+        assertBothAcceptedReads404(orderId, quoteVersionId(orderId, 2));
+
+        saveNonItemisedDraft(orderId, "440.00");
+        sendAndExtractToken(orderId);                                       // v3 ISSUED, v2 SUPERSEDED
+        Assertions.assertEquals("SUPERSEDED", versionStatus(orderId, 2));
+        assertBothAcceptedReads404(orderId, quoteVersionId(orderId, 2));
+
+        cancelIssuedQuote(orderId);                                         // v3 CANCELLED
+        Assertions.assertEquals("CANCELLED", versionStatus(orderId, 3));
+        assertBothAcceptedReads404(orderId, quoteVersionId(orderId, 3));
+
+        sendAndExtractToken(orderId);                                       // v4 ISSUED, then lazily EXPIRED
+        long v4Id = quoteVersionId(orderId, 4);
+        jdbcTemplate.update("UPDATE quote_token SET status = 'EXPIRED', dead_at = now() "
+                + "WHERE quote_version_id = ? AND status = 'ACTIVE'", v4Id);
+        jdbcTemplate.update("UPDATE quote_version SET status = 'EXPIRED' WHERE quote_version_id = ?", v4Id);
+        Assertions.assertEquals("EXPIRED", versionStatus(orderId, 4));
+        assertBothAcceptedReads404(orderId, v4Id);
+
+        assertBothAcceptedReads404(orderId, UNKNOWN_VERSION_ID);
+
+        // Another order's ACCEPTED version, addressed through THIS order: a miss like any unknown id.
+        long otherOrder = acceptedItemisedOrder(SECOND_SIGNATURE_PNG);
+        long otherVersionId = quoteVersionId(otherOrder, 1);
+        assertBothAcceptedReads404(orderId, otherVersionId);
+        for (String suffix : List.of("pdf", "signature")) {
+            clearJpaCache();
+            String crossOrderBody = mockMvc.perform(get(quoteUrl(SLUG_AUSSIE, orderId,
+                            "accepted/" + otherVersionId + "/" + suffix)).session(liamStore1Session()))
+                    .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+            clearJpaCache();
+            String unknownBody = mockMvc.perform(get(quoteUrl(SLUG_AUSSIE, orderId,
+                            "accepted/" + UNKNOWN_VERSION_ID + "/" + suffix)).session(liamStore1Session()))
+                    .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
+            Assertions.assertEquals(unknownBody, crossOrderBody,
+                    suffix + ": another order's version is indistinguishable from an unknown id");
+        }
+        // ... while its own order serves it.
+        assertStreamsStoredSignature(downloadAcceptedSignature(otherOrder, 1), otherOrder, 1, SECOND_SIGNATURE_PNG,
+                "the other order's own accepted signature");
+
+        // The accepted v1 is still served by its own id after all of it.
+        Assertions.assertArrayEquals(diskBytes(storedFileRow(versionRow(orderId, 1).get("signed_pdf_file_id"))),
+                downloadAcceptedPdf(orderId, 1).getResponse().getContentAsByteArray());
+        assertStreamsStoredSignature(downloadAcceptedSignature(orderId, 1), orderId, 1, ONE_PIXEL_PNG,
+                "v1 after the newer non-accepted versions");
+
+        // ACCEPTED is terminal in the app, so only a manual data change can give a version with stored
+        // acceptance artifacts another status. Its references stay set, yet both reads miss for each status.
+        long v1Id = quoteVersionId(orderId, 1);
+        for (String status : List.of("ISSUED", "SUPERSEDED", "CANCELLED", "EXPIRED")) {
+            jdbcTemplate.update("UPDATE quote_version SET status = ? WHERE quote_version_id = ?", status, v1Id);
+            clearJpaCache();
+            Map<String, Object> v1 = versionRow(orderId, 1);
+            Assertions.assertNotNull(v1.get("signed_pdf_file_id"), status + ": signed PDF reference kept");
+            Assertions.assertNotNull(v1.get("accepted_signature_file_id"), status + ": signature reference kept");
+            assertBothAcceptedReads404(orderId, v1Id);
+        }
     }
 
     /**
-     * Defensive branches: an accepted version whose signature / signed-PDF references are NULL keeps
-     * every key (signature_present false, download path null, signed_pdf_available false) and both
-     * downloads 404 with their own codes.
+     * Defensive branches: an accepted version whose signature / signed-PDF references are NULL keeps every
+     * key (signature_present false, download path null, signed_pdf_available false) and both version-addressed
+     * reads 404 with their own codes.
      */
     @Test
-    void acceptedReads_nullStoredReferences_report404_andWorkspaceReportsAbsence() throws Exception {
+    void acceptedVersionReads_nullStoredReferences_report404_andWorkspaceReportsAbsence() throws Exception {
         long orderId = acceptedItemisedOrder(ONE_PIXEL_PNG);
         jdbcTemplate.update(
                 "UPDATE quote_version SET accepted_signature_file_id = NULL, signed_pdf_file_id = NULL "
@@ -1429,23 +1626,16 @@ class QuoteAcceptedReadsTest {
         Assertions.assertFalse(accepted.get("signed_pdf_available").booleanValue());
         Assertions.assertEquals(SNAPSHOT_NAME, accepted.get("accepted_customer_name").asText());
 
-        clearJpaCache();
-        mockMvc.perform(get(acceptedSignatureUrl(orderId)).session(liamStore1Session()))
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.error.code").value("QUOTE_SIGNATURE_NOT_FOUND"));
-        clearJpaCache();
-        mockMvc.perform(get(pdfUrl(orderId, "accepted")).session(liamStore1Session()))
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.error.code").value("QUOTE_PDF_NOT_FOUND"));
+        assertBothAcceptedReads404(orderId, quoteVersionId(orderId, 1));
     }
 
     // ================================================================
-    // 9. LAID — reads stay allowed
+    // 11. LAID — reads stay allowed
     // ================================================================
 
-    /** A LAID order still serves the workspace, the signed PDF and the signature (200). */
+    /** A LAID order still serves the workspace and both version-addressed reads (200). */
     @Test
-    void acceptedReads_laidOrder_allReturn200() throws Exception {
+    void acceptedVersionReads_laidOrder_allReturn200() throws Exception {
         long orderId = acceptedItemisedOrder(ONE_PIXEL_PNG);
         jdbcTemplate.update("UPDATE sales_order SET order_status = 'LAID'::order_status WHERE order_id = ?", orderId);
         clearJpaCache();
@@ -1457,43 +1647,49 @@ class QuoteAcceptedReadsTest {
         Assertions.assertTrue(accepted.get("signed_pdf_available").booleanValue());
 
         Assertions.assertArrayEquals(diskBytes(storedFileRow(versionRow(orderId, 1).get("signed_pdf_file_id"))),
-                downloadAcceptedPdf(orderId).getResponse().getContentAsByteArray());
-        assertStreamsStoredSignature(downloadAcceptedSignature(orderId), orderId, 1, ONE_PIXEL_PNG,
+                downloadAcceptedPdf(orderId, 1).getResponse().getContentAsByteArray());
+        assertStreamsStoredSignature(downloadAcceptedSignature(orderId, 1), orderId, 1, ONE_PIXEL_PNG,
                 "LAID accepted signature");
     }
 
     // ================================================================
-    // 10. Isolation — another store / another business never sees the order
+    // 12. Isolation — another store / another business never sees the order
     // ================================================================
 
     /**
-     * The three reads 404 ORDER_NOT_FOUND for a same-business session on ANOTHER store (with real access
-     * to it) and for a business-2 session on its own slug — byte-identical to a missing order.
+     * The workspace and both version-addressed reads 404 ORDER_NOT_FOUND for a same-business session on
+     * ANOTHER store (with real access to it) and for a business-2 session on its own slug — byte-identical to
+     * a missing order — and the scope miss wins over a MALFORMED version id too (scope first, no leak).
      */
     @Test
-    void acceptedReads_otherStoreAndOtherBusiness_return404OrderNotFound() throws Exception {
+    void acceptedVersionReads_otherStoreAndOtherBusiness_return404OrderNotFound_evenForMalformedVersionId()
+            throws Exception {
         long orderId = acceptedItemisedOrder(ONE_PIXEL_PNG);
         String orderNumber = orderNumber(orderId);
+        long v1Id = quoteVersionId(orderId, 1);
 
         // Sanity: in scope (Liam / business 1 / store 1) all three reads succeed.
         Assertions.assertTrue(workspaceData(orderId).get("accepted").isObject());
-        downloadAcceptedPdf(orderId);
-        downloadAcceptedSignature(orderId);
+        downloadAcceptedPdf(orderId, 1);
+        downloadAcceptedSignature(orderId, 1);
 
         // Same business, ANOTHER store the session user genuinely has access to (guard passes).
         int otherStore = storeInBusiness(BUSINESS_AUSSIE, STORE_SYD_CBD);
         grantStoreAccess(BUSINESS_AUSSIE, USER_LIAM, otherStore);
         MockHttpSession otherStoreSession = session(USER_LIAM, BUSINESS_AUSSIE, otherStore);
         assertOrderNotFound(get(workspaceUrl(orderId)).session(otherStoreSession), orderNumber);
-        assertOrderNotFound(get(pdfUrl(orderId, "accepted")).session(otherStoreSession), orderNumber);
-        assertOrderNotFound(get(acceptedSignatureUrl(orderId)).session(otherStoreSession), orderNumber);
+        for (Object versionId : List.of(v1Id, "not-a-number", "0")) {
+            assertOrderNotFound(get(acceptedPdfUrl(orderId, versionId)).session(otherStoreSession), orderNumber);
+            assertOrderNotFound(get(acceptedSignatureUrl(orderId, versionId)).session(otherStoreSession), orderNumber);
+        }
 
         // No existence leak: the cross-store miss is byte-identical to a missing order's 404.
         clearJpaCache();
-        String crossStoreBody = mockMvc.perform(get(acceptedSignatureUrl(orderId)).session(otherStoreSession))
+        String crossStoreBody = mockMvc.perform(get(acceptedSignatureUrl(orderId, v1Id)).session(otherStoreSession))
                 .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
         clearJpaCache();
-        String missingOrderBody = mockMvc.perform(get(acceptedSignatureUrl(9_999_999_999L)).session(otherStoreSession))
+        String missingOrderBody = mockMvc.perform(get(acceptedSignatureUrl(9_999_999_999L, v1Id))
+                        .session(otherStoreSession))
                 .andReturn().getResponse().getContentAsString(StandardCharsets.UTF_8);
         Assertions.assertEquals(missingOrderBody, crossStoreBody);
 
@@ -1504,49 +1700,70 @@ class QuoteAcceptedReadsTest {
         grantStoreAccess(BUSINESS_PREMIER, otherBusinessUser, otherBusinessStore);
         MockHttpSession otherBusinessSession = session(otherBusinessUser, BUSINESS_PREMIER, otherBusinessStore);
         assertOrderNotFound(get(workspaceUrl(otherSlug, orderId)).session(otherBusinessSession), orderNumber);
-        assertOrderNotFound(get(pdfUrl(otherSlug, orderId, "accepted")).session(otherBusinessSession), orderNumber);
-        assertOrderNotFound(get(acceptedSignatureUrl(otherSlug, orderId)).session(otherBusinessSession), orderNumber);
+        for (Object versionId : List.of(v1Id, "not-a-number")) {
+            assertOrderNotFound(get(acceptedPdfUrl(otherSlug, orderId, versionId)).session(otherBusinessSession),
+                    orderNumber);
+            assertOrderNotFound(get(acceptedSignatureUrl(otherSlug, orderId, versionId))
+                    .session(otherBusinessSession), orderNumber);
+        }
 
         // ... and through THIS tenant's slug the tenant guard 404s first (never confirms anything).
         clearJpaCache();
-        mockMvc.perform(get(acceptedSignatureUrl(orderId)).session(otherBusinessSession))
+        mockMvc.perform(get(acceptedSignatureUrl(orderId, v1Id)).session(otherBusinessSession))
                 .andExpect(status().isNotFound())
                 .andExpect(jsonPath("$.error.code").value("NOT_FOUND"))
                 .andExpect(jsonPath("$.data").doesNotExist());
     }
 
     // ================================================================
-    // 11. Standard protected gates on the new signature endpoint
+    // 13. Standard protected gates, then the quoteVersionId validation AFTER the scoped lookup
     // ================================================================
 
-    /** No session → 401; no store → 403; non-numeric id → 400 (order_id); unknown order → 404. */
+    /**
+     * Gate order: no session → 401; no store → 403; non-numeric orderId → 400 (order_id); unknown order →
+     * 404 ORDER_NOT_FOUND, even with a malformed version id; only then a malformed quoteVersionId (not a
+     * positive integer, or out of range) → 400 VALIDATION_FAILED on quote_version_id, "Must be a positive
+     * integer." — on both version-addressed reads.
+     */
     @Test
-    void acceptedSignature_noSession401_noStore403_badOrderId400_missingOrder404() throws Exception {
+    void acceptedVersionReads_noSession401_noStore403_badOrderId400_missingOrder404_thenMalformedVersionId400()
+            throws Exception {
         long orderId = acceptedItemisedOrder(ONE_PIXEL_PNG);
+        long v1Id = quoteVersionId(orderId, 1);
 
-        clearJpaCache();
-        mockMvc.perform(get(acceptedSignatureUrl(orderId)))
-                .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
-        // Same gate as the sibling protected quote reads.
-        mockMvc.perform(get(pdfUrl(orderId, "accepted")))
-                .andExpect(status().isUnauthorized())
-                .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+        for (String suffix : List.of("pdf", "signature")) {
+            String url = quoteUrl(SLUG_AUSSIE, orderId, "accepted/" + v1Id + "/" + suffix);
+            clearJpaCache();
+            mockMvc.perform(get(url))
+                    .andExpect(status().isUnauthorized())
+                    .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
+            mockMvc.perform(get(url).session(liamSessionNoStore()))
+                    .andExpect(status().isForbidden())
+                    .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
+            mockMvc.perform(get(quoteUrl(SLUG_AUSSIE, "not-a-number", "accepted/" + v1Id + "/" + suffix))
+                            .session(liamStore1Session()))
+                    .andExpect(status().isBadRequest())
+                    .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                    .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
+            for (Object versionId : List.of(v1Id, "not-a-number")) {
+                mockMvc.perform(get(quoteUrl(SLUG_AUSSIE, 9_999_999_999L, "accepted/" + versionId + "/" + suffix))
+                                .session(liamStore1Session()))
+                        .andExpect(status().isNotFound())
+                        .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
+            }
+            for (String malformed : List.of("not-a-number", "0", "-1", "1.5", "99999999999999999999")) {
+                clearJpaCache();
+                mockMvc.perform(get(quoteUrl(SLUG_AUSSIE, orderId, "accepted/" + malformed + "/" + suffix))
+                                .session(liamStore1Session()))
+                        .andExpect(status().isBadRequest())
+                        .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                        .andExpect(jsonPath("$.error.details", org.hamcrest.Matchers.hasSize(1)))
+                        .andExpect(jsonPath("$.error.details[0].field").value("quote_version_id"))
+                        .andExpect(jsonPath("$.error.details[0].message").value("Must be a positive integer."));
+            }
+        }
         mockMvc.perform(get(workspaceUrl(orderId)))
                 .andExpect(status().isUnauthorized())
                 .andExpect(jsonPath("$.error.code").value("UNAUTHORIZED"));
-
-        mockMvc.perform(get(acceptedSignatureUrl(orderId)).session(liamSessionNoStore()))
-                .andExpect(status().isForbidden())
-                .andExpect(jsonPath("$.error.code").value("FORBIDDEN"));
-
-        mockMvc.perform(get(acceptedSignatureUrl("not-a-number")).session(liamStore1Session()))
-                .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
-                .andExpect(jsonPath("$.error.details[0].field").value("order_id"));
-
-        mockMvc.perform(get(acceptedSignatureUrl(9_999_999_999L)).session(liamStore1Session()))
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.error.code").value("ORDER_NOT_FOUND"));
     }
 }

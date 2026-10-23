@@ -1,5 +1,7 @@
 package com.flooring.salesportal.order.quote.dto;
 
+import com.fasterxml.jackson.annotation.JsonFormat;
+
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
@@ -29,6 +31,8 @@ import java.util.List;
  * retained draft rows can never appear here — §6.1) and null on a dead state. {@code gstAmount} /
  * {@code depositAmount} are server-computed with the exact issued-PDF math (inc − ex; 40% of inc,
  * HALF_UP 2dp) so the web document and the stored PDF can never disagree by a rounding cent.
+ * {@code expiresAt} is formatted to whole seconds ({@code yyyy-MM-dd'T'HH:mm:ss}, 16G PR 6, #124);
+ * the stored token expiry keeps its full precision.
  */
 public record PublicQuoteViewDto(
         String state,
@@ -54,7 +58,7 @@ public record PublicQuoteViewDto(
         BigDecimal quoteTotalIncGst,
         BigDecimal depositAmount,
         String termsHtml,
-        LocalDateTime expiresAt,
+        @JsonFormat(pattern = "yyyy-MM-dd'T'HH:mm:ss") LocalDateTime expiresAt,
         String message
 ) {
 

@@ -18,9 +18,12 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.web.context.WebApplicationContext;
 
 import java.math.BigDecimal;
+import java.time.format.DateTimeFormatter;
+import java.util.Locale;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.matchesPattern;
 import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -50,6 +53,11 @@ class QuoteControllerTest {
     private static final long USER_LIAM = 1L;
     private static final long BUSINESS_AUSSIE = 1L;
     private static final int STORE_SYD_CBD = 1;
+
+    // 16G PR 6 (#124): every quote timestamp the API returns is formatted to whole seconds.
+    private static final String WHOLE_SECONDS_PATTERN = "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$";
+    private static final DateTimeFormatter WHOLE_SECONDS =
+            DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss", Locale.ROOT);
 
     @Autowired
     private WebApplicationContext context;
@@ -312,6 +320,26 @@ class QuoteControllerTest {
                 .andExpect(jsonPath("$.data.accepted").value(nullValue()));
     }
 
+    /**
+     * 16G PR 6 (#124): the workspace draft.updated_at is formatted to whole seconds, while the stored value
+     * keeps its fractional seconds (a fractional value is seeded so the truncation is visible).
+     */
+    @Test
+    void workspaceGet_draftUpdatedAt_wholeSeconds_storedFractionKept() throws Exception {
+        long orderId = leadOrderInSession();
+        seedSimpleDraft(orderId, "100.00", "110.00");
+        jdbcTemplate.update("UPDATE quote_draft SET updated_at = ? WHERE order_id = ?",
+                java.sql.Timestamp.valueOf("2026-11-02 12:22:10.654321"), orderId);
+
+        entityManager.clear();
+        mockMvc.perform(get(workspaceUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.draft.updated_at").value("2026-11-02T12:22:10"));
+
+        Assertions.assertEquals(java.sql.Timestamp.valueOf("2026-11-02 12:22:10.654321"), draftUpdatedAt(orderId),
+                "formatting never touches the stored value");
+    }
+
     @Test
     void workspaceGet_laidOrder_returns200() throws Exception {
         long orderId = laidOrderInSession();
@@ -393,6 +421,26 @@ class QuoteControllerTest {
         assertMoney("275.00", draftDecimal(orderId, "quote_total_inc_gst"));
         // Invariant: stored total ex == sum of persisted line totals.
         Assertions.assertEquals(0, draftDecimal(orderId, "quote_total_ex_gst").compareTo(sumLineTotals(orderId)));
+    }
+
+    /**
+     * 16G PR 6 (#124): the draft PUT response's updated_at is formatted to whole seconds — the second of the
+     * stored save time, whose own precision is unchanged.
+     */
+    @Test
+    void putDraft_responseUpdatedAt_wholeSeconds_isTheStoredSecond() throws Exception {
+        long orderId = leadOrderInSession();
+
+        String body = mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"itemised\": false, \"final_total_inc_gst\": 110.00, \"lines\": []}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.updated_at").value(matchesPattern(WHOLE_SECONDS_PATTERN)))
+                .andReturn().getResponse().getContentAsString();
+
+        String responseUpdatedAt = com.jayway.jsonpath.JsonPath.read(body, "$.data.updated_at");
+        Assertions.assertEquals(WHOLE_SECONDS.format(draftUpdatedAt(orderId).toLocalDateTime()), responseUpdatedAt,
+                "the response carries the stored save time, truncated to the second");
     }
 
     @Test

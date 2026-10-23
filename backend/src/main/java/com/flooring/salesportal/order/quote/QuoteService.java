@@ -172,18 +172,24 @@ public class QuoteService {
         // Phase 16F PR1: the LATEST accepted version summary (or null) — selected independently of
         // the draft and of current_issued (contract §4.3 / §7.1). Frozen body + acceptance fields
         // only; the stored_file ids stay server-internal (derived booleans + the backend-built
-        // protected signature path). Phase 16F PR2: invoice_eligible is the SAME signature-precedence
-        // rule the create-invoice endpoint enforces (AcceptedQuoteInvoiceEligibility, decision D5(b) as
-        // amended): true with no invoice, an unsigned current invoice, or a quote signature strictly
-        // newer than the current invoice's; read inside this one REPEATABLE_READ snapshot.
+        // protected signature path, version-addressed since 16G PR 6). Phase 16F PR2: invoice_eligible
+        // is the SAME signature-precedence rule the create-invoice endpoint enforces
+        // (AcceptedQuoteInvoiceEligibility, decision D5(b) as amended): true with no invoice, an
+        // unsigned current invoice, or a quote signature strictly newer than the current invoice's.
+        // 16G PR 6 (#124): the current invoice is read ONCE, inside this one REPEATABLE_READ snapshot,
+        // and that one row feeds both invoice_eligible and invoice_created_from_this_version.
         QuoteAcceptedSummaryDto accepted = quoteVersionRepository.findLatestAcceptedByOrderId(orderId)
-                .map(row -> QuoteAcceptedSummaryDto.from(row,
-                        quoteVersionRepository.findVersionLines(row.version().quoteVersionId()),
-                        acceptedSignatureDownloadPath(slug, orderId),
-                        AcceptedQuoteInvoiceEligibility.allows(row.acceptedAt(),
-                                invoiceRepository.findCurrentByOrderId(orderId)
-                                        .map(InvoiceRepository.InvoiceRow::acceptedAt)
-                                        .orElse(null))))
+                .map(row -> {
+                    long acceptedVersionId = row.version().quoteVersionId();
+                    InvoiceRepository.InvoiceRow currentInvoice =
+                            invoiceRepository.findCurrentByOrderId(orderId).orElse(null);
+                    return QuoteAcceptedSummaryDto.from(row,
+                            quoteVersionRepository.findVersionLines(acceptedVersionId),
+                            acceptedSignatureDownloadPath(slug, orderId, acceptedVersionId),
+                            AcceptedQuoteInvoiceEligibility.allows(row.acceptedAt(),
+                                    currentInvoice == null ? null : currentInvoice.acceptedAt()),
+                            invoiceCreatedFromVersion(currentInvoice, acceptedVersionId));
+                })
                 .orElse(null);
 
         Optional<QuoteDraft> draftOpt = quoteDraftRepository.findByOrderId(orderId);
@@ -213,11 +219,26 @@ public class QuoteService {
     }
 
     /**
-     * Backend-built protected path of the latest accepted quote's signature image (Phase 16F PR1;
-     * consumed verbatim by clients, like the invoice {@code accepted_signature_download_path}).
+     * Backend-built protected path of an accepted quote version's signature image (Phase 16F PR1;
+     * consumed verbatim by clients, like the invoice {@code accepted_signature_download_path}). Since
+     * 16G PR 6 (#122) it addresses the version itself, so it always streams the signature of the version
+     * the summary describes, never whichever version is the latest accepted one when it is read.
      */
-    static String acceptedSignatureDownloadPath(String slug, long orderId) {
-        return "/api/v1/" + slug + "/orders/" + orderId + "/quote/accepted/signature";
+    static String acceptedSignatureDownloadPath(String slug, long orderId, long quoteVersionId) {
+        return "/api/v1/" + slug + "/orders/" + orderId + "/quote/accepted/" + quoteVersionId + "/signature";
+    }
+
+    /**
+     * 16G contract §13.5 (#124) provenance: true exactly when the order's CURRENT invoice has this
+     * accepted version as its source quote version, i.e. it was created from it by Path A or carried
+     * from such a version (payment, void and signing versions carry the source). No invoice, or a
+     * current invoice of another origin (Create, Rewrite, a conversion of another version), gives false.
+     */
+    private static boolean invoiceCreatedFromVersion(InvoiceRepository.InvoiceRow currentInvoice,
+                                                     long acceptedVersionId) {
+        return currentInvoice != null
+                && currentInvoice.sourceQuoteVersionId() != null
+                && currentInvoice.sourceQuoteVersionId() == acceptedVersionId;
     }
 
     // ------------------------------------------------------------------

@@ -11,13 +11,15 @@ import type { InvoiceResponse } from './orderInvoicesApi'
 // Phase 16E-B adds the delivery wrappers: send-email, cancel and the stored
 // issued-PDF download. Phase 16F PR3 adds the accepted-quote reads (the stored
 // signed PDF and the accepted signature image) and the Path A create-invoice
-// action. Field names are snake_case to mirror the backend JSON verbatim (the
+// action; since 16G PR 6 (#122) both accepted reads address the accepted version
+// on screen. Field names are snake_case to mirror the backend JSON verbatim (the
 // backend serializes with SNAKE_CASE), matching orderInvoicesApi.ts /
 // orderWorkspaceApi.ts.
 //
 // Wired quote endpoints: the workspace GET, the draft PUT, the on-demand
-// preview-pdf POST, the send-email POST, the cancel POST, the stored-PDF GET
-// (type=issued|accepted), the accepted-signature GET and the create-invoice POST.
+// preview-pdf POST, the send-email POST, the cancel POST, the stored issued-PDF
+// GET (type=issued), the version-addressed accepted signed-PDF and signature GETs
+// and the create-invoice POST.
 // The backend send-sms endpoint exists (16E-A) but is DORMANT and deliberately
 // NOT wrapped here (delivery is email only). The public token surface (view,
 // viewed, PDF, accept) lives in publicQuoteApi.ts and never uses the session.
@@ -120,6 +122,11 @@ export type QuoteIssuedLine = {
 // details_of_sale + lines are the FROZEN issue snapshot (lines is ALWAYS []
 // for a non-itemised issued quote) — the Customer Quote tab renders from this
 // object alone, never from live draft/order state.
+// Since 16G PR 6 (#124) the five timestamps arrive in whole seconds
+// (YYYY-MM-DDTHH:mm:ss) and never decide delivery: last_email_delivered
+// (always present, never null) is the server's outcome of the latest email
+// attempt, derived from the stored markers at full precision. Customer Quote
+// shows Not delivered when sent_channel is EMAIL and it is false.
 export type QuoteIssuedSummary = {
   quote_version_id: number
   version_number: number
@@ -136,25 +143,30 @@ export type QuoteIssuedSummary = {
   token_expires_at: string | null
   details_of_sale: string | null
   lines: QuoteIssuedLine[]
+  last_email_delivered: boolean
 }
 
 // The order's LATEST accepted quote version (backend QuoteAcceptedSummaryDto /
 // openapi QuoteAcceptedSummary, Phase 16F PR1; invoice_eligible amended in PR2):
-// workspace `accepted`. All fourteen fields are always present (nullable ones
+// workspace `accepted`. All fifteen fields are always present (nullable ones
 // arrive as JSON null). Every body field is the FROZEN accepted snapshot, never
 // the live draft or order: lines reuse the issued-line shape (null quantity /
 // unit price on ADJUSTMENT rows) and are ALWAYS [] for a non-itemised version.
 // accepted_customer_name is the V17 issue-snapshot name (decision D1), never
-// typed and never truncated. accepted_at is the backend timestamp string,
-// serialized WITH fractional seconds (unlike InvoiceDetail.accepted_at, which is
-// formatted to whole seconds). signature_download_path is the backend-built
-// protected path of the accepted signature stream, consumed VERBATIM (null when
-// no signature is stored); the signed PDF is read via
-// fetchQuoteStoredPdf(orderId, 'accepted') when signed_pdf_available is true.
-// invoice_eligible is the server's signature-precedence rule for
-// createInvoiceFromQuote (decision D5(b) as amended on 8 October 2026): never
-// recompute it client-side. No file id, storage path, token, cost or GP field
-// is ever returned - and none may be typed here.
+// typed and never truncated. accepted_at is the backend timestamp string in
+// whole seconds (since 16G PR 6, like InvoiceDetail.accepted_at).
+// signature_download_path is the backend-built protected path of THIS version's
+// signature stream (version-addressed since 16G PR 6), consumed VERBATIM (null
+// when no signature is stored); the signed PDF is read via
+// fetchAcceptedQuoteVersionPdf(orderId, quote_version_id) when
+// signed_pdf_available is true. invoice_eligible is the server's
+// signature-precedence rule for createInvoiceFromQuote (decision D5(b) as
+// amended on 8 October 2026): never recompute it client-side.
+// invoice_created_from_this_version (16G PR 6, #124) is true when the order's
+// CURRENT invoice was created from this accepted version (Path A, or carried
+// from it by a payment, void or signing version); it chooses the explanation
+// under a disabled Create Invoice. No file id, storage path, token, cost or GP
+// field is ever returned - and none may be typed here.
 export type QuoteAcceptedSummary = {
   quote_version_id: number
   version_number: number
@@ -170,6 +182,7 @@ export type QuoteAcceptedSummary = {
   lines: QuoteIssuedLine[]
   signature_download_path: string | null
   signed_pdf_available: boolean
+  invoice_created_from_this_version: boolean
 }
 
 // GET /quote/workspace payload. All three keys are always present. draft is null
@@ -403,20 +416,19 @@ export type QuoteStoredPdfDownload = {
   fileName: string | null
 }
 
-// GET /api/v1/{slug}/orders/{orderId}/quote/pdf?type=issued|accepted - fetch a
-// STORED quote PDF as raw bytes: type=issued is the active issued version's PDF
-// (the exact frozen artifact that was sent); type=accepted (Phase 16F) is the
-// latest accepted version's stored SIGNED PDF. Both are streamed verbatim, never
-// regenerated, and the signed PDF is portal-only. Same credentialed-fetch-to-Blob
-// pattern as fetchQuotePreviewPdf / fetchCurrentInvoicePdf: the endpoint returns
-// RAW BINARY and is session-protected, so a bare href/window.open(url) would not
-// reliably carry context. Read-only; allowed on LAID orders.
-// Errors (standard JSON envelope): 404 ORDER_NOT_FOUND / QUOTE_PDF_NOT_FOUND
-// (issued: no active issued version; accepted: no accepted version or no stored
-// signed PDF).
+// GET /api/v1/{slug}/orders/{orderId}/quote/pdf?type=issued - fetch the active
+// issued version's STORED PDF (the exact frozen artifact that was sent) as raw
+// bytes, streamed verbatim, never regenerated. issued is the only type: the
+// signed PDF of an accepted version has its own version-addressed read since 16G
+// PR 6 (fetchAcceptedQuoteVersionPdf). Same credentialed-fetch-to-Blob pattern as
+// fetchQuotePreviewPdf / fetchCurrentInvoicePdf: the endpoint returns RAW BINARY
+// and is session-protected, so a bare href/window.open(url) would not reliably
+// carry context. Read-only; allowed on LAID orders.
+// Errors (standard JSON envelope): 404 ORDER_NOT_FOUND / QUOTE_PDF_NOT_FOUND (no
+// active issued version).
 export async function fetchQuoteStoredPdf(
   orderId: number,
-  type: 'issued' | 'accepted',
+  type: 'issued',
 ): Promise<QuoteStoredPdfDownload> {
   const base = API_BASE_URL.replace(/\/+$/, '')
   const path = apiPath(
@@ -470,20 +482,89 @@ export async function fetchQuoteStoredPdf(
   return { blob, fileName }
 }
 
-// GET {accepted.signature_download_path} - Phase 16F. Fetch the latest accepted
-// quote version's stored signature image (raw image/png bytes, the
-// server-normalised PNG) for display in the Accepted Quote sub-tab. This canNOT
-// use request<T>: the endpoint returns RAW BINARY while request<T>/parseBody
-// always JSON-parses the body. It is also session-protected, so a plain image
-// URL would not carry the session cookie - hence a credentialed fetch -> Blob
-// (-> object URL owned and revoked by the component).
+// GET /api/v1/{slug}/orders/{orderId}/quote/accepted/{quoteVersionId}/pdf - 16G
+// PR 6 (#122). Fetch the stored SIGNED PDF of the accepted version the Accepted
+// Quote view displays (pass its accepted.quote_version_id), never whichever
+// version is the latest accepted one when the request lands. Streamed verbatim,
+// never regenerated, portal-only; inline file name
+// quote-{order_number}-v{n}-signed.pdf. Same credentialed-fetch-to-Blob pattern as
+// fetchQuoteStoredPdf. The caller still discards a response for a version it no
+// longer displays. Read-only; allowed on LAID orders.
+// Errors (standard JSON envelope): 404 ORDER_NOT_FOUND (checked first) /
+// QUOTE_PDF_NOT_FOUND (the version is not this order's, not ACCEPTED, or has no
+// stored signed PDF); 400 VALIDATION_FAILED for a malformed id.
+export async function fetchAcceptedQuoteVersionPdf(
+  orderId: number,
+  quoteVersionId: number,
+): Promise<QuoteStoredPdfDownload> {
+  const base = API_BASE_URL.replace(/\/+$/, '')
+  const path = apiPath(
+    getActiveSlug(),
+    `/orders/${orderId}/quote/accepted/${quoteVersionId}/pdf`,
+  )
+  let response: Response
+  try {
+    response = await fetch(`${base}${path}`, {
+      credentials: 'include',
+    })
+  } catch (err) {
+    throw new ApiError({
+      status: 0,
+      code: null,
+      message: 'Network request failed.',
+      details: err,
+    })
+  }
+
+  if (!response.ok) {
+    let code: string | null = null
+    let message = 'Could not download the signed quote PDF.'
+    try {
+      const body: unknown = await response.json()
+      const errorObj =
+        body && typeof body === 'object' && 'error' in body
+          ? (body as { error?: { code?: unknown; message?: unknown } }).error
+          : null
+      if (errorObj && typeof errorObj === 'object') {
+        if (typeof errorObj.code === 'string' && errorObj.code.length > 0) {
+          code = errorObj.code
+        }
+        if (
+          typeof errorObj.message === 'string' &&
+          errorObj.message.length > 0
+        ) {
+          message = errorObj.message
+        }
+      }
+    } catch {
+      // Non-JSON / empty error body — keep the friendly fallback message.
+    }
+    throw new ApiError({ status: response.status, code, message })
+  }
+
+  const fileName = parseContentDispositionFilename(
+    response.headers.get('Content-Disposition'),
+  )
+  const blob = await response.blob()
+  return { blob, fileName }
+}
+
+// GET {accepted.signature_download_path} - Phase 16F. Fetch an accepted quote
+// version's stored signature image (raw image/png bytes, the server-normalised
+// PNG) for display in the Accepted Quote sub-tab; since 16G PR 6 (#122) the path
+// addresses the version the summary describes. This canNOT use request<T>: the
+// endpoint returns RAW BINARY while request<T>/parseBody always JSON-parses the
+// body. It is also session-protected, so a plain image URL would not carry the
+// session cookie - hence a credentialed fetch -> Blob (-> object URL owned and
+// revoked by the component).
 //
 // `downloadPath` is the backend-built relative signature_download_path, used
 // VERBATIM (only prefixed with the API base) - never rebuilt from ids; mirrors
 // orderInvoicesApi.fetchCurrentInvoiceSignature. Only call when the path is
-// non-null. The backend guards (404 ORDER_NOT_FOUND / QUOTE_SIGNATURE_NOT_FOUND)
-// return the standard JSON error envelope, parsed here to preserve the backend
-// code/message. Allowed when LAID (read).
+// non-null. The backend guards (404 ORDER_NOT_FOUND / QUOTE_SIGNATURE_NOT_FOUND,
+// the latter when the addressed version is no longer this order's ACCEPTED
+// version or has no stored signature) return the standard JSON error envelope,
+// parsed here to preserve the backend code/message. Allowed when LAID (read).
 export async function fetchAcceptedQuoteSignature(
   downloadPath: string,
 ): Promise<Blob> {

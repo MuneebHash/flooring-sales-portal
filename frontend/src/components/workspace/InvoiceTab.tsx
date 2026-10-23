@@ -16,6 +16,7 @@ import {
 import type { DetailsOfSaleFields } from '../../lib/api/orderWorkspaceApi'
 import { fetchPublicBusiness } from '../../lib/api/tenantApi'
 import { getActiveSlug } from '../../lib/tenant'
+import { usePollWhileVisible } from '../../lib/usePollWhileVisible'
 
 type Props = {
   orderId: number
@@ -114,6 +115,43 @@ const ACCEPTANCE_LINES: string[] = [
 // the response carries none (the backend message is otherwise surfaced verbatim).
 const INVOICE_STALE_MESSAGE = 'Invoice updated, please refresh'
 
+// Phase 16G PR 6 (#120) - InvoiceDetail.invoice_link_expires_at is a timezone-free server-local
+// timestamp (YYYY-MM-DDTHH:mm:ss). It is read as LOCAL time and compared with this device's clock
+// (no timezone policy change here; #34). Returns epoch milliseconds, or null for a missing or invalid
+// value, which never permits a poll.
+function parseLocalTimestamp(value: string | null | undefined): number | null {
+  if (!value) return null
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/.exec(value)
+  if (!match) return null
+  const [year, month, day, hours, minutes, seconds] = match.slice(1).map(Number)
+  if (month < 1 || month > 12 || hours > 23 || minutes > 59 || seconds > 59) {
+    return null
+  }
+  const date = new Date(year, month - 1, day, hours, minutes, seconds)
+  // Reject a calendar overflow (31 February would roll over into March).
+  if (
+    date.getFullYear() !== year ||
+    date.getMonth() !== month - 1 ||
+    date.getDate() !== day
+  ) {
+    return null
+  }
+  const time = date.getTime()
+  return Number.isFinite(time) ? time : null
+}
+
+// Phase 16G PR 6 - the outcome of one current-invoice read (see readCurrentInvoice).
+//   applied - the answer was installed: an invoice, or null for 404 INVOICE_NOT_FOUND when the
+//             caller lets the no-invoice state be installed;
+//   ignored - nothing was installed: the tab unmounted, the order changed, a newer read or a mutation
+//             applied first, the answer was an OLDER version than the one on screen, or (for a poll)
+//             the answer was a 404;
+//   failed  - no readable answer (and nothing newer applied meanwhile).
+type CurrentInvoiceReadOutcome =
+  | { status: 'applied'; invoice: InvoiceDetail | null }
+  | { status: 'ignored' }
+  | { status: 'failed'; error: unknown }
+
 // Phase 16G PR 3 - the frozen accepted name: D.8 records the version's own customer_name_snapshot
 // (no name is sent), so a blank one disables Accept. Blankness only: no length cap.
 function hasFrozenAcceptedName(invoice: InvoiceDetail | null): boolean {
@@ -203,10 +241,34 @@ export function InvoiceTab({
 
   // Phase 16A PR1 — acceptance checkboxes (frontend-only gate; NEVER sent to the backend —
   // the accept contract is exactly { expected_version_number, signature } since 16G PR 3). One
-  // boolean per ACCEPTANCE_LINES entry. Reset structurally on invoice identity/version change
-  // (effect below) so a tick never leaks across a reload, rewrite, or payment/void regeneration.
+  // boolean per ACCEPTANCE_LINES entry. Reset on an invoice identity/version change by
+  // installInvoice (16G PR 6), in the same update as the new version, with the keyed effect below
+  // as a backstop, so a tick never leaks across a reload, rewrite, payment/void regeneration or a
+  // version installed by a refresh or poll.
   const [acceptanceChecked, setAcceptanceChecked] = useState<boolean[]>(() =>
     Array(ACCEPTANCE_LINES.length).fill(false),
+  )
+
+  // Phase 16G PR 6 — mirrors read by async continuations: the displayed invoice (written ONLY by
+  // installInvoice) and the order this tab reads.
+  const invoiceRef = useRef<InvoiceDetail | null>(null)
+  const orderIdRef = useRef(orderId)
+  orderIdRef.current = orderId
+  // Phase 16G PR 6 — ONE recency mechanism for every current-invoice response (the QuoteTab
+  // snapshot pattern). readSeqRef numbers each read when it is ISSUED and each mutation barrier or
+  // result (accept, re-send, send-link); readFloorRef is the newest number whose data (or barrier)
+  // has applied. A read applies only when its number is ABOVE the floor, and then raises the floor
+  // to it, so an older read never overwrites a newer one and a read issued before a mutation started
+  // (a pending poll included) never lands after it.
+  const readSeqRef = useRef(0)
+  const readFloorRef = useRef(0)
+  // Current-invoice reads in flight, whatever triggered them: a poll tick is skipped while one is
+  // pending, so automatic reads stay single-flight.
+  const readsInFlightRef = useRef(0)
+  // The invoice_link_expires_at value a poll tick found elapsed or unreadable: polling stops for it
+  // without a request, until a read installs another value.
+  const [elapsedLinkExpiry, setElapsedLinkExpiry] = useState<string | null>(
+    null,
   )
 
   // Stored accepted-signature display (object URL owned by the effect below).
@@ -229,9 +291,87 @@ export function InvoiceTab({
     }
   }, [])
 
+  // Phase 16G PR 6 — the ONE place the displayed invoice changes (every read and every mutation
+  // result goes through here). Installing a different invoice identity or version, or none,
+  // invalidates the signing draft of the replaced version IN THE SAME UPDATE: the pad is cleared
+  // (which also drops hasInk) and both declaration ticks reset, so the new version never renders
+  // with Accept Invoice enabled by the old ink or ticks (16G contract §13.2). Installing the
+  // unchanged version keeps the ink and ticks.
+  function installInvoice(next: InvoiceDetail | null) {
+    const displayed = invoiceRef.current
+    const versionChanged =
+      displayed === null ||
+      next === null ||
+      displayed.invoice_id !== next.invoice_id ||
+      displayed.version_number !== next.version_number
+    if (versionChanged) {
+      padRef.current?.clear()
+      setHasInk(false)
+      setAcceptanceChecked(Array(ACCEPTANCE_LINES.length).fill(false))
+    }
+    invoiceRef.current = next
+    setInvoice(next)
+  }
+
+  // A mutation (accept, re-send, send-link) is starting or has applied its own result: no
+  // current-invoice read issued before this point may apply afterwards.
+  function raiseReadFloor() {
+    readSeqRef.current += 1
+    readFloorRef.current = readSeqRef.current
+  }
+
+  // Read the current invoice and install the answer through installInvoice, but ONLY while this
+  // tab is still mounted, still on the order the read was issued for, and no newer read or
+  // mutation has applied since the read was issued; an answer OLDER than the version on screen is
+  // never installed (versions only grow). 404 INVOICE_NOT_FOUND installs the no-invoice state only
+  // when installNotFound is set (a poll passes false: its 404 changes nothing). Never throws.
+  async function readCurrentInvoice(
+    installNotFound: boolean,
+  ): Promise<CurrentInvoiceReadOutcome> {
+    readSeqRef.current += 1
+    const seq = readSeqRef.current
+    const requestOrderId = orderIdRef.current
+    const stillCurrent = () =>
+      mountedRef.current &&
+      orderIdRef.current === requestOrderId &&
+      seq > readFloorRef.current
+    readsInFlightRef.current += 1
+    try {
+      let next: InvoiceDetail | null
+      try {
+        const res = await fetchCurrentInvoice(requestOrderId)
+        next = res.data.invoice
+      } catch (err) {
+        if (!(err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND')) {
+          return stillCurrent()
+            ? { status: 'failed', error: err }
+            : { status: 'ignored' }
+        }
+        if (!installNotFound) return { status: 'ignored' }
+        next = null
+      }
+      if (!stillCurrent()) return { status: 'ignored' }
+      const displayed = invoiceRef.current
+      if (
+        next !== null &&
+        displayed !== null &&
+        next.version_number < displayed.version_number
+      ) {
+        return { status: 'ignored' }
+      }
+      readFloorRef.current = seq
+      installInvoice(next)
+      return { status: 'applied', invoice: next }
+    } finally {
+      readsInFlightRef.current -= 1
+    }
+  }
+
   // Fetch the current invoice on mount (the tab unmounts on a tab switch, so this
   // refetches fresh each open) and whenever reloadToken bumps. A 404
   // INVOICE_NOT_FOUND is the clean "no invoice yet" empty state, NOT an error.
+  // This is the only read that shows the loading state; refreshes and polls of a
+  // loaded invoice never do.
   useEffect(() => {
     let cancelled = false
     setLoading(true)
@@ -239,34 +379,28 @@ export function InvoiceTab({
     setActionError(null)
     setActionMessage(null)
     setEmailFixNeeded(false)
-    // A reload is a fresh start for the acceptance draft too (the pad below
-    // remounts empty, so the ink gate must match it).
-    setHasInk(false)
-    setInvoice(null)
-    fetchCurrentInvoice(orderId)
-      .then((res) => {
-        if (cancelled) return
-        setInvoice(res.data.invoice)
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return
-        if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
-          setInvoice(null)
-          return
-        }
+    // A reload is a fresh start: no earlier read may land after it, and the
+    // displayed invoice goes with its acceptance draft (the pad below remounts
+    // empty, so the ink gate must match it).
+    raiseReadFloor()
+    installInvoice(null)
+    void readCurrentInvoice(true).then((outcome) => {
+      if (cancelled) return
+      if (outcome.status === 'failed') {
+        const err = outcome.error
         setLoadError(
           err instanceof ApiError && err.message.length > 0
             ? err.message
             : 'Could not load the invoice. Please try again.',
         )
-      })
-      .finally(() => {
-        if (cancelled) return
-        setLoading(false)
-      })
+      }
+      setLoading(false)
+    })
     return () => {
       cancelled = true
     }
+    // readCurrentInvoice / installInvoice / raiseReadFloor read everything through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orderId, reloadToken])
 
   // Optional branding - tenant-scoped and order-independent (never keyed on orderId),
@@ -309,10 +443,11 @@ export function InvoiceTab({
   }, [loading, loadError, invoiceMissing])
 
   // Phase 16A PR1 — reset the acceptance checkboxes whenever the invoice IDENTITY or VERSION
-  // changes (initial load, accept, drift resync, rewrite, payment/void regeneration). A keyed
-  // reset, NOT a manual list of setHasInk(false) sites, so it cannot drift if those sites
-  // change. The ACCEPTED branch shows the boxes checked/read-only from the persisted
-  // acceptance, never from this state (which has just been reset).
+  // changes (initial load, accept, drift resync, rewrite, payment/void regeneration). Since 16G
+  // PR 6 installInvoice resets them (and the ink) in the same update as the new version; this
+  // keyed reset stays as a backstop and never fires for an unchanged version. The ACCEPTED
+  // branch shows the boxes checked/read-only from the persisted acceptance, never from this
+  // state (which has just been reset).
   useEffect(() => {
     setAcceptanceChecked(Array(ACCEPTANCE_LINES.length).fill(false))
   }, [invoice?.invoice_id, invoice?.version_number])
@@ -379,38 +514,28 @@ export function InvoiceTab({
     }
   }, [signaturePath, signatureInvoiceId])
 
-  // Inline current-invoice resync for drift errors (409 INVOICE_ALREADY_ACCEPTED,
-  // 422 INVOICE_REQUIRED / INVOICE_NOT_ACCEPTED). Deliberately NOT refetch(): a
-  // reloadToken bump clears the banners, and these cases need the explanatory
-  // banner to survive while the fresh state (accepted / empty) renders.
+  // Inline current-invoice re-read after a mutation: the drift errors (409
+  // INVOICE_ALREADY_ACCEPTED, 422 INVOICE_REQUIRED / INVOICE_NOT_ACCEPTED), the stale 409 and,
+  // since 16G PR 6, every Accept Remotely attempt. Deliberately NOT refetch(): a reloadToken bump
+  // clears the banners, and these cases need the explanatory banner to survive while the fresh
+  // state (accepted / empty / a new link expiry) renders. It goes through the guarded install
+  // path (readCurrentInvoice), so a DIFFERENT version drops the drawn-but-unsubmitted ink and
+  // both ticks (stale strokes must never be submittable against another version), the unchanged
+  // version keeps them, and 404 INVOICE_NOT_FOUND shows the empty state. Other failures keep the
+  // current view — the banner already explains the situation.
   async function resyncCurrentInvoice() {
-    try {
-      const res = await fetchCurrentInvoice(orderId)
-      if (!mountedRef.current) return
-      // Also wipe drawn-but-unsubmitted ink: when the fresh invoice is still
-      // unaccepted the pad stays MOUNTED, and stale strokes must never be
-      // submittable against a different version (hasInk alone only gates the
-      // button — the old ink would otherwise ride along with the next stroke).
-      padRef.current?.clear()
-      setHasInk(false)
-      setInvoice(res.data.invoice)
-    } catch (err) {
-      if (!mountedRef.current) return
-      if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
-        padRef.current?.clear()
-        setHasInk(false)
-        setInvoice(null)
-        return
-      }
-      // Other resync failures: keep the current view — the banner already
-      // explains the situation and the user can switch tabs to refresh.
-    }
+    await readCurrentInvoice(true)
   }
 
   // Shared accept / resend / send-link (Accept Remotely, 16G PR 5) error handling.
   // Backend messages are surfaced VERBATIM whenever present; the per-code branches
-  // only add the right recovery behaviour.
-  async function applyAcceptResendError(err: unknown, fallback: string) {
+  // only add the right recovery behaviour. Resolves true when it re-read the current
+  // invoice (the stale and drift branches), so Accept Remotely does not issue a
+  // second read for the same attempt (16G PR 6).
+  async function applyAcceptResendError(
+    err: unknown,
+    fallback: string,
+  ): Promise<boolean> {
     if (err instanceof ApiError) {
       const message = err.message.length > 0 ? err.message : fallback
       if (err.code === 'INVOICE_VERSION_STALE') {
@@ -426,14 +551,14 @@ export function InvoiceTab({
           err.message.length > 0 ? err.message : INVOICE_STALE_MESSAGE,
         )
         await resyncCurrentInvoice()
-        return
+        return true
       }
       if (err.code === 'INVOICE_ALREADY_ACCEPTED') {
         // Drift: this invoice was accepted elsewhere. Surface the backend message
         // and pull the accepted state.
         setActionError(message)
         await resyncCurrentInvoice()
-        return
+        return true
       }
       if (
         err.code === 'CUSTOMER_EMAIL_REQUIRED' ||
@@ -442,7 +567,7 @@ export function InvoiceTab({
         // The fix lives on the Customer tab — the banner adds the pointer/button.
         setActionError(message)
         setEmailFixNeeded(true)
-        return
+        return false
       }
       if (
         err.code === 'INVOICE_REQUIRED' ||
@@ -452,15 +577,17 @@ export function InvoiceTab({
         // accepted (e.g. rewritten elsewhere -> signature pad again).
         setActionError(message)
         await resyncCurrentInvoice()
-        return
+        return true
       }
       // Everything else — including 502 EMAIL_SEND_FAILED. On resend the backend
       // wrote NOTHING; on send-link it kept the new link ACTIVE (undelivered) but
-      // wrote no invoice row. Either way the invoice state must stay untouched.
+      // wrote no invoice row. Either way no invoice state changes here (Accept
+      // Remotely's own follow-up re-read still learns the link's expiry).
       setActionError(message)
-      return
+      return false
     }
     setActionError(fallback)
+    return false
   }
 
   async function handleAccept() {
@@ -492,48 +619,51 @@ export function InvoiceTab({
     setActionMessage(null)
     setHandoverNotice(null)
     setEmailFixNeeded(false)
+    // 16G PR 6 - the accept starts: no read issued before this point (a pending
+    // poll included) may land after it.
+    raiseReadFloor()
     try {
       // BEST-EFFORT STALE-TAB HINT: the accept endpoint targets /current, but
       // another session may have recorded a payment or rewritten the invoice
       // after this tab loaded — the customer would have reviewed/signed an
-      // invoice that is no longer /current. Refetch and compare the version
+      // invoice that is no longer /current. Re-read and compare the version
       // identity (invoice_id + version_number) BEFORE accepting; on mismatch,
       // show the fresh invoice and require a re-sign instead of silently
       // accepting a different version. This is an early hint only: since 16G
       // PR 3 the authority is the server, which compares expected_version_number
       // (the displayed version, below) under the order lock and answers 409
       // INVOICE_VERSION_STALE (handled in applyAcceptResendError) when a version
-      // was committed between this check and the POST.
-      let fresh: InvoiceDetail
-      try {
-        const check = await fetchCurrentInvoice(orderId)
-        fresh = check.data.invoice
-      } catch (err) {
-        if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
-          // The invoice vanished server-side — never accept; drop the unsigned
-          // draft and render the no-invoice empty state.
-          if (!mountedRef.current) return
-          padRef.current?.clear()
-          setHasInk(false)
-          setInvoice(null)
-          setActionError('This invoice is no longer available.')
-          return
-        }
+      // was committed between this check and the POST. Since 16G PR 6 the
+      // re-read installs its answer through the guarded install path: a changed
+      // version clears the unsigned signature draft (ink and both ticks) as it
+      // is rendered, the unchanged version keeps it.
+      const check = await readCurrentInvoice(true)
+      if (!mountedRef.current) return
+      if (check.status === 'failed') {
         // Any other pre-check failure blocks the accept (freshness unverified)
         // and falls through to the shared error handler below.
-        throw err
+        throw check.error
       }
-      if (!mountedRef.current) return
+      if (check.status === 'ignored') {
+        // Not installed (an answer older than the version on screen):
+        // freshness unverified, so never accept.
+        setActionError('Could not accept the invoice. Please try again.')
+        return
+      }
+      const fresh = check.invoice
+      if (fresh === null) {
+        // The invoice vanished server-side — never accept. The no-invoice empty
+        // state (and the dropped draft) is already installed.
+        setActionError('This invoice is no longer available.')
+        return
+      }
       if (
         fresh.invoice_id !== displayed.invoice_id ||
         fresh.version_number !== displayed.version_number
       ) {
-        // The displayed invoice is stale. Render the fresh one (the accepted
-        // state renders normally if it is already accepted), drop the unsigned
-        // signature draft, and do NOT accept.
-        padRef.current?.clear()
-        setHasInk(false)
-        setInvoice(fresh)
+        // The displayed invoice is stale. The fresh one is installed (the
+        // accepted state renders normally if it is already accepted) and the
+        // unsigned signature draft dropped: do NOT accept.
         setActionError(
           'The invoice changed since it was loaded. Please review the updated invoice and sign again.',
         )
@@ -558,12 +688,13 @@ export function InvoiceTab({
       // last_emailed_at non-null only when the delivery's success stamp was
       // recorded — a delivered email whose stamp failed keeps the emailed message
       // with last_emailed_at null, and the tab follows the marker) — no follow-up GET.
-      setInvoice(res.data.invoice)
+      // It is the newest state: it applies, no earlier read may land after it, and
+      // installing the signed version drops the local unsigned draft.
+      raiseReadFloor()
+      installInvoice(res.data.invoice)
       setActionMessage(
         res.message && res.message.length > 0 ? res.message : 'Invoice accepted.',
       )
-      // The signed state replaces the pad; drop the local unsigned draft.
-      setHasInk(false)
     } catch (err) {
       if (!mountedRef.current) return
       await applyAcceptResendError(
@@ -591,11 +722,15 @@ export function InvoiceTab({
     setActionMessage(null)
     setHandoverNotice(null)
     setEmailFixNeeded(false)
+    // 16G PR 6 - the re-send starts: no earlier read may land after it.
+    raiseReadFloor()
     try {
       const res = await resendCurrentInvoice(orderId)
       if (!mountedRef.current) return
-      // Success bumps only last_emailed_at (no new version) — apply the returned state.
-      setInvoice(res.data.invoice)
+      // Success bumps only last_emailed_at (no new version) — apply the returned state
+      // as the newest state.
+      raiseReadFloor()
+      installInvoice(res.data.invoice)
       setActionMessage(
         res.message && res.message.length > 0
           ? res.message
@@ -616,11 +751,14 @@ export function InvoiceTab({
   // 16G PR 5 - Accept Remotely: email the customer a link to review and sign the CURRENT
   // invoice (POST …/invoices/current/send-link, to the SAVED customer email). It needs no ink,
   // no ticks and no version value, is allowed on a LAID order, and only for an unsigned,
-  // safely loaded invoice. It never touches the signing draft: success and ordinary failures
-  // keep the ink and ticks. Success shows the response message; there is no re-read, link
-  // status, expiry display or cancel. Failures share the accept/resend recovery: the 502
-  // message verbatim with the invoice state untouched, the customer-email pointer, and the
+  // safely loaded invoice. The send itself never touches the signing draft. Success shows the
+  // response message; there is no link status, expiry display or cancel. Failures share the
+  // accept/resend recovery: the 502 message verbatim, the customer-email pointer, and the
   // existing drift resync for 409 INVOICE_ALREADY_ACCEPTED / 422 INVOICE_REQUIRED.
+  // 16G PR 6 (#120): every attempt, whatever its outcome, is followed by ONE re-read of the
+  // current invoice (a drift resync already made by the error handler counts), so the tab learns
+  // invoice_link_expires_at at once and starts or stops polling; that re-read keeps the ink and
+  // ticks unless it installs another version. The single-flight hold covers it too.
   async function handleSendLink() {
     if (
       mutationInFlightRef.current ||
@@ -638,20 +776,32 @@ export function InvoiceTab({
     setActionMessage(null)
     setHandoverNotice(null)
     setEmailFixNeeded(false)
+    // 16G PR 6 - the send starts: no earlier read may land after it.
+    raiseReadFloor()
     try {
-      const res = await sendInvoiceLink(orderId)
-      if (!mountedRef.current) return
-      setActionMessage(
-        res.message && res.message.length > 0
-          ? res.message
-          : 'Invoice link emailed to the customer.',
-      )
-    } catch (err) {
-      if (!mountedRef.current) return
-      await applyAcceptResendError(
-        err,
-        'Could not email the invoice link. Please try again.',
-      )
+      let reread = false
+      try {
+        const res = await sendInvoiceLink(orderId)
+        if (!mountedRef.current) return
+        // The send's result (a new ACTIVE link) is newer than any read issued before it.
+        raiseReadFloor()
+        setActionMessage(
+          res.message && res.message.length > 0
+            ? res.message
+            : 'Invoice link emailed to the customer.',
+        )
+      } catch (err) {
+        if (!mountedRef.current) return
+        reread = await applyAcceptResendError(
+          err,
+          'Could not email the invoice link. Please try again.',
+        )
+      }
+      // The follow-up re-read (201, a 502 that kept its new link ACTIVE, 422, a network
+      // failure ...). A failed re-read changes nothing and keeps the outcome banner above.
+      if (!reread && mountedRef.current) {
+        await resyncCurrentInvoice()
+      }
     } finally {
       mutationInFlightRef.current = false
       if (mountedRef.current) setSendingLink(false)
@@ -834,6 +984,48 @@ export function InvoiceTab({
   // Phase 16A PR1 — drives the bottom composition (checkbox read-only state + Accept vs
   // Re-send action bar). Persisted by the invoice acceptance event, never by local state.
   const invoiceAccepted = invoice !== null && invoice.accepted_at !== null
+
+  // Phase 16G PR 6 (#120) - the remote-signature poll: re-read the current invoice every 15
+  // seconds while the LAST APPLIED InvoiceDetail shows invoice_link_expires_at non-null and still
+  // in the future (an ACTIVE, unexpired invoice link) and the displayed invoice is unsigned, only
+  // while the browser tab is visible (this tab is mounted only while it is the active workspace
+  // tab). The condition is server state only, so it holds after a reload, for a link sent from
+  // another session and for a link kept ACTIVE after a failed send. It stops when a read shows the
+  // invoice signed or the field null, or when that expiry passes. The field is never displayed.
+  const linkExpiresAt = invoice?.invoice_link_expires_at ?? null
+  const linkExpiryMs = parseLocalTimestamp(linkExpiresAt)
+  const invoicePollEnabled =
+    invoiceReadyForAcceptance &&
+    !invoiceAccepted &&
+    linkExpiresAt !== null &&
+    linkExpiresAt !== elapsedLinkExpiry &&
+    linkExpiryMs !== null &&
+    linkExpiryMs > Date.now()
+
+  // One poll tick: skipped while any current-invoice read or a mutation (accept, re-send,
+  // send-link) is in flight. The expiry is re-checked BEFORE any request, so an elapsed (or
+  // unreadable) expiry stops polling without a request and without a successful response. The read
+  // itself is silent: no loading state, no banner change, and a failure or a 404 changes nothing; an
+  // answer is installed through the guarded path, so only a different version clears the ink and
+  // ticks.
+  function pollCurrentInvoice() {
+    if (
+      !mountedRef.current ||
+      mutationInFlightRef.current ||
+      readsInFlightRef.current > 0
+    ) {
+      return
+    }
+    const current = invoiceRef.current
+    if (current === null || current.accepted_at !== null) return
+    const expiresAtMs = parseLocalTimestamp(current.invoice_link_expires_at)
+    if (expiresAtMs === null || expiresAtMs <= Date.now()) {
+      setElapsedLinkExpiry(current.invoice_link_expires_at)
+      return
+    }
+    void readCurrentInvoice(false)
+  }
+  usePollWhileVisible(invoicePollEnabled, pollCurrentInvoice)
 
   return (
     <div>

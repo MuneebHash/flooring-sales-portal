@@ -163,7 +163,7 @@ Do not confirm the existence of another tenant's data.
 - all timestamps are stored and returned in server local time (Australia)
 - example: `"2026-04-22T14:30:00"`
 - used for: `created_at`, `updated_at`, `last_emailed_at`
-- known drift: the quote DTO timestamps apply no whole-second format today, so they can carry fractional seconds; 16G PR 6 formats every quote timestamp to whole seconds (16G contract §13.5). Whole-second strings never decide quote email delivery: from the same PR the derived `QuoteIssuedSummary.last_email_delivered` does
+- quote timestamps: since 16G PR 6 every quote timestamp is formatted to whole seconds (16G contract §13.5); before it the quote DTO timestamps applied no whole-second format and could carry fractional seconds. Whole-second strings never decide quote email delivery: since the same PR the derived `QuoteIssuedSummary.last_email_delivered` does
 
 ### Money
 - all monetary values are `DECIMAL(10,2)`

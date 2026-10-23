@@ -1,5 +1,7 @@
 package com.flooring.salesportal.order.quote;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.flooring.salesportal.common.email.QuoteEmailRequest;
 import com.flooring.salesportal.common.email.RecordingQuoteAcceptanceNotificationSender;
 import com.flooring.salesportal.common.email.RecordingQuoteEmailSender;
@@ -32,6 +34,7 @@ import java.lang.reflect.RecordComponent;
 import java.math.BigDecimal;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
+import java.sql.Timestamp;
 import java.time.LocalDateTime;
 import java.util.Arrays;
 import java.util.Base64;
@@ -95,6 +98,11 @@ class QuoteSendControllerTest {
     // exercising the acceptance.
     private static final byte[] ONE_PIXEL_PNG = Base64.getDecoder().decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==");
+
+    // 16G PR 6 (#124): every quote timestamp the API returns is formatted to whole seconds.
+    private static final Pattern WHOLE_SECONDS = Pattern.compile("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}$");
+
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     @Autowired
     private WebApplicationContext context;
@@ -161,6 +169,11 @@ class QuoteSendControllerTest {
 
     private static String cancelUrl(Object orderId) {
         return "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/quote/cancel";
+    }
+
+    /** 16G PR 6 (#122): the version-addressed signed-PDF read of one accepted version. */
+    private static String acceptedVersionPdfUrl(Object orderId, Object quoteVersionId) {
+        return "/api/v1/" + SLUG_AUSSIE + "/orders/" + orderId + "/quote/accepted/" + quoteVersionId + "/pdf";
     }
 
     private static String pdfUrl(Object orderId, String type) {
@@ -1252,14 +1265,18 @@ class QuoteSendControllerTest {
     }
 
     @Test
-    void downloadPdf_acceptedType_returns404QuotePdfNotFound() throws Exception {
+    void downloadPdf_acceptedType_returns400MustBeIssued() throws Exception {
         long orderId = sendReadyOrder();
         sendEmailOk(orderId);
-        // Issued only: no ACCEPTED version exists for this order, so there is no stored signed PDF
-        // for type=accepted to stream (16F PR1 serves the latest accepted version's) → 404.
+        // 16G PR 6 (#122): type=accepted (the latest accepted version at request time) is REMOVED in
+        // favour of the version-addressed GET .../quote/accepted/{quoteVersionId}/pdf; issued is the only
+        // type left, so accepted is now an invalid value like any other.
         mockMvc.perform(get(pdfUrl(orderId, "accepted")).session(liamStore1Session()))
-                .andExpect(status().isNotFound())
-                .andExpect(jsonPath("$.error.code").value("QUOTE_PDF_NOT_FOUND"));
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details", hasSize(1)))
+                .andExpect(jsonPath("$.error.details[0].field").value("type"))
+                .andExpect(jsonPath("$.error.details[0].message").value("Must be issued."));
     }
 
     @Test
@@ -1268,10 +1285,14 @@ class QuoteSendControllerTest {
         sendEmailOk(orderId);
         mockMvc.perform(get(pdfUrl(orderId, null)).session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("type"))
+                .andExpect(jsonPath("$.error.details[0].message").value("Must be issued."));
         mockMvc.perform(get(pdfUrl(orderId, "signed")).session(liamStore1Session()))
                 .andExpect(status().isBadRequest())
-                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"));
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details[0].field").value("type"))
+                .andExpect(jsonPath("$.error.details[0].message").value("Must be issued."));
     }
 
     @Test
@@ -1671,7 +1692,9 @@ class QuoteSendControllerTest {
         Assertions.assertEquals(v1TokenAfterAccept, tokenRowByPlainToken(v1Token),
                 "the CONSUMED v1 token must be untouched by a later send");
         Assertions.assertArrayEquals(v1IssuedBytes, storedIssuedPdf(orderId, 1));
-        mockMvc.perform(get(pdfUrl(orderId, "accepted")).session(liamStore1Session()))
+        // 16G PR 6 (#122): the signed PDF is read through the version-addressed read of v1 itself.
+        long v1Id = ((Number) v1Accepted.get("quote_version_id")).longValue();
+        mockMvc.perform(get(acceptedVersionPdfUrl(orderId, v1Id)).session(liamStore1Session()))
                 .andExpect(status().isOk())
                 .andExpect(header().string("Content-Disposition",
                         org.hamcrest.Matchers.containsString(
@@ -1809,5 +1832,233 @@ class QuoteSendControllerTest {
         Assertions.assertEquals(expected, orderPriceState(orderId),
                 "a cancel must never write the order price");
         assertOrderInvariants(orderId);
+    }
+
+    // ================================================================
+    // Phase 16G PR 6 (#124) — last_email_delivered from the stored markers, whole-second timestamps
+    // ================================================================
+
+    /**
+     * 16G contract §13.5: last_email_delivered is derived from the STORED markers at full precision, before
+     * any whole-second formatting — true when last_emailed_at is non-null and not before last_sent_at. The
+     * three same-second histories of the contract table, stored at full precision on one issued version:
+     * the first two return IDENTICAL whole-second strings yet different outcomes (the second is the
+     * regression case: a successful send followed, in the same second, by a failed resend). Stored values
+     * keep their fractional seconds.
+     */
+    @Test
+    void lastEmailDelivered_comesFromTheStoredMarkersAtFullPrecision_threeSameSecondHistories() throws Exception {
+        long orderId = sendReadyOrder();
+        sendEmailOk(orderId);
+        long versionId = ((Number) issuedVersionRow(orderId).get("quote_version_id")).longValue();
+
+        // 1. Attempt 12:22:10.400, success 12:22:10.600 → delivered.
+        JsonNode delivered = currentIssuedWithMarkers(orderId, versionId,
+                "2026-11-02 12:22:10.400", "2026-11-02 12:22:10.600");
+        assertLastEmailDelivered(delivered, true, "history 1 (.400 / .600)");
+        Assertions.assertEquals("2026-11-02T12:22:10", delivered.get("last_sent_at").asText());
+        Assertions.assertEquals("2026-11-02T12:22:10", delivered.get("last_emailed_at").asText());
+
+        // 2. Attempt 12:22:10.400, success 12:22:10.200 → NOT delivered (the later attempt failed), although
+        //    the two whole-second strings are exactly those of history 1.
+        JsonNode failedResend = currentIssuedWithMarkers(orderId, versionId,
+                "2026-11-02 12:22:10.400", "2026-11-02 12:22:10.200");
+        assertLastEmailDelivered(failedResend, false, "history 2 (.400 / .200)");
+        Assertions.assertEquals(delivered.get("last_sent_at").asText(), failedResend.get("last_sent_at").asText(),
+                "the same whole-second attempt string as history 1");
+        Assertions.assertEquals(delivered.get("last_emailed_at").asText(),
+                failedResend.get("last_emailed_at").asText(), "the same whole-second success string as history 1");
+
+        // 3. Attempt 12:22:10.400, no successful email → NOT delivered.
+        JsonNode neverDelivered = currentIssuedWithMarkers(orderId, versionId, "2026-11-02 12:22:10.400", null);
+        assertLastEmailDelivered(neverDelivered, false, "history 3 (.400 / null)");
+        assertPresentNull(neverDelivered, "last_emailed_at", "history 3");
+
+        // Equal markers: the success is not BEFORE the attempt → delivered.
+        assertLastEmailDelivered(currentIssuedWithMarkers(orderId, versionId,
+                "2026-11-02 12:22:10.400", "2026-11-02 12:22:10.400"), true, "equal markers");
+
+        // Interpretation (PR 6 report): a success marker with NO attempt marker counts as delivered, since no
+        // later attempt exists to have failed.
+        JsonNode noAttemptMarker = currentIssuedWithMarkers(orderId, versionId, null, "2026-11-02 12:22:10.600");
+        assertLastEmailDelivered(noAttemptMarker, true, "null last_sent_at, non-null last_emailed_at");
+        assertPresentNull(noAttemptMarker, "last_sent_at", "null last_sent_at");
+
+        // Formatting never touches the stored values: the fraction is still there after the reads.
+        currentIssuedWithMarkers(orderId, versionId, "2026-11-02 12:22:10.400", "2026-11-02 12:22:10.200");
+        Map<String, Object> stored = issuedVersionRow(orderId);
+        Assertions.assertEquals(Timestamp.valueOf("2026-11-02 12:22:10.400"), stored.get("last_sent_at"));
+        Assertions.assertEquals(Timestamp.valueOf("2026-11-02 12:22:10.200"), stored.get("last_emailed_at"));
+    }
+
+    /**
+     * last_email_delivered is always present and never null wherever QuoteIssuedSummary is returned: the
+     * send-email, send-sms and cancel responses and the workspace current_issued.
+     */
+    @Test
+    void lastEmailDelivered_alwaysPresentNonNull_onSendEmailSendSmsCancelAndWorkspace() throws Exception {
+        long emailedOrder = sendReadyOrder();
+        JsonNode sent = readJson(sendEmailOk(emailedOrder)).path("data");
+        assertLastEmailDelivered(sent, true, "send-email 201 after a delivered email");
+        assertLastEmailDelivered(workspaceCurrentIssued(emailedOrder), true, "workspace after a delivered email");
+
+        clearJpaCache();
+        MvcResult cancelled = mockMvc.perform(post(cancelUrl(emailedOrder)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.status").value("CANCELLED"))
+                .andReturn();
+        assertLastEmailDelivered(readJson(cancelled).path("data"), true,
+                "cancel 200: the delivered email is still the latest attempt");
+
+        // The dormant SMS path returns the same summary: no email was ever delivered → false (the
+        // Customer Quote tab applies the flag to the email channel only).
+        long smsOrder = leadOrderInSession();
+        seedCustomer(smsOrder, VALID_EMAIL, VALID_MOBILE_LOCAL);
+        saveItemisedTwoLineDraft(smsOrder);
+        clearJpaCache();
+        MvcResult sms = mockMvc.perform(post(sendSmsUrl(smsOrder)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.data.sent_channel").value("SMS"))
+                .andReturn();
+        assertLastEmailDelivered(readJson(sms).path("data"), false, "send-sms 201");
+        assertLastEmailDelivered(workspaceCurrentIssued(smsOrder), false, "workspace after an SMS send");
+    }
+
+    /**
+     * A successful send followed by a failed resend of the same version: the workspace reports
+     * last_email_delivered false. The success marker of the earlier attempt is kept as it was, and the
+     * latest attempt marker moved past it.
+     */
+    @Test
+    void lastEmailDelivered_successfulSendThenFailedResend_workspaceReportsNotDelivered() throws Exception {
+        long orderId = sendReadyOrder();
+        sendEmailOk(orderId);
+        Map<String, Object> afterSuccess = issuedVersionRow(orderId);
+        assertLastEmailDelivered(workspaceCurrentIssued(orderId), true, "after the successful send");
+
+        quoteEmailSender.failNextSend();
+        clearJpaCache();
+        mockMvc.perform(post(sendEmailUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isBadGateway())
+                .andExpect(jsonPath("$.error.code").value("EMAIL_SEND_FAILED"));
+
+        Map<String, Object> afterFailure = issuedVersionRow(orderId);
+        Assertions.assertEquals(afterSuccess.get("quote_version_id"), afterFailure.get("quote_version_id"),
+                "the unchanged draft resent the SAME version");
+        Assertions.assertEquals(afterSuccess.get("last_emailed_at"), afterFailure.get("last_emailed_at"),
+                "a failed attempt never writes the success marker");
+        Assertions.assertTrue(((Timestamp) afterFailure.get("last_sent_at"))
+                        .after((Timestamp) afterSuccess.get("last_emailed_at")),
+                "the failed resend's attempt marker is the latest");
+
+        JsonNode issued = workspaceCurrentIssued(orderId);
+        Assertions.assertEquals("EMAIL", issued.get("sent_channel").asText());
+        assertLastEmailDelivered(issued, false, "workspace after the failed resend");
+    }
+
+    /**
+     * Every QuoteIssuedSummary timestamp is formatted to whole seconds (YYYY-MM-DDTHH:mm:ss) on the send,
+     * cancel and workspace responses; nullable ones stay present as JSON null; the stored values keep their
+     * full precision. Fractional stored values are seeded so the truncation is visible.
+     */
+    @Test
+    void issuedSummaryTimestamps_wholeSeconds_onSendWorkspaceAndCancel_nullablesPresent_storedPrecisionUnchanged()
+            throws Exception {
+        long orderId = sendReadyOrder();
+        JsonNode sent = readJson(sendEmailOk(orderId)).path("data");
+        for (String field : List.of("first_sent_at", "last_sent_at", "last_emailed_at", "token_expires_at")) {
+            assertWholeSeconds(sent, field, "send-email 201");
+        }
+        assertPresentNull(sent, "viewed_at", "send-email 201");
+
+        long versionId = ((Number) issuedVersionRow(orderId).get("quote_version_id")).longValue();
+        jdbcTemplate.update("UPDATE quote_version SET first_sent_at = ?, last_sent_at = ?, last_emailed_at = ?, "
+                        + "viewed_at = ? WHERE quote_version_id = ?",
+                Timestamp.valueOf("2026-11-01 08:00:01.123456"), Timestamp.valueOf("2026-11-02 12:22:10.400"),
+                Timestamp.valueOf("2026-11-02 12:22:10.600"), Timestamp.valueOf("2026-11-02 13:00:05.987654"),
+                versionId);
+        Assertions.assertEquals(1, jdbcTemplate.update(
+                "UPDATE quote_token SET expires_at = ? WHERE quote_version_id = ? AND status = 'ACTIVE'",
+                Timestamp.valueOf("2026-11-09 12:22:10.999999"), versionId));
+
+        JsonNode issued = workspaceCurrentIssued(orderId);
+        Assertions.assertEquals("2026-11-01T08:00:01", issued.get("first_sent_at").asText());
+        Assertions.assertEquals("2026-11-02T12:22:10", issued.get("last_sent_at").asText());
+        Assertions.assertEquals("2026-11-02T12:22:10", issued.get("last_emailed_at").asText());
+        Assertions.assertEquals("2026-11-02T13:00:05", issued.get("viewed_at").asText());
+        Assertions.assertEquals("2026-11-09T12:22:10", issued.get("token_expires_at").asText());
+
+        clearJpaCache();
+        MvcResult cancelled = mockMvc.perform(post(cancelUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                .andExpect(status().isOk())
+                .andReturn();
+        JsonNode cancelSummary = readJson(cancelled).path("data");
+        Assertions.assertEquals("2026-11-01T08:00:01", cancelSummary.get("first_sent_at").asText());
+        Assertions.assertEquals("2026-11-02T12:22:10", cancelSummary.get("last_sent_at").asText());
+        Assertions.assertEquals("2026-11-02T12:22:10", cancelSummary.get("last_emailed_at").asText());
+        Assertions.assertEquals("2026-11-02T13:00:05", cancelSummary.get("viewed_at").asText());
+        assertPresentNull(cancelSummary, "token_expires_at", "cancel 200 (the link is dead)");
+        assertLastEmailDelivered(cancelSummary, true, "cancel 200 (.400 / .600)");
+
+        Map<String, Object> stored = versionRowByNumber(orderId, 1);
+        Assertions.assertEquals(Timestamp.valueOf("2026-11-01 08:00:01.123456"), stored.get("first_sent_at"));
+        Assertions.assertEquals(Timestamp.valueOf("2026-11-02 12:22:10.400"), stored.get("last_sent_at"));
+        Assertions.assertEquals(Timestamp.valueOf("2026-11-02 12:22:10.600"), stored.get("last_emailed_at"));
+        Assertions.assertEquals(Timestamp.valueOf("2026-11-02 13:00:05.987654"), stored.get("viewed_at"));
+        Assertions.assertEquals(Timestamp.valueOf("2026-11-09 12:22:10.999999"), jdbcTemplate.queryForObject(
+                "SELECT expires_at FROM quote_token WHERE quote_version_id = ? AND status = 'CANCELLED'",
+                Timestamp.class, versionId));
+    }
+
+    /** Store the two delivery markers on the version, then return the workspace current_issued. */
+    private JsonNode currentIssuedWithMarkers(long orderId, long quoteVersionId, String lastSentAt,
+                                              String lastEmailedAt) throws Exception {
+        jdbcTemplate.update("UPDATE quote_version SET last_sent_at = ?, last_emailed_at = ? WHERE quote_version_id = ?",
+                lastSentAt == null ? null : Timestamp.valueOf(lastSentAt),
+                lastEmailedAt == null ? null : Timestamp.valueOf(lastEmailedAt),
+                quoteVersionId);
+        return workspaceCurrentIssued(orderId);
+    }
+
+    private JsonNode workspaceCurrentIssued(long orderId) throws Exception {
+        clearJpaCache();
+        MvcResult result = mockMvc.perform(get(workspaceUrl(orderId)).session(liamStore1Session()))
+                .andExpect(status().isOk())
+                .andReturn();
+        JsonNode issued = readJson(result).path("data").path("current_issued");
+        Assertions.assertTrue(issued.isObject(), () -> "current_issued must be populated: " + issued);
+        return issued;
+    }
+
+    private static JsonNode readJson(MvcResult result) throws Exception {
+        return JSON.readTree(result.getResponse().getContentAsString(StandardCharsets.UTF_8));
+    }
+
+    /** last_email_delivered: always present, a JSON boolean (never null), with the expected value. */
+    private static void assertLastEmailDelivered(JsonNode summary, boolean expected, String label) {
+        JsonNode delivered = summary.get("last_email_delivered");
+        Assertions.assertNotNull(delivered, () -> label + ": last_email_delivered must always be present");
+        Assertions.assertTrue(delivered.isBoolean(),
+                () -> label + ": last_email_delivered must be a JSON boolean, never null: " + delivered);
+        Assertions.assertEquals(expected, delivered.booleanValue(), label + ": last_email_delivered");
+    }
+
+    /** A non-null quote timestamp on the wire: whole seconds, YYYY-MM-DDTHH:mm:ss. */
+    private static void assertWholeSeconds(JsonNode summary, String field, String label) {
+        JsonNode value = summary.get(field);
+        Assertions.assertTrue(value != null && value.isTextual(),
+                () -> label + ": " + field + " must be a timestamp string: " + value);
+        Assertions.assertTrue(WHOLE_SECONDS.matcher(value.asText()).matches(),
+                () -> label + ": " + field + " must be formatted to whole seconds: " + value.asText());
+    }
+
+    /** A nullable field that is present as JSON null (never omitted). */
+    private static void assertPresentNull(JsonNode summary, String field, String label) {
+        Assertions.assertTrue(summary.has(field), () -> label + ": " + field + " must always be present");
+        Assertions.assertTrue(summary.get(field).isNull(), () -> label + ": " + field + " must be JSON null");
     }
 }

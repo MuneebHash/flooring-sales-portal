@@ -427,17 +427,22 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertEquals("ISSUED", versionStatus(orderId, 3));
         Assertions.assertTrue(invoiceEligible(orderId), "newer draft / superseded / issued history never feeds it");
 
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId), "16G PR 6: no invoice yet");
         Conversion first = convertOk(orderId);
         assertConverted(orderId, first, 1, 1, "250.00", "275.00", "0.00", "275.00");
         Assertions.assertEquals("SUPERSEDED", versionStatus(orderId, 2));
         Assertions.assertEquals("ISSUED", versionStatus(orderId, 3));
         assertPublicState(token3, "ACTIVE");
         Assertions.assertFalse(invoiceEligible(orderId), "the conversion tied the invoice with v1's signature");
+        Assertions.assertTrue(invoiceCreatedFromThisVersion(orderId),
+                "16G PR 6: the current invoice was created from the accepted v1");
 
         // The still-ACTIVE v3 link is signed later: a strictly newer signature makes the order eligible again.
         long v1Id = asLong(quoteVersionRow(orderId, 1).get("quote_version_id"));
         acceptPublicly(token3, SECOND_SIGNATURE_PNG);
         Assertions.assertTrue(invoiceEligible(orderId));
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId),
+                "16G PR 6: the summary now describes v3, and the current invoice was created from v1, not v3");
         // 16G PR 3: a confirmation still showing v1 once v3 is signed sends v1's id: 409 QUOTE_VERSION_STALE.
         Assertions.assertNotEquals(v1Id, latestAcceptedQuoteVersionId(orderId), "fixture: v3 is now the latest");
         assertRefused(orderId, quoteVersionIdBody(v1Id), 409, "QUOTE_VERSION_STALE", QUOTE_VERSION_STALE_MESSAGE,
@@ -445,6 +450,8 @@ class QuoteInvoiceConversionControllerTest {
         Conversion second = convertOk(orderId);
         assertConverted(orderId, second, 2, 3, "400.00", "440.00", "0.00", "440.00");
         Assertions.assertFalse(invoiceEligible(orderId));
+        Assertions.assertTrue(invoiceCreatedFromThisVersion(orderId),
+                "16G PR 6: the current invoice was created from the accepted v3");
     }
 
     @Test
@@ -1017,6 +1024,11 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertEquals(quoteVersionRow(orderId, 1).get("accepted_at"), invoiceRow(orderId, 2).get("accepted_at"),
                 "fixture: identical signature timestamps");
         Assertions.assertFalse(invoiceEligible(orderId), "a tie: ineligible");
+        // 16G PR 6 (#124): the signature times are identical, yet the current invoice is the in-store signing
+        // of a D.1 invoice, not this quote's conversion — provenance comes from the source quote version, never
+        // from comparing timestamps (the removed 19-character accepted_at comparison read this as converted).
+        Assertions.assertFalse(invoiceCreatedFromThisVersion(orderId),
+                "an in-store signing tied with the quote's signature time is not created from this quote");
 
         JsonNode error = assertRefused(orderId, versionBody(orderId), 409, "INVOICE_ALREADY_ACCEPTED",
                 NOT_NEWER_MESSAGE, "equal signatures");
@@ -1960,6 +1972,21 @@ class QuoteInvoiceConversionControllerTest {
         Assertions.assertTrue(eligible != null && eligible.isBoolean(),
                 () -> "invoice_eligible must be a JSON boolean but was " + eligible);
         return eligible.booleanValue();
+    }
+
+    /**
+     * {@code data.accepted.invoice_created_from_this_version} (16G PR 6, #124) from the workspace read,
+     * asserted to be a JSON boolean (never null).
+     */
+    private boolean invoiceCreatedFromThisVersion(long orderId) throws Exception {
+        MvcResult result = perform(get(quoteUrl(orderId, "workspace")).session(liamStore1Session()));
+        assertStatus(result, 200, "quote workspace");
+        JsonNode accepted = readJson(result).get("data").get("accepted");
+        Assertions.assertTrue(accepted != null && accepted.isObject(), () -> "accepted must be populated: " + accepted);
+        JsonNode provenance = accepted.get("invoice_created_from_this_version");
+        Assertions.assertTrue(provenance != null && provenance.isBoolean(),
+                () -> "invoice_created_from_this_version must be a JSON boolean but was " + provenance);
+        return provenance.booleanValue();
     }
 
     // ================================================================
