@@ -2,7 +2,7 @@
 
 **Status:** Phase 13 MVP contract: implemented in Phase 13 (migration `V10`) and amended since by Phase 15D (payment void) and 16F (Create Invoice from the accepted quote, D5(c)). Additive to the locked **Phase 12 / Chunk 4** invoices + payments contract (`docs/API-Contracts-Chunk-4.md`).
 
-**16G amendments (16G PR 1, target contract).** Remote invoice signing through an emailed link, the frozen words on every invoice version, the mandatory version precondition on D.8 and the signed-PDF email on every signing route are specified in [the 16G contract](API-Contracts-Phase16G-Invoice-Link.md). The passages below that 16G changes are updated in place and name their implementation PR (16G PR 2 to PR 6). Every rule marked with a 16G PR is implemented (PR 6 was the last); the rest describes current behaviour.
+**16G amendments (written in 16G PR 1; all implemented).** Remote invoice signing through an emailed link, the frozen words on every invoice version, the mandatory version precondition on D.8 and the signed-PDF email on every signing route are specified in [the 16G contract](API-Contracts-Phase16G-Invoice-Link.md). The passages below that 16G changes are updated in place and name their implementation PR (16G PR 2 to PR 6). Every rule marked with a 16G PR is implemented (PR 6 was the last); the rest describes current behaviour.
 
 **Source of truth priority:**
 1. `docs/API-Conventions.md`
@@ -37,8 +37,8 @@ Concretely, Phase 13 adds:
 ## 2. MVP scope (included)
 
 - Customer **email is required and valid** before Create Invoice, Rewrite Invoice, Accept, and Resend, and (16G PR 4) before the invoice link send. Backend contract rule, not frontend-only. Create Invoice from the accepted quote (Path A) and remote invoice signing (16G PR 4) have **no** email gate (16G contract §6).
-- Customer **signature capture** on the Invoice tab (draw on iPad/touchscreen). The **accepted customer name** is shown with it and is never typed: today the Invoice tab derives it from the saved customer record and sends it; from 16G PR 3 the server takes it from the current invoice version's frozen `customer_name_snapshot` and the request carries no name (16G contract §4, §5.4).
-- **Accept Invoice** (one endpoint): requires an existing current invoice, a signature and a valid customer email (today also the accepted-name part; from 16G PR 3 instead the mandatory `expected_version_number`, the version on screen). Stores `accepted_at`, `accepted_customer_name`, and a signature file reference; regenerates the signed PDF; **auto-emails** the accepted PDF; updates `last_emailed_at`.
+- Customer **signature capture** on the Invoice tab (draw on iPad/touchscreen). The **accepted customer name** is shown with it and is never typed: since 16G PR 3 the server takes it from the current invoice version's frozen `customer_name_snapshot` and the request carries no name (16G contract §4, §5.4); before 16G PR 3 the Invoice tab derived it from the saved customer record and sent it.
+- **Accept Invoice** (one endpoint): requires an existing current invoice, a signature and a valid customer email (since 16G PR 3 also the mandatory `expected_version_number`, the version on screen; before 16G PR 3 the accepted-name part instead). Stores `accepted_at`, `accepted_customer_name`, and a signature file reference; regenerates the signed PDF; **auto-emails** the accepted PDF; updates `last_emailed_at`.
 - Accepted invoice is **not directly mutated** afterward (see §4, §7).
 - **Re-send Invoice**: re-emails the current accepted invoice PDF; updates `last_emailed_at`. Re-send Invoice is shown once the current invoice is **accepted**, including when the initial automatic email failed — it does **not** depend on a prior successful email (an accepted invoice with `last_emailed_at = null` can still be re-sent).
 - **Download PDF** remains available before acceptance (Phase 12 `D.4`); 16G PR 5 renamed the button **Preview PDF** (the same `D.4` read, opened in a new tab). The invoice **PDF** is never emailed before signature/acceptance. Since 16G PR 4 an unsigned current invoice can be sent to the customer as a **link** (`POST …/invoices/current/send-link`, behind the **Accept Remotely** button of 16G PR 5; link only, no PDF attached) for the customer to review and sign remotely (16G contract §8, §9).
@@ -181,7 +181,7 @@ An **unaccepted** current invoice returns `accepted_at: null`, `accepted_custome
 }
 ```
 
-The acceptance (signature + `accepted_at`) is **durably persisted even if the email fails**; we never discard a captured signature because the provider hiccuped. After a `201`, `accepted_at` is non-null; `last_emailed_at` is non-null **iff** the auto-email succeeded and its stamp was recorded (null ⇒ not recorded ⇒ frontend offers Re-send). The message reports the delivery outcome. Known limitation, not fixed in 16G (audit F49; a proposed follow-up, not yet filed): if another version is appended between the commit and the stamp, the `201` body describes that newer current version.
+The acceptance (signature + `accepted_at`) is **durably persisted even if the email fails**; we never discard a captured signature because the provider hiccuped. After a `201`, `accepted_at` is non-null; `last_emailed_at` is non-null **iff** the auto-email succeeded and its stamp was recorded (null ⇒ not recorded ⇒ frontend offers Re-send). The message reports the delivery outcome. Known limitation, not fixed in 16G (audit F49, tracked as [#148](https://github.com/MuneebHash/flooring-sales-portal/issues/148)): if another version is appended between the commit and the stamp, the `201` body describes that newer current version.
 
 **Business rules (in order).** This is the order since **16G PR 3** ([16G contract §5.4](API-Contracts-Phase16G-Invoice-Link.md#5-version-preconditions-69-123)). Before PR 3, rules 3 and 4 did not exist and rule 7 checked the `accepted_customer_name` part instead. Every refusal below writes nothing.
 1. Order in scope (locked), else 404 `ORDER_NOT_FOUND`.
@@ -232,7 +232,7 @@ The acceptance (signature + `accepted_at`) is **durably persisted even if the em
 
 **Status codes:** 200; 400 (`VALIDATION_FAILED`); 401; 403; 404 (`ORDER_NOT_FOUND`); 422 (`INVOICE_REQUIRED`, `INVOICE_NOT_ACCEPTED`, `CUSTOMER_EMAIL_REQUIRED`, `CUSTOMER_EMAIL_INVALID`); 502 (`EMAIL_SEND_FAILED`); 500.
 
-16G leaves D.9 unchanged: it is the manual route for re-emailing the signed PDF, including after a failed or skipped automatic email. Sending an unsigned invoice as a link is a separate endpoint (16G contract §8). D.9's unlocked split read and delayed stamp belong to the proposed F49 follow-up.
+16G leaves D.9 unchanged: it is the manual route for re-emailing the signed PDF, including after a failed or skipped automatic email. Sending an unsigned invoice as a link is a separate endpoint (16G contract §8). D.9's unlocked split read and delayed stamp belong to the F49 follow-up, [#148](https://github.com/MuneebHash/flooring-sales-portal/issues/148).
 
 ---
 
@@ -268,7 +268,7 @@ Errors use the standard JSON error wrapper (conventions §3).
 - **`D.7` POST `…/payments` (Record payment).** See §6. A payment never requires acceptance; if the current invoice was accepted, acceptance/signature carries forward (the customer does not re-sign) and the regenerated signed PDF is produced — but **Phase 15D: no email is sent** (the old "re-email after a payment on an accepted invoice" behaviour was removed). `last_emailed_at` stays null and the message is `"Payment recorded. Current invoice updated."`. To email the updated PDF, use Re-send (`D.9`).
 - **`D.10` POST `…/payments/{paymentTransactionId}/void` (Void payment — Phase 15D).** See §6 and Chunk 4 D.10. Soft-voids a payment and regenerates the current invoice exactly like `D.7` (acceptance/signature carries forward, no re-sign, no email); the voided payment is excluded from the active `total_paid`.
 - **`D.3` GET `…/invoices/current`**, **`D.4` GET `…/invoices/current/file`** — unchanged behaviour; `D.3`'s `invoice_detail` now carries the five new fields. `D.4` continues to stream the current PDF (which is the **signed** PDF once accepted).
-- **16G deltas** ([16G contract](API-Contracts-Phase16G-Invoice-Link.md)): D.1 and D.2 freeze the live Invoice To name, billing lines and terms into the new version, and D.7, D.10 and D.8 copy the previous version's words (PR 2, §4). From PR 3, D.8 copies `invoice_date` from the current version into its signed version (§5.4; today it is the signing day, rule 11 above); remote signing does the same since PR 4 (§10.1), and D.1, D.2, D.7 and D.10 keep dating their version the day it is written. D.2 also marks an `ACTIVE` invoice link `REWRITTEN`; D.7 and D.10 leave it `ACTIVE`, and the link then shows the new version (PR 4, §7.5). D.3 returns the three frozen identity fields and `terms_source` `QUOTE` / `BUSINESS` (PR 2), and the derived `invoice_link_expires_at` (PR 4), on which the Invoice tab polls since PR 6 (§13.2). D.4 is unchanged; the Invoice tab button becomes Preview PDF (PR 5). The new protected `POST …/invoices/current/send-link` (PR 4, §8) emails an unsigned invoice as a link.
+- **16G deltas** ([16G contract](API-Contracts-Phase16G-Invoice-Link.md)): D.1 and D.2 freeze the live Invoice To name, billing lines and terms into the new version, and D.7, D.10 and D.8 copy the previous version's words (PR 2, §4). Since PR 3, D.8 copies `invoice_date` from the current version into its signed version (§5.4; before PR 3 it was the signing day, rule 11 above); remote signing does the same since PR 4 (§10.1), and D.1, D.2, D.7 and D.10 keep dating their version the day it is written. D.2 also marks an `ACTIVE` invoice link `REWRITTEN`; D.7 and D.10 leave it `ACTIVE`, and the link then shows the new version (PR 4, §7.5). D.3 returns the three frozen identity fields and `terms_source` `QUOTE` / `BUSINESS` (PR 2), and the derived `invoice_link_expires_at` (PR 4), on which the Invoice tab polls since PR 6 (§13.2). D.4 is unchanged; the Invoice tab button became Preview PDF (PR 5). The new protected `POST …/invoices/current/send-link` (PR 4, §8) emails an unsigned invoice as a link.
 
 ---
 
@@ -318,7 +318,7 @@ Summary of acceptance state per transition (on the resulting **current** invoice
 | Payment (`D.7`) on **unaccepted** invoice | null | none | no |
 | Payment void (`D.10`) on **accepted** invoice | carried forward | carried forward | no — Phase 15D (Re-send to email) |
 | Payment void (`D.10`) on **unaccepted** invoice | null | none | no |
-| Create Invoice from the accepted quote (Path A, 16F) | inherited from the quote | the quote's signature file | today no; **from 16G PR 3 yes** (auto, signed PDF, after commit; skipped with a WARN when the saved email is missing or invalid; no email gate) |
+| Create Invoice from the accepted quote (Path A, 16F) | inherited from the quote | the quote's signature file | **yes since 16G PR 3** (auto, signed PDF, after commit; skipped with a WARN when the saved email is missing or invalid; no email gate; no email before PR 3) |
 | Remote invoice accept (16G PR 4) | set | stored (normalised PNG) | yes (auto, signed PDF, after commit; skipped with a WARN when the saved email is missing or invalid; no email gate) |
 | Invoice link send (16G PR 4) | unchanged (no new version) | unchanged | a link email only, no PDF; never stamps `last_emailed_at` |
 
@@ -397,7 +397,7 @@ Both fields are **required keys** on the row (`invoice_accepted` always a boolea
 | Payment after **accepted** (`D.7`) | `null` (new version; **no auto-email** — Phase 15D; `201`; Re-send to email) | `null` |
 | Payment **before** acceptance (`D.7`) | `null` (unaccepted/unemailed) | `null` |
 | Payment **void** (`D.10`), accepted or not | `null` (new version; **no auto-email** — Phase 15D; `201`; Re-send to email) | `null` |
-| Create Invoice from the accepted quote (Path A) — today | `null` (new version; no email) | `null` |
+| Create Invoice from the accepted quote (Path A) — before 16G PR 3 | `null` (new version; no email) | `null` |
 | Path A — from 16G PR 3, email succeeds | `<timestamp>` | `<same timestamp>` |
 | Path A — from 16G PR 3, email fails (or its stamp fails) | `null` (the invoice is still created; `201`; Re-send to email) | `null` |
 | Path A — from 16G PR 3, saved email missing or invalid (send skipped, WARN) | `null` | `null` |
@@ -407,7 +407,7 @@ Both fields are **required keys** on the row (`invoice_accepted` always a boolea
 | Invoice link send (16G PR 4), delivered or failed | unchanged (no new version; only `invoice_token.sent_at` / `emailed_at`) | unchanged |
 | Store notification on remote signing (16G PR 4) | unchanged | unchanged |
 
-Resend and the invoice link send are the only email operations that do **not** create a new current version. On a Resend **failure** nothing is written and the current invoice's `last_emailed_at` (and therefore the mirror) is **unchanged**; on Resend success both are set to the new timestamp. A link send never touches either value. Known limitation (audit F49, a proposed follow-up, not yet filed): when another version is appended between a D.8 or D.9 email and its stamp, the emailed version keeps its own stamp and the mirror follows the newer current version (`null`), as this rule requires, while the response describes the newer version.
+Resend and the invoice link send are the only email operations that do **not** create a new current version. On a Resend **failure** nothing is written and the current invoice's `last_emailed_at` (and therefore the mirror) is **unchanged**; on Resend success both are set to the new timestamp. A link send never touches either value. Known limitation (audit F49, tracked as [#148](https://github.com/MuneebHash/flooring-sales-portal/issues/148)): when another version is appended between a D.8 or D.9 email and its stamp, the emailed version keeps its own stamp and the mirror follows the newer current version (`null`), as this rule requires, while the response describes the newer version.
 
 ---
 
@@ -444,7 +444,7 @@ Clarifications:
 - **Email gate vs preconditions.** On Create/Rewrite the email gate (`CUSTOMER_EMAIL_*`) is evaluated **before** the 9 `INVOICE_PRECONDITIONS_NOT_MET` checks; if the email gate fails, that request returns the email code and the 9-precondition check is skipped (both are 422; the frontend handles each). Email validation is stricter than the DB `email LIKE '%@%'` check; implementations should use a standard email-format validator.
 - **Rewrite after accepted ≠ error.** Producing a new unsigned/unaccepted version on Rewrite is expected behaviour (§7), not an error.
 - **Payment before acceptance ≠ error.** Allowed; simply no email is sent (§6).
-- **`EMAIL_SEND_FAILED` status.** 502 Bad Gateway (upstream/provider dependency failure; added to conventions §4). Used by Resend; **not** raised by Accept (Accept's send is non-fatal).
+- **`EMAIL_SEND_FAILED` status.** 502 Bad Gateway (upstream/provider dependency failure; added to conventions §4). Used by Resend and (16G PR 4) the invoice link send; **not** raised by Accept (Accept's send is non-fatal).
 
 ---
 
@@ -468,4 +468,4 @@ Clarifications:
 - `InvoiceDetail` and `CurrentInvoiceSummary` gain the five acceptance/email fields.
 - New `SignatureAcceptRequest` multipart schema; new `BadGateway` (502) shared response; `EMAIL_SEND_FAILED` is conveyed through the existing free-form `error.code` string (OpenAPI does not enumerate code strings).
 - `DashboardOrderRow` gains `invoice_accepted`.
-- **16G (PR 1, target contract):** `SignatureAcceptRequest` becomes `expected_version_number` + `signature` (PR 3; the `accepted_customer_name` property and its 150-character limit are removed); `InvoiceDetail` gains the three frozen identity fields and the `terms_source` enum `QUOTE` / `BUSINESS` (PR 2), and the derived `invoice_link_expires_at` (PR 4, implemented); `DashboardOrderRow.last_emailed_at` describes the mirror as above; the send-link and public invoice paths and schemas (PR 4, implemented) are listed in the [16G contract appendix](API-Contracts-Phase16G-Invoice-Link.md#appendix--openapi-alignment).
+- **16G (implemented):** `SignatureAcceptRequest` becomes `expected_version_number` + `signature` (PR 3; the `accepted_customer_name` property and its 150-character limit are removed); `InvoiceDetail` gains the three frozen identity fields and the `terms_source` enum `QUOTE` / `BUSINESS` (PR 2), and the derived `invoice_link_expires_at` (PR 4); `DashboardOrderRow.last_emailed_at` describes the mirror as above; the send-link and public invoice paths and schemas (PR 4) are listed in the [16G contract appendix](API-Contracts-Phase16G-Invoice-Link.md#appendix--openapi-alignment).

@@ -1,6 +1,6 @@
 # Sales Portal MVP — API Contracts · Phase 16G (Invoice Link, Remote Invoice Signing, Frozen Invoice Words, Version Preconditions) (Lock-Ready)
 
-**Status:** Phase 16G target contract, written in 16G PR 1 (documentation and OpenAPI only). It locks the rules that 16G PRs 2 to 6 implement. **Nothing in this document is implemented at the PR 1 base (`main` at `91e0506`) unless a sentence says "today".** Every rule names the PR that implements it. The rules come from Muneeb's 16G decisions (13 October 2026, reviewed by Fable and GPT), as amended before PR 1. The evidence base is the 16G read-only verify gate audit (audited at `91e0506`).
+**Status:** Phase 16G contract, written in 16G PR 1 (documentation and OpenAPI only) before any 16G code. It locks the rules that 16G PRs 2 to 6 implemented. **All six 16G PRs have merged (#139, #140, #141, #143, #146 and #154, the last on 23 October 2026), and every rule names the PR that implemented it.** The rules come from Muneeb's 16G decisions (13 October 2026, reviewed by Fable and GPT), as amended before PR 1. The evidence base is the 16G read-only verify gate audit (audited at `91e0506`).
 
 **Where this contract sits.** It is additive to `docs/API-Conventions.md`, the Chunk 1 to 4 contracts, [the Phase 13 contract](API-Contracts-Phase13-Acceptance-Signature-Email.md), [the 16B quotation contract](API-Contracts-Phase16B-Quotation.md) and [the UX lock](Phase16D-Quotation-UX-Lock.md), and it amends them where a section below says so. Those documents were updated in place in PR 1 and point here. For the invoice link, the public invoice surface, remote invoice signing, the frozen invoice words (#125), the version preconditions (#69, #123), the automatic signed-PDF email on Path A and the 16G quote changes (#120 to #124, #126), **this contract is authoritative**.
 
@@ -11,7 +11,7 @@
 4. Phase 13 contract (invoice acceptance + signature + email)
 5. Phase 16B quotation contract
 6. **This Phase 16G contract**: authoritative for the rules listed above, which it amends in documents 1 to 5
-7. Locked DB schema: V1–V21 today, including the two 16G migrations, V20 in PR 2 and V21 in PR 4 (section 2)
+7. Locked DB schema: V1–V21, including the two 16G migrations, V20 in PR 2 and V21 in PR 4 (section 2)
 
 **Order number format (locked):** `{store_code}.{salesperson_code}.{order_sequence_number_padded_5}`, for example `SYD-CBD.LC1.00042`. It is the document number shown under `TAX INVOICE` and used in invoice and signature file names.
 
@@ -67,7 +67,7 @@
 | 6 | #120 polling (on server state) and the signing-draft reset when a refresh installs another invoice version, #121 financial refresh and an edit-gated Update Sale Price, #122 version-bound accepted quote reads, #124 provenance boolean and whole-second quote timestamps, and the derived `QuoteIssuedSummary.last_email_delivered` (section 13). |
 
 - PRs land in this order. The PR 3 client changes ship in PR 3 with the server change, not in PR 5, so no interval exists in which a deployed client and server disagree on a request shape.
-- **Migrations:** exactly two new migrations, V20 in PR 2 and V21 in PR 4. V1 to V20 are never edited. Both are outside the CI guard (V1–V13) and fold into the Phase 17 schema-only squash/baseline.
+- **Migrations:** exactly two new migrations, V20 in PR 2 and V21 in PR 4. V1 to V21 are never edited. Both are outside the CI guard (V1–V13) and fold into the Phase 17 schema-only squash/baseline.
 - PRs 2 to 6 may make narrowly scoped corrections to this contract, the other contracts, the UX lock, `CLAUDE.md` and `docs/openapi.yaml` where implementation shows PR 1 got a detail wrong. Each such correction is called out in that PR's report.
 
 ---
@@ -99,7 +99,7 @@
 
 ## 4. Every invoice version freezes its words (#125)
 
-**PR 2.** Today (16F, D6 and D7) every invoice render reads the Invoice To name and billing lines live, and a Path B invoice (Create, Rewrite and their payment, void and D.8 versions) reads the business's per-flooring-type terms live. After PR 2 nothing customer-facing is read live at render time except the business presentation (name, logo, accent, ABN, bank details, store contact and salesperson), which #125 does not freeze.
+**PR 2.** Before PR 2 (16F, D6 and D7) every invoice render read the Invoice To name and billing lines live, and a Path B invoice (Create, Rewrite and their payment, void and D.8 versions) read the business's per-flooring-type terms live. After PR 2 nothing customer-facing is read live at render time except the business presentation (name, logo, accent, ABN, bank details, store contact and salesperson), which #125 does not freeze.
 
 ### 4.1 Data model (PR 2 migration)
 
@@ -112,7 +112,7 @@ The PR 2 migration adds three nullable columns to `invoice`:
 | `customer_address_line2_snapshot` | `TEXT` | yes | Billing line 2: `suburb state_code postcode`. |
 
 - Terms reuse the existing `invoice.terms_snapshot` (`TEXT NULL`, `V19`). No new terms column is added.
-- **Backfill:** the migration fills the three columns for existing rows from the order's saved customer row and BILLING address row, with the derivation above. A missing customer or billing row leaves the matching columns null. Terms are **not** backfilled. An existing Path B row whose `terms_snapshot` is null renders no terms page from PR 2 onwards, until a Rewrite creates a version with frozen terms.
+- **Backfill:** the migration fills the three columns for existing rows from the order's saved customer row and BILLING address row, with the derivation above. A missing customer or billing row leaves the matching columns null. Terms are **not** backfilled. An existing Path B row whose `terms_snapshot` is null keeps the terms page in its own stored PDF, but from PR 2 its InvoiceDetail and every later payment, void and signing version show no terms, until a Rewrite or Path A writes a version with frozen terms (section 4.4).
 - The decision record says production has no invoice rows. That is a dated statement from the decision (13 October 2026), not a database check made by this contract.
 - No column is exposed except through the InvoiceDetail fields in section 4.5 and the public view in section 9.3.
 
@@ -285,7 +285,7 @@ See section 9.4. The token gate, body validation and PNG pre-validation run befo
 
 ## 6. Signed invoices are emailed after commit
 
-**Policy (staff rule):** a signed invoice is always emailed to the saved customer email when it is signed or converted, by any route: in-store D.8 (today), Create Invoice from the accepted quote (Path A, **PR 3**, amending 16F D6 "no email sent") and remote signing (**PR 4**). Payment and payment void still never auto-email, including when they carry a signed version forward. Manual Re-send (D.9) stays the retry route. Invoice link emails (section 8) are not signed-PDF emails.
+**Policy (staff rule):** a signed invoice is always emailed to the saved customer email when it is signed or converted, by any route: in-store D.8 (since Phase 13), Create Invoice from the accepted quote (Path A, **since PR 3**, amending 16F D6 "no email sent") and remote signing (**since PR 4**). Payment and payment void still never auto-email, including when they carry a signed version forward. Manual Re-send (D.9) stays the retry route. Invoice link emails (section 8) are not signed-PDF emails.
 
 ### 6.1 Per route
 
@@ -303,14 +303,14 @@ See section 9.4. The token gate, body validation and PNG pre-validation run befo
 ### 6.2 Commit boundary
 
 - **Before commit:** any failure (validation, render, storage, insert, commit) rolls everything back and deletes only this request's new files. No email and no store notification are sent, no marker moves. This is the existing transactional 500 or 4xx.
-- **After commit:** the signing or conversion stands. Delivery, a skipped delivery, a sender runtime failure of any kind, and a failure of the stamp transaction are all non-fatal. Each is logged at WARN with the order id and version number (never the recipient, body, token, link or exception), and the response is still 201. **No post-commit step may turn a committed signing or conversion into a 500.** Before PR 3, D.8 caught only the transport exception, so another sender failure or a stamp failure returned 500 after commit; PR 3 fixed D.8 and applied the same rule to Path A (implemented), and PR 4 applies it to remote signing.
+- **After commit:** the signing or conversion stands. Delivery, a skipped delivery, a sender runtime failure of any kind, and a failure of the stamp transaction are all non-fatal. Each is logged at WARN with the order id and version number (never the recipient, body, token, link or exception), and the response is still 201. **No post-commit step may turn a committed signing or conversion into a 500.** Before PR 3, D.8 caught only the transport exception, so another sender failure or a stamp failure returned 500 after commit; PR 3 fixed D.8 and applied the same rule to Path A (implemented), and PR 4 applied it to remote signing.
 - Path A's 201 always describes the version it appended: after a recorded delivery that version is re-read in the stamp transaction, so a version another request commits between the commit and the stamp never becomes its response (the mirror still follows the current version). D.8 keeps its response rule (section 6.3).
 - A stamp failure after a successful delivery leaves both markers null, so the Invoice tab shows "Accepted but not emailed yet" and offers Re-send. The D.8 and Path A messages report the delivery outcome; the markers report what was recorded. For example, a D.8 whose delivery succeeds and whose stamp then fails returns 201 with `Invoice accepted and emailed to the customer.` and both markers null; a D.8 whose delivery fails returns 201 with the not-emailed message.
 - No customer email and no store notification are ever sent for a rolled-back request or a stale or other refused request.
 
 ### 6.3 Known limitation (not fixed in 16G)
 
-The delayed-email windows found by the gate audit (F49) remain: a D.8 or D.9 response can describe a version newer than the one emailed, a customer can receive a PDF that is no longer current, and D.9 reads its row and file in separate statements. Making post-commit failures non-throwing does not fix them. They are a proposed follow-up (section 17).
+The delayed-email windows found by the gate audit (F49) remain: a D.8 or D.9 response can describe a version newer than the one emailed, a customer can receive a PDF that is no longer current, and D.9 reads its row and file in separate statements. Making post-commit failures non-throwing does not fix them. They are tracked as [#148](https://github.com/MuneebHash/flooring-sales-portal/issues/148) (section 17).
 
 ---
 
@@ -466,7 +466,7 @@ The response's `expires_at` is informational. The Invoice tab never starts or ti
 - Token-only: no slug, no session read or created, no `Set-Cookie`, no `RequestContextGuard`. The page calls them without credentials and never through the protected API client.
 - Unknown or malformed token, on all three: 404 `INVOICE_TOKEN_NOT_FOUND`, message exactly `Invoice not found.`. Status, code and message are identical for both.
 - There is no viewed-tracking endpoint and nothing is stamped on a read.
-- Rate limiting is not implemented (Phase 17, [#128](https://github.com/MuneebHash/flooring-sales-portal/issues/128), to be widened to these endpoints). No 429 is documented.
+- Rate limiting is not implemented (Phase 17, [#128](https://github.com/MuneebHash/flooring-sales-portal/issues/128), widened to these endpoints by an issue comment). No 429 is documented.
 - The page protects the token-bearing URL per element, as the quote page does (`referrerPolicy="no-referrer"` on the logo, `rel="noopener noreferrer"` on Pay online).
 
 ### 9.3 GET view
@@ -474,7 +474,7 @@ The response's `expires_at` is informational. The Invoice tab never starts or ti
 `GET /api/v1/public/invoices/{token}` → **200** `{ "data": PublicInvoiceView, "message": "Invoice loaded." }`.
 
 - **Token gate:** shape, hash lookup and lazy expiry (section 7.7). An unknown or malformed token gives 404. A found token always yields 200 with a `state`.
-- **One snapshot:** the token's status, the order, the current invoice version and the business presentation are read in **one** read-only `REPEATABLE_READ` transaction (the `QuoteService.getWorkspace` precedent), so the state and the content always come from the same committed moment. A token killed between the gate and this read is reported in its dead state, never with `ACTIVE` content. (Unlike the quote GET, which takes the state from the earlier resolve.)
+- **One snapshot:** the token's status, the order, the current invoice version and the business presentation are read in **one** read-only `REPEATABLE_READ` transaction (the `QuoteService.getWorkspace` precedent), so the state and the content always come from the same committed moment. A token killed between the gate and this read is reported in its dead state, never with `ACTIVE` content. (Unlike the quote GET, which takes the state from the earlier resolve.) An expiry that falls due between the gate and this read (a token the snapshot still shows `ACTIVE`, now past `expires_at`; a dead token is reported in its own state and never changes status, section 7.5) sends the request through the gate once more (section 7.7), so the `EXPIRED` flip commits before the GET returns 200 with the `EXPIRED` state (PR 4 interpretation I-4).
 - **Invariant check:** a token the snapshot shows `ACTIVE` whose current version is signed breaks section 7.6. The server never presents a signed version as signable: it returns 500 with the generic error envelope and no content.
 - **ACTIVE payload:** the fields below. **Dead payload:** `state`, `business_name` and `message`; every other field is `null`, and there is no document content and no action. Every key is always present (null values serialised, conventions §3).
 
@@ -626,7 +626,7 @@ Nothing else is accepted: no name, no declaration flags, no money values. The tw
 
 1. Token gate (404; lazy expiry; 410 for a dead link).
 2. `version_number` query parameter: missing, `Required.`; not a positive integer, `Must be a positive integer.` (400 `VALIDATION_FAILED`).
-3. One read-only snapshot: the token's status (dead: 410), the current invoice version and its stored file row. `version_number` ≠ the current version gives 409 `INVOICE_VERSION_STALE`, `Invoice updated, please refresh`.
+3. One read-only snapshot: the token's status (dead: 410), the current invoice version and its stored file row. An expiry that falls due between the gate and this snapshot (a token the snapshot still shows `ACTIVE`, now past `expires_at`; a dead token keeps its own 410) sends the request through the gate once more (section 7.7), so the `EXPIRED` flip commits before the 410 `INVOICE_LINK_EXPIRED` (PR 4 interpretation I-4). `version_number` ≠ the current version gives 409 `INVOICE_VERSION_STALE`, `Invoice updated, please refresh`.
 4. **200** `application/pdf`, `Content-Disposition: inline; filename="invoice-{order_number}-v{version_number}.pdf"` (the stored name), the stored bytes verbatim. A file missing on disk gives 500.
 
 This is the read binding that keeps the Preview PDF button on the version shown: a payment or void between page load and preview gives 409, and the page re-reads instead of opening another version's PDF. History access (an older version's PDF) is not possible on the public surface.
@@ -670,7 +670,7 @@ As section 6: the signed PDF of the appended version to the saved customer email
 
 ### 10.5 Quote links (D5(c) extended)
 
-In the same transaction and under the same lock, remote invoice acceptance cancels the order's `ISSUED` quote version, if one exists, and its `ACTIVE` quote token (both `CANCELLED`), exactly as D.8 does today (16F D5(c)). With no `ISSUED` quote it is a no-op. An `ACCEPTED` quote is never revoked and never blocks signing (D5(d)). Quote acceptance still never creates an invoice, and quote sends, acceptance and cancellation never touch invoice links. Path A keeps its rule that it never changes a quote version or quote token; its 16G side effects are the customer PDF email (section 6) and, since PR 4, killing an `ACTIVE` invoice token as `SIGNED` (section 7.5).
+In the same transaction and under the same lock, remote invoice acceptance cancels the order's `ISSUED` quote version, if one exists, and its `ACTIVE` quote token (both `CANCELLED`), exactly as D.8 has done since 16F (D5(c)). With no `ISSUED` quote it is a no-op. An `ACCEPTED` quote is never revoked and never blocks signing (D5(d)). Quote acceptance still never creates an invoice, and quote sends, acceptance and cancellation never touch invoice links. Path A keeps its rule that it never changes a quote version or quote token; its 16G side effects are the customer PDF email (section 6) and, since PR 4, killing an `ACTIVE` invoice token as `SIGNED` (section 7.5).
 
 A remote invoice signature sets `accepted_at` at signing time, so the 16F D5(b) comparison applies unchanged: a quote signed earlier can no longer be converted; a quote signed strictly later still can.
 
@@ -710,7 +710,7 @@ The dashboard's `invoice_accepted` keeps reading the current version's `accepted
 
 | Action | LAID | CANCELLED |
 |---|---|---|
-| Send link (PR 4) | allowed | no special rule (allowed, as for every invoice action today) |
+| Send link (PR 4) | allowed | no special rule (allowed, as for every invoice action) |
 | Public GET, accept and pdf (PR 4) | allowed | no special rule |
 | D.8, Path A, payment, void, Re-send | allowed (unchanged) | unchanged |
 | D.2 Rewrite | 422 `ORDER_LOCKED` (unchanged) | unchanged |
@@ -816,11 +816,11 @@ Public invoice endpoints never return staff wording: the only messages a custome
 
 The detailed UX is in the UX lock §20 (Invoice tab and public invoice page) and §13–§14 (quote pages). In short:
 
-- **Invoice tab:** Invoice To from InvoiceDetail and the terms-source wording for `BUSINESS` (PR 2); D.8 sends `expected_version_number`, drops the name part and handles the stale 409; the frozen-name gate (PR 3); the unsigned bottom bar became **Accept Invoice | Accept Remotely**, Accept Remotely sends the link and shows success or failure, and Download PDF became **Preview PDF** (PR 5, implemented); polling on the server field `invoice_link_expires_at` (never displayed) and the signing-draft reset when a refresh installs another version (PR 6, implemented).
-- **Quote tab:** `{"quote_version_id": N}` and the stale 409 (PR 3); #120, #122 and #124, and the Not delivered badge from `last_email_delivered` (PR 6, implemented).
-- **Details of Sale:** #121 (PR 6, implemented).
-- **Public pages:** `/i/{token}` (PR 5, implemented); specific dead-link messages on both pages (PR 5, implemented).
-- Muneeb reviews the Invoice tab result in the implementation smoke test.
+- **Invoice tab:** Invoice To from InvoiceDetail and the terms-source wording for `BUSINESS` (PR 2); D.8 sends `expected_version_number`, drops the name part and handles the stale 409; the frozen-name gate (PR 3); the unsigned bottom bar became **Accept Invoice | Accept Remotely**, Accept Remotely sends the link and shows success or failure, and Download PDF became **Preview PDF** (PR 5); polling on the server field `invoice_link_expires_at` (never displayed) and the signing-draft reset when a refresh installs another version (PR 6).
+- **Quote tab:** `{"quote_version_id": N}` and the stale 409 (PR 3); #120, #122 and #124, and the Not delivered badge from `last_email_delivered` (PR 6).
+- **Details of Sale:** #121 (PR 6).
+- **Public pages:** `/i/{token}` (PR 5); specific dead-link messages on both pages (PR 5).
+- The 16G single-session browser smoke passed on 23 October 2026 before PR #154 merged; the two-session scenarios are deferred to Playwright after deployment.
 
 ---
 
@@ -840,25 +840,25 @@ New backend tests self-seed (no dependence on the V4 legacy seed). No frontend t
 
 ## 17. Known limitations and follow-ups
 
-Proposed follow-up tickets from the 16G decisions, **not yet filed** (Muneeb files them after PR 1):
+The follow-up tickets proposed in the 16G decisions were filed on 22 October 2026:
 
-- D.8 and D.9 post-commit email windows: the emailed PDF, the stamped row and the response can describe different versions (audit F49; the real defects only, not ordinary delivery timing). Post-pilot.
-- Rewrite from a stale screen clears a remote signature the salesperson never saw (F52). Batch A or post-pilot.
-- In-store D.8 trusts the declared PNG type; apply the public path's content checks (F55). Phase 17.
-- Public controller tests run without the security filter chain; test recorders retain bearer links (F57, F59). Phase 17 or 19.
-- Rollback hooks on an unknown commit outcome (F60). Hardening.
+- [#148](https://github.com/MuneebHash/flooring-sales-portal/issues/148): D.8 and D.9 post-commit email windows: the emailed PDF, the stamped row and the response can describe different versions (audit F49; the real defects only, not ordinary delivery timing); the issue also covers concurrent quote or invoice link sends delivering a superseded link last. Post-pilot hardening, with the Phase 17 email provider; related [#142](https://github.com/MuneebHash/flooring-sales-portal/issues/142).
+- [#149](https://github.com/MuneebHash/flooring-sales-portal/issues/149): Rewrite from a stale screen clears a remote signature the salesperson never saw (F52). Batch A or post-pilot: Muneeb's call, still open.
+- [#150](https://github.com/MuneebHash/flooring-sales-portal/issues/150): In-store D.8 trusts the declared PNG type; apply the public path's content checks (F55). Phase 17.
+- [#151](https://github.com/MuneebHash/flooring-sales-portal/issues/151): Public controller tests run without the security filter chain; test recorders retain bearer links (F57, F59). Phase 17 or Phase 19, still open.
+- [#152](https://github.com/MuneebHash/flooring-sales-portal/issues/152): Rollback hooks on an unknown commit outcome (F60). Deferred (post-pilot) hardening.
 
-Edits proposed to existing issues (Muneeb): #128 adds the invoice public endpoints; #138 lists the extra drift folded into PR 1; #136 adds the stale comments listed by the audit (F63); #114 adds the Invoice tab read binding (F53). W1 (the `business_quick_description` delete order) still needs a ticket.
+The edits proposed to existing issues were posted as issue comments on 22 October 2026: #128 adds the invoice public endpoints; #138 lists the remaining drift (the two broken upload response refs and the 69 `nullable` + `allOf` properties); #136 adds the stale comments listed by the audit (F63); #114 adds the Invoice tab read binding (F53). W1 (the `business_quick_description` delete order) is [#153](https://github.com/MuneebHash/flooring-sales-portal/issues/153), Phase 17 onboarding.
 
 ---
 
 ## Appendix — OpenAPI alignment
 
-`docs/openapi.yaml` is updated in PR 1 as the target contract. Every new or changed element carries its implementation PR in its description, and a path or field is not evidence of an implementation.
+`docs/openapi.yaml` was updated in PR 1, before any 16G code. Every new or changed element names, in its description, the PR that implemented it, and all six PRs have merged; a path or field alone is still not evidence of an implementation.
 
 - **New paths:** `POST /orders/{orderId}/invoices/current/send-link` (`sendInvoiceLink`, PR 4); `GET /public/invoices/{token}` (`getPublicInvoice`), `POST /public/invoices/{token}/accept` (`acceptPublicInvoice`) and `GET /public/invoices/{token}/pdf` (`downloadPublicInvoicePdf`), PR 4, each with a `/api/v1` server override, `security: []` and the new `InvoiceToken` path parameter; `GET /orders/{orderId}/quote/accepted/{quoteVersionId}/pdf` (`downloadAcceptedQuoteVersionPdf`) and `GET /orders/{orderId}/quote/accepted/{quoteVersionId}/signature` (`downloadAcceptedQuoteVersionSignature`), PR 6.
-- **Changed operations:** `acceptCurrentInvoice` (PR 3: expected version, no name part, stale 409, non-throwing post-commit; the message follows the delivery outcome, so a stamp failure after a successful delivery keeps the emailed message, section 6.2; the signing version copies `invoice_date` from the current version, where today it is the signing day, section 5.4); `createInvoiceFromQuote` (PR 3: `CreateInvoiceFromQuoteRequest`, stale 409, automatic email whose message follows the delivery outcome; PR 2: frozen identity); `createInvoice`, `rewriteInvoice` (PR 2 freeze; PR 4 Rewrite kills the link); `recordPayment`, `voidPayment` (PR 2 copy; link survives); `downloadQuotePdf` `type=accepted` and `downloadAcceptedQuoteSignature` (deprecated in PR 1; removed in PR 6). Description notes only: `getCurrentInvoice` (the derived `invoice_link_expires_at`, PR 4; Invoice tab polling on it, PR 6), `getQuoteWorkspace` (PR 6, including `last_email_delivered`), `getPublicQuote` (#126 page behaviour, token-kind isolation), `acceptPublicQuote` (D5(c) on remote invoice signing, PR 4), `resendCurrentInvoice` (the retry route for the new signed-PDF emails) and `downloadCurrentInvoicePdf` (the Preview PDF label, PR 5).
+- **Changed operations:** `acceptCurrentInvoice` (PR 3: expected version, no name part, stale 409, non-throwing post-commit; the message follows the delivery outcome, so a stamp failure after a successful delivery keeps the emailed message, section 6.2; the signing version copies `invoice_date` from the current version, where before PR 3 it was the signing day, section 5.4); `createInvoiceFromQuote` (PR 3: `CreateInvoiceFromQuoteRequest`, stale 409, automatic email whose message follows the delivery outcome; PR 2: frozen identity); `createInvoice`, `rewriteInvoice` (PR 2 freeze; PR 4 Rewrite kills the link); `recordPayment`, `voidPayment` (PR 2 copy; link survives); `downloadQuotePdf` `type=accepted` and `downloadAcceptedQuoteSignature` (deprecated in PR 1; removed in PR 6). Description notes only: `getCurrentInvoice` (the derived `invoice_link_expires_at`, PR 4; Invoice tab polling on it, PR 6), `getQuoteWorkspace` (PR 6, including `last_email_delivered`), `getPublicQuote` (#126 page behaviour, token-kind isolation), `acceptPublicQuote` (D5(c) on remote invoice signing, PR 4), `resendCurrentInvoice` (the retry route for the new signed-PDF emails) and `downloadCurrentInvoicePdf` (the Preview PDF label, PR 5).
 - **New schemas:** `CreateInvoiceFromQuoteRequest`; `InvoiceLinkSendResult` and its wrapper; `PublicInvoiceState`; `PublicInvoiceView` and its wrapper; `PublicInvoiceAcceptRequest`; `PublicInvoiceAcceptResult` and its wrapper. New shared response `InvoiceLinkGone` (410). New parameters `InvoiceToken` (PR 4) and `QuoteVersionId` (PR 6).
-- **Changed schemas:** `SignatureAcceptRequest` (`expected_version_number` + `signature`; no name part or 150-character limit); `InvoiceDetail` (three frozen identity fields, PR 2; the derived `invoice_link_expires_at`, PR 4; `terms_source` enum `QUOTE` / `BUSINESS`; an `invoice_date` description: who dates each version today, and the signing versions that copy it from PR 3 and PR 4); `QuoteIssuedSummary` (the derived `last_email_delivered`, PR 6); `QuoteAcceptedSummary` (`invoice_created_from_this_version`; versioned `signature_download_path`); `Timestamp`, `PublicQuoteView.expires_at` and `QuoteAcceptedSummary.accepted_at` (the whole-second note, PR 6; `Timestamp` also notes that whole-second strings never decide delivery); `PublicQuoteView.message` (shown by the page from PR 5); `StandardError.code` (a description listing the 16G codes; still a free-form string, not an enum); `DashboardOrderRow.last_emailed_at` (#138 item 1).
+- **Changed schemas:** `SignatureAcceptRequest` (`expected_version_number` + `signature`; no name part or 150-character limit); `InvoiceDetail` (three frozen identity fields, PR 2; the derived `invoice_link_expires_at`, PR 4; `terms_source` enum `QUOTE` / `BUSINESS`; an `invoice_date` description: who dates each version, and the signing versions that copy it: D.8 since PR 3 (before PR 3, the signing day) and remote signing since PR 4); `QuoteIssuedSummary` (the derived `last_email_delivered`, PR 6); `QuoteAcceptedSummary` (`invoice_created_from_this_version`; versioned `signature_download_path`); `Timestamp`, `PublicQuoteView.expires_at` and `QuoteAcceptedSummary.accepted_at` (the whole-second note, PR 6; `Timestamp` also notes that whole-second strings never decide delivery); `PublicQuoteView.message` (shown by the page since PR 5); `StandardError.code` (a description listing the 16G codes; still a free-form string, not an enum); `DashboardOrderRow.last_emailed_at` (#138 item 1).
 - `EmptyObjectRequest` is unchanged and keeps its other eight consumers; `sendInvoiceLink` uses it too.
-- #138 items 2 to 5 are corrected in the same PR: the three undocumented endpoints are documented as they are implemented today (`getPublicBusiness`, `GET /public/businesses/{slug}` with the `/api/v1` server override and `security: []`; `getInvoiceConfig`, `GET /invoice-config`; `listQuickDescriptions`, `GET /quick-descriptions`), with the schemas `PublicBusinessResponse`, `TenantInvoiceConfigResponse` (each with a wrapper) and `QuickDescriptionsResponse`, the `BusinessSlug` parameter and a `Tenant` tag; `info.description` lists the 16B and 16G contracts; the rate-limit notes cite #128; the dangling "Not a documented response." is removed.
+- #138 items 2 to 5 were corrected in PR 1: the three undocumented endpoints were documented as implemented at the PR 1 base (`getPublicBusiness`, `GET /public/businesses/{slug}` with the `/api/v1` server override and `security: []`; `getInvoiceConfig`, `GET /invoice-config`; `listQuickDescriptions`, `GET /quick-descriptions`), with the schemas `PublicBusinessResponse`, `TenantInvoiceConfigResponse` (each with a wrapper) and `QuickDescriptionsResponse`, the `BusinessSlug` parameter and a `Tenant` tag; `info.description` lists the 16B and 16G contracts; the rate-limit notes cite #128; the dangling "Not a documented response." was removed.

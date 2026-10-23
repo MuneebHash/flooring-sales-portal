@@ -7,10 +7,10 @@ info:
     Invoice Acceptance + Signature + Email addendum
     (docs/API-Contracts-Phase13-Acceptance-Signature-Email.md), the Phase 16B quotation contract
     (docs/API-Contracts-Phase16B-Quotation.md) and the Phase 16G invoice link contract
-    (docs/API-Contracts-Phase16G-Invoice-Link.md). Phase 16G elements are the TARGET contract,
-    written in 16G PR 1 before any 16G code: every 16G path, field, value or rule names the 16G PR
-    (2 to 6) that implements it and is not implemented until that PR merges. A path or field here
-    is not evidence of an implementation.
+    (docs/API-Contracts-Phase16G-Invoice-Link.md). Phase 16G elements were written in 16G PR 1,
+    before any 16G code; all six 16G PRs have merged, and every 16G path, field, value or rule
+    names the 16G PR (2 to 6) that implemented it. A path or field here is not, on its own,
+    evidence of an implementation.
 
 servers:
   - url: /api/v1/{slug}
@@ -1138,10 +1138,6 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '413':
-          $ref: '#/components/responses/PayloadTooLarge'
-        '415':
-          $ref: '#/components/responses/UnsupportedMediaType'
         '500':
           $ref: '#/components/responses/InternalServerError'
 
@@ -2455,7 +2451,7 @@ paths:
         is written. A blank details of sale or a zero total does not block acceptance.
         On success the same transaction stores the server-normalised signature PNG (the decoded
         pixels re-encoded: same dimensions and pixels as the upload, ancillary chunks and trailing
-        bytes dropped - the bytes the signed PDF embeds and downloadAcceptedQuoteSignature
+        bytes dropped - the bytes the signed PDF embeds and downloadAcceptedQuoteVersionSignature
         streams) and the signed quote PDF (rendered from the frozen issued snapshot with the
         acceptance area filled), moves the version ISSUED -> ACCEPTED (its snapshot total is the
         legal billing number) and the token ACTIVE -> CONSUMED (the link is dead: GET then returns
@@ -2479,7 +2475,7 @@ paths:
         downloadAcceptedQuoteVersionPdf) and is never served on the public surface. Since 16G PR 4
         a remote invoice signing (acceptPublicInvoice) also cancels an ISSUED quote and its ACTIVE
         token, as the in-app invoice acceptance does (16F decision D5(c), extended), giving
-        QUOTE_LINK_CANCELLED here. Rate limiting (contract §8) is not implemented at this base
+        QUOTE_LINK_CANCELLED here. Rate limiting (contract §8) is not implemented
         (Phase 17, #128).
       parameters:
         - $ref: '#/components/parameters/Token'
@@ -2586,8 +2582,8 @@ paths:
         ACTIVE returns the document (PublicInvoiceView); a dead state (REPLACED, REWRITTEN,
         SIGNED, EXPIRED) returns only state, business_name and its message, every other field
         null. No viewed tracking: nothing is stamped on a read. Cost-free and id-free (see
-        PublicInvoiceView). Rate limiting is not implemented (Phase 17, #128, to be widened to
-        these endpoints); no 429 response is documented.
+        PublicInvoiceView). Rate limiting is not implemented (Phase 17, #128, widened to these
+        endpoints by an issue comment); no 429 response is documented.
       parameters:
         - $ref: '#/components/parameters/InvoiceToken'
       responses:
@@ -3722,10 +3718,10 @@ components:
           type: string
           nullable: true
           description: >-
-            The name recorded at acceptance, never typed. Today D.8 records the name the Invoice
-            tab sends (derived from the saved customer). From 16G PR 3 D.8 records the version's
-            frozen customer_name_snapshot verbatim, full length; remote signing does the same
-            (PR 4); Path A inherits the accepted quote's name (unchanged).
+            The name recorded at acceptance, never typed. Before 16G PR 3 D.8 recorded the name
+            the Invoice tab sent (derived from the saved customer). Since 16G PR 3 D.8 records the
+            version's frozen customer_name_snapshot verbatim, full length; remote signing does the
+            same (PR 4); Path A inherits the accepted quote's name (unchanged).
         accepted_signature_present:
           type: boolean
         accepted_signature_download_path:
@@ -3737,7 +3733,7 @@ components:
             - $ref: '#/components/schemas/Timestamp'
           description: >-
             When this version's signed PDF was emailed successfully, or null. Set by Accept and
-            Re-send today; from 16G PR 3 also by createInvoiceFromQuote; since 16G PR 4 also by
+            Re-send; since 16G PR 3 also by createInvoiceFromQuote; since 16G PR 4 also by
             remote signing. An invoice link email (sendInvoiceLink) never sets it.
         terms_html:
           type: string
@@ -3863,7 +3859,7 @@ components:
           description: >
             Customer signature image. PNG only (image/png), non-empty, max 2 MB
             (2097152 bytes). Phase 13. D.8 checks the declared type and size; PNG content checks
-            are a proposed follow-up (16G contract section 17, F55).
+            are tracked as #150 (Phase 17; F55).
 
 
     PaymentTransactionRead:
@@ -5785,7 +5781,7 @@ components:
             the decoded pixels are re-encoded as a clean PNG and only those bytes are stored and
             embedded in the signed PDF - same dimensions and pixels as the upload, but ancillary
             chunks and any bytes after IEND are dropped, so the stored signature (and the protected
-            downloadAcceptedQuoteSignature response) is not byte-identical to the upload.
+            downloadAcceptedQuoteVersionSignature response) is not byte-identical to the upload.
             accepted_customer_name is NOT a part: it is taken server-side from the issued version's
             frozen V17 customer_name_snapshot (16F decision D1), never the live customer record.
 
