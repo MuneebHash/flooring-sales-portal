@@ -60,7 +60,7 @@ Three public surfaces sit outside the `/api/v1/{slug}/...` structure:
 - JSON only
 - `Content-Type: application/json`
 - no query-string parameters for data mutation
-- query-string parameters are used only for filtering, searching, and pagination on GET requests
+- query-string parameters are used only for filtering, searching, and pagination on GET requests; the exceptions are two PDF reads: the public invoice PDF read takes `?version_number=N` (16G PR 4) and `downloadQuotePdf` takes `?type=`
 
 ### Response bodies
 - JSON only
@@ -604,7 +604,7 @@ Each invoice snapshot stores internally:
 The customer-facing invoice PDF shows:
 - invoice number and date
 - due date
-- customer name and billing address (from 16G PR 2, the version's stored words; today read live at render)
+- customer name and billing address (since 16G PR 2, the version's stored words; before PR 2 read live at render)
 - details of sale
 - total amount inc GST (`sale_price_inc_gst`)
 - payment made (`total_paid`)
