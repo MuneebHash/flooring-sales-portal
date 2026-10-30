@@ -40,7 +40,16 @@ type Props = {
   // CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID so the salesperson can fix the
   // email where it lives.
   onGoToCustomer?: () => void
+  // Batch A #107 (D1): awaitable flush of the Customer tab's customer, installation and
+  // billing autosaves (shell-owned wrapper; it resolves true at once on a known LAID order,
+  // so the lock still never gates this tab). Accept, Re-send and Accept Remotely email the
+  // saved customer address, so each runs it before its request; false blocks the action.
+  flushCustomerAutosave: () => Promise<boolean>
 }
+
+// Batch A #107 (D1) - the plain action error when the Customer tab flush fails.
+const CUSTOMER_NOT_SAVED_MESSAGE =
+  'Could not save the latest Customer tab changes. Complete or fix the customer details and addresses on the Customer tab, then try again.'
 
 const MONEY_FORMATTER = new Intl.NumberFormat('en-AU', {
   style: 'currency',
@@ -186,6 +195,7 @@ export function InvoiceTab({
   orderNumber,
   saleDetails,
   onGoToCustomer,
+  flushCustomerAutosave,
 }: Props) {
   // Only ever the CURRENT/latest invoice — no version list, no history.
   const [invoice, setInvoice] = useState<InvoiceDetail | null>(null)
@@ -623,6 +633,15 @@ export function InvoiceTab({
     // poll included) may land after it.
     raiseReadFloor()
     try {
+      // Batch A #107 (D1): pending Customer tab saves are flushed before the version
+      // check and the accept (the signed PDF is emailed to the saved address). A failed
+      // flush stops here: nothing is posted and the ink and both ticks are kept.
+      const customerSaved = await flushCustomerAutosave()
+      if (!mountedRef.current) return
+      if (!customerSaved) {
+        setActionError(CUSTOMER_NOT_SAVED_MESSAGE)
+        return
+      }
       // BEST-EFFORT STALE-TAB HINT: the accept endpoint targets /current, but
       // another session may have recorded a payment or rewritten the invoice
       // after this tab loaded — the customer would have reviewed/signed an
@@ -725,6 +744,14 @@ export function InvoiceTab({
     // 16G PR 6 - the re-send starts: no earlier read may land after it.
     raiseReadFloor()
     try {
+      // Batch A #107 (D1): the invoice is emailed to the saved customer address, so
+      // pending Customer tab saves are flushed first; a failed flush sends nothing.
+      const customerSaved = await flushCustomerAutosave()
+      if (!mountedRef.current) return
+      if (!customerSaved) {
+        setActionError(CUSTOMER_NOT_SAVED_MESSAGE)
+        return
+      }
       const res = await resendCurrentInvoice(orderId)
       if (!mountedRef.current) return
       // Success bumps only last_emailed_at (no new version) — apply the returned state
@@ -779,6 +806,15 @@ export function InvoiceTab({
     // 16G PR 6 - the send starts: no earlier read may land after it.
     raiseReadFloor()
     try {
+      // Batch A #107 (D1): the link is emailed to the saved customer address, so pending
+      // Customer tab saves are flushed first. A failed flush is not a send attempt: it
+      // returns before the request and before the follow-up re-read.
+      const customerSaved = await flushCustomerAutosave()
+      if (!mountedRef.current) return
+      if (!customerSaved) {
+        setActionError(CUSTOMER_NOT_SAVED_MESSAGE)
+        return
+      }
       let reread = false
       try {
         const res = await sendInvoiceLink(orderId)

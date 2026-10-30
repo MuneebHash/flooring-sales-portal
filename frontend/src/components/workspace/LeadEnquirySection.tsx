@@ -1,5 +1,4 @@
 import { useEffect, useRef, useState } from 'react'
-import { Button } from '../ui/Button'
 import { Field } from '../ui/Field'
 import { Input } from '../ui/Input'
 import { Textarea } from '../ui/Textarea'
@@ -11,10 +10,11 @@ import type {
   LeadType,
   OrderEnquiry,
 } from '../../lib/api/orderWorkspaceApi'
+import { registerPendingSave } from '../../lib/pendingSaveRegistry'
 
 // Phase 15F Lead Enquiry form — rendered inside the Customer tab as its own
-// sub-section with a SEPARATE "Save Lead Enquiry" button AND background autosave.
-// It never touches the existing customer/address save. The backend is the source
+// sub-section, saved only by its own background autosave (no manual save control).
+// It never touches the Customer tab's customer/address autosave. The backend is the source
 // of truth: the form seeds ONCE from the saved enquiry (null = empty form) and the
 // confirmed row is lifted to workspace state via onSaved. The local form stays the
 // active source for in-progress edits — it is deliberately NOT re-seeded from the
@@ -23,12 +23,13 @@ import type {
 
 // Debounce after a change before autosaving. Short enough that clicking away saves
 // promptly, long enough to not fire on every keystroke. Text fields also flush on
-// blur, and any pending dirty edit is flushed when the component unmounts.
+// blur, and any pending dirty edit is flushed when the component unmounts (queued
+// behind a save in flight, and registered so a reopen of the order waits for it).
 const AUTOSAVE_DEBOUNCE_MS = 800
 
 type Props = {
   orderId: number
-  // LAID lock — disables every input and the Save button and suppresses autosave.
+  // LAID lock — disables every input and suppresses autosave.
   locked: boolean
   enquiry?: OrderEnquiry | null
   // Lifts the server-confirmed enquiry row up so workspace state stays in sync
@@ -250,11 +251,15 @@ export function LeadEnquirySection({ orderId, locked, enquiry, onSaved }: Props)
   const savingRef = useRef(false)
   const pendingBodyRef = useRef<EnquirySaveRequest | null>(null)
   const debounceRef = useRef<number | null>(null)
+  // Batch A #101: the active save chain (runSave's whole recursive drain), so the
+  // unmount cleanup can register it with the pending-save registry.
+  const saveChainRef = useRef<Promise<void> | null>(null)
 
   // Single-flight save loop: sends exactly one PUT; on settle, drains the latest
   // queued body only if it differs from what is now persisted. lastSavedBodyRef is
-  // set ONLY after a successful response, so a failed save stays dirty and retries,
-  // and a stale older response can never advance the baseline past a newer body.
+  // set ONLY after a successful response, so a failed save stays dirty for the next
+  // trigger (including one queued during its flight), never an automatic retry, and
+  // a stale older response can never advance the baseline past a newer body.
   async function runSave(body: EnquirySaveRequest) {
     savingRef.current = true
     if (mountedRef.current) {
@@ -288,17 +293,27 @@ export function LeadEnquirySection({ orderId, locked, enquiry, onSaved }: Props)
     }
   }
 
+  // Batch A #101: starts a save chain and records its promise until it settles.
+  // runSave never rejects (it catches its own error), so the chain always resolves.
+  function startSaveChain(body: EnquirySaveRequest) {
+    const chain = runSave(body)
+    saveChainRef.current = chain
+    void chain.finally(() => {
+      if (saveChainRef.current === chain) saveChainRef.current = null
+    })
+  }
+
   // Saves the current form iff it differs from the last persisted body. If a save
   // is already in flight, queues the latest complete body for the drain.
   function requestSave() {
     if (lockedRef.current) return
     const body = buildEnquiryBody(formRef.current)
-    if (JSON.stringify(body) === lastSavedBodyRef.current) return
     if (savingRef.current) {
       pendingBodyRef.current = body
       return
     }
-    void runSave(body)
+    if (JSON.stringify(body) === lastSavedBodyRef.current) return
+    startSaveChain(body)
   }
 
   function clearDebounce() {
@@ -331,49 +346,42 @@ export function LeadEnquirySection({ orderId, locked, enquiry, onSaved }: Props)
     requestSave()
   }
 
-  // Explicit Save button: flush the debounce and save now. If nothing changed,
-  // just reassure with the saved confirmation rather than a redundant network call.
-  function handleManualSave() {
-    if (lockedRef.current) return
-    clearDebounce()
-    const body = buildEnquiryBody(formRef.current)
-    if (JSON.stringify(body) === lastSavedBodyRef.current) {
-      if (!savingRef.current && mountedRef.current) setSaved(true)
-      return
-    }
-    if (savingRef.current) {
-      pendingBodyRef.current = body
-      return
-    }
-    void runSave(body)
-  }
-
   // Flush the latest dirty edit when the section truly unmounts — i.e. the order
   // changes or the user leaves the workspace/page (CustomerTab is kept mounted
   // across top-level tab switches, so this no longer fires on a normal tab switch).
-  // The debounce already covers in-tab/in-sub-tab edits. Fire-and-forget: the lift
+  // The debounce already covers in-tab/in-sub-tab edits. Not awaited here: the lift
   // target (workspace) outlives this component. No prop re-seed effect exists.
+  // Batch A #101: the save chain still running (with the body queued for its drain)
+  // or the bare flush is registered under this order, so a reopen of the same order
+  // waits for it before reading (see pendingSaveRegistry for the limits).
   useEffect(() => {
     mountedRef.current = true
     return () => {
       mountedRef.current = false
       clearDebounce()
+      // Registered before the locked / unchanged early returns: they stop new writes,
+      // not the wait for one already running.
+      const activeChain = saveChainRef.current
+      if (activeChain !== null) {
+        registerPendingSave(orderIdRef.current, 'enquiry', activeChain)
+      }
       if (lockedRef.current) return
       const body = buildEnquiryBody(formRef.current)
-      if (JSON.stringify(body) === lastSavedBodyRef.current) return
       if (savingRef.current) {
         // A save is in flight — its drain will pick up this latest body.
         pendingBodyRef.current = body
         return
       }
+      if (JSON.stringify(body) === lastSavedBodyRef.current) return
       // Capture the order id before sending; never read orderIdRef.current inside
       // the .then (the order may have changed by the time it resolves).
       const saveOrderId = orderIdRef.current
-      saveEnquiry(saveOrderId, body)
+      const flush = saveEnquiry(saveOrderId, body)
         .then((res) =>
           onSavedRef.current({ orderId: saveOrderId, enquiry: res.data.enquiry }),
         )
         .catch(() => {})
+      registerPendingSave(saveOrderId, 'enquiry', flush)
     }
   }, [])
 
@@ -625,18 +633,6 @@ export function LeadEnquirySection({ orderId, locked, enquiry, onSaved }: Props)
             {error}
           </div>
         )}
-
-        <div className="flex justify-end">
-          <Button
-            type="button"
-            variant="success"
-            size="md"
-            onClick={handleManualSave}
-            disabled={locked || saving}
-          >
-            {saving ? 'Saving…' : 'Save Lead Enquiry'}
-          </Button>
-        </div>
       </div>
     </div>
   )

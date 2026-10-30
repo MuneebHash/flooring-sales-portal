@@ -61,6 +61,12 @@ type Props = {
   // save failed. Awaited before a Create/Rewrite invoice action so the snapshot is
   // never stale (Codex P1).
   flushDetailsAutosave: () => Promise<boolean>
+  // Batch A #107 (D1): awaitable flush of the Customer tab's customer,
+  // installation and billing autosaves (shell-owned wrapper; true without waiting
+  // on a known LAID order). Create / Rewrite freeze the saved Invoice To name and
+  // billing lines, so they run it before the Details flush (the Details draft is
+  // validated again and flushed last); false blocks them.
+  flushCustomerAutosave: () => Promise<boolean>
   detailsAutosaveSaving: boolean
   detailsAutosaveSaved: boolean
   detailsAutosaveError: string | null
@@ -454,6 +460,7 @@ export function DetailsOfSaleTab({
   applyMutationFinancialSummary,
   queueDetailsAutosave,
   flushDetailsAutosave,
+  flushCustomerAutosave,
   detailsAutosaveSaving,
   detailsAutosaveSaved,
   detailsAutosaveError,
@@ -789,17 +796,50 @@ export function DetailsOfSaleTab({
     )
   }
 
+  // Batch A #107 (D1): the latest draft prop, so the invoice flush validates the
+  // FRESHEST draft after the Customer tab wait, never the click-time closure (the
+  // inputs stay editable during that wait). Written during render; read only in
+  // async handlers, never for rendering.
+  const detailsDraftRef = useRef(detailsDraft)
+  detailsDraftRef.current = detailsDraft
+
   // Codex P1: before the backend snapshots Details of Sale into the official
   // invoice, make sure the latest draft is actually saved. A field blur only QUEUES
   // an async autosave, so a Create/Rewrite click can otherwise run before that PUT
   // settles and snapshot stale data. Validate with the same rule autosave uses
-  // (invalid -> surface the field + invoice errors and abort), then force-save the
-  // latest draft and AWAIT the autosave drain. Returns true only when the details
+  // (invalid -> surface the field + invoice errors and abort). Batch A #107 (D1):
+  // then flush the Customer tab; then validate the FRESHEST draft again and
+  // force-save it, awaiting the Details autosave drain LAST. That flush re-checks
+  // the freshest draft after its wait and nothing is awaited after it, so a Details
+  // edit made during either wait is saved or blocks the action (an unknown save
+  // outcome is not resolved here). True only when the Customer tab and the details
   // are safely persisted; false blocks the create/rewrite and keeps the user here.
   async function flushDetailsBeforeInvoice(): Promise<boolean> {
     const validationErrors = validateForm(detailsDraft)
     if (Object.keys(validationErrors).length > 0) {
       setErrors(validationErrors)
+      setInvoicePreconditions([])
+      setInvoiceActionError(
+        'Please fix the highlighted Details of Sale fields before creating or rewriting the invoice.',
+      )
+      return false
+    }
+    // Batch A #107 (D1): the invoice also freezes the saved Invoice To name and
+    // billing lines, so pending Customer tab saves are flushed too. An invalid
+    // section or a failed save blocks the create / rewrite (no request).
+    const customerSaved = await flushCustomerAutosave()
+    if (!mountedRef.current) return false
+    if (!customerSaved) {
+      setInvoicePreconditions([])
+      setInvoiceActionError(
+        'Could not save the latest Customer tab changes. Complete or fix the customer details and addresses on the Customer tab before creating or rewriting the invoice.',
+      )
+      return false
+    }
+    // The Details inputs stayed editable during the Customer tab wait.
+    const latestErrors = validateForm(detailsDraftRef.current)
+    if (Object.keys(latestErrors).length > 0) {
+      setErrors(latestErrors)
       setInvoicePreconditions([])
       setInvoiceActionError(
         'Please fix the highlighted Details of Sale fields before creating or rewriting the invoice.',
@@ -824,9 +864,10 @@ export function DetailsOfSaleTab({
     setInvoiceActionError(null)
     setInvoicePreconditions([])
     try {
-      // Codex P1: flush pending Details of Sale autosaves first so the invoice
-      // snapshots the latest SAVED details. On failure stay on Details (the inline
-      // error is set by the flush helper) and do NOT create.
+      // Codex P1 + Batch A #107: flush the Customer tab and then, last, the pending
+      // Details of Sale autosaves so the invoice snapshots the latest SAVED customer
+      // and details. On failure stay on Details (the inline error is set by the flush
+      // helper) and do NOT create.
       const detailsReady = await flushDetailsBeforeInvoice()
       if (!detailsReady) return
       if (!mountedRef.current) return
@@ -863,9 +904,9 @@ export function DetailsOfSaleTab({
     setInvoiceActionError(null)
     setInvoicePreconditions([])
     try {
-      // Codex P1: flush pending Details of Sale autosaves first so the rewritten
-      // invoice snapshots the latest SAVED details. On failure stay on Details and
-      // do NOT rewrite.
+      // Codex P1 + Batch A #107: flush the Customer tab and then, last, the pending
+      // Details of Sale autosaves so the rewritten invoice snapshots the latest SAVED
+      // customer and details. On failure stay on Details and do NOT rewrite.
       const detailsReady = await flushDetailsBeforeInvoice()
       if (!detailsReady) return
       if (!mountedRef.current) return

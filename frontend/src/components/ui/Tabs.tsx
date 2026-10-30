@@ -1,6 +1,9 @@
 type Tab<T extends string> = {
   id: T
   label: string
+  // Optional small status circle after the label: filled green when 'complete', an empty
+  // outline when 'incomplete'. Tabs without it render exactly as before.
+  indicator?: 'complete' | 'incomplete'
 }
 
 type Props<T extends string> = {
@@ -35,6 +38,21 @@ export function Tabs<T extends string>({ tabs, active, onChange }: Props<T>) {
             }`}
           >
             {tab.label}
+            {tab.indicator && (
+              <>
+                <span
+                  aria-hidden="true"
+                  className={`ml-2 inline-block h-2 w-2 rounded-full border align-middle ${
+                    tab.indicator === 'complete'
+                      ? 'border-emerald-500 bg-emerald-500'
+                      : 'border-slate-300 bg-white'
+                  }`}
+                />
+                <span className="sr-only">
+                  {tab.indicator === 'complete' ? ' (saved)' : ' (not yet saved)'}
+                </span>
+              </>
+            )}
           </button>
         )
       })}

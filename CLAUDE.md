@@ -298,7 +298,7 @@ Order-specific enquiry captured inside the Customer tab. Schema: `order_enquiry`
 - Embedded on the workspace GET (nullable data.enquiry). No standalone GET enquiry endpoint.
 - PUT /api/v1/{slug}/orders/{orderId}/enquiry is a FULL-REPLACE upsert — the whole body is sent
   on every save (autosave and manual).
-- Autosave: debounce + blur flush + unmount flush + single-flight + queue. Manual Save button kept.
+- Autosave: debounce + blur flush + unmount flush + single-flight + queue. No manual Save button (removed in Batch A PR 1, Muneeb's decision 30 October 2026).
 - LAID: read allowed; write blocked with 422 ORDER_LOCKED.
 - lead_type: FLOOR / PHONE / INTERNET / null (exact-case only). Invalid on an editable order ->
   400 VALIDATION_FAILED (field lead_type); on a LAID order the 422 ORDER_LOCKED fires first.
