@@ -46,6 +46,7 @@ import {
 import { fetchPublicBusiness } from '../../lib/api/tenantApi'
 import { getActiveSlug } from '../../lib/tenant'
 import type { FlooringType } from '../../lib/flooring'
+import { registerPendingSave } from '../../lib/pendingSaveRegistry'
 import { usePollWhileVisible } from '../../lib/usePollWhileVisible'
 
 // Phase 16D-B PR1 + PR2B + 16E-B + 16F PR3 - the salesperson Quote tab
@@ -74,16 +75,17 @@ import { usePollWhileVisible } from '../../lib/usePollWhileVisible'
 //     snapshot read and every send / cancel / conversion result (see
 //     refreshSnapshots), and a refresh only ever replaces `issued` + `accepted`
 //     together. It NEVER touches the draft rows, mode, total input, server-draft
-//     baseline, save queue or autosave status: the response's draft is ignored
-//     (#101 stays out of scope), so a refresh never causes a PUT. A refresh that
+//     baseline, save queue or autosave status: the response's draft is ignored,
+//     so a refresh never causes a PUT. A refresh that
 //     installs a new accepted version asks the workspace to re-read the order
 //     financial summary (16G PR 6, #121: the acceptance wrote the order price).
 //
 // 16E-B delivery rules (locked):
 //   - Send by Email goes through the confirmation modal ONLY (no one-click
-//     send), runs the SAME double-flush as Preview PDF (details autosave, then
-//     quote autosave — the backend issues from PERSISTED state), and is blocked
-//     when either flush fails. An in-flight guard prevents duplicate sends.
+//     send), runs the SAME flushes as Preview PDF (details autosave, the
+//     Customer tab's customer/address autosaves since Batch A #107, then quote
+//     autosave — the backend issues from PERSISTED state), and is blocked when
+//     any flush fails. An in-flight guard prevents duplicate sends.
 //   - SMS stays DISABLED ("Available soon") — no sendQuoteSms wrapper exists;
 //     frontend SMS enablement is 16E-C.
 //   - The Customer Quote sub-tab renders from the `issued` summary state
@@ -116,12 +118,15 @@ import { usePollWhileVisible } from '../../lib/usePollWhileVisible'
 // by Create Quote — which is only enabled once the probe confirmed draft ===
 // null). That ordering is the load-before-save guarantee: autosave can never
 // fire against an unknown server state, so a full-replace PUT can never wipe a
-// draft it hasn't seen (the lock doc's full-body-PUT wipe rule).
+// draft it hasn't seen (the lock doc's full-body-PUT wipe rule). Since Batch A
+// #101 the probe also waits first for this order's quote saves left running by
+// an earlier visit in this browser document (the pending-save registry), so it
+// never reads the draft from before those saves committed.
 //
 // Once revealed, OrderWorkspace keeps this tab MOUNTED across top-level tab
 // switches (hidden with CSS, like CustomerTab), so in-progress quote work
 // survives tab switches; the unmount flush below fires only on a real order
-// switch / page leave.
+// switch / page leave, and registers the save work it leaves running.
 //
 // 16D-A decoupling (locked): a quote save never changes order/header pricing, so
 // a save never refreshes the workspace financial summary — the save response
@@ -168,8 +173,9 @@ type Props = {
   billingAddress?: OrderAddress | null
   saleDetails?: DetailsOfSaleFields | null
   // The draft returned by the shell's quote-workspace probe for THIS order
-  // (null = confirmed no saved draft). The tab seeds ONCE from this and then owns
-  // the live draft state; it is never re-seeded after mount.
+  // (null = confirmed no saved draft), read after this order's pending quote
+  // saves from an earlier visit settled (Batch A #101). The tab seeds ONCE from
+  // this and then owns the live draft state; it is never re-seeded after mount.
   initialDraft: QuoteDraftRead | null
   // The active issued quote summary from the same probe (null = nothing issued).
   // Seeds the Customer Quote sub-tab ONCE; after mount the tab owns the issued
@@ -189,7 +195,8 @@ type Props = {
   onAcceptedVersionChanged: () => void
   // Switches the workspace to the Customer tab when a send fails with
   // CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID so the salesperson can fix
-  // the email where it lives (the InvoiceTab accept/resend precedent).
+  // the email where it lives (the InvoiceTab accept/resend precedent), and since
+  // Batch A #107 when the Customer tab flush before a send fails.
   onGoToCustomer?: () => void
   // Awaitable flush of any pending/in-flight Details of Sale autosave (lives in
   // the always-mounted shell — the SAME flush that gates invoice create/rewrite).
@@ -199,6 +206,13 @@ type Props = {
   // Resolves true once the latest details draft is persisted; false blocks the
   // preview.
   flushDetailsAutosave: () => Promise<boolean>
+  // Batch A #107 (D1): awaitable flush of the Customer tab's customer,
+  // installation and billing autosaves (shell-owned wrapper; true without waiting
+  // on a known LAID order). Preview PDF renders the saved customer and billing,
+  // Send by Email freezes them and emails the saved address, and Create Invoice
+  // from the accepted quote checks them and emails the signed invoice, so each
+  // runs it after the Details of Sale flush; false blocks the action.
+  flushCustomerAutosave: () => Promise<boolean>
 }
 
 // An editable quote line as held in component state. Numeric fields are RAW
@@ -755,6 +769,7 @@ export function QuoteTab({
   onInvoiceReady,
   onAcceptedVersionChanged,
   flushDetailsAutosave,
+  flushCustomerAutosave,
   onGoToCustomer,
 }: Props) {
   const [subTab, setSubTab] = useState<QuoteSubTabId>('draft')
@@ -827,6 +842,9 @@ export function QuoteTab({
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState<string | null>(null)
   const [sendEmailFixNeeded, setSendEmailFixNeeded] = useState(false)
+  // Batch A #107 (D1): the Customer tab flush failed (an invalid section or a
+  // failed save), so the modal points at the Customer tab without blaming the email.
+  const [sendCustomerFixNeeded, setSendCustomerFixNeeded] = useState(false)
   // Cancel-quote confirmation lifecycle (its own modal, per the locked UX).
   const [cancelModalOpen, setCancelModalOpen] = useState(false)
   const [cancelling, setCancelling] = useState(false)
@@ -971,8 +989,10 @@ export function QuoteTab({
   // JSON of the last body the backend confirmed persisted — the dirty baseline.
   // null = NO persisted draft yet (fresh Create Quote flow), so the first valid
   // body is always dirty and autosaves. Initialised from the probe result so a
-  // freshly-loaded saved draft is never re-saved until it changes. Advanced ONLY
-  // on a successful save response — a failed save stays dirty and keeps edits.
+  // freshly-loaded saved draft is never re-saved until it changes; the probe
+  // waited for this order's pending quote saves (Batch A #101), so a reopen does
+  // not take a pre-commit draft as its baseline. Advanced ONLY on a successful
+  // save response — a failed save stays dirty and keeps edits.
   const lastSavedBodyRef = useRef<string | null>(initialBaseline(initialDraft))
   const savingRef = useRef(false)
   const pendingBodyRef = useRef<QuoteDraftSaveRequest | null>(null)
@@ -1106,9 +1126,8 @@ export function QuoteTab({
   // mode) that differs from the persisted baseline. Invalid/blank input is never
   // sent (no partial saves — an itemised draft with any broken row sends
   // nothing).
-  // QUEUE-FIRST while a PUT is in flight (matching the shell's details chain,
-  // deliberately NOT LeadEnquirySection's check-baseline-first ordering): the
-  // baseline is STALE mid-flight, so comparing against it here would silently
+  // QUEUE-FIRST while a PUT is in flight (matching the shell's details chain):
+  // the baseline is STALE mid-flight, so comparing against it here would silently
   // drop a revert-to-baseline edit (type 100, then retype the original before
   // the PUT settles -> the wrong total would persist). The drain compares the
   // queued body against the POST-save baseline and skips unchanged bodies.
@@ -1471,10 +1490,16 @@ export function QuoteTab({
 
   // Mount/unmount guard + unmount flush. Because OrderWorkspace keeps this tab
   // mounted (hidden) across top-level tab switches, this cleanup fires only on a
-  // REAL unmount: an order switch or leaving the workspace. Fire-and-forget with
-  // the order id captured up front so a late settle can never target another
-  // order. StrictMode's setup/cleanup/setup cycle is safe: at that point the
-  // draft still equals the baseline, so nothing is sent.
+  // REAL unmount: an order switch or leaving the workspace. Nothing here awaits
+  // the save; the order id is captured up front so a late settle can never target
+  // another order. Batch A #101: the in-flight save chain (with the body queued
+  // for its drain) or the bare flush is registered under this order with the
+  // pending-save registry, and the shell's quote probe waits for it, so a reopen
+  // of the same order in this browser document never seeds from a draft read
+  // before the save committed. Limits (see pendingSaveRegistry): no protection
+  // across screens, tabs or devices, a reload, an unknown save outcome or a
+  // logout. StrictMode's setup/cleanup/setup cycle is safe: at that point the
+  // draft still equals the baseline, so nothing is sent or registered.
   useEffect(() => {
     mountedRef.current = true
     return () => {
@@ -1484,6 +1509,13 @@ export function QuoteTab({
         URL.revokeObjectURL(url)
       }
       previewUrlsRef.current = []
+      const saveOrderId = orderIdRef.current
+      // Registered before the locked / invalid-body early returns: they stop new
+      // writes, not the wait for a save already running.
+      const activeChain = saveChainRef.current
+      if (activeChain !== null) {
+        registerPendingSave(saveOrderId, 'quote', activeChain)
+      }
       if (lockedRef.current) return
       const body = buildDraftBody(
         itemisedRef.current,
@@ -1494,14 +1526,18 @@ export function QuoteTab({
       if (savingRef.current) {
         // A save is in flight — QUEUE-FIRST (the mid-flight baseline is stale;
         // see requestSave): its drain picks up this latest body and reconciles
-        // against the post-save baseline. (StrictMode is unaffected — no save
-        // is ever in flight during its immediate setup/cleanup cycle.)
+        // against the post-save baseline, inside the chain registered above.
+        // (StrictMode is unaffected — no save is ever in flight during its
+        // immediate setup/cleanup cycle.)
         pendingBodyRef.current = body
         return
       }
       if (JSON.stringify(body) === lastSavedBodyRef.current) return
-      const saveOrderId = orderIdRef.current
-      saveQuoteDraft(saveOrderId, body).catch(() => {})
+      registerPendingSave(
+        saveOrderId,
+        'quote',
+        saveQuoteDraft(saveOrderId, body).catch(() => {}),
+      )
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -1579,6 +1615,23 @@ export function QuoteTab({
               'Could not save the latest Details of Sale. Fix the details and try again.',
             )
           }
+          return
+        }
+        // Batch A #107 (D1): the preview renders the PERSISTED customer name and
+        // billing address, so pending Customer tab saves are flushed too; an
+        // invalid section or a failed save blocks the preview (no request).
+        const customerSaved = await flushCustomerAutosave()
+        // The tab may have unmounted during that wait (the user left the order):
+        // stop before any quote save or request, as Path A does.
+        if (!mountedRef.current) {
+          tab?.close()
+          return
+        }
+        if (!customerSaved) {
+          tab?.close()
+          setPreviewError(
+            'Could not save the latest Customer tab changes. Complete or fix the customer details and addresses on the Customer tab, then try again.',
+          )
           return
         }
         const flush = await flushQuoteAutosave()
@@ -1798,6 +1851,7 @@ export function QuoteTab({
     setSendCheck('checking')
     setSendError(null)
     setSendEmailFixNeeded(false)
+    setSendCustomerFixNeeded(false)
     setActionNotice(null)
     try {
       // Only a read that APPLIED informs the warning. 'superseded' means a newer
@@ -1869,10 +1923,10 @@ export function QuoteTab({
     setSendError(fallback)
   }
 
-  // Send (or resend) the quote by email. Runs the SAME double-flush as Preview
-  // PDF — the backend issues from the PERSISTED draft + PERSISTED order details
-  // — and blocks the send when either flush fails. The ref guard makes the send
-  // single-flight (no duplicate issue from a double-tap). Disabled when LAID.
+  // Send (or resend) the quote by email. Runs the SAME flushes as Preview PDF —
+  // the backend issues from the PERSISTED draft + PERSISTED order details and
+  // customer — and blocks the send when any flush fails. The ref guard makes the
+  // send single-flight (no duplicate issue from a double-tap). Disabled when LAID.
   async function handleSendEmail() {
     // Cross in-flight guard: never send while a cancel or a Create Invoice is
     // running (and vice versa) - the mutations race server-side and the loser's
@@ -1888,6 +1942,7 @@ export function QuoteTab({
     setSending(true)
     setSendError(null)
     setSendEmailFixNeeded(false)
+    setSendCustomerFixNeeded(false)
     try {
       const detailsSaved = await flushDetailsAutosave()
       if (!detailsSaved) {
@@ -1896,6 +1951,21 @@ export function QuoteTab({
             'Could not save the latest Details of Sale. Fix the details and try again.',
           )
         }
+        return
+      }
+      // Batch A #107 (D1): the issue freezes the customer name and billing lines
+      // and the email goes to the saved address, so pending Customer tab saves are
+      // flushed first; an invalid section or a failed save blocks the send (no
+      // request) and the modal points at the Customer tab.
+      const customerSaved = await flushCustomerAutosave()
+      // The tab may have unmounted during that wait (the user left the order): stop
+      // before any quote save or send, as Path A does.
+      if (!mountedRef.current) return
+      if (!customerSaved) {
+        setSendError(
+          'Could not save the latest Customer tab changes, so the quote was not sent.',
+        )
+        setSendCustomerFixNeeded(true)
         return
       }
       const flush = await flushQuoteAutosave()
@@ -2385,6 +2455,19 @@ export function QuoteTab({
         closeConvertModal()
         setConvertError(
           'Could not save the latest Details of Sale. Fix the details and try again.',
+        )
+        return
+      }
+      // Batch A #107 (D1): the backend checks the saved customer and billing and
+      // emails the signed invoice to the saved address, so pending Customer tab
+      // saves are flushed too (a known LAID order skips the wait: Path A stays
+      // allowed). A failed flush blocks the conversion: nothing is posted.
+      const customerSaved = await flushCustomerAutosave()
+      if (!mountedRef.current || orderIdRef.current !== requestOrderId) return
+      if (!customerSaved) {
+        closeConvertModal()
+        setConvertError(
+          'Could not save the latest Customer tab changes. Complete or fix the customer details and addresses on the Customer tab, then try again.',
         )
         return
       }
@@ -3900,9 +3983,9 @@ export function QuoteTab({
 
       {/* Send Quote confirmation (16E-B) — the ONLY send path (first send and
           Resend alike; hard rule: no accidental one-click sending). Send by
-          Email flushes details + quote autosaves first, is single-flight, and
-          is disabled when LAID. SMS stays disabled until 16E-C ("Available
-          soon") — no backend SMS call is ever made from here. */}
+          Email flushes the details, Customer tab and quote autosaves first, is
+          single-flight, and is disabled when LAID. SMS stays disabled until
+          16E-C ("Available soon") — no backend SMS call is ever made from here. */}
       <Modal
         open={sendModalOpen}
         onClose={() => {
@@ -3947,12 +4030,19 @@ export function QuoteTab({
           {sendError && (
             <div className="mt-4 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
               <p className="text-sm font-medium text-rose-700">{sendError}</p>
-              {sendEmailFixNeeded && (
+              {(sendEmailFixNeeded || sendCustomerFixNeeded) && (
                 <div className="mt-2 flex flex-col sm:flex-row sm:items-center gap-2">
-                  <p className="text-xs text-rose-700">
-                    Add or fix the customer's email on the Customer tab, then
-                    try again.
-                  </p>
+                  {sendEmailFixNeeded ? (
+                    <p className="text-xs text-rose-700">
+                      Add or fix the customer's email on the Customer tab, then
+                      try again.
+                    </p>
+                  ) : (
+                    <p className="text-xs text-rose-700">
+                      Complete or fix the customer details and addresses on the
+                      Customer tab, then try again.
+                    </p>
+                  )}
                   {onGoToCustomer && (
                     <Button
                       type="button"

@@ -5,7 +5,11 @@ import { ArrowLeftIcon } from './icons'
 import { Button } from './ui/Button'
 import { Panel } from './ui/Panel'
 import { Tabs } from './ui/Tabs'
-import { CustomerTab, type CustomerSavedPayload } from './workspace/CustomerTab'
+import {
+  CustomerTab,
+  type CustomerSavedPayload,
+  type CustomerTabHandle,
+} from './workspace/CustomerTab'
 import {
   DetailsOfSaleTab,
   buildDetailsBody,
@@ -28,6 +32,7 @@ import {
   type OrderStatus,
 } from '../lib/statuses'
 import { ApiError } from '../lib/api/ApiError'
+import { waitForPendingSaves } from '../lib/pendingSaveRegistry'
 import { useTenantSlug } from '../lib/useTenantSlug'
 import { fetchOrderWorkspace, saveDetailsOfSale } from '../lib/api/orderWorkspaceApi'
 import type {
@@ -208,7 +213,11 @@ function WorkspaceShell({
   // exists" — Create Quote stays unavailable (with a retry) and the Quote tab
   // stays hidden until a probe succeeds, so a fresh full-replace save can never
   // wipe a draft the frontend has not seen. QuoteTab therefore only ever mounts
-  // AFTER a successful probe.
+  // AFTER a successful probe. Batch A #101: the probe first waits for this
+  // order's pending quote saves left running by an earlier visit in this browser
+  // document (the pending-save registry), so it never reads the draft before
+  // they commit; a wait that runs out is a failed probe (error + Retry, and the
+  // retry waits again). The registry never shows or hides the tab by itself.
   const [quoteTabVisible, setQuoteTabVisible] = useState(false)
   const [quoteProbeStatus, setQuoteProbeStatus] = useState<
     'loading' | 'loaded' | 'error'
@@ -230,31 +239,40 @@ function WorkspaceShell({
   useEffect(() => {
     let cancelled = false
     setQuoteProbeStatus('loading')
-    fetchQuoteWorkspace(orderId)
-      .then((res) => {
-        if (cancelled) return
-        setQuoteInitialDraft(res.data.draft)
-        setQuoteInitialIssued(res.data.current_issued)
-        setQuoteInitialAccepted(res.data.accepted)
-        setQuoteProbeStatus('loaded')
-        // A saved draft, an active issued quote OR an accepted quote is the
-        // durable visibility source of truth (issued-only and accepted-only
-        // are unreachable via the API today - sending requires a persisted
-        // draft and drafts are never deleted - but the backend workspace
-        // deliberately supports the shapes, so the tab is revealed for them).
-        if (
-          res.data.draft !== null ||
-          res.data.current_issued !== null ||
-          res.data.accepted !== null
-        )
-          setQuoteTabVisible(true)
-      })
-      .catch(() => {
-        // STRICT: a failed probe is never "no quote" — status stays 'error',
-        // the tab stays hidden and no issued/draft state is cleared or faked.
-        if (cancelled) return
+    void waitForPendingSaves(orderId, ['quote']).then((settled) => {
+      if (cancelled) return
+      if (!settled) {
+        // STRICT: pending quote saves did not settle in time — a failed probe
+        // (never "no quote"), and nothing is read before they settle.
         setQuoteProbeStatus('error')
-      })
+        return
+      }
+      fetchQuoteWorkspace(orderId)
+        .then((res) => {
+          if (cancelled) return
+          setQuoteInitialDraft(res.data.draft)
+          setQuoteInitialIssued(res.data.current_issued)
+          setQuoteInitialAccepted(res.data.accepted)
+          setQuoteProbeStatus('loaded')
+          // A saved draft, an active issued quote OR an accepted quote is the
+          // durable visibility source of truth (issued-only and accepted-only
+          // are unreachable via the API today - sending requires a persisted
+          // draft and drafts are never deleted - but the backend workspace
+          // deliberately supports the shapes, so the tab is revealed for them).
+          if (
+            res.data.draft !== null ||
+            res.data.current_issued !== null ||
+            res.data.accepted !== null
+          )
+            setQuoteTabVisible(true)
+        })
+        .catch(() => {
+          // STRICT: a failed probe is never "no quote" — status stays 'error',
+          // the tab stays hidden and no issued/draft state is cleared or faked.
+          if (cancelled) return
+          setQuoteProbeStatus('error')
+        })
+    })
     return () => {
       cancelled = true
     }
@@ -461,6 +479,24 @@ function WorkspaceShell({
     )
   }
 
+  // --- Batch A #107 (D1): the Customer tab flush before customer data is frozen
+  // or delivered. CustomerTab owns its three section autosaves (it stays mounted,
+  // hidden, for the life of this shell) and exposes an awaitable flush through
+  // this ref; this wrapper is what QuoteTab, DetailsOfSaleTab and InvoiceTab call
+  // before Preview / Send / Create Invoice from the accepted quote, Create /
+  // Rewrite, and Accept / Re-send / Accept Remotely. Like flushDetailsAutosave it
+  // resolves true only when the latest state is confirmed saved, and false blocks
+  // the action. A known LAID order skips it (true at once): no protected write can
+  // run, and each action keeps its existing LAID rule. A missing tab is never
+  // treated as saved.
+  const customerTabRef = useRef<CustomerTabHandle | null>(null)
+  async function flushCustomerAutosave(): Promise<boolean> {
+    if (locked) return true
+    const customerTab = customerTabRef.current
+    if (customerTab === null) return false
+    return customerTab.flushCustomerAutosave()
+  }
+
   // Seed the header summary without waiting for the Products & Charges tab to be
   // mounted (it only mounts when its tab is active). The header is non-critical,
   // so a failed fetch is swallowed and the placeholder remains. The seed is a READ:
@@ -595,14 +631,19 @@ function WorkspaceShell({
           />
           <div className="p-6">
             {/* Customer is ALWAYS mounted (hidden when not active), unlike the other
-                tabs which stay conditionally rendered. This keeps the Lead Enquiry
-                autosave draft / local form state alive across top-level tab switches
+                tabs which stay conditionally rendered. This keeps the customer /
+                address autosaves (Batch A #107) and the Lead Enquiry autosave draft /
+                local form state alive across top-level tab switches
                 (Customer -> Products & Charges -> Customer must NOT remount
-                LeadEnquirySection), so an in-flight unmount-flush can't race a fresh
-                stale-prop seed. Uses the same `activeTab === 'customer'` condition. */}
+                CustomerTab or LeadEnquirySection), so an in-flight unmount-flush can't
+                race a fresh stale-prop seed on a tab switch. An order change or leaving
+                the workspace still unmounts them; their unmount flushes are registered
+                with the pending-save registry. Uses the same `activeTab === 'customer'`
+                condition. The ref exposes the tab's flush (flushCustomerAutosave). */}
             <div className={activeTab === 'customer' ? '' : 'hidden'}>
               <CustomerTab
                 key={orderId}
+                ref={customerTabRef}
                 orderId={orderId}
                 locked={locked}
                 customer={customer}
@@ -635,6 +676,7 @@ function WorkspaceShell({
                 applyMutationFinancialSummary={applyMutationFinancialSummary}
                 queueDetailsAutosave={queueDetailsAutosave}
                 flushDetailsAutosave={flushDetailsAutosave}
+                flushCustomerAutosave={flushCustomerAutosave}
                 detailsAutosaveSaving={detailsAutosaveSaving}
                 detailsAutosaveSaved={detailsAutosaveSaved}
                 detailsAutosaveError={detailsAutosaveError}
@@ -658,9 +700,11 @@ function WorkspaceShell({
                 CSS, like CustomerTab above) so in-progress quote work — the
                 draft total, autosave queue and statuses — survives top-level
                 tab switches. It mounts only after the quote probe SUCCEEDED
-                (visibility implies a loaded probe), so initialDraft is always
-                the confirmed server state and autosave can never fire against
-                an unknown draft. locked gates edits/autosave inside the tab;
+                (visibility implies a loaded probe, read once this order's
+                pending quote saves settled, Batch A #101), so initialDraft is
+                always the confirmed server state and autosave can never fire
+                against an unknown draft. Its unmount flush is registered with
+                the pending-save registry. locked gates edits/autosave inside the tab;
                 reads + preview of a persisted draft stay available when LAID.
                 Phase 16F PR3: `active` lets the tab re-read its issued/accepted
                 snapshots each time it becomes the visible tab (never the draft),
@@ -690,8 +734,13 @@ function WorkspaceShell({
                   // Details of Sale autosaves first — the same shell-owned
                   // awaitable flush that gates invoice create/rewrite.
                   flushDetailsAutosave={flushDetailsAutosave}
-                  // Lets a send-quote customer-email error send the user
-                  // straight to where the email is fixed (InvoiceTab parity).
+                  // Batch A #107 (D1): Preview, Send by Email and Create Invoice
+                  // from the accepted quote also flush the Customer tab first
+                  // (each reads or delivers the saved customer and billing details).
+                  flushCustomerAutosave={flushCustomerAutosave}
+                  // Lets a send-quote customer-email error (InvoiceTab parity) and,
+                  // since Batch A #107, a failed Customer tab flush before a send
+                  // (Send modal only) send the user straight to the Customer tab.
                   onGoToCustomer={() => setActiveTab('customer')}
                 />
               </div>
@@ -707,6 +756,9 @@ function WorkspaceShell({
                 // Lets an accept/resend customer-email error send the user
                 // straight to where the email is fixed.
                 onGoToCustomer={() => setActiveTab('customer')}
+                // Batch A #107 (D1): Accept, Re-send and Accept Remotely flush the
+                // Customer tab first (the shell skips it on a known LAID order).
+                flushCustomerAutosave={flushCustomerAutosave}
               />
             )}
           </div>
@@ -751,27 +803,42 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
     setLoadError(null)
     setNotFound(false)
     setWorkspace(null)
-    fetchOrderWorkspace(orderId)
-      .then((response) => {
-        if (cancelled) return
-        setWorkspace(response.data)
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return
-        if (err instanceof ApiError && err.code === 'ORDER_NOT_FOUND') {
-          setNotFound(true)
-          return
-        }
-        const message =
-          err instanceof ApiError && err.message.length > 0
-            ? err.message
-            : 'Could not load this order. Please try again.'
-        setLoadError(message)
-      })
-      .finally(() => {
-        if (cancelled) return
+    // Batch A #101: the Customer tab and Lead Enquiry seed their forms (and saved
+    // baselines) from this read, so it first waits for this order's customer and
+    // enquiry saves left running by an earlier visit in this browser document (the
+    // pending-save registry). Loading stays on screen meanwhile. A wait that runs
+    // out never reads: it shows the error state, and Try again waits again.
+    void waitForPendingSaves(orderId, ['customer', 'enquiry']).then((settled) => {
+      if (cancelled) return
+      if (!settled) {
+        setLoadError(
+          'Earlier changes to this order are still being saved. Please try again in a moment.',
+        )
         setLoading(false)
-      })
+        return
+      }
+      fetchOrderWorkspace(orderId)
+        .then((response) => {
+          if (cancelled) return
+          setWorkspace(response.data)
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return
+          if (err instanceof ApiError && err.code === 'ORDER_NOT_FOUND') {
+            setNotFound(true)
+            return
+          }
+          const message =
+            err instanceof ApiError && err.message.length > 0
+              ? err.message
+              : 'Could not load this order. Please try again.'
+          setLoadError(message)
+        })
+        .finally(() => {
+          if (cancelled) return
+          setLoading(false)
+        })
+    })
     return () => {
       cancelled = true
     }
@@ -788,6 +855,13 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
     )
   }
   if (!workspace) return <NotFoundWorkspace />
+  // Batch A #101: after an in-place :orderId change this component renders once
+  // with the PREVIOUS order's workspace before the effect above clears it. Never
+  // mount the shell with one order's data under another order's id, even for one
+  // frame (its tabs would seed their forms and saved baselines from it, and the
+  // shell's reads would run under the wrong identity): show the loading state
+  // until the new read lands.
+  if (workspace.order_id !== orderId) return <LoadingWorkspace />
 
   const saleDetails: DetailsOfSaleFields = {
     supply_only: workspace.supply_only,
@@ -798,10 +872,11 @@ function ExistingOrderWorkspace({ orderId }: { orderId: number }) {
   }
 
   // Customer-tab saves are confirmed server-side and arrive one section at a
-  // time as each call succeeds. Fold each provided row back into workspace state
-  // in place (leaving unprovided sections untouched) so confirmed customer /
-  // installation rows persist even when a later billing step fails, and sibling
-  // tabs see fresh data without a refetch.
+  // time: the customer, installation and billing sections autosave independently
+  // (Batch A #107), so each confirmation is lifted on its own. Fold each provided
+  // row back into workspace state in place (leaving unprovided sections
+  // untouched) so every confirmed row persists whatever another section does, and
+  // sibling tabs see fresh data without a refetch.
   function handleCustomerSaved(saved: CustomerSavedPayload) {
     setWorkspace((current) => {
       if (!current) return current

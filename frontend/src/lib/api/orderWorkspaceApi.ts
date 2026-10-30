@@ -248,7 +248,7 @@ export function saveBillingAddress(
 // POST /api/v1/{slug}/orders/{orderId}/addresses/billing/copy-from-installation
 // — backend copies the persisted installation row into billing. No request body.
 // Returns 422 INSTALLATION_ADDRESS_REQUIRED when no installation row exists, so
-// the caller must save the installation address first in the same run.
+// the installation row must be saved before any copy.
 export function copyBillingFromInstallation(
   orderId: number,
 ): Promise<ApiSuccess<BillingAddressResponse>> {

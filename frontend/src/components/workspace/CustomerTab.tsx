@@ -1,11 +1,11 @@
-import { useEffect, useRef, useState } from 'react'
-import { Button } from '../ui/Button'
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from 'react'
 import { Field } from '../ui/Field'
 import { Input } from '../ui/Input'
 import { Tabs } from '../ui/Tabs'
 import { CheckCircleIcon } from '../icons'
 import { LeadEnquirySection } from './LeadEnquirySection'
 import { ApiError } from '../../lib/api/ApiError'
+import type { ApiSuccess } from '../../lib/api/types'
 import {
   copyBillingFromInstallation,
   saveBillingAddress,
@@ -14,17 +14,28 @@ import {
 } from '../../lib/api/orderWorkspaceApi'
 import type {
   AddressUpsertRequest,
+  BillingAddressResponse,
   CustomerSaveRequest,
+  CustomerSaveResponse,
+  InstallationAddressResponse,
   OrderAddress,
   OrderCustomer,
   OrderEnquiry,
 } from '../../lib/api/orderWorkspaceApi'
+import { registerPendingSave } from '../../lib/pendingSaveRegistry'
+import {
+  useSectionAutosave,
+  type SectionAutosave,
+} from '../../lib/useSectionAutosave'
 
-// Confirmed server-saved data lifted to the parent, one section at a time as
-// each call succeeds (so customer/installation survive even when a later
-// billing step fails). Each field is optional and always sourced from the
-// server response — billing from the billing PUT / copy response, never the
-// local form.
+// Confirmed server-saved data lifted to the parent. The customer, installation and
+// billing sections autosave independently (Batch A #107), so each confirmed row is
+// lifted on its own as its save succeeds; an invalid or failing section never holds
+// another back, except that a ticked billing copy waits for a successful installation
+// save. Each field is optional and always sourced from the server response —
+// billing from the billing PUT / copy response, never the local form. CustomerTab
+// lifts only while mounted (Lead Enquiry, which shares this channel, also lifts the
+// result of its unmount flush).
 //
 // orderId is the id the save was ADDRESSED to (captured before the await). The
 // parent uses it to drop late callbacks from a previous order — see
@@ -39,6 +50,17 @@ export type CustomerSavedPayload = {
   enquiry?: OrderEnquiry
 }
 
+// Batch A #107 (D1): what the workspace shell calls before an action freezes or
+// delivers customer data (quote preview / send / Create Invoice from the accepted
+// quote, invoice create / rewrite, accept / re-send / Accept Remotely).
+export type CustomerTabHandle = {
+  // Flushes the customer, installation and billing autosaves (installation before any
+  // billing copy) and awaits their full drains. Resolves true only when all three
+  // sections are complete, valid and confirmed saved against the latest form; never
+  // rejects.
+  flushCustomerAutosave: () => Promise<boolean>
+}
+
 type Props = {
   orderId: number
   locked: boolean
@@ -47,6 +69,7 @@ type Props = {
   billingAddress?: OrderAddress | null
   enquiry?: OrderEnquiry | null
   onSaved: (saved: CustomerSavedPayload) => void
+  ref?: Ref<CustomerTabHandle>
 }
 
 type CustomerForm = {
@@ -86,26 +109,12 @@ const MOBILE_LOCAL_REGEX = /^04\d{8}$/
 const MOBILE_INTL_REGEX = /^\+614\d{8}$/
 const MOBILE_ERROR = 'Enter a valid mobile number.'
 
-// One Save click runs up to three sequential calls — customer, installation,
-// then billing (a PUT, or a copy-from-installation POST when "same as
-// installation" is checked). Each section reports its own outcome so a partial
-// failure shows exactly what persisted; "billing" covers both step-3 variants.
+// The three independently autosaved sections. "billing" covers both the billing PUT
+// and the copy-from-installation POST. Field error keys are {prefix}{snake_field}.
 type SaveSection = 'customer' | 'installation' | 'billing'
-type SectionOutcome = 'saved' | 'failed' | 'skipped'
-
-type SaveRun = {
-  ok: boolean
-  customer: SectionOutcome
-  installation: SectionOutcome
-  billing: SectionOutcome
-  failedSection: SaveSection | null
-  failedMessage: string | null
-}
-
-const SAVE_SEQUENCE: SaveSection[] = ['customer', 'installation', 'billing']
 
 const SECTION_LABELS: Record<SaveSection, string> = {
-  customer: 'Customer',
+  customer: 'Customer details',
   installation: 'Installation address',
   billing: 'Billing address',
 }
@@ -116,14 +125,46 @@ const SECTION_ERROR_PREFIX: Record<SaveSection, string> = {
   billing: 'billing_',
 }
 
-const FULL_SUCCESS_RUN: SaveRun = {
-  ok: true,
-  customer: 'saved',
-  installation: 'saved',
-  billing: 'saved',
-  failedSection: null,
-  failedMessage: null,
+const CUSTOMER_FIELDS: Array<keyof CustomerForm> = [
+  'first_name',
+  'middle_name',
+  'last_name',
+  'email',
+  'mobile',
+  'home_phone',
+  'work_phone',
+  'company_name',
+]
+
+// Batch A #107: the backend's VARCHAR limits (OrderService MAX_*), checked on the
+// same trimmed values the backend checks, so an over-long value gets its field error
+// before any request instead of a generic 400.
+const CUSTOMER_MAX_LENGTHS: Record<keyof CustomerForm, number> = {
+  first_name: 100,
+  middle_name: 100,
+  last_name: 100,
+  email: 255,
+  mobile: 20,
+  home_phone: 20,
+  work_phone: 20,
+  company_name: 150,
 }
+
+const ADDRESS_MAX_LENGTHS: Record<keyof AddressForm, number> = {
+  unit_number: 20,
+  street_number: 20,
+  street: 255,
+  suburb: 100,
+  state_code: 20,
+  postcode: 10,
+}
+
+// The billing section's pending intent: copy the SAVED installation row ("same as
+// installation"; `source` is the generation of the installation save the copy
+// copies, from installSaveGenRef when the copy is built), or PUT the billing form.
+type BillingIntent =
+  | { kind: 'copy'; owedSeq: number; source: string }
+  | { kind: 'put'; body: AddressUpsertRequest }
 
 function customerFromProps(c?: OrderCustomer | null): CustomerForm {
   return {
@@ -206,58 +247,141 @@ function buildAddressBody(form: AddressForm): AddressUpsertRequest {
   }
 }
 
+function maxLengthMessage(max: number): string {
+  return `Must be at most ${max} characters.`
+}
+
+// Strict client validation of the customer section ({customer_<field>: message};
+// empty when valid). Required fields and the email/mobile shapes first, then the
+// length limit of every field that has no error yet.
+function validateCustomer(form: CustomerForm): Record<string, string> {
+  const errors: Record<string, string> = {}
+  if (!form.first_name.trim()) {
+    errors.customer_first_name = 'First name is required.'
+  }
+  if (!form.last_name.trim()) {
+    errors.customer_last_name = 'Last name is required.'
+  }
+  const mobileTrim = form.mobile.trim()
+  if (!mobileTrim) {
+    errors.customer_mobile = 'Mobile number is required.'
+  } else if (
+    !MOBILE_LOCAL_REGEX.test(mobileTrim) &&
+    !MOBILE_INTL_REGEX.test(mobileTrim)
+  ) {
+    errors.customer_mobile = MOBILE_ERROR
+  }
+  const emailTrim = form.email.trim()
+  if (!emailTrim) {
+    errors.customer_email = 'Email is required.'
+  } else if (!EMAIL_REGEX.test(emailTrim)) {
+    errors.customer_email = 'Enter a valid email address.'
+  }
+  for (const field of CUSTOMER_FIELDS) {
+    const key = `customer_${field}`
+    if (key in errors) continue
+    const max = CUSTOMER_MAX_LENGTHS[field]
+    if (form[field].trim().length > max) errors[key] = maxLengthMessage(max)
+  }
+  return errors
+}
+
+// Strict client validation of one address section ({prefix}<field>: message).
+function validateAddress(
+  form: AddressForm,
+  prefix: string,
+): Record<string, string> {
+  const errors: Record<string, string> = {}
+  if (!form.street_number.trim()) {
+    errors[`${prefix}street_number`] = 'Street number is required.'
+  }
+  if (!form.street.trim()) {
+    errors[`${prefix}street`] = 'Street is required.'
+  }
+  if (!form.suburb.trim()) {
+    errors[`${prefix}suburb`] = 'Suburb is required.'
+  }
+  if (!form.state_code.trim()) {
+    errors[`${prefix}state_code`] = 'State is required.'
+  }
+  if (!form.postcode.trim()) {
+    errors[`${prefix}postcode`] = 'Postcode is required.'
+  }
+  for (const field of ADDRESS_FIELDS) {
+    const key = `${prefix}${field}`
+    if (key in errors) continue
+    const max = ADDRESS_MAX_LENGTHS[field]
+    if (form[field].trim().length > max) errors[key] = maxLengthMessage(max)
+  }
+  return errors
+}
+
+// The full-replace body of a VALID section, or null: an invalid section is never sent.
+function validCustomerBody(form: CustomerForm): CustomerSaveRequest | null {
+  return Object.keys(validateCustomer(form)).length === 0
+    ? buildCustomerBody(form)
+    : null
+}
+
+function validAddressBody(form: AddressForm): AddressUpsertRequest | null {
+  return Object.keys(validateAddress(form, '')).length === 0
+    ? buildAddressBody(form)
+    : null
+}
+
 function apiErrorMessage(err: unknown): string {
   if (err instanceof ApiError && err.message.length > 0) return err.message
   return 'Something went wrong while saving. Please try again.'
 }
 
-// Best-effort map of a backend VALIDATION_FAILED details[] onto this tab's
-// existing per-field error keys ({section}_{snake_field}). Anything that does
-// not line up with a field still surfaces via the section-level message.
+// Best-effort map of a backend VALIDATION_FAILED details[] onto this tab's per-field
+// error keys ({prefix}{snake_field}), kept only for fields whose current value still
+// equals the value the FAILED body sent, so an error for an older body never attaches
+// to input edited since. Anything that does not line up with a field still surfaces
+// through the section's status message.
 function mapDetailsToFieldErrors(
-  section: SaveSection,
+  prefix: string,
   err: unknown,
+  sent: Record<string, string | null>,
+  current: Record<string, string | null>,
 ): Record<string, string> {
   const result: Record<string, string> = {}
   if (!(err instanceof ApiError) || err.code !== 'VALIDATION_FAILED') return result
   const details = err.details
   if (!Array.isArray(details)) return result
-  const prefix = SECTION_ERROR_PREFIX[section]
   for (const detail of details) {
     if (!detail || typeof detail !== 'object') continue
     const field = (detail as { field?: unknown }).field
     const message = (detail as { message?: unknown }).message
     if (typeof field !== 'string' || field.length === 0) continue
+    if (!(field in sent) || sent[field] !== current[field]) continue
     result[`${prefix}${field}`] =
       typeof message === 'string' && message.length > 0 ? message : 'Invalid value.'
   }
   return result
 }
 
-// A failure at `section` means earlier sequence steps already committed
-// (server-side, not rolled back), this step failed, and later steps never ran.
-function buildFailureRun(section: SaveSection, message: string): SaveRun {
-  const failedIndex = SAVE_SEQUENCE.indexOf(section)
-  const outcomeFor = (s: SaveSection): SectionOutcome => {
-    const i = SAVE_SEQUENCE.indexOf(s)
-    if (i < failedIndex) return 'saved'
-    if (i === failedIndex) return 'failed'
-    return 'skipped'
+// Replace every error of one section (key prefix) with `next`; other sections keep theirs.
+function replaceSectionErrors(
+  prev: Record<string, string>,
+  prefix: string,
+  next: Record<string, string>,
+): Record<string, string> {
+  const merged: Record<string, string> = {}
+  for (const [key, message] of Object.entries(prev)) {
+    if (!key.startsWith(prefix)) merged[key] = message
   }
-  return {
-    ok: false,
-    customer: outcomeFor('customer'),
-    installation: outcomeFor('installation'),
-    billing: outcomeFor('billing'),
-    failedSection: section,
-    failedMessage: message,
-  }
+  return { ...merged, ...next }
 }
 
-function outcomeLabel(outcome: SectionOutcome): string {
-  if (outcome === 'saved') return 'Saved'
-  if (outcome === 'failed') return 'Failed'
-  return 'Did not run'
+function withoutError(
+  prev: Record<string, string>,
+  key: string,
+): Record<string, string> {
+  if (!(key in prev)) return prev
+  const next = { ...prev }
+  delete next[key]
+  return next
 }
 
 export function CustomerTab({
@@ -268,6 +392,7 @@ export function CustomerTab({
   billingAddress,
   enquiry,
   onSaved,
+  ref,
 }: Props) {
   const [customerForm, setCustomerForm] = useState<CustomerForm>(() =>
     customerFromProps(customer),
@@ -291,273 +416,578 @@ export function CustomerTab({
       : addressFromProps(billingAddress),
   )
   const [sameAsInstall, setSameAsInstall] = useState(defaultSameAsInstall)
-  const [errors, setErrors] = useState<Record<string, string>>({})
-  const [saving, setSaving] = useState(false)
-  const [saveRun, setSaveRun] = useState<SaveRun | null>(null)
+  // Client validation errors (shown on blur) and server field errors (from a failed
+  // save), merged per section; a field shows the client error first.
+  const [clientErrors, setClientErrors] = useState<Record<string, string>>({})
+  const [serverErrors, setServerErrors] = useState<Record<string, string>>({})
   const [activeSubTab, setActiveSubTab] = useState<SubTabId>('details')
 
-  // Guards setState after the tab unmounts (e.g. the order route changes while
-  // a multi-call save is still in flight).
+  // Latest values mirrored into refs so the debounce / blur / action / unmount
+  // paths read the freshest data. Handlers also write a ref directly when they
+  // change its value, so no path waits for a render to see the latest keystroke.
+  const customerFormRef = useRef(customerForm)
+  customerFormRef.current = customerForm
+  const installFormRef = useRef(installForm)
+  installFormRef.current = installForm
+  const billingFormRef = useRef(billingForm)
+  billingFormRef.current = billingForm
+  const sameAsInstallRef = useRef(sameAsInstall)
+  sameAsInstallRef.current = sameAsInstall
+  const lockedRef = useRef(locked)
+  lockedRef.current = locked
+  const orderIdRef = useRef(orderId)
+  orderIdRef.current = orderId
+  const onSavedRef = useRef(onSaved)
+  onSavedRef.current = onSaved
+
+  // Guards setState and lifts after the tab unmounts (the order changes or the user
+  // leaves the workspace). It never stops a save, its drain or the billing copy that
+  // waits for installation: those complete after unmount, they just are not lifted.
   const mountedRef = useRef(true)
+
+  // Whether each section has a saved row on the server. A section without one shows
+  // its validation errors on blur only for the fields the user has touched.
+  const customerRowRef = useRef(customer != null)
+  const installRowRef = useRef(installationAddress != null)
+  const billingRowRef = useRef(billingAddress != null)
+  const [billingRowExists, setBillingRowExists] = useState(billingAddress != null)
+  const touchedRef = useRef<Set<string>>(new Set())
+
+  // Billing copy bookkeeping ("same as installation"). copyOwedSeqRef counts the
+  // events that owe a copy: a successful installation save while the box is ticked,
+  // ticking it, or an action flush while ticked with no billing row (owed as a
+  // tick). copyDoneSeqRef is the count covered by the latest successful copy (or by
+  // an untick, which cancels the owed copies); copyInFlightSeqRef is the count the
+  // copy in flight covers. copyOwedByTickRef: the newest owing event owes as a tick.
+  const copyOwedSeqRef = useRef(0)
+  const copyDoneSeqRef = useRef(0)
+  const copyInFlightSeqRef = useRef<number | null>(null)
+  const copyOwedByTickRef = useRef(false)
+  const [copyOwed, setCopyOwed] = useState(false)
+  // Successful installation saves since the tab mounted (0 = the row loaded on
+  // open): the generation a billing copy copies, which keys its refusal.
+  const installSaveGenRef = useRef(0)
+  // The separate billing values held when the box is ticked; an untick in this
+  // session restores them (and saves them with their own PUT).
+  const previousBillingFormRef = useRef<AddressForm | null>(null)
+
+  const customerSave = useSectionAutosave<
+    CustomerSaveRequest,
+    ApiSuccess<CustomerSaveResponse>
+  >({
+    orderId,
+    locked,
+    // The seeded form's body, never a null "always dirty" baseline: opening the tab
+    // (or a StrictMode setup/cleanup) never writes.
+    initialBaselineKey: JSON.stringify(buildCustomerBody(customerFromProps(customer))),
+    buildBody: () => validCustomerBody(customerFormRef.current),
+    bodyKey: (body) => JSON.stringify(body),
+    send: saveCustomer,
+    onSaved: ({ orderId: savedOrderId, body, result }) => {
+      customerRowRef.current = true
+      if (mountedRef.current) {
+        setServerErrors((prev) => replaceSectionErrors(prev, 'customer_', {}))
+        onSavedRef.current({ orderId: savedOrderId, customer: result.data.customer })
+      }
+      return JSON.stringify(body)
+    },
+    onFailed: ({ body, error }) => {
+      if (!mountedRef.current) return
+      const current = buildCustomerBody(customerFormRef.current)
+      setServerErrors((prev) =>
+        replaceSectionErrors(
+          prev,
+          'customer_',
+          mapDetailsToFieldErrors('customer_', error, body, current),
+        ),
+      )
+    },
+  })
+
+  const installSave = useSectionAutosave<
+    AddressUpsertRequest,
+    ApiSuccess<InstallationAddressResponse>
+  >({
+    orderId,
+    locked,
+    initialBaselineKey: JSON.stringify(
+      buildAddressBody(addressFromProps(installationAddress)),
+    ),
+    buildBody: () => validAddressBody(installFormRef.current),
+    bodyKey: (body) => JSON.stringify(body),
+    send: saveInstallationAddress,
+    onSaved: ({ orderId: savedOrderId, body, result }) => {
+      installRowRef.current = true
+      installSaveGenRef.current += 1
+      // The installation row must persist before any copy-from-installation: a
+      // successful installation save is what owes the copy while the box is ticked,
+      // and the copy itself waits until installation has nothing in flight or queued.
+      // The success also shows the order is editable, so earlier copy refusals are
+      // forgotten (redundant now that the copy this save owes has a new generation
+      // key, but harmless); a refused billing PUT stays refused until billing succeeds.
+      billingSave.forgetRefusals((key) => key.startsWith('copy:'))
+      if (sameAsInstallRef.current) oweCopy(false)
+      if (mountedRef.current) {
+        setServerErrors((prev) => replaceSectionErrors(prev, 'install_', {}))
+        onSavedRef.current({
+          orderId: savedOrderId,
+          installAddress: result.data.install_address,
+        })
+      }
+      return JSON.stringify(body)
+    },
+    onFailed: ({ body, error }) => {
+      if (!mountedRef.current) return
+      const current = buildAddressBody(installFormRef.current)
+      setServerErrors((prev) =>
+        replaceSectionErrors(
+          prev,
+          'install_',
+          mapDetailsToFieldErrors('install_', error, body, current),
+        ),
+      )
+    },
+    // Installation went idle: send the billing copy it gates, when one is owed.
+    onIdle: () => {
+      if (sameAsInstallRef.current) billingSave.request()
+    },
+  })
+
+  const billingSave = useSectionAutosave<
+    BillingIntent,
+    ApiSuccess<BillingAddressResponse>
+  >({
+    orderId,
+    locked,
+    // The SAVED billing row (null when there is none), never the form: a pre-filled
+    // form with no billing row is not a saved row, and it is not dirty either — billing
+    // is sent only for an owed copy or a billing edit made while the box is unticked.
+    initialBaselineKey:
+      billingAddress != null
+        ? JSON.stringify(buildAddressBody(addressFromProps(billingAddress)))
+        : null,
+    buildBody: buildBillingIntent,
+    // A copy is keyed by the installation-save generation it copies, never by a tick:
+    // a copy refusal (ORDER_LOCKED) that arrives late never blocks a copy owed by a
+    // later successful installation save, even one that saved the same value again,
+    // while a re-tick or a queued duplicate of the same generation is not re-sent.
+    bodyKey: (intent) =>
+      intent.kind === 'copy'
+        ? `copy:${intent.source}`
+        : JSON.stringify(intent.body),
+    // Checked again when a queued intent drains: an untick cancels a queued copy, and a
+    // tick makes a queued PUT of the old separate values obsolete.
+    needsSave: (intent, baselineKey) =>
+      intent.kind === 'copy'
+        ? intent.owedSeq > copyDoneSeqRef.current && copyReady()
+        : !sameAsInstallRef.current &&
+          JSON.stringify(intent.body) !== baselineKey,
+    send: (saveOrderId, intent) => {
+      if (intent.kind === 'copy') {
+        copyInFlightSeqRef.current = intent.owedSeq
+        return copyBillingFromInstallation(saveOrderId)
+      }
+      return saveBillingAddress(saveOrderId, intent.body)
+    },
+    onSaved: ({ orderId: savedOrderId, body: intent, result }) => {
+      billingRowRef.current = true
+      if (intent.kind === 'copy') {
+        copyInFlightSeqRef.current = null
+        copyDoneSeqRef.current = Math.max(copyDoneSeqRef.current, intent.owedSeq)
+      }
+      if (mountedRef.current) {
+        setBillingRowExists(true)
+        setCopyOwed(copyOwedSeqRef.current > copyDoneSeqRef.current)
+        setServerErrors((prev) => replaceSectionErrors(prev, 'billing_', {}))
+        onSavedRef.current({
+          orderId: savedOrderId,
+          billingAddress: result.data.billing_address,
+        })
+      }
+      // A copy sends no body: its baseline is the row the server copied.
+      return intent.kind === 'copy'
+        ? JSON.stringify(
+            buildAddressBody(addressFromProps(result.data.billing_address)),
+          )
+        : JSON.stringify(intent.body)
+    },
+    onFailed: ({ body: intent, error }) => {
+      if (intent.kind === 'copy') copyInFlightSeqRef.current = null
+      if (!mountedRef.current || intent.kind !== 'put') return
+      const current = buildAddressBody(billingFormRef.current)
+      setServerErrors((prev) =>
+        replaceSectionErrors(
+          prev,
+          'billing_',
+          mapDetailsToFieldErrors('billing_', error, intent.body, current),
+        ),
+      )
+    },
+  })
+
+  function oweCopy(byTick: boolean) {
+    copyOwedSeqRef.current += 1
+    copyOwedByTickRef.current = byTick
+    if (mountedRef.current) setCopyOwed(true)
+  }
+
+  // A copy reads the SAVED installation row, so it runs only while installation has
+  // nothing in flight or queued. A copy owed by a tick also needs the installation
+  // form saved and unchanged (otherwise the next successful installation save owes
+  // it again); one owed by a successful installation save copies that saved row.
+  function copyReady(): boolean {
+    if (installSave.isBusy()) return false
+    if (!copyOwedByTickRef.current) return true
+    const body = validAddressBody(installFormRef.current)
+    return body !== null && JSON.stringify(body) === installSave.baseline()
+  }
+
+  function buildBillingIntent(): BillingIntent | null {
+    if (sameAsInstallRef.current) {
+      const owedSeq = copyOwedSeqRef.current
+      if (owedSeq <= copyDoneSeqRef.current) return null
+      if (copyInFlightSeqRef.current === owedSeq) return null
+      if (!copyReady()) return null
+      return { kind: 'copy', owedSeq, source: String(installSaveGenRef.current) }
+    }
+    const body = validAddressBody(billingFormRef.current)
+    return body === null ? null : { kind: 'put', body }
+  }
+
+  function sectionSave(section: SaveSection): SectionAutosave {
+    if (section === 'customer') return customerSave
+    if (section === 'installation') return installSave
+    return billingSave
+  }
+
+  // A section is confirmed when its latest valid body is the confirmed baseline with
+  // nothing in flight or queued. Billing while ticked is confirmed only with a SAVED
+  // billing row, no copy still owed and a confirmed installation (an absent billing
+  // row behind a pre-filled form is never "saved").
+  function customerConfirmed(): boolean {
+    const body = validCustomerBody(customerFormRef.current)
+    return (
+      body !== null &&
+      !customerSave.isBusy() &&
+      JSON.stringify(body) === customerSave.baseline()
+    )
+  }
+
+  function installationConfirmed(): boolean {
+    const body = validAddressBody(installFormRef.current)
+    return (
+      body !== null &&
+      !installSave.isBusy() &&
+      JSON.stringify(body) === installSave.baseline()
+    )
+  }
+
+  function billingConfirmed(): boolean {
+    if (billingSave.isBusy()) return false
+    if (sameAsInstallRef.current) {
+      return (
+        billingRowRef.current &&
+        copyOwedSeqRef.current <= copyDoneSeqRef.current &&
+        installationConfirmed()
+      )
+    }
+    const body = validAddressBody(billingFormRef.current)
+    return body !== null && JSON.stringify(body) === billingSave.baseline()
+  }
+
+  // The complete Customer save sequence, shared by the action flush and the unmount
+  // registration: the customer and installation flushes and the billing PUT (which
+  // does not depend on installation) start at once; an owed billing copy starts only
+  // once installation is idle; then every chain is awaited until no section has work
+  // left (a settling installation chain may have started the copy). Locked orders
+  // start nothing new but still await work already running. Never rejects.
+  async function flushAllSections(): Promise<void> {
+    customerSave.flushNow()
+    installSave.flushNow()
+    const billingIndependent = !sameAsInstallRef.current
+    if (billingIndependent) billingSave.flushNow()
+    await installSave.whenIdle()
+    if (!billingIndependent) billingSave.flushNow()
+    for (;;) {
+      const chains = [
+        customerSave.activeChain(),
+        installSave.activeChain(),
+        billingSave.activeChain(),
+      ].filter((chain): chain is Promise<void> => chain !== null)
+      if (chains.length === 0) return
+      await Promise.all(chains)
+    }
+  }
+
+  // Batch A #107 (D1): validate, save every eligible section, await the full drains,
+  // then re-check the FRESHEST forms and intent. An invalid section, an owed copy, an
+  // absent billing row or a latest form that differs from its confirmed baseline (a
+  // failed save leaves it so) is never reported as saved. Like QuoteTab, the re-check
+  // ignores the section error: after an ambiguous failure (the save may have committed)
+  // a form equal to its confirmed baseline passes while the status line keeps the
+  // error; the unknown-outcome problem is not solved here. With "same as installation"
+  // ticked and no billing row (an earlier copy failed, then a reload), this action
+  // flush owes a copy as a tick does (Muneeb's decision, 30 October 2026): it runs
+  // once installation is saved, unchanged and idle, otherwise after the next
+  // successful installation save. Only the action flush owes it, never the mount, the
+  // debounce, a blur or the unmount flush. On failure the invalid sections show all
+  // their field errors; a failed save (a failed copy included) shows in the status
+  // line; a copy that cannot run yet shows only as the empty Addresses circle.
+  async function flushCustomerAutosave(): Promise<boolean> {
+    if (!lockedRef.current && sameAsInstallRef.current && !billingRowRef.current) {
+      oweCopy(true)
+    }
+    try {
+      await flushAllSections()
+    } catch {
+      return false
+    }
+    const confirmed =
+      customerConfirmed() && installationConfirmed() && billingConfirmed()
+    if (!confirmed && mountedRef.current) {
+      revealErrors('customer', true)
+      revealErrors('installation', true)
+      revealErrors('billing', true)
+    }
+    return confirmed
+  }
+
+  useImperativeHandle(ref, () => ({ flushCustomerAutosave }))
+
+  // Mount/unmount guard + unmount flush. CustomerTab stays mounted (hidden) across
+  // top-level tab switches, so this cleanup fires only on a REAL unmount: an order
+  // switch or leaving the workspace. Batch A #101: the whole Customer save sequence
+  // (work already running, the unmount flush of every valid dirty section and the
+  // billing copy that waits for installation) is registered BEFORE returning, under
+  // this order, so a reopen of the same order waits for it before reading. Locked
+  // orders and invalid sections send nothing new; existing work is still registered.
+  // StrictMode's setup/cleanup/setup cycle sends nothing: every section still equals
+  // its seeded baseline and no copy is owed.
   useEffect(() => {
     // Reset on setup so a StrictMode setup→cleanup→setup cycle (or any remount)
     // leaves the ref true for the live component; cleanup marks a real unmount.
-    // Without this reset the ref can stick at false and strand `saving`/forms.
+    // Without this reset the ref can stick at false and suppress every lift and
+    // every guarded state update (server field errors, the billing-row and copy-owed
+    // flags, the failed flush's error reveal).
     mountedRef.current = true
     return () => {
       mountedRef.current = false
+      registerPendingSave(orderIdRef.current, 'customer', flushAllSections())
     }
+    // flushAllSections reads everything through refs and the hooks' ref-backed methods.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  function clearError(key: string) {
-    setErrors((prev) => {
-      if (!(key in prev)) return prev
-      const next = { ...prev }
-      delete next[key]
-      return next
-    })
+  function clearFieldError(key: string) {
+    setClientErrors((prev) => withoutError(prev, key))
+    setServerErrors((prev) => withoutError(prev, key))
   }
 
-  function clearErrorsWithPrefix(prefix: string) {
-    setErrors((prev) => {
-      let changed = false
-      const next: Record<string, string> = {}
-      for (const [k, v] of Object.entries(prev)) {
-        if (k.startsWith(prefix)) {
-          changed = true
-        } else {
-          next[k] = v
-        }
-      }
-      return changed ? next : prev
-    })
+  // Show a section's validation errors (blur, or a failed action flush with `all`).
+  // A section without a saved row shows them only for touched fields unless `all`;
+  // fields shown by `all` count as touched, so a later blur keeps showing them.
+  function revealErrors(section: SaveSection, all: boolean) {
+    const prefix = SECTION_ERROR_PREFIX[section]
+    let found: Record<string, string> = {}
+    if (section === 'customer') {
+      found = validateCustomer(customerFormRef.current)
+    } else if (section === 'installation') {
+      found = validateAddress(installFormRef.current, prefix)
+    } else if (!sameAsInstallRef.current) {
+      found = validateAddress(billingFormRef.current, prefix)
+    }
+    const rowSaved =
+      section === 'customer'
+        ? customerRowRef.current
+        : section === 'installation'
+          ? installRowRef.current
+          : billingRowRef.current
+    const shown: Record<string, string> = {}
+    for (const [key, message] of Object.entries(found)) {
+      if (all) touchedRef.current.add(key)
+      if (all || rowSaved || touchedRef.current.has(key)) shown[key] = message
+    }
+    setClientErrors((prev) => replaceSectionErrors(prev, prefix, shown))
+  }
+
+  // Blur: save the section now (no waiting for the debounce) and show its errors.
+  function handleBlur(section: SaveSection, field: string) {
+    touchedRef.current.add(`${SECTION_ERROR_PREFIX[section]}${field}`)
+    sectionSave(section).flushNow()
+    revealErrors(section, false)
   }
 
   function updateCustomer<K extends keyof CustomerForm>(
     key: K,
     value: CustomerForm[K],
   ) {
-    setCustomerForm((prev) => ({ ...prev, [key]: value }))
-    clearError(`customer_${key}`)
-    setSaveRun(null)
+    const next = { ...customerFormRef.current, [key]: value }
+    customerFormRef.current = next
+    setCustomerForm(next)
+    clearFieldError(`customer_${key}`)
+    customerSave.clearError()
+    customerSave.schedule()
   }
 
   function updateInstall<K extends keyof AddressForm>(
     key: K,
     value: AddressForm[K],
   ) {
-    setInstallForm((prev) => ({ ...prev, [key]: value }))
-    if (sameAsInstall) {
-      setBillingForm((prev) => ({ ...prev, [key]: value }))
+    const next = { ...installFormRef.current, [key]: value }
+    installFormRef.current = next
+    setInstallForm(next)
+    if (sameAsInstallRef.current) {
+      const mirror = { ...billingFormRef.current, [key]: value }
+      billingFormRef.current = mirror
+      setBillingForm(mirror)
     }
-    clearError(`install_${key}`)
-    setSaveRun(null)
+    clearFieldError(`install_${key}`)
+    installSave.clearError()
+    installSave.schedule()
   }
 
   function updateBilling<K extends keyof AddressForm>(
     key: K,
     value: AddressForm[K],
   ) {
-    setBillingForm((prev) => ({ ...prev, [key]: value }))
-    clearError(`billing_${key}`)
-    setSaveRun(null)
+    const next = { ...billingFormRef.current, [key]: value }
+    billingFormRef.current = next
+    setBillingForm(next)
+    clearFieldError(`billing_${key}`)
+    billingSave.clearError()
+    billingSave.schedule()
   }
 
+  // Ticking "same as installation" is an explicit billing edit: it owes a copy, sent
+  // at once when installation is saved, unchanged and idle (otherwise after the next
+  // successful installation save), and it keeps the separate billing values for an
+  // untick. Unticking cancels every owed copy (a copy already in flight still lands,
+  // and the restored values are drained after it), restores those values and
+  // schedules their own PUT (debounced, so a billing edit right after joins it).
   function toggleSameAsInstall(checked: boolean) {
+    if (lockedRef.current) return
+    sameAsInstallRef.current = checked
     setSameAsInstall(checked)
     if (checked) {
-      setBillingForm({ ...installForm })
-      clearErrorsWithPrefix('billing_')
+      previousBillingFormRef.current = billingFormRef.current
+      const mirror = { ...installFormRef.current }
+      billingFormRef.current = mirror
+      setBillingForm(mirror)
+      setClientErrors((prev) => replaceSectionErrors(prev, 'billing_', {}))
+      setServerErrors((prev) => replaceSectionErrors(prev, 'billing_', {}))
+      oweCopy(true)
+    } else {
+      copyDoneSeqRef.current = copyOwedSeqRef.current
+      copyOwedByTickRef.current = false
+      setCopyOwed(false)
+      const previous = previousBillingFormRef.current
+      if (previous !== null) {
+        billingFormRef.current = previous
+        setBillingForm(previous)
+      }
     }
-    setSaveRun(null)
+    billingSave.clearError()
+    if (checked) billingSave.flushNow()
+    else billingSave.schedule()
   }
 
-  function validateForms(): Record<string, string> {
-    const newErrors: Record<string, string> = {}
-
-    if (!customerForm.first_name.trim()) {
-      newErrors.customer_first_name = 'First name is required.'
-    }
-    if (!customerForm.last_name.trim()) {
-      newErrors.customer_last_name = 'Last name is required.'
-    }
-    const mobileTrim = customerForm.mobile.trim()
-    if (!mobileTrim) {
-      newErrors.customer_mobile = 'Mobile number is required.'
-    } else if (
-      !MOBILE_LOCAL_REGEX.test(mobileTrim) &&
-      !MOBILE_INTL_REGEX.test(mobileTrim)
-    ) {
-      newErrors.customer_mobile = MOBILE_ERROR
-    }
-    const emailTrim = customerForm.email.trim()
-    if (!emailTrim) {
-      newErrors.customer_email = 'Email is required.'
-    } else if (!EMAIL_REGEX.test(emailTrim)) {
-      newErrors.customer_email = 'Enter a valid email address.'
-    }
-
-    if (!installForm.street_number.trim()) {
-      newErrors.install_street_number = 'Street number is required.'
-    }
-    if (!installForm.street.trim()) {
-      newErrors.install_street = 'Street is required.'
-    }
-    if (!installForm.suburb.trim()) {
-      newErrors.install_suburb = 'Suburb is required.'
-    }
-    if (!installForm.state_code.trim()) {
-      newErrors.install_state_code = 'State is required.'
-    }
-    if (!installForm.postcode.trim()) {
-      newErrors.install_postcode = 'Postcode is required.'
-    }
-
-    if (!sameAsInstall) {
-      if (!billingForm.street_number.trim()) {
-        newErrors.billing_street_number = 'Street number is required.'
-      }
-      if (!billingForm.street.trim()) {
-        newErrors.billing_street = 'Street is required.'
-      }
-      if (!billingForm.suburb.trim()) {
-        newErrors.billing_suburb = 'Suburb is required.'
-      }
-      if (!billingForm.state_code.trim()) {
-        newErrors.billing_state_code = 'State is required.'
-      }
-      if (!billingForm.postcode.trim()) {
-        newErrors.billing_postcode = 'Postcode is required.'
-      }
-    }
-
-    return newErrors
-  }
-
-  async function handleSave() {
-    if (locked || saving) return
-
-    // Strict client validation first — no network call when the form is invalid.
-    const validationErrors = validateForms()
-    if (Object.keys(validationErrors).length > 0) {
-      setErrors(validationErrors)
-      setSaveRun(null)
-      const hasCustomerErrors = Object.keys(validationErrors).some((k) =>
-        k.startsWith('customer_'),
-      )
-      const hasAddressErrors = Object.keys(validationErrors).some(
-        (k) => k.startsWith('install_') || k.startsWith('billing_'),
-      )
-      if (hasCustomerErrors) {
-        setActiveSubTab('details')
-      } else if (hasAddressErrors) {
-        setActiveSubTab('addresses')
-      }
-      return
-    }
-    setErrors({})
-
-    // Capture the order id the save is addressed to BEFORE any await, so a late
-    // lift (after the component may have unmounted / the order may have changed)
-    // still carries the correct source order id for the parent's guard.
-    const saveOrderId = orderId
-
-    // Always send the complete field set (full-replace PUT). Optionals collapse
-    // blank -> null here so omitted-as-empty does not get written as "".
-    const customerBody = buildCustomerBody(customerForm)
-    const installBody = buildAddressBody(installForm)
-    const billingBody = buildAddressBody(billingForm)
-    const copyBilling = sameAsInstall
-
-    setSaving(true)
-    setSaveRun(null)
-
-    // Sequential, stop-on-first-failure. Earlier successes are NOT rolled back
-    // (no cross-endpoint transaction), so partial state must be surfaced.
-    const fail = (section: SaveSection, err: unknown) => {
-      if (!mountedRef.current) return
-      const fieldErrors = mapDetailsToFieldErrors(section, err)
-      if (Object.keys(fieldErrors).length > 0) {
-        setErrors((prev) => ({ ...prev, ...fieldErrors }))
-      }
-      setSaveRun(buildFailureRun(section, apiErrorMessage(err)))
-      setActiveSubTab(section === 'customer' ? 'details' : 'addresses')
-    }
-
-    try {
-      // 1. Customer.
-      let savedCustomer: OrderCustomer
-      try {
-        const res = await saveCustomer(orderId, customerBody)
-        savedCustomer = res.data.customer
-      } catch (err) {
-        fail('customer', err)
-        return
-      }
-      if (!mountedRef.current) return
-      setCustomerForm(customerFromProps(savedCustomer))
-      // Lift the confirmed customer row up immediately — it must survive even if
-      // a later section (installation/billing) fails in this same run.
-      onSaved({ orderId: saveOrderId, customer: savedCustomer })
-
-      // 2. Installation address (must persist before any copy-from-installation).
-      let savedInstall: OrderAddress
-      try {
-        const res = await saveInstallationAddress(orderId, installBody)
-        savedInstall = res.data.install_address
-      } catch (err) {
-        fail('installation', err)
-        return
-      }
-      if (!mountedRef.current) return
-      setInstallForm(addressFromProps(savedInstall))
-      // Lift the confirmed installation row up — survives a later billing failure.
-      onSaved({ orderId: saveOrderId, installAddress: savedInstall })
-
-      // 3. Billing — copy-from-installation when "same as installation" is
-      //    checked (the installation row exists from step 2), otherwise a full
-      //    billing PUT. Either variant reports as the single "Billing" section.
-      let savedBilling: OrderAddress
-      try {
-        const res = copyBilling
-          ? await copyBillingFromInstallation(orderId)
-          : await saveBillingAddress(orderId, billingBody)
-        savedBilling = res.data.billing_address
-      } catch (err) {
-        fail('billing', err)
-        return
-      }
-      if (!mountedRef.current) return
-      setBillingForm(addressFromProps(savedBilling))
-      // Lift the confirmed billing row up.
-      onSaved({ orderId: saveOrderId, billingAddress: savedBilling })
-
-      // Every required call in this run succeeded — only now a global success.
-      // Parent state was already updated per-section above (per-step only —
-      // never a combined call here as well).
-      setSaveRun(FULL_SUCCESS_RUN)
-    } finally {
-      if (mountedRef.current) setSaving(false)
-    }
-  }
-
-  const editingDisabled = locked || saving
+  // Inputs stay editable while a section saves; only LAID locks them.
+  const editingDisabled = locked
   const billingDisabled = editingDisabled || sameAsInstall
+  const errors = { ...serverErrors, ...clientErrors }
+
+  // Sub-tab circles: green only while the content is complete, valid and confirmed
+  // saved, with no save running and no unresolved save error (Details = customer
+  // details; Addresses = installation AND billing).
+  const customerBody = validCustomerBody(customerForm)
+  const detailsComplete =
+    customerBody !== null &&
+    !customerSave.saving &&
+    customerSave.error === null &&
+    JSON.stringify(customerBody) === customerSave.baselineKey
+  const installBody = validAddressBody(installForm)
+  const installComplete =
+    installBody !== null &&
+    !installSave.saving &&
+    installSave.error === null &&
+    JSON.stringify(installBody) === installSave.baselineKey
+  const billingBody = validAddressBody(billingForm)
+  const billingComplete =
+    !billingSave.saving &&
+    billingSave.error === null &&
+    (sameAsInstall
+      ? billingRowExists && !copyOwed && installComplete
+      : billingBody !== null &&
+        JSON.stringify(billingBody) === billingSave.baselineKey)
+  const addressesComplete = installComplete && billingComplete
+  const subTabs = SUB_TABS.map((tab) =>
+    tab.id === 'enquiry'
+      ? tab
+      : {
+          ...tab,
+          indicator:
+            (tab.id === 'details' ? detailsComplete : addressesComplete)
+              ? ('complete' as const)
+              : ('incomplete' as const),
+        },
+  )
+
+  // Status line (Details of Sale style): Saving… / an error naming its section /
+  // Saved. Saved shows only after a save in this session, and only while every
+  // section is complete, valid and saved.
+  const anySaving =
+    customerSave.saving || installSave.saving || billingSave.saving
+  const sectionErrors = (['customer', 'installation', 'billing'] as const)
+    .filter((section) => sectionSave(section).error !== null)
+    .map((section) => ({
+      section,
+      message: apiErrorMessage(sectionSave(section).error),
+    }))
+  const allSaved =
+    detailsComplete &&
+    addressesComplete &&
+    (customerSave.savedThisSession ||
+      installSave.savedThisSession ||
+      billingSave.savedThisSession)
 
   return (
     <div>
-      <div className="mb-6">
-        <h2 className="text-lg font-semibold text-slate-900 tracking-tight">
-          Customer
-        </h2>
-        <p className="text-sm text-slate-500 mt-1">
-          Enter customer details and addresses.
-        </p>
+      <div className="mb-6 flex items-start justify-between gap-3">
+        <div>
+          <h2 className="text-lg font-semibold text-slate-900 tracking-tight">
+            Customer
+          </h2>
+          <p className="text-sm text-slate-500 mt-1">
+            {locked
+              ? 'Enter customer details and addresses.'
+              : 'Enter customer details and addresses. Changes are saved automatically.'}
+          </p>
+        </div>
+        {!locked && activeSubTab !== 'enquiry' && (
+          <div className="shrink-0 pt-0.5 text-xs">
+            {anySaving ? (
+              <span className="text-slate-500">Saving…</span>
+            ) : sectionErrors.length > 0 ? (
+              <div className="space-y-0.5 text-right">
+                {sectionErrors.map(({ section, message }) => (
+                  <p key={section} className="text-red-600">
+                    {SECTION_LABELS[section]}: {message}
+                  </p>
+                ))}
+              </div>
+            ) : allSaved ? (
+              <span className="inline-flex items-center gap-1 text-teal-700">
+                <CheckCircleIcon className="w-3.5 h-3.5" />
+                Saved
+              </span>
+            ) : null}
+          </div>
+        )}
       </div>
 
       <div className="mb-6">
         <Tabs
-          tabs={SUB_TABS}
+          tabs={subTabs}
           active={activeSubTab}
           onChange={setActiveSubTab}
         />
@@ -580,11 +1010,16 @@ export function CustomerTab({
                 autoComplete="given-name"
                 value={customerForm.first_name}
                 onChange={(e) => updateCustomer('first_name', e.target.value)}
+                onBlur={() => handleBlur('customer', 'first_name')}
                 invalid={!!errors.customer_first_name}
                 disabled={editingDisabled}
               />
             </Field>
-            <Field label="Middle name" htmlFor="middle_name">
+            <Field
+              label="Middle name"
+              htmlFor="middle_name"
+              error={errors.customer_middle_name}
+            >
               <Input
                 id="middle_name"
                 type="text"
@@ -593,6 +1028,8 @@ export function CustomerTab({
                 onChange={(e) =>
                   updateCustomer('middle_name', e.target.value)
                 }
+                onBlur={() => handleBlur('customer', 'middle_name')}
+                invalid={!!errors.customer_middle_name}
                 disabled={editingDisabled}
               />
             </Field>
@@ -607,6 +1044,7 @@ export function CustomerTab({
                 autoComplete="family-name"
                 value={customerForm.last_name}
                 onChange={(e) => updateCustomer('last_name', e.target.value)}
+                onBlur={() => handleBlur('customer', 'last_name')}
                 invalid={!!errors.customer_last_name}
                 disabled={editingDisabled}
               />
@@ -622,6 +1060,7 @@ export function CustomerTab({
                 autoComplete="email"
                 value={customerForm.email}
                 onChange={(e) => updateCustomer('email', e.target.value)}
+                onBlur={() => handleBlur('customer', 'email')}
                 invalid={!!errors.customer_email}
                 disabled={editingDisabled}
               />
@@ -637,11 +1076,16 @@ export function CustomerTab({
                 autoComplete="tel"
                 value={customerForm.mobile}
                 onChange={(e) => updateCustomer('mobile', e.target.value)}
+                onBlur={() => handleBlur('customer', 'mobile')}
                 invalid={!!errors.customer_mobile}
                 disabled={editingDisabled}
               />
             </Field>
-            <Field label="Home number" htmlFor="home_number">
+            <Field
+              label="Home number"
+              htmlFor="home_number"
+              error={errors.customer_home_phone}
+            >
               <Input
                 id="home_number"
                 type="tel"
@@ -650,10 +1094,16 @@ export function CustomerTab({
                 onChange={(e) =>
                   updateCustomer('home_phone', e.target.value)
                 }
+                onBlur={() => handleBlur('customer', 'home_phone')}
+                invalid={!!errors.customer_home_phone}
                 disabled={editingDisabled}
               />
             </Field>
-            <Field label="Work number" htmlFor="work_number">
+            <Field
+              label="Work number"
+              htmlFor="work_number"
+              error={errors.customer_work_phone}
+            >
               <Input
                 id="work_number"
                 type="tel"
@@ -661,10 +1111,16 @@ export function CustomerTab({
                 onChange={(e) =>
                   updateCustomer('work_phone', e.target.value)
                 }
+                onBlur={() => handleBlur('customer', 'work_phone')}
+                invalid={!!errors.customer_work_phone}
                 disabled={editingDisabled}
               />
             </Field>
-            <Field label="Company" htmlFor="company">
+            <Field
+              label="Company"
+              htmlFor="company"
+              error={errors.customer_company_name}
+            >
               <Input
                 id="company"
                 type="text"
@@ -673,6 +1129,8 @@ export function CustomerTab({
                 onChange={(e) =>
                   updateCustomer('company_name', e.target.value)
                 }
+                onBlur={() => handleBlur('customer', 'company_name')}
+                invalid={!!errors.customer_company_name}
                 disabled={editingDisabled}
               />
             </Field>
@@ -687,7 +1145,11 @@ export function CustomerTab({
               Installation address
             </h3>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              <Field label="Unit number" htmlFor="install_unit_number">
+              <Field
+                label="Unit number"
+                htmlFor="install_unit_number"
+                error={errors.install_unit_number}
+              >
                 <Input
                   id="install_unit_number"
                   type="text"
@@ -695,6 +1157,8 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateInstall('unit_number', e.target.value)
                   }
+                  onBlur={() => handleBlur('installation', 'unit_number')}
+                  invalid={!!errors.install_unit_number}
                   disabled={editingDisabled}
                 />
               </Field>
@@ -710,6 +1174,7 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateInstall('street_number', e.target.value)
                   }
+                  onBlur={() => handleBlur('installation', 'street_number')}
                   invalid={!!errors.install_street_number}
                   disabled={editingDisabled}
                 />
@@ -724,6 +1189,7 @@ export function CustomerTab({
                   type="text"
                   value={installForm.street}
                   onChange={(e) => updateInstall('street', e.target.value)}
+                  onBlur={() => handleBlur('installation', 'street')}
                   invalid={!!errors.install_street}
                   disabled={editingDisabled}
                 />
@@ -738,6 +1204,7 @@ export function CustomerTab({
                   type="text"
                   value={installForm.suburb}
                   onChange={(e) => updateInstall('suburb', e.target.value)}
+                  onBlur={() => handleBlur('installation', 'suburb')}
                   invalid={!!errors.install_suburb}
                   disabled={editingDisabled}
                 />
@@ -754,6 +1221,7 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateInstall('state_code', e.target.value)
                   }
+                  onBlur={() => handleBlur('installation', 'state_code')}
                   invalid={!!errors.install_state_code}
                   disabled={editingDisabled}
                 />
@@ -771,6 +1239,7 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateInstall('postcode', e.target.value)
                   }
+                  onBlur={() => handleBlur('installation', 'postcode')}
                   invalid={!!errors.install_postcode}
                   disabled={editingDisabled}
                 />
@@ -793,7 +1262,11 @@ export function CustomerTab({
               <span>Same as installation address</span>
             </label>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-              <Field label="Unit number" htmlFor="billing_unit_number">
+              <Field
+                label="Unit number"
+                htmlFor="billing_unit_number"
+                error={errors.billing_unit_number}
+              >
                 <Input
                   id="billing_unit_number"
                   type="text"
@@ -801,7 +1274,9 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateBilling('unit_number', e.target.value)
                   }
+                  onBlur={() => handleBlur('billing', 'unit_number')}
                   disabled={billingDisabled}
+                  invalid={!!errors.billing_unit_number}
                 />
               </Field>
               <Field
@@ -816,6 +1291,7 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateBilling('street_number', e.target.value)
                   }
+                  onBlur={() => handleBlur('billing', 'street_number')}
                   disabled={billingDisabled}
                   invalid={!!errors.billing_street_number}
                 />
@@ -832,6 +1308,7 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateBilling('street', e.target.value)
                   }
+                  onBlur={() => handleBlur('billing', 'street')}
                   disabled={billingDisabled}
                   invalid={!!errors.billing_street}
                 />
@@ -848,6 +1325,7 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateBilling('suburb', e.target.value)
                   }
+                  onBlur={() => handleBlur('billing', 'suburb')}
                   disabled={billingDisabled}
                   invalid={!!errors.billing_suburb}
                 />
@@ -864,6 +1342,7 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateBilling('state_code', e.target.value)
                   }
+                  onBlur={() => handleBlur('billing', 'state_code')}
                   disabled={billingDisabled}
                   invalid={!!errors.billing_state_code}
                 />
@@ -881,6 +1360,7 @@ export function CustomerTab({
                   onChange={(e) =>
                     updateBilling('postcode', e.target.value)
                   }
+                  onBlur={() => handleBlur('billing', 'postcode')}
                   disabled={billingDisabled}
                   invalid={!!errors.billing_postcode}
                 />
@@ -891,8 +1371,8 @@ export function CustomerTab({
       )}
 
       {/* Kept mounted (toggled with `hidden`) so unsaved enquiry edits survive a
-          sub-tab switch, the same way the customer/address fields persist via
-          CustomerTab state. */}
+          sub-tab switch, the same way the customer/address fields and their
+          pending autosaves persist via CustomerTab state. */}
       <div className={activeSubTab === 'enquiry' ? '' : 'hidden'}>
         <LeadEnquirySection
           orderId={orderId}
@@ -904,8 +1384,7 @@ export function CustomerTab({
         />
       </div>
 
-      {/* Customer/address save footer — only for the Details/Addresses sub-tabs.
-          The Lead enquiry sub-tab has its own separate Save Lead Enquiry button. */}
+      {/* Customer/address footer — only for the Details/Addresses sub-tabs, which autosave (status above). */}
       {activeSubTab !== 'enquiry' && (
       <div className="mt-8 pt-5 border-t border-slate-200 space-y-4">
         {locked && (
@@ -914,56 +1393,10 @@ export function CustomerTab({
           </p>
         )}
 
-        {saveRun?.ok && (
-          <div className="inline-flex items-center gap-1.5 text-xs text-teal-700">
-            <CheckCircleIcon className="w-3.5 h-3.5" />
-            Customer and addresses saved.
-          </div>
-        )}
-
-        {saveRun && !saveRun.ok && (
-          <div className="rounded-lg border border-amber-300 bg-amber-50 px-4 py-3 text-xs text-amber-900">
-            <p className="font-semibold">Some sections didn’t save</p>
-            <ul className="mt-2 space-y-0.5">
-              <li>
-                {SECTION_LABELS.customer} — {outcomeLabel(saveRun.customer)}
-              </li>
-              <li>
-                {SECTION_LABELS.installation} —{' '}
-                {outcomeLabel(saveRun.installation)}
-              </li>
-              <li>
-                {SECTION_LABELS.billing} — {outcomeLabel(saveRun.billing)}
-              </li>
-            </ul>
-            {saveRun.failedSection && saveRun.failedMessage && (
-              <p className="mt-2">
-                {SECTION_LABELS[saveRun.failedSection]}:{' '}
-                {saveRun.failedMessage}
-              </p>
-            )}
-            <p className="mt-2 text-amber-700">
-              Sections marked “Saved” are stored on the server and don’t need
-              re-entering.
-            </p>
-          </div>
-        )}
-
-        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <p className="text-[11px] text-slate-500">
-            Customer and billing address details are required before creating
-            an invoice.
-          </p>
-          <Button
-            type="button"
-            variant="success"
-            size="md"
-            onClick={handleSave}
-            disabled={editingDisabled}
-          >
-            {saving ? 'Saving…' : 'Save customer'}
-          </Button>
-        </div>
+        <p className="text-[11px] text-slate-500">
+          Customer and billing address details are required before creating
+          an invoice.
+        </p>
       </div>
       )}
     </div>
