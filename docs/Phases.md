@@ -415,7 +415,7 @@ GitHub cleanup (done) -> post-16E docs reconciliation (done) -> 16F verify gate 
   -> 17 -> 18 -> 19
 ```
 
-The 16G verify gate was a read-only step. Each 16G PR, Batch A and Batch B get their own branch/PR. Steps are not cut, merged or reordered without the user's decision.
+The 16G verify gate was a read-only step. Each 16G PR and Batch B get their own branch/PR; Batch A is two PRs: PR 1 (#107, #96, #101) and PR 2 (the quote and invoice items), PR 2 based on merged PR 1. Steps are not cut, merged or reordered without the user's decision.
 
 ### Phase 16 — Quotation + remote signing  (16A to 16G done; 16G PRs 1 to 6 merged)
 
@@ -479,18 +479,20 @@ The six 16G PRs, in order (two new migrations: V20 in PR 2 and V21 in PR 4), all
 
 16G implementation issues, all closed: #125 (PR 2); #123 with [#69](https://github.com/MuneebHash/flooring-sales-portal/issues/69) (PR 3; #69 also PR 4 for remote signing); #126 (PR 5); #120, #121, #122 and #124 (PR 6). [#138](https://github.com/MuneebHash/flooring-sales-portal/issues/138) OpenAPI drift stays open: PR 1 corrected its original items, and the 16G docs pass (issue #145) removes its two broken upload response refs; the 69 `nullable: true` + `allOf` properties remain. Each code PR carries the mandatory test list in the 16G contract §16; no frontend test runner was added (build plus manual smoke test). The 16G single-session browser smoke passed on 23 October 2026 before PR #154 merged; the two-session scenarios are deferred to Playwright after deployment.
 
-### Batch A — own branch/PR after 16G
+### Batch A — two PRs after 16G
 
-- [#107](https://github.com/MuneebHash/flooring-sales-portal/issues/107) Customer tab: autosave customer details and addresses.
-- [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108) Quote: switching a draft from non-itemised to itemised refills lines from Products & Charges.
-- [#104](https://github.com/MuneebHash/flooring-sales-portal/issues/104) Seed the non-itemised quote total from the order total when a quote is first created.
-- [#109](https://github.com/MuneebHash/flooring-sales-portal/issues/109) Quote helper: "Add extra cost" button when the intended total is above the lines.
-- [#110](https://github.com/MuneebHash/flooring-sales-portal/issues/110) Quote helper: mismatch message hides after "Add adjustment".
-- [#96](https://github.com/MuneebHash/flooring-sales-portal/issues/96) Lead Enquiry autosave stale-baseline race.
-- [#101](https://github.com/MuneebHash/flooring-sales-portal/issues/101) QuoteTab autosave unmount/remount stale-overwrite hardening.
-- [#134](https://github.com/MuneebHash/flooring-sales-portal/issues/134) Require non-blank details of sale before a quote can be sent.
+- [#107](https://github.com/MuneebHash/flooring-sales-portal/issues/107) Customer tab: autosave customer details and addresses. (PR 1, done in #157.)
+- [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108) Quote: switching a draft from non-itemised to itemised refills lines from Products & Charges. (PR 2.)
+- [#104](https://github.com/MuneebHash/flooring-sales-portal/issues/104) Seed the non-itemised quote total from the order total when a quote is first created. (PR 2.)
+- [#109](https://github.com/MuneebHash/flooring-sales-portal/issues/109) Quote helper: "Add extra cost" button when the intended total is above the lines. (PR 2.)
+- [#110](https://github.com/MuneebHash/flooring-sales-portal/issues/110) Quote helper: mismatch message hides after "Add adjustment". (PR 2.)
+- [#96](https://github.com/MuneebHash/flooring-sales-portal/issues/96) Lead Enquiry autosave stale-baseline race. (PR 1, done in #157.)
+- [#101](https://github.com/MuneebHash/flooring-sales-portal/issues/101) QuoteTab autosave unmount/remount stale-overwrite hardening. (PR 1, done in #157.)
+- [#134](https://github.com/MuneebHash/flooring-sales-portal/issues/134) Require non-blank details of sale before a quote can be sent. (PR 2.)
+- [#149](https://github.com/MuneebHash/flooring-sales-portal/issues/149) F52: Rewrite from a stale screen clears an unseen remote signature. (PR 2: the Rewrite version precondition and the bound confirmation.)
+- Quote and Invoice tab polling every 5 seconds instead of 15 (Muneeb's decision, 29 October 2026; no issue number). (PR 2.)
 
-Boundaries: #104 seeds only at first quote creation and does not re-couple quote and order pricing. #108 (approved) is draft-only — the explicit OFF→ON switch refills from current Products & Charges and discards manual quote rows/adjustments; it is not continuous auto-sync, and issued/accepted snapshots and invoices converted from accepted quotes are never touched. Until the #108 PR ships, the contract §6.1 retained-row rule stays active (non-itemised saves retain dormant rows; switching back restores them); the #108 PR amends the contract, UX lock and OpenAPI wording together with its implementation.
+Boundaries: #104 seeds only at first quote creation and does not re-couple quote and order pricing. #108 is draft-only — every explicit OFF→ON switch refills from current Products & Charges and discards manual quote rows/adjustments, with no confirmation; it is not continuous auto-sync, and issued/accepted snapshots and invoices converted from accepted quotes are never touched. PR 2 implements it in the Quote tab only: the backend still keeps dormant rows on non-itemised saves (the contract §6.1 storage rule, unchanged), and the Quote tab never restores them; PR 2 amends the contract, UX lock and OpenAPI wording together with its implementation.
 
 ### Batch B — own branch/PR after Batch A
 
@@ -500,15 +502,13 @@ Boundaries: #104 seeds only at first quote creation and does not re-couple quote
 
 Boundaries: #112 adds a per-business deposit percentage (default 40%, set by SQL until an Operations surface exists), frozen on quote issue and preserved through acceptance/conversion; existing issued/accepted quotes keep 40%. Today 40% is hardcoded in two places (`QuotePdfGenerator`, `PublicQuoteService`) — configurable deposit is not implemented. #114 previews the exact stored PDF of the invoice version with the latest successful signed-PDF email (including the 16G emails after a Path A conversion or a remote signing), labelled "Last emailed invoice: Version N"; it never claims the customer received it and adds no invoice history list. 16G invoice **link** sends never count: they stamp only the `invoice_token` markers, never `invoice.last_emailed_at` or the dashboard mirror. Versions already have stored PDFs and per-version `last_emailed_at`; storage/schema reuse is checked during implementation. #114 also takes the Invoice tab PDF/signature read binding (audit F53, added to #114 by an issue comment on 22 October 2026).
 
-Batch A or Batch B, placement undecided: [#135](https://github.com/MuneebHash/flooring-sales-portal/issues/135) Rewrite Invoice with active payments above the new price returns 500 instead of 422; [#147](https://github.com/MuneebHash/flooring-sales-portal/issues/147) Blank frozen customer name: warn before Accept Remotely and end signing on the customer's 422 (Muneeb's call).
-
-Batch A or post-pilot, placement undecided: [#149](https://github.com/MuneebHash/flooring-sales-portal/issues/149) F52: Rewrite from a stale screen clears an unseen remote signature.
+Batch B (moved out of Batch A, Muneeb's decision for Batch A PR 2): [#135](https://github.com/MuneebHash/flooring-sales-portal/issues/135) Rewrite Invoice with active payments above the new price returns 500 instead of 422. Dropped from Batch A (Muneeb's decision, 29 October 2026; no code change; closed on 30 October 2026): [#147](https://github.com/MuneebHash/flooring-sales-portal/issues/147) Blank frozen customer name: warn before Accept Remotely and end signing on the customer's 422.
 
 ### Open decisions (the user's; none blocks an earlier step)
 
 | Due | Decision (Muneeb) |
 |---|---|
-| Before Batch A | Keep or remove the manual "Save customer" button (#107); confirmation before the refill discards edits (#108); default "Add extra cost" row text (#109) |
+| Before Batch A | Decided: the manual "Save customer" button is removed (#107, done in Batch A PR 1, #157); no confirmation before the refill discards edits (#108) and the "Add extra cost" row text is "Additional charges" (#109), both Muneeb's decisions for Batch A PR 2 |
 | Before Batch B | Lead Enquiry PDF content/layout and generated-on-request vs stored (#111); deposit base amount, remaining-deposit calculation and empty-state display (#112) |
 | 16G | None; 16G complete |
 
@@ -599,12 +599,12 @@ Ticketed since the post-16E docs pass:
 - **SMS "coming soon" wording**: [#133](https://github.com/MuneebHash/flooring-sales-portal/issues/133) Disabled Send by Phone/SMS button wording (Phase 18). The disabled "Send by Phone/SMS" button in the Quote tab still says "Available soon", and code comments (`QuoteTab.tsx`, `orderQuoteApi.ts`, `SmsSender` / `RecordingSmsSender`, `application.properties`) still describe SMS/Twilio delivery as coming; SMS is outside the approved scope (email only).
 - **Public quote-link rate limiting**: [#128](https://github.com/MuneebHash/flooring-sales-portal/issues/128) Rate limiting on public quote endpoints and a decode concurrency cap (Phase 17). Not implemented today (contract section 8 requires it).
 
-The other issues filed after 16F (16G, Phase 17, Phase 18, Phase 19, Batch A and the undecided #135 and #147) are listed with their phases in section 7; the 16G follow-ups #148 to #153 are listed below. [#138](https://github.com/MuneebHash/flooring-sales-portal/issues/138) (OpenAPI drift): 16G PR 1 handled its original drift, and the 16G docs pass (issue #145) removes its two broken upload response refs; #138 stays open for the 69 `nullable: true` + `allOf` properties.
+The other issues filed after 16F (16G, Phase 17, Phase 18, Phase 19, Batch A, Batch B's #135 and the dropped #147) are listed with their phases in section 7; the 16G follow-ups #148 to #153 are listed below. [#138](https://github.com/MuneebHash/flooring-sales-portal/issues/138) (OpenAPI drift): 16G PR 1 handled its original drift, and the 16G docs pass (issue #145) removes its two broken upload response refs; #138 stays open for the 69 `nullable: true` + `allOf` properties.
 
 16G follow-ups (proposed in the 16G decisions; filed on 22 October 2026; details in the 16G contract §17):
 
 - [#148](https://github.com/MuneebHash/flooring-sales-portal/issues/148) D.8 and D.9 post-commit email windows: the emailed PDF, the stamped row and the response can describe different versions (audit F49); the issue also covers concurrent quote or invoice link sends delivering a superseded link last. Post-pilot hardening, with the Phase 17 email provider (related: [#142](https://github.com/MuneebHash/flooring-sales-portal/issues/142)).
-- [#149](https://github.com/MuneebHash/flooring-sales-portal/issues/149) Rewrite from a stale screen clears a remote signature the salesperson never saw (F52). Batch A or post-pilot: Muneeb's call, still open.
+- [#149](https://github.com/MuneebHash/flooring-sales-portal/issues/149) Rewrite from a stale screen clears a remote signature the salesperson never saw (F52). Batch A PR 2.
 - [#150](https://github.com/MuneebHash/flooring-sales-portal/issues/150) In-store D.8 trusts the declared PNG type; apply the public path's content checks (F55). Phase 17.
 - [#151](https://github.com/MuneebHash/flooring-sales-portal/issues/151) Public controller tests run without the security filter chain; test recorders retain bearer links (F57, F59). Phase 17 or Phase 19, still open.
 - [#152](https://github.com/MuneebHash/flooring-sales-portal/issues/152) Rollback hooks on an unknown commit outcome (F60). Deferred (post-pilot) hardening.
@@ -615,4 +615,4 @@ The other issues filed after 16F (16G, Phase 17, Phase 18, Phase 19, Batch A and
 
 ## 9. Next step
 
-**Batch A** (section 7). Phases 16A to 16G are complete on `main` (section 4): the post-16F docs reconciliation (#137), the 16G read-only verify gate (13 October 2026) and Muneeb's 16G decisions are done, and the six 16G PRs merged in order, the last on 23 October 2026 (#139, #140, #141, #143, #146, #154). The 16G docs pass (issue #145) brings the contracts, the UX lock, this roadmap and `docs/openapi.yaml` ([`docs/API-Contracts-Phase16G-Invoice-Link.md`](API-Contracts-Phase16G-Invoice-Link.md)) in line with the shipped state. Batch A gets its own branch and PR, reviewed as usual (section 7). After Batch A: Batch B, Phase 17 deployment, 18, 19.
+**Batch A** (section 7). Phases 16A to 16G are complete on `main` (section 4): the post-16F docs reconciliation (#137), the 16G read-only verify gate (13 October 2026) and Muneeb's 16G decisions are done, and the six 16G PRs merged in order, the last on 23 October 2026 (#139, #140, #141, #143, #146, #154). The 16G docs pass (issue #145) brings the contracts, the UX lock, this roadmap and `docs/openapi.yaml` ([`docs/API-Contracts-Phase16G-Invoice-Link.md`](API-Contracts-Phase16G-Invoice-Link.md)) in line with the shipped state. Batch A is two PRs, each reviewed as usual (section 7): PR 1 (#107, #96, #101) merged in #157, and PR 2 (#108, #104, #109, #110, #134, #149 and the polling change) is based on merged PR 1. After Batch A: Batch B, Phase 17 deployment, 18, 19.

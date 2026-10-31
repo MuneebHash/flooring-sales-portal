@@ -199,17 +199,21 @@ class QuoteSendControllerTest {
         entityManager.clear();
     }
 
+    // Batch A PR 2 (#134): a quote send needs non-blank saved Details of Sale, so every order this fixture
+    // seeds carries neutral details (no "Carpet" / "Underlay": some PDF checks require those words absent).
+    private static final String FIXTURE_DETAILS_OF_SALE = "Supply and install as quoted (quote send test).";
+
     private long insertOrder(long businessId, int storeId, long userId, String status) {
         int s = ++seq;
         String orderNumber = "QSENDT.ZZ9." + String.format("%05d", s % 100_000);
         return jdbcTemplate.queryForObject(
                 "INSERT INTO sales_order "
                         + "(business_id, store_id, user_id, order_sequence_number, order_number, "
-                        + " flooring_type, order_status, week_number, week_year) "
-                        + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, ?::order_status, 1, 2026) "
+                        + " flooring_type, order_status, week_number, week_year, details_of_sale) "
+                        + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, ?::order_status, 1, 2026, ?) "
                         + "RETURNING order_id",
                 Long.class,
-                businessId, storeId, userId, s, orderNumber, status);
+                businessId, storeId, userId, s, orderNumber, status, FIXTURE_DETAILS_OF_SALE);
     }
 
     private long leadOrderInSession() {
@@ -541,10 +545,12 @@ class QuoteSendControllerTest {
                 .andExpect(jsonPath("$.data.last_emailed_at").isNotEmpty())
                 .andExpect(jsonPath("$.data.viewed_at").value(nullValue()))
                 .andExpect(jsonPath("$.data.token_expires_at").isNotEmpty())
-                // 16E-B frozen body snapshot: no details were saved on this order (null), and the
-                // itemised issue snapshots BOTH lines in (sort_order, PK) order with the full
+                // 16E-B frozen body snapshot: the order's saved details, frozen at issue (since Batch A
+                // PR 2, #134, a send needs non-blank saved details, so a send can no longer freeze null;
+                // a legacy null snapshot is read back in workspace_currentIssuedPopulatedAfterSend_...),
+                // and the itemised issue snapshots BOTH lines in (sort_order, PK) order with the full
                 // customer-facing field set — never a cost, id or snapshot-internal field.
-                .andExpect(jsonPath("$.data.details_of_sale").value(nullValue()))
+                .andExpect(jsonPath("$.data.details_of_sale").value(FIXTURE_DETAILS_OF_SALE))
                 .andExpect(jsonPath("$.data.lines", hasSize(2)))
                 .andExpect(jsonPath("$.data.lines[0].line_type").value("ITEM"))
                 .andExpect(jsonPath("$.data.lines[0].description").value("Carpet"))
@@ -658,7 +664,7 @@ class QuoteSendControllerTest {
         Assertions.assertEquals(0, versionLineCount(orderId),
                 "a non-itemised issue must snapshot ZERO quote_version_line rows");
         Assertions.assertEquals(2, draftLineCount(orderId),
-                "dormant draft rows survive the issue (still restorable by an itemised toggle)");
+                "dormant draft rows survive the issue (backend storage only; never restored since Batch A PR 2)");
 
         // The issued PDF renders the single-amount presentation — never the dormant rows.
         byte[] pdf = mockMvc.perform(get(pdfUrl(orderId, "issued")).session(liamStore1Session()))
@@ -1377,6 +1383,12 @@ class QuoteSendControllerTest {
         MvcResult sendResult = sendEmailOk(orderId);
         String plainToken = extractToken(quoteEmailSender.sentEmails().get(0).bodyText());
         String tokenHash = (String) singleTokenRow(orderId, "ACTIVE").get("token_hash");
+        // Batch A PR 2 (#134): a send now requires saved Details of Sale, so a version frozen with NULL details
+        // exists only as legacy data. Seed that legacy snapshot after the legitimate issue (the
+        // QuoteInvoiceConversionControllerTest pattern) so the workspace still reports a frozen NULL as null.
+        jdbcTemplate.update("UPDATE quote_version SET details_of_sale_snapshot = NULL "
+                + "WHERE order_id = ? AND version_number = 1", orderId);
+        clearJpaCache();
 
         MvcResult result = mockMvc.perform(get(workspaceUrl(orderId)).session(liamStore1Session()))
                 .andExpect(status().isOk())
@@ -1394,7 +1406,7 @@ class QuoteSendControllerTest {
                 .andExpect(jsonPath("$.data.current_issued.viewed_at").value(nullValue()))
                 .andExpect(jsonPath("$.data.current_issued.token_expires_at").isNotEmpty())
                 // 16E-B: the workspace summary carries the frozen body snapshot — details (null
-                // here; never saved) and the ordered issued lines.
+                // here: the legacy NULL snapshot seeded above) and the ordered issued lines.
                 .andExpect(jsonPath("$.data.current_issued.details_of_sale").value(nullValue()))
                 .andExpect(jsonPath("$.data.current_issued.lines", hasSize(2)))
                 .andExpect(jsonPath("$.data.current_issued.lines[0].description").value("Carpet"))

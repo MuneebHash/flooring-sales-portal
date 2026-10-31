@@ -361,9 +361,10 @@ public class QuoteService {
             quoteDraftWriteRepository.insertLines(quoteDraftId, computation.lines());
         }
         // Non-itemised save (Phase 16D-B PR2A retention, contract §6.1): header-only — quote_draft_line
-        // is NEVER touched. Rows persisted by the last itemised save stay as dormant rows so switching
-        // back to itemised restores the salesperson's edited lines (they must survive toggle-OFF, page
-        // reload, and returning days later). Deliberately NO delete on any non-itemised save: a
+        // is NEVER touched. Rows persisted by the last itemised save stay as dormant rows (storage only:
+        // since Batch A PR 2, #108, the Quote tab never restores them - every explicit switch back to
+        // itemised refills from Products & Charges, and that itemised save full-replaces them).
+        // Deliberately NO delete on any non-itemised save: a
         // false-mode draft with lines is indistinguishable from the retained state (no schema flag;
         // description matching is forbidden), and repeated non-itemised autosaves after a toggle-OFF
         // would otherwise destroy the retained rows. A legacy pre-PR2A synthetic "Quoted works" row

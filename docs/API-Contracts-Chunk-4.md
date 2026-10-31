@@ -208,12 +208,12 @@ list), `GET .../invoices/{invoiceId}` (detail by id), `GET .../invoices/{invoice
 
 **Path params.** `orderId` — positive integer.
 
-**Request DTO**
+**Request DTO** *(Batch A PR 2, #149)*
 ```json
-{}
+{ "expected_version_number": 3 }
 ```
 
-**Field rules.** No request fields. The frontend never sends `due_date`. Backend derives it from current `sales_order.proposed_lay_date` (see Business rules).
+**Field rules.** Exactly one mandatory field, `expected_version_number`: a positive integer, the `version_number` of the current invoice the Details of Sale Rewrite confirmation was bound to. It is a comparison precondition only (F.9; [16G contract §5](API-Contracts-Phase16G-Invoice-Link.md#5-version-preconditions-69-123)): it never selects, loads or writes a row, and the new version is always the server's current + 1. The frontend never sends `due_date`. Backend derives it from current `sales_order.proposed_lay_date` (see Business rules). (Before Batch A PR 2 the request body had to be `{}`.)
 
 **Response DTO — 201 Created**
 ```json
@@ -226,7 +226,7 @@ list), `GET .../invoices/{invoiceId}` (detail by id), `GET .../invoices/{invoice
 ```
 
 **Business rules** (conventions §14)
-1. Verify at least one invoice already exists for this order. Otherwise → **422 `INVOICE_REQUIRED`**.
+1. Verify at least one invoice already exists for this order. Otherwise → **422 `INVOICE_REQUIRED`**. *(Batch A PR 2, #149)* Then validate the body (see Validation) and compare its `expected_version_number` with that current invoice's `version_number`, read under the order lock: a mismatch → **409 `INVOICE_VERSION_STALE`** ("Invoice updated, please refresh", no details), before every later step, so a stale Rewrite writes nothing ([16G contract §5.8](API-Contracts-Phase16G-Invoice-Link.md#58-d2-rewrite-order-of-checks-batch-a-pr-2-149)). The Phase 13 customer email gate (Phase 13 contract §12, `D.2` delta) then runs before step 2.
 2. Validate the 9 invoice preconditions (see F.1). Any failure → **422 `INVOICE_PRECONDITIONS_NOT_MET`**.
 3. Determine `version_number = max(existing version_number) + 1`.
 4. Determine `due_date = sales_order.proposed_lay_date − 2 calendar days` (proposed_lay_date is guaranteed non-null by precondition 7). The latest existing invoice's `due_date` is NOT carried forward on a manual rewrite — manual rewrite is what makes new live edits (including a changed proposed lay date) official. May be earlier than `invoice_date` — that is valid (see G.2).
@@ -244,21 +244,22 @@ list), `GET .../invoices/{invoiceId}` (detail by id), `GET .../invoices/{invoice
 
 **Validation**
 - `orderId` is a positive integer.
-- Request body must be empty (`{}`). Any request fields, including `due_date`, return 400 `VALIDATION_FAILED`.
+- *(Batch A PR 2, #149)* The request body is a JSON object with exactly one field, `expected_version_number`, a positive integer, validated after the scope, LAID and current-invoice checks ([16G contract §5.3](API-Contracts-Phase16G-Invoice-Link.md#53-value-validation)). An absent or blank body, `{}`, or a missing or null field → 400 `VALIDATION_FAILED` `Required.`; the key repeated at the top level → `Must appear at most once.`; not a positive integer → `Must be a positive integer.`; any other field, including `due_date` → `Not allowed.` (in body order, the version detail last); a non-object body → `body` `Must be an object.`; unparseable → 400 `MALFORMED_JSON`. Before Batch A PR 2 the body had to be empty (`{}`).
 
 **Tenant / session / store / order scoping.** Same as D.1.
 
-**LAID lock.** **Blocked when LAID** → **422 `ORDER_LOCKED`** (conventions §16: manual Rewrite Invoice is in the LAID-blocked list).
+**LAID lock.** **Blocked when LAID** → **422 `ORDER_LOCKED`** (conventions §16: manual Rewrite Invoice is in the LAID-blocked list), before the invoice read and the body.
 
 **Status codes**
 | Code | When |
 |------|------|
 | 201 | New invoice version created |
-| 400 | Malformed JSON, invalid `orderId` format, non-empty request body (any field including `due_date` → `VALIDATION_FAILED`) |
+| 400 | Malformed JSON (`MALFORMED_JSON`), invalid `orderId` format, or an invalid body (Batch A PR 2): absent, `{}`, a missing, null, repeated or non-positive-integer `expected_version_number`, any other field including `due_date`, or a non-object body (`VALIDATION_FAILED`) |
 | 401 | No session |
 | 403 | Session has no active store / user does not have access |
 | 404 | Order not in scope, or business slug not found / inactive |
-| 422 | No prior invoice (`INVOICE_REQUIRED`); order is LAID (`ORDER_LOCKED`); preconditions not met (`INVOICE_PRECONDITIONS_NOT_MET`) |
+| 409 | `expected_version_number` is not the current invoice's `version_number` (`INVOICE_VERSION_STALE`, "Invoice updated, please refresh"; Batch A PR 2, #149) |
+| 422 | No prior invoice (`INVOICE_REQUIRED`); order is LAID (`ORDER_LOCKED`); customer email missing or invalid (`CUSTOMER_EMAIL_REQUIRED` / `CUSTOMER_EMAIL_INVALID`, Phase 13 §12); preconditions not met (`INVOICE_PRECONDITIONS_NOT_MET`) |
 | 500 | Unexpected (transactional rollback) |
 
 **Error example — no prior invoice**
@@ -298,11 +299,13 @@ only the current invoice; there is no history list and no per-version detail (de
 The current invoice is the `invoice` row with the highest `version_number` for the order.
 `version_number` is returned in the snapshot; the MVP frontend shows no version label and no
 revision dropdown. From 16G PR 3 the Invoice tab sends it back as `expected_version_number`
-when accepting (a comparison precondition, F.9), and since 16G PR 4 the public invoice view
-carries it as the document identity (16G contract §5, §9). Since 16G PR 4 the snapshot also
-carries the derived `invoice_link_expires_at` (E.2; the read writes nothing), and since PR 6
-the Invoice tab re-reads D.3 every 15 seconds while that field is non-null and the invoice
-unsigned (16G contract §13.2).
+when accepting (a comparison precondition, F.9), since Batch A PR 2 the Details of Sale tab
+sends the version its Rewrite confirmation was bound to as D.2's `expected_version_number`,
+and since 16G PR 4 the public invoice view carries it as the document identity (16G contract
+§5, §9). Since 16G PR 4 the snapshot also carries the derived `invoice_link_expires_at` (E.2;
+the read writes nothing), and since PR 6 the Invoice tab re-reads D.3 while that field is
+non-null and the invoice unsigned, every 5 seconds (since Batch A PR 2, Muneeb's decision
+29 October 2026; 15 seconds in 16G PR 6) (16G contract §13.2).
 
 **Business rules / scoping**
 - Resolve the current invoice = `max(version_number)` row in `invoice` for this order.
@@ -822,7 +825,7 @@ In all paths:
 - `gateway_transaction_id`, `response_status`, `response_message` on payments.
 - `created_at` everywhere.
 
-**16G comparison preconditions (not client-controlled values).** From 16G PR 3 the in-store accept (D.8) sends `expected_version_number` and Path A sends `{"quote_version_id": N}`; since PR 4 the public accept requires `expected_version_number` and the public PDF read requires the shown `version_number` (the public page sends them since PR 5). These are **comparison preconditions only**. D.8, the public invoice accept and Path A compare the value with the row they read under the order lock (the current invoice version, or the latest accepted quote version). The public invoice PDF read takes no order lock: it compares the requested `version_number` with the current version inside its one read-only snapshot ([16G contract §9.5](API-Contracts-Phase16G-Invoice-Link.md#95-get-pdf)). Every mismatch is refused with 409. The values never select, load or write a row and never become a stored value ([16G contract §5](API-Contracts-Phase16G-Invoice-Link.md#5-version-preconditions-69-123)).
+**16G comparison preconditions (not client-controlled values).** From 16G PR 3 the in-store accept (D.8) sends `expected_version_number` and Path A sends `{"quote_version_id": N}`; since PR 4 the public accept requires `expected_version_number` and the public PDF read requires the shown `version_number` (the public page sends them since PR 5); since Batch A PR 2 (#149) the D.2 Rewrite sends `{"expected_version_number": N}`. These are **comparison preconditions only**. D.8, the public invoice accept, D.2 Rewrite and Path A compare the value with the row they read under the order lock (the current invoice version, or the latest accepted quote version). The public invoice PDF read takes no order lock: it compares the requested `version_number` with the current version inside its one read-only snapshot ([16G contract §9.5](API-Contracts-Phase16G-Invoice-Link.md#95-get-pdf)). Every mismatch is refused with 409. The values never select, load or write a row and never become a stored value ([16G contract §5](API-Contracts-Phase16G-Invoice-Link.md#5-version-preconditions-69-123)).
 
 ---
 

@@ -121,6 +121,10 @@ import java.util.Optional;
  * failure, any other sender failure or a failure of the success stamp - turns a committed signing or
  * conversion into an error.
  *
+ * <p>Batch A PR 2 (#149): D.2 Rewrite also carries a mandatory precondition, the JSON body
+ * {@code {"expected_version_number": N}}, compared under the order lock with the current version
+ * ({@link #rewriteInvoice}); a mismatch is the same 409 {@code INVOICE_VERSION_STALE}, before any write.
+ *
  * <p>Phase 16G PR 4 (16G contract §7 to §12): the order-bound invoice link ({@code invoice_token}). The
  * protected send-link ({@link #sendInvoiceLink}) mints the order's new {@code ACTIVE} link (replacing an
  * older one) and emails it, link-only, after commit; the token-only public surface that reads and signs
@@ -322,16 +326,24 @@ public class OrderInvoiceService {
      * official, so the snapshot is taken from live state (NOT carried forward from the previous invoice).
      * After commit, D.3 / D.4 resolve this new row as the current invoice.
      *
-     * <p>Gate order follows the approved mutation ordering in {@code OrderService}: guard -> orderId
-     * parse (400 {@code VALIDATION_FAILED} on {@code order_id}) -> scoped {@code FOR UPDATE} order lookup
-     * (missing / cross-store / cross-business -> 404 {@code ORDER_NOT_FOUND}, no existence leak) -> LAID
-     * gate (422 {@code ORDER_LOCKED}; conventions §16 blocks manual Rewrite) -> empty-body check
-     * ({@code {}} only; any field -> 400 {@code VALIDATION_FAILED}; unparseable -> 400
-     * {@code MALFORMED_JSON}) -> require an existing invoice (else 422 {@code INVOICE_REQUIRED}) -> the 9
-     * preconditions (422 {@code INVOICE_PRECONDITIONS_NOT_MET}) -> snapshot + PDF + insert. The LAID gate
-     * runs BEFORE the body parse (mirroring {@code OrderService}) so a locked in-scope order is
-     * {@code ORDER_LOCKED} regardless of body content. The {@code FOR UPDATE} order lock serialises
-     * version allocation against a concurrent rewrite, so {@code uq_invoice_order_version} cannot be raced.
+     * <p>Gate order (Batch A PR 2, #149; the D.8 / Path A order for a version-carrying request): guard ->
+     * orderId parse (400 {@code VALIDATION_FAILED} on {@code order_id}) -> scoped {@code FOR UPDATE} order
+     * lookup (missing / cross-store / cross-business -> 404 {@code ORDER_NOT_FOUND}, no existence leak) ->
+     * LAID gate (422 {@code ORDER_LOCKED}; conventions §16 blocks manual Rewrite) -> the current invoice
+     * read under that lock (none -> 422 {@code INVOICE_REQUIRED}, before the body is looked at) -> the
+     * mandatory JSON body {@code {"expected_version_number": N}} ({@link #parseRewriteBody}: 400
+     * {@code VALIDATION_FAILED} / {@code MALFORMED_JSON}) -> N compared with that current version's
+     * {@code version_number} (mismatch -> 409 {@code INVOICE_VERSION_STALE}, before any snapshot, PDF,
+     * file, insert, mirror reset or link kill) -> the Phase 13 email gate (422) -> the 9 preconditions
+     * (422 {@code INVOICE_PRECONDITIONS_NOT_MET}) -> the overpaid backstop -> snapshot + PDF + insert. The
+     * LAID gate runs BEFORE the body parse (mirroring {@code OrderService}) so a locked in-scope order is
+     * {@code ORDER_LOCKED} regardless of body content. N is only COMPARED, never used to select a row, and
+     * the new version is always the server's current + 1. Unlike D.8 there is no already-accepted refusal:
+     * a matching Rewrite of a signed current version still appends an unsigned version (Phase 13 §7). The
+     * {@code FOR UPDATE} order lock serialises version allocation against every other version writer, so a
+     * version committed while this request waited for the lock is the one compared here and
+     * {@code uq_invoice_order_version} cannot be raced. Before Batch A PR 2 the body had to be empty and the
+     * empty-body check ran before the invoice read.
      */
     @Transactional
     public ApiResponse<InvoiceResponse> rewriteInvoice(String slug,
@@ -351,14 +363,20 @@ public class OrderInvoiceService {
         // the body parse), mirroring OrderService: a LAID in-scope order is ORDER_LOCKED regardless of body.
         requireNotLaid(order);
 
-        // Body must be empty ({} / blank). Any field (including due_date) -> 400 VALIDATION_FAILED;
-        // unparseable -> 400 MALFORMED_JSON.
-        rejectNonEmptyBody(body);
-
-        // Rewrite requires an existing invoice; the current (max version) row drives the next version.
+        // Rewrite requires an existing invoice; the current (max version) row, read under the lock, drives
+        // the next version. Checked BEFORE the body (Batch A PR 2: no invoice -> 422 whatever the body).
         InvoiceRow current = invoiceRepository.findCurrentByOrderId(orderId)
                 .orElseThrow(() -> new BusinessRuleException(
                         ErrorCode.INVOICE_REQUIRED, ErrorCode.INVOICE_REQUIRED.defaultMessage()));
+
+        // Batch A PR 2 (#149): the mandatory expected_version_number, COMPARED with the current version read
+        // above - never used as a lookup key - so an old, forged or foreign value can only mismatch (409
+        // before the email gate, the preconditions, the overpaid backstop and every write).
+        long expectedVersionNumber = parseRewriteBody(body);
+        if (expectedVersionNumber != current.versionNumber()) {
+            throw new ConflictException(ErrorCode.INVOICE_VERSION_STALE,
+                    ErrorCode.INVOICE_VERSION_STALE.defaultMessage());
+        }
 
         // Phase 16G PR 4: the Rewrite branch also kills the order's ACTIVE invoice link as REWRITTEN, in
         // this same order-locked transaction (see snapshotAndPersistInvoice).
@@ -375,8 +393,8 @@ public class OrderInvoiceService {
      * render + store its PDF, and return the E.2 detail wrapped with {@code successMessage}. Shared by D.1
      * Create (version 1) and D.2 Rewrite (max + 1): both make the current live order state official, so
      * the snapshot is identical apart from the version number and the response message. Caller has already
-     * passed the gates (scope, and — for rewrite — LAID + invoice-exists) and holds the order
-     * {@code FOR UPDATE} inside its transaction.
+     * passed the gates (scope, and — for rewrite — LAID + invoice-exists + the Batch A PR 2 version
+     * precondition) and holds the order {@code FOR UPDATE} inside its transaction.
      *
      * <p>Runs the 9 preconditions against the live summary (422 {@code INVOICE_PRECONDITIONS_NOT_MET}).
      * {@code sale_price_inc_gst} is taken directly from {@code final_sale_price_inc_gst} (not re-derived
@@ -1255,7 +1273,8 @@ public class OrderInvoiceService {
                 .findByOrderIdAndBusinessIdAndStoreIdForUpdate(orderId, ctx.businessId(), ctx.storeId())
                 .orElseThrow(() -> new NotFoundException(ErrorCode.ORDER_NOT_FOUND, "Order not found."));
 
-        // EmptyObjectRequest: the shared empty-body rule of the other eight routes, unchanged.
+        // EmptyObjectRequest: the shared empty-body rule of the other seven routes, unchanged (D.2 Rewrite
+        // left it for its own JSON body in Batch A PR 2).
         rejectNonEmptyBody(body);
 
         InvoiceRow current = invoiceRepository.findCurrentByOrderId(orderId)
@@ -1526,6 +1545,59 @@ public class OrderInvoiceService {
             errors.add(new ErrorDetail(null, QUOTE_VERSION_ID_FIELD, "Required."));
         } else if (!value.isIntegralNumber() || !value.canConvertToLong() || value.longValue() <= 0) {
             errors.add(new ErrorDetail(null, QUOTE_VERSION_ID_FIELD, "Must be a positive integer."));
+        }
+        if (!errors.isEmpty()) {
+            throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);
+        }
+        return value.longValue();
+    }
+
+    /**
+     * Batch A PR 2 (#149) - the D.2 Rewrite body, {@code RewriteInvoiceRequest}: a JSON object with exactly
+     * one field, {@code expected_version_number}, a positive integer (the current invoice version the
+     * Details of Sale confirmation was bound to). The Path A rules (16G contract §5.3) with this carrier:
+     * an absent or blank body, {@code {}} or a missing / null field → {@code Required.}; the key given more
+     * than once at the top level (an escaped spelling of it included; a nested key is not counted) →
+     * {@code Must appear at most once.}, whatever the values; a value that is not a positive integer (a
+     * string, a boolean, a fraction such as {@code 1.5} or {@code 1.0}, zero, a negative, an array or object,
+     * or beyond the signed 64-bit range) → {@code Must be a positive integer.}; every other field (including
+     * {@code due_date}) → {@code Not allowed.} (one detail per field, in body order, in the same 400 as any
+     * {@code expected_version_number} detail, which comes last); a non-object body (a JSON {@code null}
+     * included) → {@code body} {@code Must be an object.}; unparseable → 400 {@code MALFORMED_JSON}. Parsed
+     * only after the scope, LAID and current-invoice gates; the value is only compared, never used to select
+     * a version. {@link #parseCreateInvoiceFromQuoteBody} and {@link #rejectNonEmptyBody} are unchanged.
+     */
+    private long parseRewriteBody(String body) {
+        if (body == null || body.isBlank()) {
+            throw fieldValidation(EXPECTED_VERSION_FIELD, "Required.");
+        }
+        JsonNode node;
+        try {
+            node = objectMapper.readTree(body);
+        } catch (JsonProcessingException ex) {
+            throw new MalformedJsonException();
+        }
+        if (node == null || node.isMissingNode()) {
+            throw fieldValidation(EXPECTED_VERSION_FIELD, "Required.");
+        }
+        if (!node.isObject()) {
+            throw fieldValidation("body", "Must be an object.");
+        }
+        List<ErrorDetail> errors = new ArrayList<>();
+        Iterator<String> names = node.fieldNames();
+        while (names.hasNext()) {
+            String name = names.next();
+            if (!EXPECTED_VERSION_FIELD.equals(name)) {
+                errors.add(new ErrorDetail(null, name, "Not allowed."));
+            }
+        }
+        JsonNode value = node.get(EXPECTED_VERSION_FIELD);
+        if (topLevelKeyOccurrences(body, EXPECTED_VERSION_FIELD) > 1) {
+            errors.add(new ErrorDetail(null, EXPECTED_VERSION_FIELD, "Must appear at most once."));
+        } else if (value == null || value.isNull()) {
+            errors.add(new ErrorDetail(null, EXPECTED_VERSION_FIELD, "Required."));
+        } else if (!value.isIntegralNumber() || !value.canConvertToLong() || value.longValue() <= 0) {
+            errors.add(new ErrorDetail(null, EXPECTED_VERSION_FIELD, "Must be a positive integer."));
         }
         if (!errors.isEmpty()) {
             throw new ValidationException(ErrorCode.VALIDATION_FAILED.defaultMessage(), errors);

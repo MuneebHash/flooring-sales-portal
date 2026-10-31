@@ -306,6 +306,10 @@ class QuoteAcceptedReadsTest {
     // Helpers — self-seeding (business 1 / store 1 / user 1 only)
     // ================================================================
 
+    // Batch A PR 2 (#134): a quote send needs non-blank saved Details of Sale, so every order this fixture
+    // seeds carries neutral details (no "Carpet" / "Underlay": some PDF checks require those words absent).
+    private static final String FIXTURE_DETAILS_OF_SALE = "Supply and install as quoted (accepted reads test).";
+
     private long insertOrder(String status) {
         int s = ++seq;
         // order_number must match chk_sales_order_number_format (V6): {code}.{LL#}.{#####}
@@ -313,11 +317,11 @@ class QuoteAcceptedReadsTest {
         return jdbcTemplate.queryForObject(
                 "INSERT INTO sales_order "
                         + "(business_id, store_id, user_id, order_sequence_number, order_number, "
-                        + " flooring_type, order_status, week_number, week_year) "
-                        + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, ?::order_status, 1, 2026) "
+                        + " flooring_type, order_status, week_number, week_year, details_of_sale) "
+                        + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, ?::order_status, 1, 2026, ?) "
                         + "RETURNING order_id",
                 Long.class,
-                BUSINESS_AUSSIE, STORE_SYD_CBD, USER_LIAM, s, orderNumber, status);
+                BUSINESS_AUSSIE, STORE_SYD_CBD, USER_LIAM, s, orderNumber, status, FIXTURE_DETAILS_OF_SALE);
     }
 
     private void seedCustomer(long orderId) {
@@ -557,14 +561,19 @@ class QuoteAcceptedReadsTest {
         clearJpaCache();
     }
 
-    /** D.2 manual Rewrite (empty body) — a new UNSIGNED current version from the live order. */
-    private void rewriteInvoice(long orderId, int expectedVersion) throws Exception {
+    /**
+     * D.2 manual Rewrite — a new UNSIGNED current version from the live order. Since Batch A PR 2 (#149) it carries
+     * the order's CURRENT version (read just before the request) as expected_version_number; {@code producedVersion}
+     * is the version the Rewrite appends (current + 1), asserted on the response.
+     */
+    private void rewriteInvoice(long orderId, int producedVersion) throws Exception {
         clearJpaCache();
         mockMvc.perform(post(invoiceRewriteUrl(orderId)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"expected_version_number\":" + currentInvoiceVersion(orderId) + "}"))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.message").value("Invoice rewritten."))
-                .andExpect(jsonPath("$.data.invoice.version_number").value(expectedVersion))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(producedVersion))
                 .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(false));
         clearJpaCache();
     }
@@ -1087,6 +1096,12 @@ class QuoteAcceptedReadsTest {
         Assertions.assertEquals(2, draftLineCount(orderId), "precondition: dormant draft rows retained");
         String token = sendAndExtractToken(orderId);
         Assertions.assertEquals(0, versionLineCount(orderId), "a non-itemised issue snapshots zero lines");
+        // Batch A PR 2 (#134): a send needs non-blank saved Details of Sale, so a version frozen with NULL details
+        // exists only as legacy data. Seed that legacy snapshot after the legitimate issue (the
+        // QuoteInvoiceConversionControllerTest pattern); the public accept still has no details check.
+        jdbcTemplate.update("UPDATE quote_version SET details_of_sale_snapshot = NULL "
+                + "WHERE order_id = ? AND version_number = 1", orderId);
+        clearJpaCache();
         acceptPublicly(token, ONE_PIXEL_PNG);
 
         JsonNode data = workspaceData(orderId);
@@ -1099,7 +1114,7 @@ class QuoteAcceptedReadsTest {
         assertMoney("500.00", accepted.get("quote_total_ex_gst"), "quote_total_ex_gst");
         assertMoney("550.00", accepted.get("quote_total_inc_gst"), "quote_total_inc_gst");
         Assertions.assertTrue(accepted.get("details_of_sale").isNull(),
-                "details were never saved: the frozen null serializes as JSON null (key still present)");
+                "a legacy NULL frozen snapshot serializes as JSON null (key still present)");
         Assertions.assertTrue(accepted.get("signed_pdf_available").booleanValue());
         assertNoInternalKeys(accepted, "data.accepted");
 

@@ -913,6 +913,10 @@ class QuoteAcceptanceCommitIntegrationTest {
         return quote;
     }
 
+    // Batch A PR 2 (#134): a quote send needs non-blank saved Details of Sale, so the seeded order carries
+    // neutral details (no "Carpet" / "Underlay").
+    private static final String FIXTURE_DETAILS_OF_SALE = "Supply and install as quoted (acceptance commit test).";
+
     /** The OrderCreateRepository allocation: per-business advisory lock, MAX + 1, insert — one commit. */
     private SeededOrder seedOrder() {
         SeededOrder seeded = new TransactionTemplate(transactionManager).execute(txStatus -> {
@@ -926,10 +930,11 @@ class QuoteAcceptanceCommitIntegrationTest {
             Long orderId = jdbcTemplate.queryForObject(
                     "INSERT INTO sales_order "
                             + "(business_id, store_id, user_id, order_sequence_number, order_number, "
-                            + " flooring_type, order_status, week_number, week_year) "
-                            + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, 'LEAD'::order_status, 1, 2026) "
+                            + " flooring_type, order_status, week_number, week_year, details_of_sale) "
+                            + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, 'LEAD'::order_status, 1, 2026, ?) "
                             + "RETURNING order_id",
-                    Long.class, BUSINESS_AUSSIE, STORE_SYD_CBD, USER_LIAM, sequence, orderNumber);
+                    Long.class, BUSINESS_AUSSIE, STORE_SYD_CBD, USER_LIAM, sequence, orderNumber,
+                    FIXTURE_DETAILS_OF_SALE);
             Assertions.assertNotNull(orderId, "order insert must return an id");
             return new SeededOrder(orderId, orderNumber);
         });

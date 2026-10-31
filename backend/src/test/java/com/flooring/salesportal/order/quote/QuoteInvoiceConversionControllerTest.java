@@ -1274,9 +1274,15 @@ class QuoteInvoiceConversionControllerTest {
     @Test
     void createInvoice_detailsNullWhenTheQuoteWasIssued_reportsQuoteDetails_evenWithValidLiveDetails() throws Exception {
         long orderId = invoiceReadyOrder();
-        setDetailsOfSale(orderId, null);                           // nothing to freeze at issue
         saveItemisedTwoLineDraft(orderId);
-        acceptPublicly(sendAndExtractToken(orderId), ONE_PIXEL_PNG);
+        String token = sendAndExtractToken(orderId);
+        // Batch A PR 2 (#134): a send needs non-blank saved Details of Sale, so a version frozen with NULL details
+        // ("nothing to freeze at issue") exists only as legacy data. Seed that legacy snapshot after the
+        // legitimate issue, as the siblings below do; the public accept still has no details check.
+        jdbcTemplate.update("UPDATE quote_version SET details_of_sale_snapshot = NULL "
+                + "WHERE order_id = ? AND version_number = 1", orderId);
+        clearJpaCache();
+        acceptPublicly(token, ONE_PIXEL_PNG);
         Assertions.assertNull(quoteVersionRow(orderId, 1).get("details_of_sale_snapshot"),
                 "fixture: the frozen details are null");
         setDetailsOfSale(orderId, "Valid live details written after the acceptance");

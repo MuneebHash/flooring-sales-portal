@@ -156,6 +156,21 @@ class QuoteDraftCalculatorTest {
     }
 
     @Test
+    void adjustmentLine_positiveSignedTotalAddedAsIs() {
+        // Batch A PR 2 (#109): "Add extra cost" sends a POSITIVE adjustment; it is added as given (no sign check, no
+        // automatic adjustment): 250.00 + 22.73 = 272.73 ex, x 1.10 = 300.003 -> 300.00 inc (HALF_UP).
+        QuoteDraftComputation c = calc.compute(true,
+                List.of(item("Supply and install", "1.00", "250.00", 0),
+                        adjustment("Additional charges", "22.73", 1)),
+                null, NO_COST);
+        assertMoney("272.73", c.quoteTotalExGst());
+        assertMoney("300.00", c.quoteTotalIncGst());
+        assertEquals(2, c.lines().size(), "no server-added adjustment line");
+        assertMoney("22.73", c.lines().get(1).lineTotalExGst());
+        assertEquals(0, c.quoteTotalExGst().compareTo(sumLines(c)));
+    }
+
+    @Test
     void nonItemisedWithFinal_returnsNoLines_totalsDerivedFromFinal() {
         // Phase 16D-B PR2A: no synthetic line. itemised=false + final 550 inc => EMPTY line set,
         // ex 500 (= 550 / 1.10), inc 550. Supplied lines are ignored (the service retains any

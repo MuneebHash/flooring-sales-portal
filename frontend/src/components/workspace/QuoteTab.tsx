@@ -70,7 +70,8 @@ import { usePollWhileVisible } from '../../lib/usePollWhileVisible'
 //   - Issued/accepted refresh: the tab re-reads the workspace snapshots when the
 //     top-level tab becomes active, on a sub-tab change and before the Send
 //     confirmation opens (the D9 warning needs the current accepted state), and
-//     (16G PR 6, #120) every 15 seconds while an issued quote waits for a
+//     (16G PR 6, #120) every 5 seconds (since Batch A PR 2, Muneeb's decision
+//     29 October 2026; 15 seconds in 16G PR 6) while an issued quote waits for a
 //     signature and the tab is visible. ONE recency mechanism covers every
 //     snapshot read and every send / cancel / conversion result (see
 //     refreshSnapshots), and a refresh only ever replaces `issued` + `accepted`
@@ -99,13 +100,16 @@ import { usePollWhileVisible } from '../../lib/usePollWhileVisible'
 //
 // PR2B adds ITEMISED editing on top of PR1's non-itemised total:
 //   - a toggle switches the draft between the two modes (no warnings/modals);
-//   - toggle ON restores the draft's existing lines[] (retained dormant rows
-//     included — Phase 16D-B PR2A returns them on reads even when
-//     itemised=false), and only seeds from Products & Charges when the draft
-//     has NO lines at all;
+//   - since Batch A PR 2 (#108) EVERY explicit switch to itemised refills the
+//     rows from the order's current Products & Charges and discards the previous
+//     quote rows and adjustments, with no confirmation; the mode flips only once
+//     that read succeeds. Nothing is restored: neither the rows kept locally
+//     across a toggle OFF nor the retained dormant rows (Phase 16D-B PR2A still
+//     returns them on reads while itemised=false);
 //   - toggle OFF copies the itemised inc-GST total into the non-itemised total
 //     and saves {itemised:false, final_total_inc_gst, lines:[]} — the backend
-//     retains the itemised rows (PR2A), and the local rows are kept too;
+//     retains the itemised rows as dormant storage (PR2A), and the local rows are
+//     kept too (the next switch ON replaces them);
 //   - itemised saves OMIT final_total_inc_gst (locked wire rule): the client
 //     keeps total = sum of visible rows and manages ADJUSTMENT rows itself, so
 //     the backend's hidden auto-adjustment lever is never engaged.
@@ -146,9 +150,13 @@ const AUTOSAVE_DEBOUNCE_MS = 800
 // Backend caps a quote line description at 500 chars (trimmed).
 const DESCRIPTION_MAX = 500
 
-// Description of the ADJUSTMENT row the intended-total helper appends. A plain
-// visible row — never hidden, user-editable/deletable like any other line.
+// Descriptions of the ADJUSTMENT rows the intended-total helper appends: Add
+// discount adjustment (intended total below the lines) and, since Batch A PR 2
+// (#109), Add extra cost (intended total above the lines; Muneeb's default
+// wording). Plain visible rows — never hidden, user-editable/deletable like any
+// other line.
 const ADJUSTMENT_HELPER_DESCRIPTION = 'Discount / price adjustment'
+const EXTRA_COST_HELPER_DESCRIPTION = 'Additional charges'
 
 type QuoteSubTabId = 'draft' | 'customer' | 'accepted'
 
@@ -165,7 +173,8 @@ type Props = {
   locked: boolean
   // Phase 16F PR3: true while the top-level Quote tab is the visible tab. Each
   // false -> true transition re-reads the issued/accepted snapshots; since 16G
-  // PR 6 it also gates the 15-second poll.
+  // PR 6 it also gates the poll (every 5 seconds since Batch A PR 2, Muneeb's
+  // decision 29 October 2026; 15 seconds in 16G PR 6).
   active: boolean
   flooringType: FlooringType
   orderNumber?: string
@@ -185,6 +194,13 @@ type Props = {
   // Phase 16F: the latest accepted quote from the same probe (null = none
   // accepted). Seeds the Accepted Quote sub-tab ONCE, alongside initialIssued.
   initialAccepted: QuoteAcceptedSummary | null
+  // Batch A PR 2 (#104): the header Sale total (final_sale_price_inc_gst,
+  // override included) that Create Quote captured, or undefined (no usable
+  // total, or the tab was revealed by the probe). Read ONLY by the initial state
+  // of a brand-new draft (initialDraft null, order not locked): it pre-fills the
+  // non-itemised total at 2 dp and is saved once by the normal autosave. Never
+  // read again, so the quote never follows later order-price changes.
+  createQuoteTotalIncGst?: number
   // Phase 16F PR3: called with the backend success message after Create Invoice
   // from the accepted quote succeeds; the workspace switches to the Invoice tab.
   onInvoiceReady: (message: string) => void
@@ -198,6 +214,10 @@ type Props = {
   // the email where it lives (the InvoiceTab accept/resend precedent), and since
   // Batch A #107 when the Customer tab flush before a send fails.
   onGoToCustomer?: () => void
+  // Batch A PR 2 (#134): switches the workspace to the Details of Sale tab when a
+  // send is refused with QUOTE_DETAILS_OF_SALE_REQUIRED (the saved Details of Sale
+  // is blank), so the salesperson can write them where they live.
+  onGoToDetails?: () => void
   // Awaitable flush of any pending/in-flight Details of Sale autosave (lives in
   // the always-mounted shell — the SAME flush that gates invoice create/rewrite).
   // Codex P2: the quote preview PDF renders sales_order.details_of_sale from the
@@ -505,7 +525,9 @@ function buildDraftBody(
 // nothing: they block every itemised save, and toggle OFF falls back to the
 // last PERSISTED total while a row is broken — so a partial-sum total is only
 // ever persisted when no draft has been saved at all. inc = ex × 1.10 HALF_UP
-// 2dp in exact cents, matching the backend's itemised derivation exactly.
+// 2dp in exact cents, matching the backend's itemised derivation exactly. This
+// is the totals card's figure (and what a save would persist); the
+// intended-total helper message uses computeDisplayRowsEx below instead.
 function computeItemisedTotals(rows: EditorRow[]): { ex: number; inc: number } {
   let ex = 0
   for (const row of rows) {
@@ -514,6 +536,43 @@ function computeItemisedTotals(rows: EditorRow[]): { ex: number; inc: number } {
   }
   const exRounded = round2(ex)
   return { ex: exRounded, inc: incFromExGst(exRounded) }
+}
+
+// Batch A PR 2 (#110): a DISPLAY-ONLY ex-GST sum of the visible rows for the
+// intended-total helper message, so the message stays visible and follows the
+// amount while a new row is still being completed. A row counts as soon as its
+// numbers are valid, even with a blank description (an ADJUSTMENT amount typed
+// before its description included): the same numeric rules and rounding as
+// parseEditorRow (ITEM quantity > 0 and unit price >= 0, each rounded to 2 dp,
+// line total in exact cents; a signed ADJUSTMENT amount), minus the description
+// check. Unparsable or out-of-range numbers contribute nothing. It is never a
+// save input: parseEditorRow, the save bodies and the totals card are unchanged
+// and an invalid row is never sent, so the message and the card can differ by
+// the contribution of rows that are still incomplete; they agree again once
+// every row is valid.
+function computeDisplayRowsEx(rows: EditorRow[]): number {
+  let ex = 0
+  for (const row of rows) {
+    if (row.line_type === 'ITEM') {
+      const quantityParsed = parseMoneyInput(row.quantityInput)
+      const unitParsed = parseMoneyInput(row.unitPriceInput)
+      if (quantityParsed === null || unitParsed === null) continue
+      const quantity = round2(quantityParsed)
+      const unitPrice = round2(unitParsed)
+      if (quantity <= 0 || quantity > QUOTE_TOTAL_MAX) continue
+      if (unitPrice < 0 || unitPrice > QUOTE_TOTAL_MAX) continue
+      const lineTotal = itemLineTotal(quantity, unitPrice)
+      if (lineTotal === null || lineTotal > QUOTE_TOTAL_MAX) continue
+      ex += lineTotal
+      continue
+    }
+    const amountParsed = parseMoneyInput(row.amountInput)
+    if (amountParsed === null) continue
+    const amount = round2(amountParsed)
+    if (Math.abs(amount) > QUOTE_TOTAL_MAX) continue
+    ex += amount
+  }
+  return round2(ex)
 }
 
 // Per-field validity flags for row input styling (parseEditorRow collapses a
@@ -576,8 +635,9 @@ function readLinesToRows(lines: QuoteDraftLineRead[]): EditorRow[] {
     })
 }
 
-// Seed itemised rows from the order's REAL Products & Charges — the one
-// automatic seed case (draft has no lines at all). EXPLICIT field picking only:
+// Seed itemised rows from the order's REAL Products & Charges — used by every
+// explicit switch to itemised (Batch A PR 2, #108: the switch always refills and
+// nothing is restored). EXPLICIT field picking only:
 // the source DTOs carry cost_snapshot / price_snapshot / ids that must never
 // reach a quote payload, so nothing here spreads a source object.
 //   - product lines first, charge lines after (locked seed order);
@@ -624,6 +684,23 @@ function initialBaseline(initialDraft: QuoteDraftRead | null): string | null {
   }
   const body = buildItemisedBody(readLinesToRows(initialDraft.lines))
   return body === null ? null : JSON.stringify(body)
+}
+
+// Batch A PR 2 (#104): the starting total of a brand-new non-itemised draft —
+// the Sale total Create Quote captured — as a 2 dp input string, or null when
+// there is nothing to apply: no captured value, a locked order, or a value that
+// is not a finite total in (0, QUOTE_TOTAL_MAX] once rounded to 2 dp (the
+// workspace already filters it; repeated here defensively). Only consulted while
+// there is no persisted draft (initialDraft null).
+function createQuoteSeedInput(
+  locked: boolean,
+  createQuoteTotalIncGst: number | undefined,
+): string | null {
+  if (locked || createQuoteTotalIncGst === undefined) return null
+  if (!Number.isFinite(createQuoteTotalIncGst)) return null
+  const total = round2(createQuoteTotalIncGst)
+  if (total <= 0 || total > QUOTE_TOTAL_MAX) return null
+  return toFixed2(total)
 }
 
 // Friendly message for a failed quote save. ORDER_LOCKED gets a specific line;
@@ -766,11 +843,13 @@ export function QuoteTab({
   initialDraft,
   initialIssued,
   initialAccepted,
+  createQuoteTotalIncGst,
   onInvoiceReady,
   onAcceptedVersionChanged,
   flushDetailsAutosave,
   flushCustomerAutosave,
   onGoToCustomer,
+  onGoToDetails,
 }: Props) {
   const [subTab, setSubTab] = useState<QuoteSubTabId>('draft')
 
@@ -790,33 +869,41 @@ export function QuoteTab({
 
   // The single editable field of a non-itemised draft: the GST-inclusive quote
   // total, as a raw input string. Seeded ONCE from the probe result; toggle OFF
-  // rewrites it with the itemised inc total.
-  const [totalInput, setTotalInput] = useState<string>(() =>
-    initialDraft !== null && !initialDraft.itemised
-      ? toFixed2(initialDraft.quote_total_inc_gst)
-      : '',
-  )
+  // rewrites it with the itemised inc total. Batch A PR 2 (#104): a brand-new
+  // draft (no persisted draft, order not locked) starts from the Sale total
+  // Create Quote captured, formatted to 2 dp (see createQuoteSeedInput); the
+  // initial-save effect below saves it once. Nothing re-seeds it afterwards.
+  const [totalInput, setTotalInput] = useState<string>(() => {
+    if (initialDraft !== null) {
+      return initialDraft.itemised
+        ? ''
+        : toFixed2(initialDraft.quote_total_inc_gst)
+    }
+    return createQuoteSeedInput(locked, createQuoteTotalIncGst) ?? ''
+  })
 
   // Editable itemised rows. Seeded from the probe when the draft is already
-  // itemised; otherwise populated on toggle ON (restore or Products & Charges
-  // seed). KEPT across toggle OFF (spec: local rows are never deleted) so a
-  // later toggle ON restores the freshest local edits instantly.
+  // itemised; otherwise filled by the switch to itemised (Batch A PR 2, #108:
+  // always a fresh Products & Charges refill). Kept locally across toggle OFF,
+  // but never restored: the next switch ON replaces them.
   const [rows, setRows] = useState<EditorRow[]>(() =>
     initialDraft !== null && initialDraft.itemised
       ? readLinesToRows(initialDraft.lines)
       : [],
   )
 
-  // Products & Charges seed lifecycle for toggle ON with an empty draft:
-  // 'loading' shows the small inline state (mode does NOT flip yet — no
-  // accidental empty itemised draft), 'error' shows the inline error + Retry.
+  // Products & Charges refill lifecycle for every switch to itemised: 'loading'
+  // shows the small inline state (mode does NOT flip yet — nothing is discarded
+  // before the read succeeds), 'error' shows the inline error + Retry. The
+  // synchronous mirror is seedInFlightRef (below).
   const [seedState, setSeedState] = useState<'idle' | 'loading' | 'error'>(
     'idle',
   )
 
   // Intended-total HELPER input (inc GST). Pure client-side aid: never sent to
   // the backend, never part of any save payload, never persisted. Drives only
-  // the mismatch messages + the explicit "Add discount adjustment" button.
+  // the mismatch messages + the explicit "Add discount adjustment" and (Batch A
+  // PR 2, #109) "Add extra cost" buttons.
   const [intendedInput, setIntendedInput] = useState('')
 
   // Autosave status trio + the send-quote modal + preview state.
@@ -845,6 +932,10 @@ export function QuoteTab({
   // Batch A #107 (D1): the Customer tab flush failed (an invalid section or a
   // failed save), so the modal points at the Customer tab without blaming the email.
   const [sendCustomerFixNeeded, setSendCustomerFixNeeded] = useState(false)
+  // Batch A PR 2 (#134): the send was refused with QUOTE_DETAILS_OF_SALE_REQUIRED
+  // (blank saved Details of Sale), so the modal adds its Go to Details of Sale
+  // pointer. Cleared with the other pointer flags whenever the error is replaced.
+  const [sendDetailsFixNeeded, setSendDetailsFixNeeded] = useState(false)
   // Cancel-quote confirmation lifecycle (its own modal, per the locked UX).
   const [cancelModalOpen, setCancelModalOpen] = useState(false)
   const [cancelling, setCancelling] = useState(false)
@@ -988,7 +1079,9 @@ export function QuoteTab({
   const mountedRef = useRef(true)
   // JSON of the last body the backend confirmed persisted — the dirty baseline.
   // null = NO persisted draft yet (fresh Create Quote flow), so the first valid
-  // body is always dirty and autosaves. Initialised from the probe result so a
+  // body is always dirty: since Batch A PR 2 (#104) that is usually the
+  // pre-filled Sale total, which the initial-save effect saves once at mount;
+  // otherwise the first valid edit autosaves. Initialised from the probe result so a
   // freshly-loaded saved draft is never re-saved until it changes; the probe
   // waited for this order's pending quote saves (Batch A #101), so a reopen does
   // not take a pre-commit draft as its baseline. Advanced ONLY on a successful
@@ -1013,6 +1106,12 @@ export function QuoteTab({
   // status chip already shows "Saving…"). Prevents double flips / duplicate
   // saves from rapid taps mid-flush.
   const toggleBusyRef = useRef(false)
+  // Batch A PR 2 (#108): true from the moment a Products & Charges refill starts
+  // until its read settles — the SYNCHRONOUS mirror of seedState 'loading'. The
+  // switch and every Send entry point check it, so a rapid second activation
+  // cannot start another refill and no send can start, before React has rendered
+  // the loading state.
+  const seedInFlightRef = useRef(false)
   const debounceRef = useRef<number | null>(null)
   // In-flight guards for Send by Email and Cancel quote (16E-B): refs, not the
   // render state, so a double-click in the same tick can never fire twice.
@@ -1283,10 +1382,10 @@ export function QuoteTab({
     return draft !== null ? draft.quote_total_inc_gst : null
   }
 
-  // Prefill the helper input when the restored/seeded line sum differs from the
-  // draft's previous quote total, so the salesperson immediately sees the
-  // mismatch and gets offered the discount-adjustment fix. Cleared when they
-  // already match (or there is no previous total).
+  // Prefill the helper input when the refilled line sum differs from the draft's
+  // previous quote total, so the salesperson immediately sees the mismatch and
+  // gets offered the adjustment fix (discount or, since Batch A PR 2, extra
+  // cost). Cleared when they already match (or there is no previous total).
   function prefillIntended(nextRows: EditorRow[], prevInc: number | null) {
     if (prevInc === null) {
       setIntendedInput('')
@@ -1308,11 +1407,20 @@ export function QuoteTab({
     requestSave()
   }
 
-  // Seed from Products & Charges — ONLY when the draft has no lines[] at all.
-  // The mode does not flip until the fetch succeeds, so a fetch failure can
-  // never strand the editor on an accidental empty seed or autosave an empty
-  // itemised draft.
+  // Refill from Products & Charges — every explicit switch to itemised (Batch A
+  // PR 2, #108). The mode does not flip and the current rows are not replaced
+  // until the fetch succeeds, so a fetch failure discards nothing: it keeps the
+  // old mode and rows and shows the error with Retry, and it can never strand the
+  // editor on an accidental empty itemised draft. An empty Products & Charges
+  // gives an empty itemised draft at $0.00. The refilled rows save through the
+  // normal autosave (enterItemised -> requestSave); like any itemised save, a
+  // refill that is below cost is refused with the normal 422 and stays unsaved on
+  // screen, and the unchanged switch back to non-itemised (which flushes these
+  // rows first) then also stops until they are fixed — an accepted trap, with no
+  // separate recovery UI. seedInFlightRef is taken synchronously, before the
+  // first await.
   async function runSeed(prevInc: number | null) {
+    seedInFlightRef.current = true
     setSeedState('loading')
     try {
       const res = await fetchOrderLines(orderIdRef.current)
@@ -1322,14 +1430,28 @@ export function QuoteTab({
     } catch {
       if (!mountedRef.current) return
       setSeedState('error')
+    } finally {
+      seedInFlightRef.current = false
     }
   }
 
   async function handleToggleItemised() {
+    // Batch A PR 2 (#108): a switch is ignored while a send, cancel or Create
+    // Invoice is running (the refill must never change the draft a send is
+    // flushing and issuing), while a refill read is in flight, and — for the
+    // switch to itemised, the destructive direction — while a quote save is in
+    // flight (a fast double click OFF then ON must not discard the rows it has
+    // just saved). All checks are synchronous refs, so a rapid second activation
+    // is caught before React renders any loading state. This covers the
+    // refill-error Retry, which calls this handler too.
     if (
       lockedRef.current ||
-      seedState === 'loading' ||
-      toggleBusyRef.current
+      seedInFlightRef.current ||
+      toggleBusyRef.current ||
+      sendingRef.current ||
+      cancellingRef.current ||
+      convertingRef.current ||
+      (!itemisedRef.current && savingRef.current)
     ) {
       return
     }
@@ -1338,14 +1460,16 @@ export function QuoteTab({
     if (itemisedRef.current) {
       // Toggle OFF: copy the current itemised inc-GST total into the
       // non-itemised total and save {itemised:false, final_total_inc_gst,
-      // lines:[]}. The backend retains the itemised rows (PR2A) and the local
-      // rows are deliberately kept, so toggling ON again restores them without
-      // any re-seed.
+      // lines:[]}. The backend retains the itemised rows as dormant storage
+      // (PR2A) and the local rows are kept, but since Batch A PR 2 (#108)
+      // neither is restored: the next switch ON refills from Products & Charges.
       //
-      // ROW-FLUSH GUARD (Codex P2 round 2): a row edit made inside the 800ms
-      // debounce window would otherwise NEVER persist — the non-itemised save
-      // is header-only (PR2A), so the server would keep the PREVIOUS itemised
-      // rows and a reload (or 16E send) would silently lose the latest edits.
+      // ROW-FLUSH GUARD (Codex P2 round 2; code unchanged): a row edit made
+      // inside the 800ms debounce window would otherwise NEVER persist — the
+      // non-itemised save is header-only (PR2A). Since #108 the persisted rows
+      // are never restored after a successful switch OFF, so this flush matters
+      // when the non-itemised save does not land (a reload or a send then shows
+      // the persisted itemised rows, which must be the latest edits).
       // When the rows are all valid, flush the itemised body through the
       // normal single-flight machinery FIRST and only flip the mode once that
       // body IS the persisted state (an already-clean draft short-circuits
@@ -1406,30 +1530,28 @@ export function QuoteTab({
       requestSave()
       return
     }
-    // Toggle ON — restore-first, seed only when nothing to restore:
-    //   1. local rows from this session (freshest edits, kept across toggle OFF);
-    //   2. the draft's persisted lines[] (retained dormant rows — a legacy dev
-    //      draft may restore a "Quoted works" row; deletable, never special-cased);
-    //   3. seed from Products & Charges (the ONLY automatic seed case).
-    // Existing rows are never silently re-seeded over.
+    // Toggle ON (Batch A PR 2, #108): ALWAYS refill from the current Products &
+    // Charges. The explicit switch is the rebuild: it discards the previous quote
+    // rows and adjustments, with no confirmation. Neither the rows kept locally
+    // across a toggle OFF nor the persisted dormant lines[] are restored (a
+    // legacy dev "Quoted works" row therefore never reaches the editor; the
+    // refill's itemised save replaces it). Only a successful read flips the mode.
     const prevInc = previousQuoteTotalIncGst()
-    if (rowsRef.current.length > 0) {
-      enterItemised(rowsRef.current, prevInc)
-      return
-    }
-    const draft = serverDraftRef.current
-    if (draft !== null && draft.lines.length > 0) {
-      enterItemised(readLinesToRows(draft.lines), prevInc)
-      return
-    }
     void runSeed(prevInc)
   }
 
-  // Append the visible discount ADJUSTMENT row the helper offers. Explicit
-  // user click only — the helper never changes rows on its own. The amount is
-  // the EX-GST difference (rows are ex-GST): target ex = round2(intended/1.1),
-  // minus the current visible ex sum.
-  function handleAddDiscountAdjustment() {
+  // Append the visible ADJUSTMENT row the helper offers. Explicit user click
+  // only — the helper never changes rows on its own, and there is no hidden or
+  // automatic adjustment. The amount is the EX-GST difference (rows are ex-GST):
+  // target ex = round2(intended/1.1), minus the current visible ex sum — negative
+  // for Add discount adjustment, positive for Add extra cost (Batch A PR 2, #109),
+  // with the same rounding either way, so the new itemised total lands on the
+  // intended total or one cent above it. The row saves through the normal
+  // autosave and stays editable and deletable. Both buttons render only while
+  // every row is valid; a click that still finds an invalid row does nothing
+  // (the valid-rows sum would be the wrong base).
+  function appendIntendedTotalAdjustment(description: string) {
+    if (rowsRef.current.some((row) => parseEditorRow(row, 0) === null)) return
     const intendedParsed = parseMoneyInput(intendedInput)
     if (intendedParsed === null) return
     const intended = round2(intendedParsed)
@@ -1440,11 +1562,19 @@ export function QuoteTab({
     const row: AdjustmentEditorRow = {
       key: nextRowKey(),
       line_type: 'ADJUSTMENT',
-      description: ADJUSTMENT_HELPER_DESCRIPTION,
+      description,
       amountInput: toFixed2(adjustment),
     }
     commitRows([...rowsRef.current, row])
     requestSave()
+  }
+
+  function handleAddDiscountAdjustment() {
+    appendIntendedTotalAdjustment(ADJUSTMENT_HELPER_DESCRIPTION)
+  }
+
+  function handleAddExtraCostAdjustment() {
+    appendIntendedTotalAdjustment(EXTRA_COST_HELPER_DESCRIPTION)
   }
 
   // Awaitable flush used by Preview PDF: force-commit the freshest draft if it
@@ -1498,8 +1628,14 @@ export function QuoteTab({
   // of the same order in this browser document never seeds from a draft read
   // before the save committed. Limits (see pendingSaveRegistry): no protection
   // across screens, tabs or devices, a reload, an unknown save outcome or a
-  // logout. StrictMode's setup/cleanup/setup cycle is safe: at that point the
-  // draft still equals the baseline, so nothing is sent or registered.
+  // logout. StrictMode's setup/cleanup/setup cycle stays safe: for a loaded or a
+  // blank draft the draft still equals the baseline, so nothing is sent or
+  // registered; for a Batch A PR 2 (#104) pre-filled total, the initial-save
+  // effect below has already started its PUT, so this cleanup registers that
+  // chain and queues the same body behind it (QUEUE-FIRST) — never a second,
+  // untracked PUT — and the drain skips that body once the first PUT has
+  // persisted it (a failed first PUT is retried once by that drain, in
+  // development only).
   useEffect(() => {
     mountedRef.current = true
     return () => {
@@ -1527,8 +1663,8 @@ export function QuoteTab({
         // A save is in flight — QUEUE-FIRST (the mid-flight baseline is stale;
         // see requestSave): its drain picks up this latest body and reconciles
         // against the post-save baseline, inside the chain registered above.
-        // (StrictMode is unaffected — no save is ever in flight during its
-        // immediate setup/cleanup cycle.)
+        // (Under StrictMode this is the #104 initial save's case: its queued copy
+        // is the same body, which the drain skips or retries inside that chain.)
         pendingBodyRef.current = body
         return
       }
@@ -1539,6 +1675,34 @@ export function QuoteTab({
         saveQuoteDraft(saveOrderId, body).catch(() => {}),
       )
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Batch A PR 2 (#104): a brand-new draft pre-filled with the Sale total Create
+  // Quote captured is saved once, right after mount (this effect runs after the
+  // mount guard above has set mountedRef), through the normal autosave machinery:
+  // requestSave -> the single-flight save chain, so leaving the order meanwhile
+  // registers that chain with the pending-save registry. The tab mounts only after
+  // the quote probe (which first waited for this order's pending quote saves)
+  // confirmed there is no draft, so this PUT never overwrites a draft the tab has
+  // not seen. The baseline advances only when the PUT succeeds: a refusal (for
+  // example 422 QUOTE_BELOW_COST when the order itself is below cost) shows the
+  // normal save error and keeps the pre-filled value unsaved. No pre-fill (a
+  // loaded draft, a missing or unusable total, or a locked order) means nothing
+  // is sent here. The ref makes it a single attempt even when StrictMode replays
+  // the effect (the replay's own call would only queue the same body).
+  const initialSeedSaveAttemptedRef = useRef(false)
+  useEffect(() => {
+    if (initialSeedSaveAttemptedRef.current) return
+    initialSeedSaveAttemptedRef.current = true
+    if (
+      initialDraft !== null ||
+      createQuoteSeedInput(locked, createQuoteTotalIncGst) === null
+    ) {
+      return
+    }
+    requestSave()
+    // Mount-only by design: the pre-fill is applied and saved once, never again.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -1805,8 +1969,9 @@ export function QuoteTab({
   }, [active])
 
   // Refresh trigger 4 (16G PR 6, #120): while a quote link waits for a
-  // signature (current_issued non-null), poll the snapshots every 15 seconds,
-  // only while the browser tab is visible and this is the active workspace tab.
+  // signature (current_issued non-null), poll the snapshots every 5 seconds
+  // (since Batch A PR 2, Muneeb's decision 29 October 2026; 15 seconds in 16G
+  // PR 6), only while the browser tab is visible and this is the active workspace tab.
   // A tick is skipped while a snapshot read or a send / cancel / Create Invoice
   // (or the pre-Send check) is in flight; otherwise it is the same guarded read
   // as every other trigger, silent on failure (reportError: false), and never
@@ -1841,10 +2006,17 @@ export function QuoteTab({
   // snapshots FIRST and open the confirmation only after that read succeeded,
   // so the accepted-state warning reflects the current server state. A failed
   // read explains itself and offers a retry; it never opens an uninformed modal
-  // and never sends anything.
+  // and never sends anything. Batch A PR 2 (#108): never while a Products &
+  // Charges refill is loading (the draft on screen is about to be replaced),
+  // checked again before the modal opens.
   async function handleOpenSendModal() {
     if (sendCheckRef.current) return
-    if (sendingRef.current || cancellingRef.current || convertingRef.current) {
+    if (
+      sendingRef.current ||
+      cancellingRef.current ||
+      convertingRef.current ||
+      seedInFlightRef.current
+    ) {
       return
     }
     sendCheckRef.current = true
@@ -1852,6 +2024,7 @@ export function QuoteTab({
     setSendError(null)
     setSendEmailFixNeeded(false)
     setSendCustomerFixNeeded(false)
+    setSendDetailsFixNeeded(false)
     setActionNotice(null)
     try {
       // Only a read that APPLIED informs the warning. 'superseded' means a newer
@@ -1873,12 +2046,13 @@ export function QuoteTab({
       }
       setSendCheck('idle')
       // Never open over another action: the tab must still be visible, no
-      // mutation may be running and no other confirmation may be open.
+      // mutation or refill may be running and no other confirmation may be open.
       if (
         !activeRef.current ||
         sendingRef.current ||
         cancellingRef.current ||
         convertingRef.current ||
+        seedInFlightRef.current ||
         cancelModalOpenRef.current ||
         convertModalOpenRef.current
       ) {
@@ -1892,7 +2066,8 @@ export function QuoteTab({
 
   // Map a failed send to its in-modal message. Backend messages surface
   // VERBATIM whenever present; the per-code branches only add the right
-  // recovery pointer (Customer tab for the email gates; safe-retry for the
+  // recovery pointer (Customer tab for the email gates; Details of Sale for a
+  // blank saved Details of Sale, Batch A PR 2 #134; safe-retry for the
   // provider 502, where the backend KEPT the issued version/PDF/link).
   function applySendError(err: unknown) {
     const fallback = 'Could not send the quote. Please try again.'
@@ -1905,6 +2080,15 @@ export function QuoteTab({
         // The fix lives on the Customer tab — the modal adds the pointer/button.
         setSendError(message)
         setSendEmailFixNeeded(true)
+        return
+      }
+      if (err.code === 'QUOTE_DETAILS_OF_SALE_REQUIRED') {
+        // 422 before anything was issued or sent: the saved Details of Sale is
+        // blank. The fix lives on the Details of Sale tab — the modal adds its
+        // pointer/button. The server's locked check decides; there is no client
+        // pre-check.
+        setSendError(message)
+        setSendDetailsFixNeeded(true)
         return
       }
       if (err.code === 'EMAIL_SEND_FAILED') {
@@ -1930,11 +2114,15 @@ export function QuoteTab({
   async function handleSendEmail() {
     // Cross in-flight guard: never send while a cancel or a Create Invoice is
     // running (and vice versa) - the mutations race server-side and the loser's
-    // response could reinstall dead state.
+    // response could reinstall dead state. Batch A PR 2 (#108): nor while a
+    // Products & Charges refill is loading (it would send the draft that is about
+    // to be replaced); sendingRef, taken below before the first await, in turn
+    // keeps a refill from starting while this send flushes and issues.
     if (
       sendingRef.current ||
       cancellingRef.current ||
       convertingRef.current ||
+      seedInFlightRef.current ||
       lockedRef.current
     )
       return
@@ -1943,6 +2131,7 @@ export function QuoteTab({
     setSendError(null)
     setSendEmailFixNeeded(false)
     setSendCustomerFixNeeded(false)
+    setSendDetailsFixNeeded(false)
     try {
       const detailsSaved = await flushDetailsAutosave()
       if (!detailsSaved) {
@@ -2624,11 +2813,18 @@ export function QuoteTab({
   // Live itemised totals from the visible rows (editable itemised mode).
   const itemisedTotals = computeItemisedTotals(rows)
 
-  // Intended-total helper derivations. Helper messages are suppressed while any
-  // row is invalid — the visible sum would be misleading mid-fix.
+  // Intended-total helper derivations. Batch A PR 2 (#110): the messages stay
+  // visible while a row is incomplete or invalid (they used to be suppressed then,
+  // which hid them as soon as Add adjustment appended its blank row). They compare
+  // against the DISPLAY-ONLY row sum (computeDisplayRowsEx: a row counts once its
+  // numbers are valid, blank description or not), so the message follows the
+  // amount as it is typed — description first or amount first — and agrees with
+  // the totals card again once every row is valid. Both fix buttons render only
+  // while every row is valid: they compute from the valid-rows sum, and nothing
+  // invalid is ever saved.
   //
   // Mismatch is detected at the EX level (target ex = round2(intended/1.1) vs
-  // the visible ex sum), NOT by comparing inc totals: itemised inc totals only
+  // the displayed ex sum), NOT by comparing inc totals: itemised inc totals only
   // exist in round2(ex × 1.1) steps, so some typed inc values (e.g. 4900.00)
   // are unreachable by ANY adjustment. Comparing at the inc level would show a
   // "$0.01 above" banner whose fix button appends a $0.00 row — a visible
@@ -2649,21 +2845,23 @@ export function QuoteTab({
       intendedValue > QUOTE_TOTAL_MAX)
   const intendedTargetEx =
     intendedValue === null ? null : round2(intendedValue / 1.1)
+  // The display-only sum the messages compare against (equal to
+  // itemisedTotals.ex whenever every row is valid).
+  const displayRowsEx = computeDisplayRowsEx(rows)
   const intendedMismatch: 'lower' | 'higher' | null =
     itemised &&
     draftEditable &&
-    !rowsInvalid &&
     intendedTrimmed !== '' &&
     !intendedInvalid &&
     intendedTargetEx !== null &&
-    intendedTargetEx !== itemisedTotals.ex
-      ? intendedTargetEx < itemisedTotals.ex
+    intendedTargetEx !== displayRowsEx
+      ? intendedTargetEx < displayRowsEx
         ? 'lower'
         : 'higher'
       : null
   const intendedDiff =
     intendedMismatch !== null && intendedValue !== null
-      ? round2(Math.abs(itemisedTotals.inc - intendedValue))
+      ? round2(Math.abs(incFromExGst(displayRowsEx) - intendedValue))
       : 0
 
   // Preview needs a PERSISTED draft (the backend 404s QUOTE_NOT_FOUND without
@@ -2799,7 +2997,7 @@ export function QuoteTab({
             type="button"
             variant="secondary"
             size="sm"
-            disabled={locked}
+            disabled={locked || seedState === 'loading'}
             onClick={() => void handleOpenSendModal()}
           >
             Try again
@@ -2828,9 +3026,12 @@ export function QuoteTab({
           )}
 
           {/* Itemised mode toggle — a plain switch, no warnings or confirmation
-              modals (locked UX rule). Hidden entirely when the order is laid
-              (no toggle changes on locked orders). Disabled while the
-              Products & Charges seed is loading so the flip can't race it. */}
+              modals (locked UX rule; Batch A PR 2 #108: also none before the
+              switch to itemised refills and discards the quote rows). Hidden
+              entirely when the order is laid (no toggle changes on locked
+              orders). Disabled while the Products & Charges refill is loading
+              so the flip can't race it, and while a send, cancel or Create
+              Invoice runs (the handler ignores those clicks either way). */}
           {draftEditable && (
             <div className="mb-4 flex flex-wrap items-center gap-3">
               <button
@@ -2839,7 +3040,9 @@ export function QuoteTab({
                 aria-checked={itemised}
                 aria-label="Itemised quote"
                 onClick={handleToggleItemised}
-                disabled={seedState === 'loading'}
+                disabled={
+                  seedState === 'loading' || sending || cancelling || converting
+                }
                 className={`relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-500/40 disabled:cursor-not-allowed disabled:opacity-50 ${
                   itemised ? 'bg-teal-600' : 'bg-slate-300'
                 }`}
@@ -2861,8 +3064,9 @@ export function QuoteTab({
             </div>
           )}
 
-          {/* Products & Charges seed failure — inline error + Retry. The mode
-              was NOT switched: retrying re-runs the same toggle-ON decision. */}
+          {/* Products & Charges refill failure — inline error + Retry. The mode
+              was NOT switched and nothing was discarded: Retry runs the same
+              switch to itemised (a fresh refill) under the same guards. */}
           {seedState === 'error' && (
             <div className="mb-4 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3">
               <p className="text-sm font-medium text-rose-700">
@@ -2977,7 +3181,8 @@ export function QuoteTab({
 
             {/* Locked itemised drafts: the persisted customer-facing lines,
                 read-only. Non-itemised mode NEVER renders a line breakdown —
-                retained dormant lines and any legacy synthetic "Quoted works"
+                retained dormant lines (backend storage only, never restored
+                since Batch A PR 2, #108) and any legacy synthetic "Quoted works"
                 row stay invisible. */}
             {lockedItemised && serverDraft && (
               <div className="mt-8 overflow-x-auto">
@@ -3340,9 +3545,12 @@ export function QuoteTab({
             </div>
 
             {/* Intended-total HELPER (itemised editing only). Client-side aid:
-                never sent, never saved. Offers the visible discount-adjustment
-                fix when the intended total is BELOW the line sum; message-only
-                when ABOVE (never a hidden/automatic increase). */}
+                never sent, never saved. Offers a visible adjustment row as the
+                fix: Add discount adjustment when the intended total is BELOW the
+                lines, and (Batch A PR 2, #109) Add extra cost when it is ABOVE
+                them — always an explicit click, never a hidden/automatic
+                increase. The messages stay visible while a row is incomplete
+                (#110); the buttons show only while every row is valid. */}
             {draftEditable && itemised && (
               <div className="mt-3 sm:ml-auto sm:w-[360px]">
                 <label
@@ -3372,23 +3580,38 @@ export function QuoteTab({
                       Itemised lines are {formatMoney(intendedDiff)} above the
                       quote total.
                     </p>
-                    <Button
-                      type="button"
-                      variant="secondary"
-                      size="sm"
-                      className="mt-2"
-                      onClick={handleAddDiscountAdjustment}
-                    >
-                      Add discount adjustment
-                    </Button>
+                    {!rowsInvalid && (
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        className="mt-2"
+                        onClick={handleAddDiscountAdjustment}
+                      >
+                        Add discount adjustment
+                      </Button>
+                    )}
                   </div>
                 )}
                 {intendedMismatch === 'higher' && (
-                  <p className="mt-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-600">
-                    Quote total is {formatMoney(intendedDiff)} above the
-                    itemised lines. Adjust item prices or add an additional
-                    works / price adjustment line.
-                  </p>
+                  <div className="mt-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2">
+                    <p className="text-xs text-slate-600">
+                      Quote total is {formatMoney(intendedDiff)} above the
+                      itemised lines. Adjust item prices or add an additional
+                      works / price adjustment line.
+                    </p>
+                    {!rowsInvalid && (
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="sm"
+                        className="mt-2"
+                        onClick={handleAddExtraCostAdjustment}
+                      >
+                        Add extra cost
+                      </Button>
+                    )}
+                  </div>
                 )}
               </div>
             )}
@@ -3455,7 +3678,12 @@ export function QuoteTab({
               <button
                 type="button"
                 onClick={() => void handleOpenSendModal()}
-                disabled={locked || sendCheck === 'checking' || converting}
+                disabled={
+                  locked ||
+                  sendCheck === 'checking' ||
+                  converting ||
+                  seedState === 'loading'
+                }
                 title={
                   locked
                     ? 'This order is laid and locked, so the quote cannot be sent.'
@@ -3612,7 +3840,12 @@ export function QuoteTab({
                   variant="success"
                   size="md"
                   onClick={() => void handleOpenSendModal()}
-                  disabled={locked || sendCheck === 'checking' || converting}
+                  disabled={
+                    locked ||
+                    sendCheck === 'checking' ||
+                    converting ||
+                    seedState === 'loading'
+                  }
                   title={
                     locked
                       ? 'This order is laid and locked, so the quote cannot be resent.'
@@ -4058,6 +4291,29 @@ export function QuoteTab({
                   )}
                 </div>
               )}
+              {/* Batch A PR 2 (#134): only for QUOTE_DETAILS_OF_SALE_REQUIRED —
+                  the message above is the backend's, verbatim. */}
+              {sendDetailsFixNeeded && (
+                <div className="mt-2 flex flex-col sm:flex-row sm:items-center gap-2">
+                  <p className="text-xs text-rose-700">
+                    Add the details of sale on the Details of Sale tab, then try
+                    again.
+                  </p>
+                  {onGoToDetails && (
+                    <Button
+                      type="button"
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => {
+                        setSendModalOpen(false)
+                        onGoToDetails()
+                      }}
+                    >
+                      Go to Details of Sale
+                    </Button>
+                  )}
+                </div>
+              )}
             </div>
           )}
           <div className="mt-5 space-y-2">
@@ -4065,7 +4321,13 @@ export function QuoteTab({
               type="button"
               variant="success"
               size="md"
-              disabled={locked || sending || cancelling || converting}
+              disabled={
+                locked ||
+                sending ||
+                cancelling ||
+                converting ||
+                seedState === 'loading'
+              }
               title={
                 locked
                   ? 'This order is laid and locked, so the quote cannot be sent.'

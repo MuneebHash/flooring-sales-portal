@@ -32,7 +32,8 @@ import java.nio.charset.StandardCharsets;
  * non-numeric / non-positive value becomes VALIDATION_FAILED on {@code order_id} in the service
  * rather than a path-binding error. The create / rewrite bodies are taken as a raw {@code String}
  * ({@code required = false}) so they are parsed inside the service strictly after the guard / order-scope
- * (and, for rewrite, LAID) gates (D.1 / D.2 take no body — {@code {}} only). The JSON endpoints return
+ * (and, for rewrite, LAID and current-invoice) gates (D.1 takes no body — {@code {}} only; since Batch A
+ * PR 2, #149, D.2 takes the mandatory JSON {@code {"expected_version_number": N}}). The JSON endpoints return
  * the service-built {@code ApiResponse} envelope; D.4 returns a raw {@code ResponseEntity<byte[]>} (the
  * file-binary exception, mirroring D.17 attachment download) while its error paths still flow through the
  * standard JSON {@code GlobalExceptionHandler}. Payments (D.6/D.7) are a later branch.

@@ -59,7 +59,7 @@ Current behaviour (16E-A backend, 16E-B UI):
 
 A quote is a **customer-facing commercial document**. Products & Charges / Details of Sale are the **internal operational sales record**.
 
-- Quote Draft is a customer-facing, editable presentation, initially seeded from the order, that then becomes its own working quote canvas.
+- Quote Draft is a customer-facing, editable presentation that becomes its own working quote canvas. Since Batch A PR 2 it takes exactly two seeds from the order and is otherwise never synced to it: a new draft's total starts as the order's Sale total (#104, §7), and every explicit switch to itemised refills the lines from Products & Charges (#108, §8.1).
 - Quote lines **never** mutate order product/charge lines.
 - A quote **may** differ from the internal/current order working price by design; saving or sending a quote does not change the order price. Acceptance does: the accepted total becomes the order's sale-price override (decision D6b, backend built in 16F PR1 — see §1.1).
 - The accepted quote snapshot (created by the public accept, 16F PR1) is the source for quote-led invoice creation (Path A: backend built in 16F PR2; the Create Invoice button built in 16F PR3).
@@ -94,7 +94,7 @@ Reason: once the Quote tab exists, quote work continues inside it. Showing `Crea
 
 **GP warning:** the existing GP warning still appears when applicable, inside this same modal/flow. It must **not** remove or block `Create Quote`. `Create Quote` is available regardless of the GP warning, until the Quote tab exists.
 
-**Invoice path:** choosing `Create Invoice` / `Rewrite Invoice` preserves the existing invoice flow unchanged.
+**Invoice path:** choosing `Create Invoice` preserves the existing invoice flow unchanged. `Rewrite Invoice` keeps that flow with one addition since Batch A PR 2 (#149): opening its confirmation reads the current invoice and binds the confirmation to that version, which the Rewrite sends as `expected_version_number` (Confirm stays disabled until the read lands; a failed read offers Try again). When the bound version is signed, the confirmation warns that rewriting clears the signature and that the customer will need to sign the new invoice again — a warning, not a block (unlike Create Invoice from the accepted quote, a Rewrite never carries a signature over). A 409 `INVOICE_VERSION_STALE` closes the confirmation, shows "Invoice updated, please refresh" and re-reads the current invoice in the background; a new click opens a new binding, and the Rewrite is never retried on its own.
 
 **Create Quote action:** reveals the Quote tab, switches to it, opens the `Quote Draft` internal sub-tab. It does **not** create or rewrite an invoice, and does not wipe order data.
 
@@ -178,7 +178,9 @@ Default / non-itemised quote is clean and invoice-like:
 
 Non-itemised is a clean customer-facing quotation without a line breakdown.
 
-**Backend mapping (amended Phase 16D-B PR2A):** non-itemised saves still send exactly `itemised: false`, `final_total_inc_gst`, and `lines: []`. The backend **no longer stores a synthetic line** — it updates the draft mode/totals only and **retains** previously saved itemised rows as dormant `quote_draft_line` rows (see §9). A read of a non-itemised draft returns those retained rows in `lines[]`; they must **not** be shown on the screen or the non-itemised PDF, and must not be rendered as editable rows while itemised is OFF.
+**First-creation total (Batch A PR 2, #104):** when `Create Quote` opens a quote with no saved draft, the non-itemised total starts as the order's Sale total inc GST (`final_sale_price_inc_gst`, including any sale-price override), captured once at the `Create Quote` click. It is used only when the financial summary is loaded and the total is above $0.00 and at most $99,999,999.99; otherwise the total starts blank, as before. A pre-filled total is saved by one immediate autosave attempt through the normal autosave (a below-cost total is still pre-filled, and the normal 422 explains it). The total is never updated from the order afterwards: the 16D-A decoupling still applies, and the seed never drives Quote tab visibility (§4).
+
+**Backend mapping (amended Phase 16D-B PR2A):** non-itemised saves still send exactly `itemised: false`, `final_total_inc_gst`, and `lines: []`. The backend **no longer stores a synthetic line** — it updates the draft mode/totals only and **retains** previously saved itemised rows as dormant `quote_draft_line` rows (see §9), which the Quote tab never restores on a switch back to itemised (§9, #108). A read of a non-itemised draft returns those retained rows in `lines[]`; they must **not** be shown on the screen or the non-itemised PDF, and must not be rendered as editable rows while itemised is OFF.
 
 ---
 
@@ -191,9 +193,9 @@ When itemised is ON:
 - totals move lower if needed to make room
 - Preview PDF shows the itemised lines
 
-### 8.1 Initial carry-over (seed)
+### 8.1 Carry-over (seed and refill)
 
-When itemised is first turned ON and there are no existing quote draft lines, seed the quote lines from the order's current **sale-side** product/charge line data.
+Every explicit switch of a draft from non-itemised to itemised, the first one included, fills the quote lines from the order's current **sale-side** product/charge line data, replacing any earlier quote rows and adjustments (since Batch A PR 2, #108; before it, only the first switch with no saved lines seeded).
 
 Use customer-facing sale data only:
 
@@ -209,7 +211,7 @@ After seeding:
 - quote lines are independent, quote-only, customer-facing lines
 - editing quote lines does **not** edit Products & Charges
 - editing quote lines does **not** mutate operational product/charge rows
-- if a saved quote draft already has lines, **the saved quote draft lines are the source of truth** — do not silently overwrite them from Products & Charges just because the order changed. Re-seeding only happens on an explicit user rebuild. This includes retained dormant rows on a non-itemised draft: toggling itemised back ON restores them and must not re-seed (§9 — active until Batch A #108 changes it).
+- if a saved quote draft already has lines, **the saved quote draft lines are the source of truth** — do not silently overwrite them from Products & Charges just because the order changed. Re-seeding only happens on an explicit user rebuild, and the explicit switch to itemised is that rebuild: it always refills and discards the previous rows (§9, #108). Retained dormant rows on a non-itemised draft are never restored.
 
 ### 8.2 Quote draft pricing is independent of the order (locked; acceptance exception D6b)
 
@@ -219,10 +221,10 @@ Seed the quote from the order's current sale-side line data as a **starting poin
 
 ### 8.3 Itemised math / adjustment helper
 
-The editor is modular and helpful, never silently destructive.
+The editor is modular and helpful, never silently destructive. The one deliberate exception is the explicit switch to itemised, which refills the lines and discards the previous rows and adjustments without a confirmation (§9, #108).
 
 - Do **not** auto-add an adjustment silently on the itemised toggle.
-- If the itemised lines do not match the intended/current quote total, show a clear helper prompt.
+- If the itemised lines do not match the intended/current quote total, show a clear helper prompt. Since Batch A PR 2 (#110) the prompt stays visible and updates live while a row is being filled in: it compares against a display-only sum of the rows' parsable amounts (a row typed amount-first counts before its description exists). An incomplete row keeps its own error and is never saved, the totals card and save validation are unchanged, and the helper buttons are hidden while any row is invalid.
 
 **Discount case** — itemised lines $5,000, desired quote total $4,700, difference −$300:
 
@@ -234,7 +236,8 @@ The editor is modular and helpful, never silently destructive.
 
 - UI must not silently add hidden margin.
 - UI: `Quote total is $500 above the itemised lines. Adjust item prices or add an additional works / price adjustment line.`
-- The salesperson edits line prices or adds a positive adjustment / additional-works line.
+- Action offered (Batch A PR 2, #109): `Add extra cost`. One click appends one visible, editable adjustment line, `Additional charges`, for the positive difference **ex GST** (the intended total converted to ex GST minus the lines' ex-GST sum, with the same rounding as the discount helper), so the row amount is not the inc-GST figure in the message. The message text is unchanged.
+- The salesperson edits line prices, adds a positive adjustment / additional-works line, or uses `Add extra cost`.
 
 Rules:
 
@@ -244,21 +247,21 @@ Rules:
 
 ---
 
-## 9. Itemised line retention (locked — Phase 16D-B PR2A)
+## 9. Itemised line retention (locked — Phase 16D-B PR2A; amended Batch A PR 2, #108)
 
-Edited itemised quote rows are permanent working data. They must survive switching the quote to non-itemised mode, page reloads, and returning days later.
+Edited itemised quote rows are working data that persist across page reloads and returning days later while the draft stays itemised. Switching the quote to non-itemised keeps them only as backend dormant rows, which the Quote tab never restores (since Batch A PR 2).
 
-1. **First itemised ON with no persisted itemised rows:** the frontend seeds the quote lines from Products & Charges (§8.1). This is the only seeding trigger.
-2. **Edited itemised rows persist permanently:** they survive toggle-OFF, page reload, and coming back days later. The backend keeps them as dormant `quote_draft_line` rows while the draft is non-itemised — a non-itemised save never writes and never deletes lines.
+1. **Every switch ON refills:** each explicit switch from non-itemised to itemised, the first included, fills the quote lines from Products & Charges (§8.1), discarding the earlier local and persisted rows and adjustments. While the refill read or a save is in flight the switch ON is ignored, and while the refill read is in flight the Send actions are unavailable.
+2. **Edited itemised rows persist while the draft stays itemised** (page reload, coming back days later). The backend keeps them as dormant `quote_draft_line` rows while the draft is non-itemised — a non-itemised save never writes and never deletes lines.
 3. **Toggle OFF:** the frontend saves non-itemised mode with the current itemised total as `final_total_inc_gst` (request shape unchanged: `itemised: false`, `final_total_inc_gst`, `lines: []`).
-4. **Toggle ON later:** the frontend restores the persisted `quote_draft_line` rows returned by the backend. It must **not** re-seed from Products & Charges when persisted itemised rows exist.
-5. **No warnings. No confirmation modals.** Toggling between modes is silent and non-destructive.
+4. **Toggle ON later:** the refill of item 1. The persisted dormant rows are never restored; the refill's next itemised save replaces them (full replace). If the refilled lines are below cost (they copy the Products & Charges prices, not the order's sale-price override), that save is refused with the usual `QUOTE_BELOW_COST` message and nothing is persisted; switching back to non-itemised then re-sends those rows and is refused too until they are fixed, and leaving the order keeps the previously saved draft (accepted in Batch A PR 2).
+5. **No warnings. No confirmation modals** (for the switch ON, Muneeb's decision for Batch A PR 2). Switching OFF is silent and non-destructive; switching ON replaces the quote rows and adjustments.
 
 While non-itemised, the quote total is `final_total_inc_gst` and is fully independent of the retained rows (never validated against them; below-cost/GP use the final-total-derived ex total). In itemised mode the total must equal the sum of the visible lines as before (§8.3).
 
-**Legacy note (dev data only):** drafts saved non-itemised before PR2A carry an old stored `Quoted works` row that is indistinguishable from retained rows (no schema flag; description matching is forbidden). It may appear in `lines[]` on read (never rendered in non-itemised mode) and, if the draft is toggled to itemised, in the editor; it heals on the next itemised save (full replace) or manual dev-data cleanup.
+**Legacy note (dev data only):** drafts saved non-itemised before PR2A carry an old stored `Quoted works` row that is indistinguishable from retained rows (no schema flag; description matching is forbidden). It may appear in `lines[]` on read (never rendered in non-itemised mode); since Batch A PR 2 it never reaches the editor, because a switch to itemised refills from Products & Charges, and it heals on the next itemised save (full replace) or manual dev-data cleanup.
 
-> **Planned change — Batch A, [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108) (approved, NOT implemented).** The explicit switch of a **draft** from non-itemised to itemised will refill the lines from the current Products & Charges and discard manual quote rows/adjustments (draft only; not continuous auto-sync; issued/accepted snapshots and converted invoices untouched). Whether a confirmation is shown first is still an open decision. Until the #108 PR merges, the retention rules above are the **active** behaviour; that PR amends this section, contract §6.1 and `openapi.yaml` together with its code.
+> **Implemented in Batch A PR 2 — [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108).** The explicit switch of a **draft** from non-itemised to itemised refills the lines from the current Products & Charges and discards the manual quote rows and adjustments (draft only; not continuous auto-sync; issued/accepted snapshots and converted invoices untouched). No confirmation is shown (Muneeb's decision). Backend storage is unchanged; this section, contract §6.1 and `openapi.yaml` were amended together with the code.
 
 ---
 
@@ -318,7 +321,7 @@ Current behavior (built in 16E-B; 16D shipped the same modal with delivery disab
 - actions: `Send by Email`, `Send by Phone/SMS` (disabled), `Cancel`
 - `Send by Email` first flushes the Details of Sale autosave and then the quote autosave (the backend issues from **persisted** state); if either flush fails the send is blocked with an inline error. It is single-flight (no duplicate send on a double tap), mutually exclusive with Cancel quote, and disabled when the order is LAID.
 - on success the modal closes, the confirmation `Quote sent by email.` shows, and Customer Quote renders the returned issued summary.
-- errors show inside the modal: a missing/invalid customer email adds a pointer and a `Go to Customer tab` button; a delivery failure (502) says nothing was sent and it is safe to try again (the issued version/PDF/link were kept); other backend messages show verbatim.
+- errors show inside the modal: a missing/invalid customer email adds a pointer and a `Go to Customer tab` button; since Batch A PR 2 (#134) a blank saved Details of Sale refusal (`QUOTE_DETAILS_OF_SALE_REQUIRED`, "Details of sale is required before sending a quote.") adds "Add the details of sale on the Details of Sale tab, then try again." and a `Go to Details of Sale` button; a delivery failure (502) says nothing was sent and it is safe to try again (the issued version/PDF/link were kept); other backend messages show verbatim.
 - delivery is **recording-only** in the current build — the send is recorded in memory and no real email reaches the customer (Phase 17 adds the provider).
 - the quote email is **link-only** (16F PR1): a short body with the public quote link and **no PDF attachment** (16E-A attached the issued PDF). The immutable issued PDF is still generated and stored on issue; the customer opens it from the public page (its `PDF` button) and the salesperson from Customer Quote `Preview PDF`.
 - **sending after an acceptance (decision D9):** the backend allows it — with no active issued version a send always issues a **new** quote version (with a new link) that needs a new signature, and the accepted version is never changed. **Built (16F PR3):** before the modal opens the Quote tab re-reads the issued and accepted state, and when an accepted quote exists the modal first shows the accepted state (version, accepted name and time) and warns `Sending again creates a new quote version that needs a new signature.` If that read fails the modal does not open; a notice explains it and offers a retry. Nothing is ever sent without the deliberate `Send by Email` click.
@@ -332,7 +335,7 @@ Hard rule: **no accidental one-click sending** — sending always passes through
 
 Read-only. Shows the active issued quote from the workspace `current_issued` summary (seeded by the probe, replaced by send responses and by the refreshes below, cleared by a successful cancel) — **never** from the live draft rows, totals, details or terms, which may have drifted since the issue was frozen. Never shows raw cost, GP, token or internal file data. Since 16F PR1 the backend also returns `current_issued` as null once the quote is accepted, or once an in-app invoice acceptance cancels it (D5(c)). Since 16F PR3 the Quote tab re-reads the issued and accepted state together from one workspace response (never the draft) when the Quote tab becomes active, on a sub-tab change and before the Send confirmation opens, so either change shows without a reload. An older response never overwrites a newer one or a send, cancel or Create Invoice result, pending reads are discarded on unmount or order change, and a failed read keeps the last known state with a retry. With no active issued quote but an accepted one, Customer Quote shows the accepted state and a control that opens Accepted Quote instead of the never-sent empty state.
 
-**Polling (16G PR 6, #120, built):** while `current_issued` is non-null (a quote link waits for a signature), the Quote tab also re-reads the issued and accepted state every 15 seconds through `refreshSnapshots({ reportError: false })`, only while the browser tab is visible and the Quote tab is the active workspace tab. It keeps every guard above. A failed poll changes nothing and shows no banner, and a poll never re-seeds draft rows, totals or the autosave baseline. A poll that installs a new accepted version also triggers the order financial refresh (section 10).
+**Polling (16G PR 6, #120, built):** while `current_issued` is non-null (a quote link waits for a signature), the Quote tab also re-reads the issued and accepted state every 5 seconds (since Batch A PR 2, Muneeb's decision 29 October 2026; 15 seconds in 16G PR 6) through `refreshSnapshots({ reportError: false })`, only while the browser tab is visible and the Quote tab is the active workspace tab. It keeps every guard above. A failed poll changes nothing and shows no banner, and a poll never re-seeds draft rows, totals or the autosave baseline. A poll that installs a new accepted version also triggers the order financial refresh (section 10).
 
 - **Status badge:** `Sent`; `Opened` once the customer has opened the public link (`viewed_at` set — 16E-C, shown from the next workspace load, which since 16G PR 6 includes the next poll); `Not delivered` when the latest email attempt failed (with "The email could not be delivered. Resend to try again."). **Since 16G PR 6** the tab reads the server's `current_issued.last_email_delivered` (Not delivered when the channel is email and it is `false`; contract §13.5) and no longer compares timestamp strings, which are whole seconds since the same PR; before it, the tab compared the returned `last_emailed_at` with `last_sent_at`. Not delivered still applies to the email channel only; the dormant SMS channel never shows it. Keep the status model simple — no further states for MVP.
 - **Details:** channel, sent time, link expiry.
@@ -484,7 +487,7 @@ The 16G UX, written in 16G PR 1 and built in 16G PRs 2 to 6; each item names the
   - **Accept Invoice** keeps its gates (ink, both ticks, the frozen name, the InvoiceDetail loaded) and calls D.8 with `expected_version_number` (built in PR 3).
   - **Accept Remotely** needs no ink and no ticks. It is enabled when an unsigned current invoice is loaded and no accept or send is in flight, is single-flight, and calls `POST …/invoices/current/send-link`, which emails the link to the **saved** customer email. On success it shows the response message ("Invoice link emailed to the customer.") in the existing notice. On failure it shows the backend message verbatim: the 502 "The invoice link could not be emailed. Please try again."; the customer-email 422s with the existing Go to Customer tab pointer; a 409 `INVOICE_ALREADY_ACCEPTED`, which also re-reads the invoice like the existing drift handling. There is **no link status line, no expiry display and no cancel**. It is allowed on a LAID order.
 - **Stale version (built in PR 3):** a 409 `INVOICE_VERSION_STALE` from Accept Invoice clears the pad and both ticks (even if the re-read then fails), shows "Invoice updated, please refresh", re-reads the current invoice and waits for a fresh signature. It never retries on its own. The existing best-effort re-read before posting stays as an early hint with its existing message, and Accept Invoice posts the `version_number` of the invoice on screen, never one adopted from a later read.
-- **Polling (built in PR 6, #120):** the tab re-reads the current invoice every 15 seconds while the last InvoiceDetail it applied shows `invoice_link_expires_at` non-null (an `ACTIVE`, unexpired invoice link; contract §4.5) and the displayed invoice is unsigned, only while the browser tab is visible and the Invoice tab is the active workspace tab.
+- **Polling (built in PR 6, #120):** the tab re-reads the current invoice every 5 seconds (since Batch A PR 2, Muneeb's decision 29 October 2026; 15 seconds in 16G PR 6) while the last InvoiceDetail it applied shows `invoice_link_expires_at` non-null (an `ACTIVE`, unexpired invoice link; contract §4.5) and the displayed invoice is unsigned, only while the browser tab is visible and the Invoice tab is the active workspace tab.
   - The condition is server state only. It holds after a page reload, for a link sent from another staff session or device, and for an `ACTIVE` link kept after a failed send (502). It never depends on a successful Accept Remotely in this workspace or on an expiry remembered from a send response.
   - The tab learns the field from every current-invoice read: the initial load, a reload, the re-read that follows every Accept Remotely attempt whatever its outcome, and each poll.
   - Polling stops when a read shows the invoice signed or `invoice_link_expires_at` null, or when the returned expiry passes. Failed polls are silent and keep the existing stale-response guards. A signed result renders the normal accepted state.
