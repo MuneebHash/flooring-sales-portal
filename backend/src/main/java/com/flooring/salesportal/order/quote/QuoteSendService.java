@@ -79,7 +79,8 @@ import java.util.Optional;
  * TransactionTemplate pattern).</b> The send methods are deliberately NOT {@code @Transactional}:
  * <ol>
  *   <li><b>Transaction 1</b> ({@link #prepareSend}, order held {@code FOR UPDATE} from its first
- *       statement): gates → recipient gate → draft load → live below-cost re-check →
+ *       statement): gates → recipient gate → draft load → live below-cost re-check → saved
+ *       Details of Sale non-blank (Batch A PR 2, #134) →
  *       changed-detection → persist (new version + snapshot lines + stored issued PDF, or reuse
  *       the unchanged issued version) → token transitions + fresh {@code ACTIVE}
  *       token mint → pre-delivery ATTEMPT markers ({@code sent_channel} / {@code first_sent_at} /
@@ -517,7 +518,9 @@ public class QuoteSendService {
      * quote/order mutations: scoped {@code FOR UPDATE} lookup (404, never 403/leak) → LAID gate
      * (422 {@code ORDER_LOCKED}, before the body parse) → empty-body check → recipient gate (422,
      * before the draft-exists check — locked order) → draft load (404 {@code QUOTE_NOT_FOUND}) →
-     * live below-cost re-check (422 {@code QUOTE_BELOW_COST}, before ANY persistence) →
+     * live below-cost re-check (422 {@code QUOTE_BELOW_COST}, before ANY persistence) → the saved
+     * Details of Sale of this same locked order non-blank (422
+     * {@code QUOTE_DETAILS_OF_SALE_REQUIRED}, Batch A PR 2 #134; also before ANY persistence) →
      * changed-detection → persist → token mint → attempt markers.
      */
     private PreparedSend prepareSend(RequestContext ctx, long orderId, String body, String channel) {
@@ -552,6 +555,19 @@ public class QuoteSendService {
         if (quoteDraftCalculator.belowCost(draft.getQuoteTotalExGst(), totalCostExGst)) {
             throw new BusinessRuleException(ErrorCode.QUOTE_BELOW_COST,
                     ErrorCode.QUOTE_BELOW_COST.defaultMessage());
+        }
+
+        // Batch A PR 2 (#134): the saved Details of Sale must be non-blank before any send or resend
+        // (both channels share this transaction). It is read from the SAME locked order instance the
+        // snapshot freezes, after every earlier refusal and before changed-detection, so nothing is
+        // written or attempted on a refusal: no version, line, PDF, stored_file, token or attempt
+        // marker, and no email or SMS. An unchanged resend of a legacy version frozen with blank
+        // details is refused too (its token and markers stay as they were); once the live details are
+        // filled, changed-detection issues a new version. Frozen snapshots are never modified.
+        String detailsOfSale = order.getDetailsOfSale();
+        if (detailsOfSale == null || detailsOfSale.isBlank()) {
+            throw new BusinessRuleException(ErrorCode.QUOTE_DETAILS_OF_SALE_REQUIRED,
+                    ErrorCode.QUOTE_DETAILS_OF_SALE_REQUIRED.defaultMessage());
         }
 
         LocalDateTime now = LocalDateTime.now();
@@ -648,8 +664,9 @@ public class QuoteSendService {
         String termsHtml = termsSanitizer.sanitize(rawTerms);
 
         // Customer identity frozen AT ISSUE (V17, Codex P1): a later pre-LAID customer edit must
-        // never reach the already-issued public quote. Nullable — the send gate only requires the
-        // channel recipient, not a name or billing address.
+        // never reach the already-issued public quote. Nullable — the send gates never require a name
+        // or billing address (they require the channel recipient and, since Batch A PR 2 #134, the
+        // non-blank saved details of sale frozen below).
         CustomerIdentity identity = currentCustomerIdentity(orderId);
 
         return QuoteIssueSnapshot.of(draft, draftLines, order.getFlooringType(), termsHtml,

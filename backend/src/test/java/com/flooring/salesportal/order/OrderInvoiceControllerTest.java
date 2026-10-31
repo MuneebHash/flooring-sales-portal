@@ -33,6 +33,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.Timestamp;
 import java.util.Arrays;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -214,6 +215,16 @@ class OrderInvoiceControllerTest {
     private int maxInvoiceVersion(long orderId) {
         return jdbcTemplate.queryForObject(
                 "SELECT COALESCE(MAX(version_number), 0) FROM invoice WHERE order_id = ?", Integer.class, orderId);
+    }
+
+    /** Batch A PR 2 (#149): the D.2 Rewrite body carrying {@code version} as expected_version_number. */
+    private static String rewriteBody(int version) {
+        return "{\"expected_version_number\":" + version + "}";
+    }
+
+    /** The D.2 Rewrite body carrying the order's CURRENT version, read just before the request is built. */
+    private String currentRewriteBody(long orderId) {
+        return rewriteBody(maxInvoiceVersion(orderId));
     }
 
     private void setOrderLastEmailedAt(long orderId, String timestamp) {
@@ -874,7 +885,7 @@ class OrderInvoiceControllerTest {
         // Order 1 has the seeded v1 (ex 840 / inc 924 / paid 500 / balance 424). Rewrite snapshots the
         // current live state into v2 with the same live totals and the same due_date rule (2026-05-01 - 2).
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.message").value("Invoice rewritten."))
                 .andExpect(jsonPath("$.data.invoice.invoice_id").isNumber())
@@ -894,11 +905,46 @@ class OrderInvoiceControllerTest {
     }
 
     @Test
-    void rewrite_emptyBody_alsoAccepted() throws Exception {
-        // No body at all (the contract allows {} or an empty body).
+    void rewrite_absentBody_returns400ExpectedVersionRequired_writesNothing() throws Exception {
+        // Batch A PR 2 (#149): no body at all is no longer accepted - expected_version_number is mandatory (before
+        // Batch A PR 2 an absent body was a 201). Nothing is written: no invoice row, stored_file row or PDF, no
+        // order-row change (the mirror carries a sentinel first, so a reset would show) and no invoice-link change.
+        setOrderLastEmailedAt(ORDER_FULL, "2026-01-02 03:04:05");
+        int versionBefore = maxInvoiceVersion(ORDER_FULL);
+        Map<String, Object> before = rewriteFootprint(ORDER_FULL);
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session()))
-                .andExpect(status().isCreated())
-                .andExpect(jsonPath("$.data.invoice.version_number").value(2));
+                .andExpect(status().isBadRequest())
+                .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
+                .andExpect(jsonPath("$.error.details.length()").value(1))
+                .andExpect(jsonPath("$.error.details[0].field").value("expected_version_number"))
+                .andExpect(jsonPath("$.error.details[0].message").value("Required."));
+        Assertions.assertEquals(versionBefore, maxInvoiceVersion(ORDER_FULL), "no new invoice version");
+        Assertions.assertEquals(before, rewriteFootprint(ORDER_FULL), "a refused Rewrite writes nothing");
+    }
+
+    /**
+     * Everything a D.2 Rewrite writes, for a refused-request check: the order's invoice rows, its sales_order row
+     * (the last_emailed_at mirror included), its invoice links, the global stored_file count and the files in the
+     * order's storage directory.
+     */
+    private Map<String, Object> rewriteFootprint(long orderId) throws IOException {
+        Map<String, Object> footprint = new LinkedHashMap<>();
+        footprint.put("invoice", jdbcTemplate.queryForList(
+                "SELECT * FROM invoice WHERE order_id = ? ORDER BY version_number", orderId));
+        footprint.put("sales_order", jdbcTemplate.queryForList("SELECT * FROM sales_order WHERE order_id = ?", orderId));
+        footprint.put("invoice_token", jdbcTemplate.queryForList(
+                "SELECT * FROM invoice_token WHERE order_id = ? ORDER BY invoice_token_id", orderId));
+        footprint.put("stored_file count", jdbcTemplate.queryForObject("SELECT COUNT(*) FROM stored_file", Long.class));
+        Set<String> files = new TreeSet<>();
+        Path orderDir = tempStorageDir.resolve("uploads").resolve(String.valueOf(BUSINESS_AUSSIE))
+                .resolve("orders").resolve(String.valueOf(orderId));
+        if (Files.isDirectory(orderDir)) {
+            try (var listing = Files.list(orderDir)) {
+                listing.forEach(file -> files.add(file.getFileName().toString()));
+            }
+        }
+        footprint.put("files", files);
+        return footprint;
     }
 
     @Test
@@ -906,7 +952,7 @@ class OrderInvoiceControllerTest {
         // Seeded v1 only. After rewrite there are exactly two invoice rows and the new MAX(version) is 2.
         Assertions.assertEquals(1, countInvoices(ORDER_FULL));
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated());
 
         Assertions.assertEquals(2, countInvoices(ORDER_FULL), "rewrite appends a new version (v1 retained)");
@@ -928,7 +974,7 @@ class OrderInvoiceControllerTest {
         insertInvoiceVersion(ORDER_FULL, 3, sf3, "1000.00", "1100.00", "0.00", "1100.00");
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.data.invoice.version_number").value(4));
     }
@@ -942,7 +988,7 @@ class OrderInvoiceControllerTest {
                 "SELECT stored_file_id FROM invoice WHERE invoice_id = ?", Long.class, v1InvoiceId);
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated());
 
         long v2InvoiceId = latestInvoiceId(ORDER_FULL);
@@ -972,7 +1018,7 @@ class OrderInvoiceControllerTest {
     @Test
     void rewrite_thenGetCurrent_returnsRewrittenInvoice() throws Exception {
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated());
         long rewrittenId = latestInvoiceId(ORDER_FULL);
 
@@ -985,7 +1031,7 @@ class OrderInvoiceControllerTest {
     @Test
     void rewrite_thenGetCurrentFile_returnsRewrittenPdf() throws Exception {
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated());
 
         MvcResult result = mockMvc.perform(get(currentFileUrl(ORDER_FULL)).session(liamStore1Session()))
@@ -1008,7 +1054,7 @@ class OrderInvoiceControllerTest {
         jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = 76.00 WHERE order_id = ?", ORDER_FULL);
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.data.invoice.version_number").value(2))
                 .andExpect(jsonPath("$.data.invoice.sale_price_inc_gst").value(1000.00))
@@ -1023,7 +1069,7 @@ class OrderInvoiceControllerTest {
         insertPayment(ORDER_FULL, "100.00", "EFTPOS-EXTRA");
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.data.invoice.total_paid").value(600.00))
                 .andExpect(jsonPath("$.data.invoice.balance_due").value(324.00));
@@ -1043,7 +1089,7 @@ class OrderInvoiceControllerTest {
         jdbcTemplate.update("UPDATE sales_order SET price_adjustment_inc_gst = 76.00, "
                 + "details_of_sale = 'CHANGED BEFORE REWRITE' WHERE order_id = ?", ORDER_FULL);
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated())
                 // (a) the new version reflects the live (changed) details + live summary, not a carry-forward.
                 .andExpect(jsonPath("$.data.invoice.version_number").value(2))
@@ -1060,7 +1106,7 @@ class OrderInvoiceControllerTest {
     @Test
     void rewrite_response_doesNotExposeStoredFileIdOrStoragePath() throws Exception {
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.data.invoice.stored_file_id").doesNotExist())
                 .andExpect(jsonPath("$.data.invoice.storage_path").doesNotExist())
@@ -1113,7 +1159,7 @@ class OrderInvoiceControllerTest {
         // now trips the email gate first — asserted separately.)
         jdbcTemplate.update("UPDATE sales_order SET details_of_sale = NULL WHERE order_id = ?", ORDER_FULL);
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("INVOICE_PRECONDITIONS_NOT_MET"))
                 .andExpect(jsonPath("$.error.details", hasSize(1)))
@@ -1124,14 +1170,19 @@ class OrderInvoiceControllerTest {
     // ---- body / id validation (gate ordering) -----------------------
 
     @Test
-    void rewrite_nonEmptyBody_returns400_validationFailed() throws Exception {
-        // Order 1 (ACCEPTED, has an invoice): passes the LAID gate, then a non-empty body is rejected.
-        // Any field (incl. due_date) -> VALIDATION_FAILED.
+    void rewrite_extraFieldWithoutVersion_returns400_notAllowedThenVersionRequired() throws Exception {
+        // Order 1 (ACCEPTED, has an invoice): passes the LAID gate and the invoice read. Since Batch A PR 2 (#149)
+        // the body must be exactly {"expected_version_number": N}, so an extra field without the version gives two
+        // details: the field "Not allowed.", then expected_version_number "Required." (last).
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON).content("{\"due_date\":\"2026-01-01\"}"))
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error.code").value("VALIDATION_FAILED"))
-                .andExpect(jsonPath("$.error.details[0].field").value("due_date"));
+                .andExpect(jsonPath("$.error.details.length()").value(2))
+                .andExpect(jsonPath("$.error.details[0].field").value("due_date"))
+                .andExpect(jsonPath("$.error.details[0].message").value("Not allowed."))
+                .andExpect(jsonPath("$.error.details[1].field").value("expected_version_number"))
+                .andExpect(jsonPath("$.error.details[1].message").value("Required."));
     }
 
     @Test
@@ -1406,7 +1457,7 @@ class OrderInvoiceControllerTest {
         jdbcTemplate.update("DELETE FROM order_customer WHERE order_id = ?", ORDER_FULL);
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"));
         Assertions.assertEquals(invoicesBefore, countInvoices(ORDER_FULL),
@@ -1420,7 +1471,7 @@ class OrderInvoiceControllerTest {
         setCustomerEmail(ORDER_FULL, "   ");
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"));
         Assertions.assertEquals(invoicesBefore, countInvoices(ORDER_FULL));
@@ -1433,7 +1484,7 @@ class OrderInvoiceControllerTest {
         setCustomerEmail(ORDER_FULL, null);
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"));
         Assertions.assertEquals(invoicesBefore, countInvoices(ORDER_FULL));
@@ -1445,7 +1496,7 @@ class OrderInvoiceControllerTest {
         setCustomerEmail(ORDER_FULL, "james@");
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_INVALID"));
         Assertions.assertEquals(invoicesBefore, countInvoices(ORDER_FULL));
@@ -1459,7 +1510,7 @@ class OrderInvoiceControllerTest {
         jdbcTemplate.update("UPDATE sales_order SET details_of_sale = NULL WHERE order_id = ?", ORDER_FULL);
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_INVALID"))
                 .andExpect(jsonPath("$.error.details").doesNotExist());
@@ -1508,9 +1559,10 @@ class OrderInvoiceControllerTest {
 
     @Test
     void rewrite_returnsUnsignedAcceptanceAndEmailFields() throws Exception {
-        int nextVersion = maxInvoiceVersion(ORDER_FULL) + 1;
+        int currentVersion = maxInvoiceVersion(ORDER_FULL);
+        int nextVersion = currentVersion + 1;
         MvcResult result = mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(rewriteBody(currentVersion)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.data.invoice.version_number").value(nextVersion))
                 .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(false))
@@ -1571,7 +1623,7 @@ class OrderInvoiceControllerTest {
                 + "accepted_customer_name = 'James Wilson' WHERE invoice_id = ?", acceptedInvoiceId);
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(false));
 
@@ -1609,7 +1661,7 @@ class OrderInvoiceControllerTest {
         setOrderLastEmailedAt(ORDER_FULL, "2026-01-05 09:30:00");
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isCreated());
 
         Assertions.assertNull(orderLastEmailedAt(ORDER_FULL), "mirror reset to the new version's null value");
@@ -1622,7 +1674,7 @@ class OrderInvoiceControllerTest {
         jdbcTemplate.update("UPDATE sales_order SET details_of_sale = NULL WHERE order_id = ?", ORDER_FULL);
 
         mockMvc.perform(post(rewriteUrl(ORDER_FULL)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(ORDER_FULL)))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("INVOICE_PRECONDITIONS_NOT_MET"));
 
@@ -1797,13 +1849,17 @@ class OrderInvoiceControllerTest {
         return invoiceDetail(result);
     }
 
-    /** D.2 Rewrite (empty body) -> 201 with the expected version; returns the raw result. */
-    private MvcResult rewrite(long orderId, int expectedVersion) throws Exception {
+    /**
+     * D.2 Rewrite carrying the order's CURRENT version (read from the database just before the call, Batch A
+     * PR 2 #149) -> 201 with {@code producedVersion} (the version the Rewrite appends, current + 1); returns the
+     * raw result.
+     */
+    private MvcResult rewrite(long orderId, int producedVersion) throws Exception {
         MvcResult result = mockMvc.perform(post(rewriteUrl(orderId)).session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON).content(currentRewriteBody(orderId)))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.message").value("Invoice rewritten."))
-                .andExpect(jsonPath("$.data.invoice.version_number").value(expectedVersion))
+                .andExpect(jsonPath("$.data.invoice.version_number").value(producedVersion))
                 .andExpect(jsonPath("$.data.invoice.accepted_signature_present").value(false))
                 .andReturn();
         clearJpaCache();

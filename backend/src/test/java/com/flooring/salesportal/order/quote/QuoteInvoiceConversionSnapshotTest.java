@@ -580,10 +580,11 @@ class QuoteInvoiceConversionSnapshotTest {
         return result;
     }
 
-    /** D.2 Rewrite (empty body). */
+    /** D.2 Rewrite carrying the order's current version as expected_version_number (Batch A PR 2, #149). */
     private MvcResult rewriteInvoice(long orderId) throws Exception {
         MvcResult result = perform(post(invoicesUrl(orderId) + "/rewrite").session(liamStore1Session())
-                .contentType(MediaType.APPLICATION_JSON).content("{}"), 201, "D.2 rewrite");
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"expected_version_number\":" + currentInvoiceVersion(orderId) + "}"), 201, "D.2 rewrite");
         Assertions.assertEquals("Invoice rewritten.", readJson(result).path("message").asText());
         return result;
     }

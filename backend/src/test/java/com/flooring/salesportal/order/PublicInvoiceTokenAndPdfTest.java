@@ -1092,7 +1092,7 @@ class PublicInvoiceTokenAndPdfTest {
                 "an over-age ACTIVE link is reported as null on InvoiceDetail: " + invoice);
         Assertions.assertEquals(overAge, invoiceTokenRow(token), "a staff read never flips (or writes) the link");
 
-        rewrite(order);
+        rewrite(order, 1);
         Map<String, Object> killed = invoiceTokenRow(token);
         Assertions.assertEquals(STATE_REWRITTEN, killed.get("status"), "the writer's reason, not EXPIRED");
         Assertions.assertNotNull(killed.get("dead_at"), "the Rewrite stamped dead_at");
@@ -1183,7 +1183,7 @@ class PublicInvoiceTokenAndPdfTest {
         Assertions.assertEquals(rewrittenRow.get("sent_at"), invoiceTokenRow(replaced).get("dead_at"),
                 "setup: link 1 died at link 2's sent_at");
 
-        rewrite(order);
+        rewrite(order, 1);
         Assertions.assertEquals(2, currentVersion(order.orderId()), "setup: the Rewrite appended v2");
         Assertions.assertEquals(STATE_REWRITTEN, invoiceTokenRow(rewritten).get("status"), "setup: the Rewrite killed link 2");
 
@@ -1196,7 +1196,7 @@ class PublicInvoiceTokenAndPdfTest {
         Assertions.assertEquals(v3.get("accepted_at"), invoiceTokenRow(signed).get("dead_at"),
                 "setup: link 3 died at the signing time");
 
-        rewrite(order);
+        rewrite(order, 3);
         Assertions.assertEquals(4, currentVersion(order.orderId()), "setup: the Rewrite appended the unsigned v4");
         String expired = sendLink(order);
         backdateExpiry(expired);
@@ -1542,9 +1542,10 @@ class PublicInvoiceTokenAndPdfTest {
         Assertions.assertEquals(1, currentVersion(order.orderId()), "setup: D.1 committed v1");
     }
 
-    /** D.2 Rewrite (empty body): 201, a new unsigned version. */
-    private void rewrite(SeededOrder order) throws Exception {
-        protectedPost(orderUrl(order.orderId()) + "/invoices/rewrite", "{}", 201, "setup: D.2 rewrite");
+    /** D.2 Rewrite carrying {@code currentVersion} (Batch A PR 2, #149): 201, a new unsigned version. */
+    private void rewrite(SeededOrder order, int currentVersion) throws Exception {
+        protectedPost(orderUrl(order.orderId()) + "/invoices/rewrite",
+                "{\"expected_version_number\":" + currentVersion + "}", 201, "setup: D.2 rewrite");
     }
 
     /** D.7 CASH payment: 201, a new version with its own PDF (never emails). */

@@ -1021,8 +1021,9 @@ export function InvoiceTab({
   // Re-send action bar). Persisted by the invoice acceptance event, never by local state.
   const invoiceAccepted = invoice !== null && invoice.accepted_at !== null
 
-  // Phase 16G PR 6 (#120) - the remote-signature poll: re-read the current invoice every 15
-  // seconds while the LAST APPLIED InvoiceDetail shows invoice_link_expires_at non-null and still
+  // Phase 16G PR 6 (#120) - the remote-signature poll: re-read the current invoice every 5 seconds
+  // (since Batch A PR 2, Muneeb's decision 29 October 2026; 15 seconds in 16G PR 6) while the LAST
+  // APPLIED InvoiceDetail shows invoice_link_expires_at non-null and still
   // in the future (an ACTIVE, unexpired invoice link) and the displayed invoice is unsigned, only
   // while the browser tab is visible (this tab is mounted only while it is the active workspace
   // tab). The condition is server state only, so it holds after a reload, for a link sent from

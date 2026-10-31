@@ -695,10 +695,11 @@ class QuoteInvoiceFrozenWordsTest {
         return result;
     }
 
-    /** D.2 Rewrite (empty body). */
-    private MvcResult rewriteInvoice(long orderId) throws Exception {
+    /** D.2 Rewrite carrying {@code currentVersion} as expected_version_number (Batch A PR 2, #149). */
+    private MvcResult rewriteInvoice(long orderId, int currentVersion) throws Exception {
         MvcResult result = perform(post(invoicesUrl(orderId) + "/rewrite").session(tenant.session())
-                .contentType(MediaType.APPLICATION_JSON).content("{}"), 201, "D.2 rewrite");
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"expected_version_number\":" + currentVersion + "}"), 201, "D.2 rewrite");
         Assertions.assertEquals("Invoice rewritten.", readJson(result).path("message").asText());
         return result;
     }
@@ -1725,7 +1726,7 @@ class QuoteInvoiceFrozenWordsTest {
         Assertions.assertNotNull(pathARow.get("source_quote_version_id"), "precondition: v1 is quote-sourced");
         Assertions.assertNotNull(pathARow.get("accepted_at"), "precondition: v1 is signed");
 
-        MvcResult rewrite = rewriteInvoice(orderId);
+        MvcResult rewrite = rewriteInvoice(orderId, 1);
 
         Words freshWords = new Words(LIVE_AT_CONVERSION.name(), LIVE_AT_CONVERSION.line1(), LIVE_AT_CONVERSION.line2(),
                 sanitized(CONVERSION_TERMS.softRaw()));

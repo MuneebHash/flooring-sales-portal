@@ -575,6 +575,42 @@ class QuoteControllerTest {
         Assertions.assertEquals(2, adjSortOrder, "adjustment sort_order is max(0,1) + 1");
     }
 
+    /**
+     * Batch A PR 2 (#109): the Quote tab's "Add extra cost" appends a POSITIVE ADJUSTMENT row ("Additional charges")
+     * and saves the itemised body as usual (no final_total_inc_gst). The draft PUT stores the signed amount as given
+     * and the totals include it: ITEM 250.00 ex + ADJUSTMENT +22.73 = 272.73 ex, x 1.10 = 300.00 inc (HALF_UP).
+     */
+    @Test
+    void putDraft_itemisedPositiveAdjustment_extraCost_savesSignedLine_totalsIncludeIt() throws Exception {
+        long orderId = leadOrderInSession();
+
+        mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"itemised": true, "lines": [
+                                  {"line_type":"ITEM","description":"Supply and install","quantity":1,"unit_price_ex_gst":250,"line_total_ex_gst":250,"sort_order":0},
+                                  {"line_type":"ADJUSTMENT","description":"Additional charges","line_total_ex_gst":22.73,"sort_order":1}
+                                ]}"""))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.itemised").value(true))
+                .andExpect(jsonPath("$.data.lines", hasSize(2)))
+                .andExpect(jsonPath("$.data.lines[1].line_type").value("ADJUSTMENT"))
+                .andExpect(jsonPath("$.data.lines[1].description").value("Additional charges"))
+                .andExpect(jsonPath("$.data.lines[1].line_total_ex_gst").value(22.73))
+                .andExpect(jsonPath("$.data.quote_total_ex_gst").value(272.73))
+                .andExpect(jsonPath("$.data.quote_total_inc_gst").value(300.00));
+
+        Assertions.assertEquals(2, lineCount(orderId), "the positive adjustment is stored as its own line");
+        assertMoney("272.73", draftDecimal(orderId, "quote_total_ex_gst"));
+        assertMoney("300.00", draftDecimal(orderId, "quote_total_inc_gst"));
+        Assertions.assertEquals(0, draftDecimal(orderId, "quote_total_ex_gst").compareTo(sumLineTotals(orderId)),
+                "itemised total = sum of the visible lines, the positive adjustment included");
+        BigDecimal adjTotal = jdbcTemplate.queryForObject(
+                "SELECT line_total_ex_gst FROM quote_draft_line l JOIN quote_draft d ON l.quote_draft_id = d.quote_draft_id "
+                        + "WHERE d.order_id = ? AND l.line_type = 'ADJUSTMENT'", BigDecimal.class, orderId);
+        assertMoney("22.73", adjTotal);
+    }
+
     @Test
     void putDraft_finalAboveLineSum_returns422_TotalExceedsLines_notPersisted() throws Exception {
         long orderId = leadOrderInSession();
@@ -808,8 +844,9 @@ class QuoteControllerTest {
                                 {"itemised": false, "final_total_inc_gst": 550, "lines": []}"""))
                 .andExpect(status().isOk());
 
-        // Toggle ON later: the retained rows are still available (no forced re-seed) and an
-        // itemised save can update them — here the Carpet quantity changes 2 -> 3.
+        // An itemised save later full-replaces the retained rows (backend storage only: since Batch A PR 2, #108,
+        // the Quote tab refills on every switch to itemised instead of restoring them) — here the Carpet quantity
+        // changes 2 -> 3.
         mockMvc.perform(put(draftUrl(orderId)).session(liamStore1Session())
                         .contentType(MediaType.APPLICATION_JSON)
                         .content("""

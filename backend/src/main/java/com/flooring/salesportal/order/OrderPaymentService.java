@@ -538,7 +538,7 @@ public class OrderPaymentService {
 
     /**
      * No-body endpoints (D.10 void): the body must be empty. Identical semantics to
-     * {@code OrderInvoiceService.rejectNonEmptyBody} (Create/Rewrite/Resend): {@code null} / blank /
+     * {@code OrderInvoiceService.rejectNonEmptyBody} (Create/Resend): {@code null} / blank /
      * whitespace-only / explicit JSON {@code null} / {@code {}} are accepted (no-op); a non-object body
      * (array / scalar) -> 400 {@code VALIDATION_FAILED} on {@code body}; a JSON object with ANY field ->
      * 400 {@code VALIDATION_FAILED} (one detail per field); an unparseable body -> 400

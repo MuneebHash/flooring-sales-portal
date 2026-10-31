@@ -403,7 +403,7 @@ class InvoiceFrozenWordsTest {
         moveSavedStateOn(orderId);
         Words edited = new Words(EDITED_NAME, EDITED_LINE1, EDITED_LINE2, sanitisedTerms(RAW_EDITED_SOFT_TERMS));
 
-        JsonNode rewritten = rewrite(orderId);
+        JsonNode rewritten = rewrite(orderId, 2);
 
         assertDetailWords(rewritten, 3, edited, "D.2");
         Assertions.assertTrue(rewritten.path("accepted_at").isNull(), "D.2 clears accepted_at");
@@ -668,7 +668,7 @@ class InvoiceFrozenWordsTest {
         assertDetailWords(getCurrent(orderId), 4, frozen, "D.3 after D.8");
 
         Words refrozen = new Words(ORIGINAL_NAME, ORIGINAL_LINE1, ORIGINAL_LINE2, sanitisedTerms(RAW_SOFT_TERMS));
-        assertDetailWords(rewrite(orderId), 5, refrozen, "D.2 after the business set SOFT terms");
+        assertDetailWords(rewrite(orderId, 4), 5, refrozen, "D.2 after the business set SOFT terms");
         long v5 = invoiceId(orderId, 5);
         Assertions.assertEquals(refrozen, storedWords(v5), "D.2 v5 row freezes the business's terms now");
         assertPdfWords(pdfOnDisk(v5), refrozen, SOFT_TERMS_TEXT, "D.2 v5 PDF", HARD_TERMS_TEXT, LEGACY_TERMS_TEXT);
@@ -741,7 +741,7 @@ class InvoiceFrozenWordsTest {
         assertAcceptedCaption(v4Pdf, BACKFILLED_NAME, acceptedAt(v4), "D.8 v4 PDF");
 
         Words refrozen = new Words(ORIGINAL_NAME, ORIGINAL_LINE1, ORIGINAL_LINE2, sanitisedTerms(RAW_SOFT_TERMS));
-        assertDetailWords(rewrite(orderId), 5, refrozen, "D.2 of a legacy version");
+        assertDetailWords(rewrite(orderId, 4), 5, refrozen, "D.2 of a legacy version");
         long v5 = invoiceId(orderId, 5);
         Assertions.assertEquals(refrozen, storedWords(v5), "D.2 v5 row freezes the saved values");
         assertPdfWords(pdfOnDisk(v5), refrozen, SOFT_TERMS_TEXT, "D.2 v5 PDF", BACKFILLED_NAME, ACCEPTED_CAPTION);
@@ -806,7 +806,7 @@ class InvoiceFrozenWordsTest {
 
         setBusinessTerms(RAW_SOFT_TERMS, RAW_HARD_TERMS);
         Words refrozen = new Words(ORIGINAL_NAME, ORIGINAL_LINE1, ORIGINAL_LINE2, sanitisedTerms(RAW_SOFT_TERMS));
-        assertDetailWords(rewrite(orderId), 5, refrozen, "D.2 after the business sets SOFT terms");
+        assertDetailWords(rewrite(orderId, 4), 5, refrozen, "D.2 after the business sets SOFT terms");
 
         for (int version = 1; version <= 5; version++) {
             Assertions.assertNull(invoiceRow(invoiceId(orderId, version)).get("source_quote_version_id"),
@@ -1011,10 +1011,14 @@ class InvoiceFrozenWordsTest {
         return invoiceDetail(result, "D.1 create");
     }
 
-    /** D.2 Rewrite (empty body): 201 with its message; returns the checked data.invoice. */
-    private JsonNode rewrite(long orderId) throws Exception {
+    /**
+     * D.2 Rewrite carrying {@code currentVersion}, the order's current invoice version, as its expected_version_number
+     * (Batch A PR 2, #149): 201 with its message; returns the checked data.invoice.
+     */
+    private JsonNode rewrite(long orderId, int currentVersion) throws Exception {
         MvcResult result = perform(post(orderUrl(orderId) + "/invoices/rewrite").session(session())
-                .contentType(MediaType.APPLICATION_JSON).content("{}"), 201, "D.2 rewrite");
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"expected_version_number\":" + currentVersion + "}"), 201, "D.2 rewrite");
         Assertions.assertEquals(REWRITTEN_MESSAGE, readJson(result).path("message").asText(), "D.2 message");
         return invoiceDetail(result, "D.2 rewrite");
     }

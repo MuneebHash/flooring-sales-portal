@@ -362,7 +362,7 @@ class PublicInvoiceSnapshotIntegrationTest {
         MvcResult result;
         WriterOutcome writer;
         try (SnapshotRace race = new SnapshotRace(label, HookPoint.TOKEN_RE_READ, order,
-                writer("Rewrite (D.2)", order, rewrite(order)))) {
+                writer("Rewrite (D.2)", order, rewrite(order, 1)))) {
             result = race.perform(publicView(order.token()));
             writer = race.assertGateToSnapshot(201, INVOICE_REWRITTEN_MESSAGE, TOKEN_REWRITTEN);
         }
@@ -460,7 +460,7 @@ class PublicInvoiceSnapshotIntegrationTest {
         MvcResult result;
         WriterOutcome writer;
         try (SnapshotRace race = new SnapshotRace(label, HookPoint.TOKEN_RE_READ, order,
-                writer("Rewrite (D.2)", order, rewrite(order)))) {
+                writer("Rewrite (D.2)", order, rewrite(order, 1)))) {
             result = race.perform(publicPdf(order.token(), "2"));
             writer = race.assertGateToSnapshot(201, INVOICE_REWRITTEN_MESSAGE, TOKEN_REWRITTEN);
         }
@@ -641,7 +641,7 @@ class PublicInvoiceSnapshotIntegrationTest {
         MvcResult result;
         WriterOutcome writer;
         try (SnapshotRace race = new SnapshotRace(label, HookPoint.CURRENT_VERSION_READ, order,
-                writer("Rewrite (D.2) of the revised sale", order, rewrite(order)))) {
+                writer("Rewrite (D.2) of the revised sale", order, rewrite(order, 1)))) {
             result = race.perform(publicView(order.token()));
             writer = race.assertWithinRead(201, INVOICE_REWRITTEN_MESSAGE, "v1 unsigned", 1, TOKEN_REWRITTEN, 2);
         }
@@ -769,7 +769,7 @@ class PublicInvoiceSnapshotIntegrationTest {
         MvcResult result;
         WriterOutcome writer;
         try (SnapshotRace race = new SnapshotRace(label, HookPoint.TOKEN_RE_READ, order,
-                writer("Rewrite (D.2)", order, rewrite(order)))) {
+                writer("Rewrite (D.2)", order, rewrite(order, 1)))) {
             result = race.perform(publicPdf(order.token(), "1"));
             writer = race.assertGateToSnapshot(201, INVOICE_REWRITTEN_MESSAGE, TOKEN_REWRITTEN);
             Assertions.assertEquals(2, race.probe().maxInvoiceVersion(),
@@ -1519,9 +1519,14 @@ class PublicInvoiceSnapshotIntegrationTest {
     // Protected requests (the tenant's session; the writers and the setup)
     // ================================================================
 
-    private RequestBuilder rewrite(LinkedOrder order) {
+    /**
+     * The D.2 Rewrite request carrying {@code currentVersion} as its expected_version_number (Batch A PR 2, #149):
+     * built before the race, so it carries the version that is current when the writer starts.
+     */
+    private RequestBuilder rewrite(LinkedOrder order, int currentVersion) {
         return post(orderUrl(order.orderId()) + "/invoices/rewrite").session(tenant.session())
-                .contentType(MediaType.APPLICATION_JSON).content("{}");
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"expected_version_number\":" + currentVersion + "}");
     }
 
     /** D.8 exactly as the Invoice tab sends it: the expected version form field and one PNG signature part. */

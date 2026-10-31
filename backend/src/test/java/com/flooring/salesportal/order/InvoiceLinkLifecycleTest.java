@@ -444,7 +444,7 @@ class InvoiceLinkLifecycleTest {
         Order order = seedOrderWithInvoiceV1();
         SentLink link = sendLink(order, tenant.first());
 
-        Timed rewrite = rewrite(order.orderId());
+        Timed rewrite = rewrite(order.orderId(), 1);
 
         assertStatus(rewrite.result(), 201, "D.2 Rewrite");
         JsonNode body = json(rewrite.result());
@@ -806,7 +806,7 @@ class InvoiceLinkLifecycleTest {
         SentLink link = sendLink(order, tenant.first());
         Map<String, Object> overAge = backdateExpiry(link.token());
 
-        Timed rewrite = rewrite(order.orderId());
+        Timed rewrite = rewrite(order.orderId(), 1);
 
         assertStatus(rewrite.result(), 201, "D.2 Rewrite");
         assertKilledWithin(overAge, tokenRow(link.token()), REWRITTEN, rewrite, "the Rewrite of an over-age link");
@@ -891,7 +891,7 @@ class InvoiceLinkLifecycleTest {
         Assertions.assertEquals(withColumns(a.row(), "status", "REPLACED", "dead_at", b.row().get("sent_at")), aReplaced,
                 "setup: A is REPLACED by B");
 
-        Timed rewrite = rewrite(order.orderId());
+        Timed rewrite = rewrite(order.orderId(), 1);
         assertStatus(rewrite.result(), 201, "D.2 Rewrite");
         Assertions.assertEquals(aReplaced, tokenRow(a.token()), "the Rewrite never touches the REPLACED A");
         Map<String, Object> bRewritten = tokenRow(b.token());
@@ -1158,7 +1158,7 @@ class InvoiceLinkLifecycleTest {
                 "public GET on a LAID order");
         assertPdfStreams(publicPdf(link.token(), "1"), order, 1, "public pdf on a LAID order");
         OrderState beforeRewrite = orderState(order.orderId());
-        Timed rewrite = rewrite(order.orderId());
+        Timed rewrite = rewrite(order.orderId(), 1);
         assertErrorEnvelope(rewrite.result(), 422, "ORDER_LOCKED", ORDER_LOCKED_MESSAGE, "Rewrite of a LAID order");
         Assertions.assertEquals(List.of(link.row()), tokenRows(order.orderId()),
                 "the refused Rewrite leaves the ACTIVE link exactly as it was");
@@ -1336,14 +1336,14 @@ class InvoiceLinkLifecycleTest {
         String trigger = installCommitFailureProbe(order.orderId());
         Timed failed;
         try {
-            failed = rewrite(order.orderId());
+            failed = rewrite(order.orderId(), 1);
         } finally {
             jdbcTemplate.execute("DROP TRIGGER IF EXISTS " + trigger + " ON invoice");
         }
 
         assertRolledBackWriter(failed.result(), order, link, linkBefore, before, PROBE_REWRITTEN,
                 "a Rewrite failing at commit");
-        Timed retry = rewrite(order.orderId());
+        Timed retry = rewrite(order.orderId(), 1);
         assertStatus(retry.result(), 201, "the same Rewrite without the fault");
         Assertions.assertEquals("REWRITTEN", tokenRow(link.token()).get("status"), "the committed Rewrite kills the link");
     }
@@ -1521,8 +1521,10 @@ class InvoiceLinkLifecycleTest {
         return invoice;
     }
 
-    private Timed rewrite(long orderId) throws Exception {
-        return timed(protectedJson(post(orderUrl(orderId) + "/invoices/rewrite"), "{}"));
+    /** D.2 Rewrite carrying {@code currentVersion} as its expected_version_number (Batch A PR 2, #149). */
+    private Timed rewrite(long orderId, int currentVersion) throws Exception {
+        return timed(protectedJson(post(orderUrl(orderId) + "/invoices/rewrite"),
+                "{\"expected_version_number\":" + currentVersion + "}"));
     }
 
     /** D.3: 200 with only {@code data.invoice} (no message). */

@@ -1260,9 +1260,22 @@ paths:
       summary: Rewrite invoice
       operationId: rewriteInvoice
       description: >
-        Creates the next official invoice version from current live order state. The
-        request body must be an empty JSON object. Phase 13: requires a valid customer
-        email (else 422 CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID). The new version
+        Creates the next official invoice version from current live order state. Batch A PR 2
+        (#149): the body is mandatory, {"expected_version_number": N} (RewriteInvoiceRequest),
+        where N is the version_number of the current invoice the Details of Sale Rewrite
+        confirmation was bound to. Before Batch A PR 2 the body had to be an empty JSON object; a
+        client still posting {} now gets 400 VALIDATION_FAILED "Required.". Checks run in this
+        order: standard guard, positive orderId, then the order scoped to the session business
+        and store, which takes the order row lock (404 ORDER_NOT_FOUND); LAID (422
+        ORDER_LOCKED); the current invoice read under that lock (none: 422 INVOICE_REQUIRED,
+        whatever the body); body validation (400 VALIDATION_FAILED / MALFORMED_JSON); N compared
+        with that current version's version_number (a mismatch is 409 INVOICE_VERSION_STALE
+        "Invoice updated, please refresh", with no details, before any snapshot, PDF, file,
+        insert, mirror reset or link kill); then the Phase 13 email gate, the preconditions and
+        the overpaid backstop. N is only compared, never used to select a version; the new
+        version is always the current one + 1. There is no already-accepted refusal: a matching
+        Rewrite of a signed current version appends an unsigned version. Phase 13: requires a
+        valid customer email (else 422 CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID). The new version
         is UNSIGNED/UNACCEPTED — it clears accepted_at, accepted_customer_name, the
         signature reference and last_emailed_at (sales_order.last_emailed_at mirror becomes
         null); the customer must re-accept. Rewrite sends NO email. Returns 422 when rewrite
@@ -1271,8 +1284,8 @@ paths:
         per-flooring-type terms, as createInvoice does (terms_source BUSINESS; the source quote
         version is cleared). 16G PR 4: in the same transaction an ACTIVE
         invoice link becomes REWRITTEN (the customer's page then shows "This invoice has been
-        revised. Please contact the store for the updated invoice."). Rewrite gains no
-        expected-version precondition in 16G.
+        revised. Please contact the store for the updated invoice."). 16G gave Rewrite no
+        expected-version precondition; Batch A PR 2 (#149) added the one above.
       parameters:
         - $ref: '#/components/parameters/OrderId'
       requestBody:
@@ -1280,7 +1293,7 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/EmptyObjectRequest'
+              $ref: '#/components/schemas/RewriteInvoiceRequest'
       responses:
         '201':
           description: Invoice rewritten
@@ -1296,6 +1309,8 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
         '422':
           $ref: '#/components/responses/UnprocessableEntity'
         '500':
@@ -1313,7 +1328,8 @@ paths:
         Returns 404 when no invoice exists yet for the order. 16G PR 4: the response
         carries invoice_link_expires_at, derived in this read from the order's ACTIVE, unexpired
         invoice link (null otherwise); the read writes nothing and never expires a token. 16G
-        PR 6 (#120): the Invoice tab re-reads this endpoint every 15 seconds while the
+        PR 6 (#120): the Invoice tab re-reads this endpoint every 5 seconds (since Batch A PR 2,
+        Muneeb's decision 29 October 2026; 15 seconds in 16G PR 6) while the
         last InvoiceDetail it applied shows invoice_link_expires_at non-null and the invoice
         unsigned, the browser tab is visible and the Invoice tab is active (reads only; failed
         polls are silent). Polling stops when a read shows the invoice signed or the field null,
@@ -1789,8 +1805,9 @@ paths:
         signature_download_path (#124, #122), current_issued gains the derived
         last_email_delivered that Customer Quote's Not delivered badge reads, every quote
         timestamp is formatted to whole seconds (#124), and the Quote tab re-reads this endpoint
-        every 15 seconds while current_issued is non-null, the browser tab is visible and the
-        Quote tab is active (#120; reads only).
+        every 5 seconds (since Batch A PR 2, Muneeb's decision 29 October 2026; 15 seconds in 16G
+        PR 6) while current_issued is non-null, the browser tab is visible and the Quote tab is
+        active (#120; reads only).
       parameters:
         - $ref: '#/components/parameters/OrderId'
       responses:
@@ -1930,7 +1947,10 @@ paths:
         send never writes the order sale price (only acceptPublicQuote does, decision D6b). In the
         current build delivery is recorded in memory only - no real email is sent. Re-checks
         below-cost (QUOTE_BELOW_COST, 422) and requires a valid customer email
-        (CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID, 422). Blocked when LAID (ORDER_LOCKED,
+        (CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID, 422). Batch A PR 2 (#134): the order's
+        saved details of sale must be non-blank, checked after the below-cost check and before
+        any write, on a first issue and on every resend alike (422 QUOTE_DETAILS_OF_SALE_REQUIRED
+        "Details of sale is required before sending a quote."). Blocked when LAID (ORDER_LOCKED,
         422). On provider failure returns 502 (EMAIL_SEND_FAILED); the issued version/PDF/token
         are kept and the salesperson resends.
       parameters:
@@ -1974,7 +1994,9 @@ paths:
         (delivery is email only). The frontend never calls it and no SMS provider exists
         (in-memory recording sender only); the definition is kept, not promised.
         Issues (or resends) the quote and sends an SMS containing the public quote link only (no
-        PDF) (Phase 16B). Same issue/resend + token logic as send-email. Requires a valid customer
+        PDF) (Phase 16B). Same issue/resend + token logic as send-email, including its Batch A PR 2
+        saved details of sale gate (422 QUOTE_DETAILS_OF_SALE_REQUIRED, before any write, resends
+        included; #134). Requires a valid customer
         mobile (CUSTOMER_MOBILE_REQUIRED / CUSTOMER_MOBILE_INVALID, 422). Blocked when LAID
         (ORDER_LOCKED, 422). On provider failure returns 502 (SMS_SEND_FAILED); the issued
         version/PDF/token are kept and the salesperson resends.
@@ -3675,7 +3697,9 @@ components:
           description: >-
             The version's number (1, 2, 3 ...); the highest is the current invoice. From 16G PR 3
             the Invoice tab sends the version_number of the invoice on screen as
-            expected_version_number on acceptCurrentInvoice (#69).
+            expected_version_number on acceptCurrentInvoice (#69). Since Batch A PR 2 (#149) the
+            Details of Sale tab sends the version_number of the current invoice its Rewrite
+            confirmation was bound to as expected_version_number on rewriteInvoice.
         invoice_date:
           allOf:
             - $ref: '#/components/schemas/Date'
@@ -5097,7 +5121,9 @@ components:
             implemented in PR 4: INVOICE_TOKEN_NOT_FOUND (404; the
             public invoice endpoints); INVOICE_LINK_REPLACED, INVOICE_LINK_REWRITTEN,
             INVOICE_LINK_SIGNED and INVOICE_LINK_EXPIRED (410; acceptPublicInvoice and
-            downloadPublicInvoicePdf).
+            downloadPublicInvoicePdf). Batch A PR 2 adds rewriteInvoice to INVOICE_VERSION_STALE
+            (409, #149) and adds QUOTE_DETAILS_OF_SALE_REQUIRED (422; sendQuoteEmail and
+            sendQuoteSms, #134).
         message:
           type: string
         details:
@@ -5254,7 +5280,9 @@ components:
           description: >
             Ordered draft lines. On a non-itemised draft this contains the RETAINED dormant
             itemised rows (empty when none exist; Phase 16D-B PR2A) — they are not part of the
-            non-itemised totals and must not be rendered while itemised is false.
+            non-itemised totals and must not be rendered while itemised is false. Since Batch A
+            PR 2 (#108) the Quote tab never restores them: every explicit switch to itemised
+            refills the editor from the order's current Products & Charges lines.
           items:
             $ref: '#/components/schemas/QuoteDraftLine'
         updated_at:
@@ -5943,6 +5971,35 @@ components:
             used to select a version. A mismatch gives 409 QUOTE_VERSION_STALE "The accepted quote
             changed while the confirmation was open. Review the accepted quote before creating an
             invoice."
+
+    RewriteInvoiceRequest:
+      type: object
+      additionalProperties: false
+      description: >-
+        Batch A PR 2 (#149; replaced EmptyObjectRequest on rewriteInvoice only). A JSON object
+        with exactly one field, validated only after the order scope, LAID and current-invoice
+        checks. An absent or blank body, {}, or a missing or null expected_version_number: 400
+        VALIDATION_FAILED "Required."; the key given more than once at the top level of the
+        object (an escaped spelling of it included; a key nested inside a value is not counted):
+        "Must appear at most once.", whatever the values; not a positive integer (a string, a
+        boolean, a fraction such as 1.5 or 1.0, zero, a negative, an object or array, or beyond
+        the signed 64-bit range): "Must be a positive integer."; any other field, due_date
+        included: "Not allowed." (one detail per field, in body order, in the same 400 as any
+        expected_version_number detail, which comes last); a non-object body (a JSON null is a
+        non-object body): 400 VALIDATION_FAILED on body "Must be an object."; unparseable JSON:
+        400 MALFORMED_JSON.
+      required:
+        - expected_version_number
+      properties:
+        expected_version_number:
+          type: integer
+          format: int64
+          minimum: 1
+          description: >-
+            The version_number of the current invoice the Details of Sale Rewrite confirmation
+            was bound to. Compared under the order lock with the current invoice's
+            version_number; never used to select a version. A mismatch gives 409
+            INVOICE_VERSION_STALE "Invoice updated, please refresh" (no details).
 
     InvoiceLinkSendResult:
       type: object

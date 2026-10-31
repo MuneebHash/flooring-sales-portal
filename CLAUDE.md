@@ -297,7 +297,7 @@ Order-specific enquiry captured inside the Customer tab. Schema: `order_enquiry`
 ```text
 - Embedded on the workspace GET (nullable data.enquiry). No standalone GET enquiry endpoint.
 - PUT /api/v1/{slug}/orders/{orderId}/enquiry is a FULL-REPLACE upsert — the whole body is sent
-  on every save (autosave and manual).
+  on every save (autosave only).
 - Autosave: debounce + blur flush + unmount flush + single-flight + queue. No manual Save button (removed in Batch A PR 1, Muneeb's decision 30 October 2026).
 - LAID: read allowed; write blocked with 422 ORDER_LOCKED.
 - lead_type: FLOOR / PHONE / INTERNET / null (exact-case only). Invalid on an editable order ->
@@ -365,9 +365,11 @@ Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-
   non-fatal, NO email gate (PR 3, amends 16F D6 "no email"). It still never touches quote rows/tokens.
 - Draft (one per order): itemised total = sum of lines (a direct reduction auto-adds a negative
   ADJUSTMENT; above the line sum -> 422 QUOTE_TOTAL_EXCEEDS_LINES); non-itemised = final total only.
-  Below cost is blocked at save and send (QUOTE_BELOW_COST). Itemised rows are RETAINED as dormant
-  rows on non-itemised saves and restored on toggle-ON (contract §6.1) — the active rule until #108
-  (Batch A) changes it in its own PR.
+  Below cost is blocked at save and send (QUOTE_BELOW_COST); send and resend also need non-blank
+  saved Details of Sale (422 QUOTE_DETAILS_OF_SALE_REQUIRED, Batch A PR 2, #134). Itemised rows are
+  still RETAINED as dormant backend rows on non-itemised saves (contract §6.1, storage unchanged), but
+  the Quote tab never restores them: every explicit switch to itemised refills from the current
+  Products & Charges and discards the quote rows/adjustments, with no confirmation (Batch A PR 2, #108).
 - Issue/send: append-only quote_version snapshot (lines, totals, flooring type, details of sale,
   frozen terms, V17 customer name + billing lines) + stored immutable issued PDF + hashed 7-day
   token. A changed draft OR changed customer name/billing -> NEW version (prior SUPERSEDED);
@@ -441,7 +443,9 @@ Contract: `docs/API-Contracts-Phase16B-Quotation.md` · UX lock: `docs/Phase16D-
   D.8 and remote invoice accept carry a mandatory expected_version_number (409 INVOICE_VERSION_STALE
   "Invoice updated, please refresh"); Path A carries {"quote_version_id": N} (409 QUOTE_VERSION_STALE).
   Compared under the order lock with the row read there, NEVER used as a lookup key.
-  Rewrite/payment/void get no precondition in 16G.
+  Rewrite got none in 16G; since Batch A PR 2 (#149) D.2 Rewrite carries the mandatory JSON
+  {"expected_version_number": N} (the same 409 INVOICE_VERSION_STALE and under-the-lock comparison;
+  a stale Rewrite writes nothing). Payment and void still have no precondition.
 - Never leave follow-ups untracked — file a GitHub issue (the PR #71 lesson).
 - business_quick_description column is `description`, NOT `text` (Postgres type-name footgun);
   its FK to business has no ON DELETE — wipe child rows before the business row.
@@ -518,10 +522,9 @@ Issue base: https://github.com/MuneebHash/flooring-sales-portal/issues/
 - Phase 17: [#127](https://github.com/MuneebHash/flooring-sales-portal/issues/127) Restore the login session on page reload · [#128](https://github.com/MuneebHash/flooring-sales-portal/issues/128) Rate limiting on public quote endpoints and a decode concurrency cap (widened by an issue comment to the 16G public invoice endpoints) · [#129](https://github.com/MuneebHash/flooring-sales-portal/issues/129) Tenant-independent test fixtures · [#130](https://github.com/MuneebHash/flooring-sales-portal/issues/130) Terms per store · [#142](https://github.com/MuneebHash/flooring-sales-portal/issues/142) Signed-PDF email WARN logs carry no failure reason (with the real email provider) · [#144](https://github.com/MuneebHash/flooring-sales-portal/issues/144) Public quote gate: lazy expiry re-checks status but not the time after taking the order lock · [#150](https://github.com/MuneebHash/flooring-sales-portal/issues/150) F55: apply the public accept's PNG content checks to the in-store D.8 accept · [#153](https://github.com/MuneebHash/flooring-sales-portal/issues/153) W1: business_quick_description rows must be deleted before the business row (onboarding) · [#151](https://github.com/MuneebHash/flooring-sales-portal/issues/151) F57/F59: older public-controller tests bypass the filter chain; recording senders retain bearer links (Phase 17 or Phase 19, undecided)
 - Phase 18: [#131](https://github.com/MuneebHash/flooring-sales-portal/issues/131) Shared Modal: focus trap and inert background · [#132](https://github.com/MuneebHash/flooring-sales-portal/issues/132) AppHeader overflow on narrow screens · [#133](https://github.com/MuneebHash/flooring-sales-portal/issues/133) Disabled Send by Phone/SMS button wording
 - Phase 19: [#136](https://github.com/MuneebHash/flooring-sales-portal/issues/136) End-of-project cosmetic cleanups from the 16F reviews
-- Batch A (own PR after 16G): [#107](https://github.com/MuneebHash/flooring-sales-portal/issues/107) · [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108) · [#104](https://github.com/MuneebHash/flooring-sales-portal/issues/104) · [#109](https://github.com/MuneebHash/flooring-sales-portal/issues/109) · [#110](https://github.com/MuneebHash/flooring-sales-portal/issues/110) · [#96](https://github.com/MuneebHash/flooring-sales-portal/issues/96) · [#101](https://github.com/MuneebHash/flooring-sales-portal/issues/101) · [#134](https://github.com/MuneebHash/flooring-sales-portal/issues/134) — details in `docs/Phases.md` §7
+- Batch A (two PRs after 16G): PR 1 [#107](https://github.com/MuneebHash/flooring-sales-portal/issues/107) · [#96](https://github.com/MuneebHash/flooring-sales-portal/issues/96) · [#101](https://github.com/MuneebHash/flooring-sales-portal/issues/101), merged in #157; PR 2 [#108](https://github.com/MuneebHash/flooring-sales-portal/issues/108) · [#104](https://github.com/MuneebHash/flooring-sales-portal/issues/104) · [#109](https://github.com/MuneebHash/flooring-sales-portal/issues/109) · [#110](https://github.com/MuneebHash/flooring-sales-portal/issues/110) · [#134](https://github.com/MuneebHash/flooring-sales-portal/issues/134) · [#149](https://github.com/MuneebHash/flooring-sales-portal/issues/149) plus the Quote/Invoice polling change (15 to 5 seconds) — details in `docs/Phases.md` §7
 - Batch B (own PR after Batch A): [#111](https://github.com/MuneebHash/flooring-sales-portal/issues/111) · [#112](https://github.com/MuneebHash/flooring-sales-portal/issues/112) · [#114](https://github.com/MuneebHash/flooring-sales-portal/issues/114) — details in `docs/Phases.md` §7
-- Batch A or Batch B (placement undecided): [#135](https://github.com/MuneebHash/flooring-sales-portal/issues/135) Rewrite Invoice with active payments above the new price returns 500 instead of 422 · [#147](https://github.com/MuneebHash/flooring-sales-portal/issues/147) Blank frozen customer name: warn before Accept Remotely and end signing on the customer's 422
-- Batch A or post-pilot (placement undecided): [#149](https://github.com/MuneebHash/flooring-sales-portal/issues/149) F52: Rewrite from a stale screen clears an unseen remote signature
+- Batch B (moved out of Batch A, Muneeb's decision for Batch A PR 2): [#135](https://github.com/MuneebHash/flooring-sales-portal/issues/135) Rewrite Invoice with active payments above the new price returns 500 instead of 422 · Dropped from Batch A (Muneeb's decision, 29 October 2026; no code change; closed on 30 October 2026): [#147](https://github.com/MuneebHash/flooring-sales-portal/issues/147) Blank frozen customer name: warn before Accept Remotely and end signing on the customer's 422
 - Post-pilot hardening: [#148](https://github.com/MuneebHash/flooring-sales-portal/issues/148) F49: delayed-email windows (with the Phase 17 email provider; related #142) · [#152](https://github.com/MuneebHash/flooring-sales-portal/issues/152) F60: rollback hooks on an unknown commit outcome
 
 Docs are authoritative for phase numbering.

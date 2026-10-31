@@ -45,7 +45,7 @@ import type {
 } from '../lib/api/orderWorkspaceApi'
 import { fetchOrderLines } from '../lib/api/orderLinesApi'
 import type { OrderFinancialSummary } from '../lib/api/orderLinesApi'
-import { fetchQuoteWorkspace } from '../lib/api/orderQuoteApi'
+import { QUOTE_TOTAL_MAX, fetchQuoteWorkspace } from '../lib/api/orderQuoteApi'
 import type {
   QuoteAcceptedSummary,
   QuoteDraftRead,
@@ -296,11 +296,34 @@ function WorkspaceShell({
           ? 'hidden'
           : 'enabled'
 
+  // Batch A PR 2 (#104): the header Sale total captured ONCE when Create Quote is
+  // clicked (final_sale_price_inc_gst, so any sale-price override is included), as
+  // the starting total of the brand-new non-itemised quote draft. Captured only when
+  // the summary is loaded and the total is finite and 0 < total <= QUOTE_TOTAL_MAX;
+  // otherwise undefined and the quote total starts blank, as before. Never updated
+  // afterwards: QuoteTab reads it only in its initial state and never follows later
+  // summary changes, polls or Products & Charges edits (the 16D-A decoupling).
+  const [createQuoteTotalIncGst, setCreateQuoteTotalIncGst] = useState<
+    number | undefined
+  >(undefined)
+
   // Create Quote action (locked): reveal the Quote tab, switch to it. QuoteTab
   // opens on its Quote Draft sub-tab by default (it mounts fresh here). No
   // invoice call, no order mutation, no quote data wiped — the tab initialises
-  // from the probe-confirmed draft (null = fresh local draft).
+  // from the probe-confirmed draft (always null here: Create Quote is offered only
+  // after the probe confirmed no saved draft). Since Batch A PR 2 (#104) it also
+  // hands QuoteTab the captured Sale total, which pre-fills the new draft's total and
+  // is saved once by its normal autosave.
   function handleCreateQuote() {
+    const saleTotal = financialSummary?.final_sale_price_inc_gst
+    setCreateQuoteTotalIncGst(
+      typeof saleTotal === 'number' &&
+        Number.isFinite(saleTotal) &&
+        saleTotal > 0 &&
+        saleTotal <= QUOTE_TOTAL_MAX
+        ? saleTotal
+        : undefined,
+    )
     setQuoteTabVisible(true)
     setActiveTab('quote')
   }
@@ -710,8 +733,10 @@ function WorkspaceShell({
                 snapshots each time it becomes the visible tab (never the draft),
                 and onInvoiceReady switches to the Invoice tab after a Create
                 Invoice from the accepted quote. 16G PR 6: `active` also gates the
-                tab's 15-second poll, and onAcceptedVersionChanged re-reads the
-                order financial summary when a new accepted version lands. */}
+                tab's poll (every 5 seconds since Batch A PR 2, Muneeb's decision
+                29 October 2026; 15 seconds in 16G PR 6), and
+                onAcceptedVersionChanged re-reads the order financial summary when
+                a new accepted version lands. */}
             {quoteTabVisible && (
               <div className={activeTab === 'quote' ? '' : 'hidden'}>
                 <QuoteTab
@@ -727,6 +752,9 @@ function WorkspaceShell({
                   initialDraft={quoteInitialDraft}
                   initialIssued={quoteInitialIssued}
                   initialAccepted={quoteInitialAccepted}
+                  // Batch A PR 2 (#104): the Sale total captured by Create Quote
+                  // (undefined when the tab was revealed by the probe).
+                  createQuoteTotalIncGst={createQuoteTotalIncGst}
                   onInvoiceReady={handleQuoteInvoiceReady}
                   onAcceptedVersionChanged={refreshFinancialSummary}
                   // Codex P2: the quote preview PDF renders the PERSISTED
@@ -742,6 +770,10 @@ function WorkspaceShell({
                   // since Batch A #107, a failed Customer tab flush before a send
                   // (Send modal only) send the user straight to the Customer tab.
                   onGoToCustomer={() => setActiveTab('customer')}
+                  // Batch A PR 2 (#134): a send refused for blank Details of Sale
+                  // (QUOTE_DETAILS_OF_SALE_REQUIRED) points the user at the tab
+                  // where the details are written.
+                  onGoToDetails={() => setActiveTab('details')}
                 />
               </div>
             )}

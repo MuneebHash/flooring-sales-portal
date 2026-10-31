@@ -369,12 +369,15 @@ export async function fetchQuotePreviewPdf(
 // POST /api/v1/{slug}/orders/{orderId}/quote/send-email — issue (or resend) the
 // quote and email it (stored issued PDF + public link). The body MUST be an
 // empty JSON object {}. 201; `data` is the updated QuoteIssuedSummary (never
-// the token). The backend issues from the PERSISTED draft, so callers must
-// flush the quote autosave AND the details autosave first (same double-flush
-// discipline as the preview).
+// the token). The backend issues from the PERSISTED draft, saved Details of
+// Sale and saved customer, so callers must first flush the Details of Sale
+// autosave, then the Customer tab's customer/address autosaves (Batch A PR 1,
+// #107), then the quote autosave (the same flushes as the preview).
 // Errors: 400 VALIDATION_FAILED / MALFORMED_JSON; 404 ORDER_NOT_FOUND /
 // QUOTE_NOT_FOUND (no saved draft); 422 ORDER_LOCKED (LAID) / QUOTE_BELOW_COST
-// (live re-check) / CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID; 502
+// (live re-check) / QUOTE_DETAILS_OF_SALE_REQUIRED (the saved Details of Sale
+// is blank, checked after below cost on every send and resend; Batch A PR 2,
+// #134) / CUSTOMER_EMAIL_REQUIRED / CUSTOMER_EMAIL_INVALID; 502
 // EMAIL_SEND_FAILED (delivery failed — the issued version/PDF/link are KEPT
 // server-side, so retrying is safe and never duplicates a version).
 export function sendQuoteEmail(

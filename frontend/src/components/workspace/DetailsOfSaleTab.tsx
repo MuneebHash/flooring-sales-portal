@@ -128,6 +128,54 @@ function formatIsoDate(iso: string | null | undefined): string {
   return `${day} ${name} ${year}`
 }
 
+// Compact timestamp for the Rewrite confirmation's signed warning (copy of the
+// QuoteTab / InvoiceTab helper): "08 Jul 2026, 14:05". Returns '' for an
+// unparsable value.
+function formatTimestamp(iso: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/.exec(iso)
+  if (!match) return ''
+  const [, year, month, day, hours, minutes] = match
+  const name = MONTH_NAMES[Number(month) - 1]
+  if (!name) return ''
+  return `${day} ${name} ${year}, ${hours}:${minutes}`
+}
+
+// Batch A PR 2 (#149) - the stale Rewrite 409 (INVOICE_VERSION_STALE) default
+// message, shown when the response carries none (the backend message is
+// otherwise surfaced verbatim; the InvoiceTab constant).
+const INVOICE_STALE_MESSAGE = 'Invoice updated, please refresh'
+const NO_INVOICE_TO_REWRITE_MESSAGE =
+  'This order has no invoice to rewrite any more. Use Create invoice instead.'
+
+// Batch A PR 2 (#149) - the Rewrite confirmation's binding to ONE fresh read of
+// the current invoice, started when that confirmation opens (key = that
+// opening). Only a 'ready' binding for the open key and this order enables
+// Confirm; its versionNumber is the expected_version_number the Rewrite POST
+// carries, and its acceptance fields drive the signed warning shown with it.
+type RewriteBinding =
+  | { status: 'loading'; key: number; orderId: number }
+  | { status: 'error'; key: number; orderId: number }
+  | {
+      status: 'ready'
+      key: number
+      orderId: number
+      invoiceId: number
+      versionNumber: number
+      acceptedAt: string | null
+      acceptedCustomerName: string | null
+      totalPaid: number
+    }
+
+// The outcome of one current-invoice read (see readCurrentInvoice): applied (an
+// invoice, or null for 404 INVOICE_NOT_FOUND when the caller installs that
+// state), ignored (nothing installed: unmounted, another order, a newer read
+// applied first, an OLDER version than the one known, or a 404 the caller does
+// not install), failed (no readable answer and nothing newer applied).
+type CurrentInvoiceReadOutcome =
+  | { status: 'applied'; invoice: InvoiceDetail | null }
+  | { status: 'ignored' }
+  | { status: 'failed'; error: unknown }
+
 export function formFromProps(d?: DetailsOfSaleFields | null): DetailsForm {
   return {
     supply_only: d?.supply_only ?? false,
@@ -509,7 +557,9 @@ export function DetailsOfSaleTab({
   const [targetGpSuccess, setTargetGpSuccess] = useState<string | null>(null)
 
   // Guards setState after the tab unmounts (e.g. the order route changes, or the
-  // user switches tabs, while a save is still in flight).
+  // user switches tabs, while a save is still in flight). Batch A PR 2 (#149): an
+  // unmount (tab switch, order change, leaving the order) also drops any Rewrite
+  // confirmation binding, so a late binding read lands nowhere.
   const mountedRef = useRef(true)
   useEffect(() => {
     // Reset on setup so a StrictMode setup→cleanup→setup cycle (or any remount)
@@ -517,8 +567,16 @@ export function DetailsOfSaleTab({
     mountedRef.current = true
     return () => {
       mountedRef.current = false
+      rewriteBindingRef.current = null
     }
   }, [])
+  // Batch A PR 2 (#149) - mirrors read by async continuations: the order this tab
+  // reads and writes, and the live summary (the overpaid fallback after a failed
+  // Rewrite reads the sale total current at that moment).
+  const orderIdRef = useRef(orderId)
+  orderIdRef.current = orderId
+  const financialSummaryRef = useRef(financialSummary)
+  financialSummaryRef.current = financialSummary
 
   // Seed the sale-price input from the live summary, but never overwrite an
   // active edit. After a successful override/reset we clear `salePriceDirty` and
@@ -698,13 +756,38 @@ export function DetailsOfSaleTab({
   // --- Invoice create / rewrite (D.1 create, D.2 rewrite). ---
   // The invoice ACTION lives in this tab (not the Invoice tab) so the invoice is
   // generated from this order's saved details. We probe GET /invoices/current on
-  // mount ONLY to choose Create (no invoice yet) vs Rewrite (an invoice exists).
+  // mount to choose Create (no invoice yet) vs Rewrite (an invoice exists).
   // invoiceExists === null means still probing. The Invoice tab is view/download
-  // only.
+  // only. Batch A PR 2 (#149): the probe is NOT what a Rewrite carries - the
+  // Rewrite confirmation makes its own fresh, keyed read when it opens and binds
+  // the version it shows (see RewriteBinding); every read installs through the
+  // one sequenced path below.
   const [invoiceExists, setInvoiceExists] = useState<boolean | null>(null)
-  // The current invoice from the mount probe — kept (not just invoiceExists) so the
-  // overpaid-rewrite guard can read its total_paid. null while probing / no invoice.
+  // The last current invoice installed by a read (the mount probe, a Rewrite
+  // binding read or the re-read after a stale Rewrite) — kept (not just
+  // invoiceExists) so the pre-open overpaid-rewrite guard can read its
+  // total_paid. null while probing / no invoice. A read's answer is written
+  // only through installCurrentInvoice; the mount probe effect alone also
+  // resets it to null when it starts and when its read fails (then Create).
   const [currentInvoice, setCurrentInvoice] = useState<InvoiceDetail | null>(null)
+  const currentInvoiceRef = useRef<InvoiceDetail | null>(null)
+  // Batch A PR 2 (#149) - ONE recency rule for every current-invoice read (the
+  // InvoiceTab pattern): invoiceReadSeqRef numbers each read when it is ISSUED,
+  // invoiceReadFloorRef is the newest number whose answer has been installed. A
+  // read installs only while it is above the floor, and an answer OLDER than the
+  // known version is never installed (versions only grow), so no late read rolls
+  // back a newer one.
+  const invoiceReadSeqRef = useRef(0)
+  const invoiceReadFloorRef = useRef(0)
+  // Batch A PR 2 (#149) - the open Rewrite confirmation's binding (state for
+  // rendering, ref for async continuations and Confirm), its key sequence, and
+  // the SYNCHRONOUS in-flight flag of the Rewrite POST.
+  const [rewriteBinding, setRewriteBinding] = useState<RewriteBinding | null>(
+    null,
+  )
+  const rewriteBindingRef = useRef<RewriteBinding | null>(null)
+  const rewriteKeySeqRef = useRef(0)
+  const rewriteInFlightRef = useRef(false)
   const [creatingInvoice, setCreatingInvoice] = useState(false)
   const [rewritingInvoice, setRewritingInvoice] = useState(false)
   const [invoiceActionError, setInvoiceActionError] = useState<string | null>(
@@ -719,41 +802,101 @@ export function DetailsOfSaleTab({
     null,
   )
 
+  // The ONE place a read's answer changes the known invoice (and with it Create
+  // vs Rewrite). The only other writes are the mount probe's own resets: to
+  // "probing" (null) when it starts and to Create after a failed read.
+  function installCurrentInvoice(next: InvoiceDetail | null) {
+    currentInvoiceRef.current = next
+    setCurrentInvoice(next)
+    setInvoiceExists(next !== null)
+  }
+
+  // Read the current invoice and install the answer through installCurrentInvoice,
+  // but ONLY while this tab is still mounted, still on the order the read was issued
+  // for, no newer read has been installed since it was issued, and the caller's
+  // optional canInstall still returns true (checked together with those guards,
+  // before the floor advances or anything installs); an answer older than the
+  // known version, or for another order, is never installed. 404
+  // INVOICE_NOT_FOUND installs the no-invoice state only when installNotFound is
+  // set. Whenever one of those guards fails (canInstall included) the read is
+  // ignored: no install and no floor change, for a 404 as well. Never throws.
+  async function readCurrentInvoice(
+    installNotFound: boolean,
+    canInstall?: () => boolean,
+  ): Promise<CurrentInvoiceReadOutcome> {
+    invoiceReadSeqRef.current += 1
+    const seq = invoiceReadSeqRef.current
+    const requestOrderId = orderIdRef.current
+    const stillCurrent = () =>
+      mountedRef.current &&
+      orderIdRef.current === requestOrderId &&
+      seq > invoiceReadFloorRef.current &&
+      (canInstall === undefined || canInstall())
+    let next: InvoiceDetail | null
+    try {
+      const res = await fetchCurrentInvoice(requestOrderId)
+      next = res.data.invoice
+    } catch (err) {
+      if (!(err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND')) {
+        return stillCurrent()
+          ? { status: 'failed', error: err }
+          : { status: 'ignored' }
+      }
+      if (!installNotFound) return { status: 'ignored' }
+      next = null
+    }
+    if (!stillCurrent()) return { status: 'ignored' }
+    if (next !== null && next.order_id !== requestOrderId) {
+      return { status: 'ignored' }
+    }
+    const known = currentInvoiceRef.current
+    if (
+      next !== null &&
+      known !== null &&
+      next.version_number < known.version_number
+    ) {
+      return { status: 'ignored' }
+    }
+    invoiceReadFloorRef.current = seq
+    installCurrentInvoice(next)
+    return { status: 'applied', invoice: next }
+  }
+
   // Probe the current invoice on mount (the tab refetches fresh on each open) to
   // decide Create vs Rewrite. 404 INVOICE_NOT_FOUND = no invoice yet = Create. Any
   // other failure also defaults to Create — the backend stays authoritative (a real
   // existing invoice is caught by 409 INVOICE_ALREADY_EXISTS, which flips this to
-  // Rewrite). Uses a per-run cancelled guard, not mountedRef.
+  // Rewrite). The probe never binds a Rewrite (Batch A PR 2, #149): it only informs
+  // the button and the pre-open overpaid hint. Uses a per-run cancelled guard plus
+  // the sequenced install above.
   useEffect(() => {
     let cancelled = false
     setInvoiceExists(null)
+    currentInvoiceRef.current = null
     setCurrentInvoice(null)
     setInvoiceActionError(null)
     setInvoicePreconditions([])
-    fetchCurrentInvoice(orderId)
-      .then((res) => {
-        if (cancelled) return
-        setInvoiceExists(true)
-        // Keep the invoice so the rewrite guard can read total_paid.
-        setCurrentInvoice(res.data.invoice)
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return
+    void readCurrentInvoice(true).then((outcome) => {
+      if (cancelled) return
+      if (outcome.status === 'failed') {
+        // No readable answer and nothing newer installed: default to Create.
+        currentInvoiceRef.current = null
         setCurrentInvoice(null)
-        if (err instanceof ApiError && err.code === 'INVOICE_NOT_FOUND') {
-          setInvoiceExists(false)
-          return
-        }
         setInvoiceExists(false)
-      })
+      }
+    })
     return () => {
       cancelled = true
     }
+    // readCurrentInvoice reads everything through refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orderId])
 
   // GP health flag already computed by the backend financial summary (Chunk 3).
-  // The confirmation popup is a FRONTEND guard only — it never changes the create/
-  // rewrite call or invents backend manager-approval behaviour.
+  // The GP warning in the confirmation is a FRONTEND hint only — it never changes
+  // the create/rewrite call or invents backend manager-approval behaviour. (Since
+  // Batch A PR 2, #149, the Rewrite confirmation also carries the version it was
+  // bound to, which the server checks authoritatively; see RewriteBinding.)
   const gpWarning = financialSummary?.gp_warning ?? false
   // Busy guard for ALL invoice actions. Includes salePriceMutationInFlight (Update
   // Sale Price / Reset Price, in flight in the always-mounted shell) so a Create /
@@ -764,21 +907,33 @@ export function DetailsOfSaleTab({
     creatingInvoice || rewritingInvoice || salePriceMutationInFlight
 
   // Overpaid-rewrite guard (MVP, frontend-only — no refunds, no negative balance,
-  // no payment/backend changes). A Rewrite regenerates the invoice with the NEW
-  // live sale total; if payments already recorded on the current invoice exceed
-  // that new total, the rewrite would push the balance negative (the backend
-  // rejects it). Detect it from already-available state: the current invoice's
-  // total_paid (mount probe) vs the live final sale price inc GST
-  // (order_financial_summary). NO cost/GP data is used. Returns the amounts when
-  // paid exceeds the new total by at least a cent (avoids a float-rounding false
-  // positive at exact equality), else null (also null when either value is not
-  // safely available, so the guard never blocks on unknown data).
-  function overpaidRewriteAmounts(): { paid: number; newTotal: number } | null {
-    const paid = currentInvoice?.total_paid
-    const newTotal = financialSummary?.final_sale_price_inc_gst
+  // no payment/backend changes; the backend's own overpaid backstop, #135, is
+  // unchanged). A Rewrite regenerates the invoice with the NEW live sale total; if
+  // payments already recorded on the current invoice exceed that new total, the
+  // rewrite would push the balance negative (the backend rejects it). Detect it
+  // from already-available state: a current invoice's total_paid vs the live final
+  // sale price inc GST (order_financial_summary). NO cost/GP data is used. Returns
+  // the amounts when paid exceeds the new total by at least a cent (avoids a
+  // float-rounding false positive at exact equality), else null (also null when
+  // either value is not safely available, so the guard never blocks on unknown
+  // data). overpaidRewriteAmounts is the pre-open hint (the last installed
+  // invoice); since Batch A PR 2 (#149) the same check runs again against the
+  // Rewrite binding's own total_paid once that read lands, and the fallback after
+  // a failed Rewrite uses the bound total_paid too.
+  function overpaidAmountsFor(
+    paid: number | undefined,
+    newTotal: number | undefined,
+  ): { paid: number; newTotal: number } | null {
     if (typeof paid !== 'number' || typeof newTotal !== 'number') return null
     if (paid - newTotal > 0.005) return { paid, newTotal }
     return null
+  }
+
+  function overpaidRewriteAmounts(): { paid: number; newTotal: number } | null {
+    return overpaidAmountsFor(
+      currentInvoice?.total_paid,
+      financialSummary?.final_sale_price_inc_gst,
+    )
   }
 
   function applyInvoiceActionError(err: unknown, fallback: string) {
@@ -879,9 +1034,17 @@ export function DetailsOfSaleTab({
       onInvoiceReady()
     } catch (err) {
       if (!mountedRef.current) return
-      // An invoice already exists (state drifted) — flip the action to Rewrite.
+      // An invoice already exists (state drifted) — flip the action to Rewrite and
+      // show the server message (Batch A PR 2, #149). No Rewrite binding is
+      // created here: the next Rewrite click makes its own fresh read.
       if (err instanceof ApiError && err.code === 'INVOICE_ALREADY_EXISTS') {
         setInvoiceExists(true)
+        setInvoicePreconditions([])
+        setInvoiceActionError(
+          err.message.length > 0
+            ? err.message
+            : 'An invoice already exists for this order. Use Rewrite Invoice to create a new version.',
+        )
         return
       }
       applyInvoiceActionError(
@@ -891,15 +1054,133 @@ export function DetailsOfSaleTab({
     } finally {
       if (mountedRef.current) {
         setCreatingInvoice(false)
-        setConfirmAction(null)
+        closeInvoiceActionModal()
       }
     }
   }
 
+  // Batch A PR 2 (#149) - the ONE close path of the invoice action modal (Cancel,
+  // Escape, the backdrop, Create Quote, and the end of a Create / Rewrite). It drops
+  // the Rewrite binding, so a binding read that lands later is discarded and a later
+  // Confirm can never post. The modal's own onClose still refuses to dismiss while a
+  // real Create / Rewrite is in flight.
+  function closeInvoiceActionModal() {
+    rewriteBindingRef.current = null
+    setRewriteBinding(null)
+    setConfirmAction(null)
+  }
+
+  // Batch A PR 2 (#149) - the Rewrite confirmation's fresh read of the current
+  // invoice: a new key, the binding cleared to 'loading', then GET
+  // .../invoices/current. Started from the click handler (and from Try again),
+  // never from an effect, and never sets the invoice-action busy flag, so Cancel,
+  // Escape, the backdrop and Create Quote keep working while it waits (no timeout).
+  // The read may install only while the open binding is still this key for this
+  // order (its canInstall, checked by readCurrentInvoice before the floor advances
+  // or anything installs). Once Cancel, Escape, the backdrop, Create Quote or an
+  // unmount has cleared the binding, or a newer opening has replaced it, a late
+  // 200 or 404 changes nothing: no install, no floor change, no binding. A usable
+  // 200 for the open key installs through the sequenced path and binds the version
+  // shown; only 404 INVOICE_NOT_FOUND means "no invoice" (close, flip to Create,
+  // say so); any other failure — or an older / foreign / superseded answer —
+  // leaves the modal on its error with Try again. Nothing is retried automatically.
+  async function startRewriteBindingRead() {
+    rewriteKeySeqRef.current += 1
+    const key = rewriteKeySeqRef.current
+    const requestOrderId = orderIdRef.current
+    const loading: RewriteBinding = {
+      status: 'loading',
+      key,
+      orderId: requestOrderId,
+    }
+    rewriteBindingRef.current = loading
+    setRewriteBinding(loading)
+    const outcome = await readCurrentInvoice(true, () => {
+      const binding = rewriteBindingRef.current
+      return (
+        binding !== null &&
+        binding.key === key &&
+        binding.orderId === requestOrderId
+      )
+    })
+    const open = rewriteBindingRef.current
+    if (
+      !mountedRef.current ||
+      open === null ||
+      open.key !== key ||
+      orderIdRef.current !== requestOrderId
+    ) {
+      return
+    }
+    if (outcome.status === 'applied') {
+      if (outcome.invoice === null) {
+        closeInvoiceActionModal()
+        setInvoicePreconditions([])
+        setInvoiceActionError(NO_INVOICE_TO_REWRITE_MESSAGE)
+        return
+      }
+      const invoice = outcome.invoice
+      const ready: RewriteBinding = {
+        status: 'ready',
+        key,
+        orderId: requestOrderId,
+        invoiceId: invoice.invoice_id,
+        versionNumber: invoice.version_number,
+        acceptedAt: invoice.accepted_at,
+        acceptedCustomerName: invoice.accepted_customer_name,
+        totalPaid: invoice.total_paid,
+      }
+      rewriteBindingRef.current = ready
+      setRewriteBinding(ready)
+      return
+    }
+    const failed: RewriteBinding = { status: 'error', key, orderId: requestOrderId }
+    rewriteBindingRef.current = failed
+    setRewriteBinding(failed)
+  }
+
+  function handleRetryRewriteBinding() {
+    if (confirmAction !== 'rewrite' || invoiceActionBusy) return
+    void startRewriteBindingRead()
+  }
+
+  // Batch A PR 2 (#149) - after a stale Rewrite: re-read the current invoice in the
+  // background (never awaited by the failed request) so the known invoice — and
+  // with it the pre-open overpaid hint — catches up. It never creates a binding
+  // and never re-posts; a failure keeps the last known state and the stale
+  // message, and a 404 changes nothing.
+  function refreshCurrentInvoiceInBackground() {
+    void readCurrentInvoice(false)
+  }
+
   async function runRewriteInvoice() {
     // Rewrite is blocked when LAID — the backend is the authority (422
-    // ORDER_LOCKED); this just disables the path early.
-    if (invoiceActionBusy || locked) return
+    // ORDER_LOCKED); this just disables the path early. Batch A PR 2 (#149): a
+    // synchronous in-flight ref, and a READY binding for the open confirmation of
+    // THIS order, whose version is captured before any await: the POST carries
+    // that version and nothing else (never the mount probe, the known invoice or a
+    // later read). An overpaid binding cannot be confirmed.
+    if (invoiceActionBusy || locked || rewriteInFlightRef.current) return
+    const binding = rewriteBindingRef.current
+    if (
+      binding === null ||
+      binding.status !== 'ready' ||
+      binding.orderId !== orderIdRef.current
+    ) {
+      return
+    }
+    if (
+      overpaidAmountsFor(
+        binding.totalPaid,
+        financialSummaryRef.current?.final_sale_price_inc_gst,
+      ) !== null
+    ) {
+      return
+    }
+    const expectedVersionNumber = binding.versionNumber
+    const boundTotalPaid = binding.totalPaid
+    const requestOrderId = binding.orderId
+    rewriteInFlightRef.current = true
     setRewritingInvoice(true)
     setInvoiceActionError(null)
     setInvoicePreconditions([])
@@ -909,16 +1190,35 @@ export function DetailsOfSaleTab({
       // customer and details. On failure stay on Details and do NOT rewrite.
       const detailsReady = await flushDetailsBeforeInvoice()
       if (!detailsReady) return
-      if (!mountedRef.current) return
-      // D.2 rewrite — body is always {}. Regenerates the current invoice. On
-      // success switch straight to the Invoice tab (no success notice, no View
-      // button) so the rewritten invoice is shown immediately.
-      await rewriteInvoice(orderId)
+      if (!mountedRef.current || orderIdRef.current !== requestOrderId) return
+      // D.2 rewrite — since Batch A PR 2 (#149) the body is exactly
+      // {"expected_version_number": N}, the version the confirmation was bound to;
+      // the server compares it under the order lock. Regenerates the current
+      // invoice. On success switch straight to the Invoice tab (no success notice,
+      // no View button) so the rewritten invoice is shown immediately.
+      await rewriteInvoice(requestOrderId, expectedVersionNumber)
       if (!mountedRef.current) return
       setInvoiceExists(true)
       onInvoiceReady()
     } catch (err) {
       if (!mountedRef.current) return
+      // Batch A PR 2 (#149): another version became current after the
+      // confirmation was bound (a signature, a payment, a void, Path A or another
+      // Rewrite). Handled FIRST, before the overpaid fallback, so it is never
+      // masked. Show the server message, drop the binding and re-read in the
+      // background (not awaited here, so finally still closes the modal and frees
+      // the busy flag). Never re-posted: a new click opens a new confirmation,
+      // bound to a fresh read (and warns when that version is signed).
+      if (err instanceof ApiError && err.code === 'INVOICE_VERSION_STALE') {
+        rewriteBindingRef.current = null
+        setRewriteBinding(null)
+        setInvoicePreconditions([])
+        setInvoiceActionError(
+          err.message.length > 0 ? err.message : INVOICE_STALE_MESSAGE,
+        )
+        refreshCurrentInvoiceInBackground()
+        return
+      }
       // No invoice to rewrite (state drifted) — flip the action back to Create.
       if (err instanceof ApiError && err.code === 'INVOICE_REQUIRED') {
         setInvoiceExists(false)
@@ -930,10 +1230,13 @@ export function DetailsOfSaleTab({
         )
         return
       }
-      // Defensive: if the rewrite still failed and current state shows payments
+      // Defensive: if the rewrite still failed and the BOUND invoice's payments
       // already exceed the new total, show the friendly overpayment message rather
       // than a generic "unexpected error".
-      const overpaid = overpaidRewriteAmounts()
+      const overpaid = overpaidAmountsFor(
+        boundTotalPaid,
+        financialSummaryRef.current?.final_sale_price_inc_gst,
+      )
       if (overpaid) {
         setInvoicePreconditions([])
         setInvoiceActionError(overpaidRewriteMessage(overpaid))
@@ -944,9 +1247,10 @@ export function DetailsOfSaleTab({
         'Could not rewrite the invoice. Please try again.',
       )
     } finally {
+      rewriteInFlightRef.current = false
       if (mountedRef.current) {
         setRewritingInvoice(false)
-        setConfirmAction(null)
+        closeInvoiceActionModal()
       }
     }
   }
@@ -963,19 +1267,34 @@ export function DetailsOfSaleTab({
     setConfirmAction('create')
   }
 
-  // Phase 16D-B: Create Quote from the action modal. Closes the modal and hands
-  // off to the shell (reveal Quote tab + switch). No invoice call, no order
-  // mutation. Only actionable once the quote probe confirmed no saved draft.
+  // Phase 16D-B: Create Quote from the action modal. Closes the modal (through the
+  // shared close path, which also drops any Rewrite binding, so a Confirm can never
+  // post afterwards) and hands off to the shell (reveal Quote tab + switch). No
+  // invoice call, no order mutation. Only actionable once the quote probe
+  // confirmed no saved draft.
   function handleCreateQuoteClick() {
     if (invoiceActionBusy || createQuoteAvailability !== 'enabled') return
-    setConfirmAction(null)
+    closeInvoiceActionModal()
     onCreateQuote()
   }
 
   // Rewrite: ALWAYS confirm (it regenerates the invoice and makes the changes
-  // official). The GP warning, when active, is shown in the same modal.
+  // official). The GP warning, when active, is shown in the same modal. Batch A
+  // PR 2 (#149): only from a mounted tab with a known invoice, nothing in flight
+  // and NO modal already open (keyboard focus can reach this button behind the
+  // modal); every opening gets a fresh key and its own read of the current invoice
+  // (startRewriteBindingRead), and Confirm stays disabled until that read is bound.
   function handleRewriteInvoiceClick() {
-    if (invoiceActionBusy || locked || invoiceExists === null) return
+    if (!mountedRef.current) return
+    if (
+      invoiceActionBusy ||
+      rewriteInFlightRef.current ||
+      locked ||
+      invoiceExists !== true ||
+      confirmAction !== null
+    ) {
+      return
+    }
     // Overpaid-rewrite guard: block BEFORE opening the confirmation / calling the
     // API when payments already exceed the new live total. Show the inline error
     // near the action row; do not open the modal, call rewriteInvoice, or navigate.
@@ -988,6 +1307,7 @@ export function DetailsOfSaleTab({
     setInvoiceActionError(null)
     setInvoicePreconditions([])
     setConfirmAction('rewrite')
+    void startRewriteBindingRead()
   }
 
   function handleConfirmInvoiceAction() {
@@ -1083,6 +1403,27 @@ export function DetailsOfSaleTab({
     confirmAction === null &&
     overpaidRewriteAmounts() !== null &&
     createQuoteAvailability !== 'hidden'
+  // Batch A PR 2 (#149): the open Rewrite confirmation's binding, only for THIS
+  // order. Confirm is enabled exactly when it is ready and not overpaid; the
+  // signed warning renders from the same binding, so it appears in the same render
+  // that enables Confirm.
+  const openRewriteBinding =
+    confirmAction === 'rewrite' &&
+    rewriteBinding !== null &&
+    rewriteBinding.orderId === orderId
+      ? rewriteBinding
+      : null
+  const rewriteBindingOverpaid =
+    openRewriteBinding !== null && openRewriteBinding.status === 'ready'
+      ? overpaidAmountsFor(
+          openRewriteBinding.totalPaid,
+          financialSummary?.final_sale_price_inc_gst,
+        )
+      : null
+  const rewriteConfirmReady =
+    openRewriteBinding !== null &&
+    openRewriteBinding.status === 'ready' &&
+    rewriteBindingOverpaid === null
 
   return (
     <div>
@@ -1462,13 +1803,16 @@ export function DetailsOfSaleTab({
           confirm here. The GP warning, when active, is shown so the user
           explicitly accepts the below-threshold price — it never removes or
           blocks Create Quote. While no quote exists for this order the modal
-          also offers Create Quote (a separate sibling action — the
-          create/rewrite confirm flow itself is unchanged). FRONTEND
-          confirmation only — it does not change backend behaviour. */}
+          also offers Create Quote (a separate sibling action). The Create
+          confirmation and the GP warning are frontend steps only. Batch A PR 2
+          (#149): the Rewrite confirmation is bound to its own fresh read of the
+          current invoice (Checking… / an error with Try again / ready, with the
+          signed warning when that version is signed); Confirm posts that
+          version, which the server compares under the order lock. */}
       <Modal
         open={confirmAction !== null}
         onClose={() => {
-          if (!invoiceActionBusy) setConfirmAction(null)
+          if (!invoiceActionBusy) closeInvoiceActionModal()
         }}
         labelledBy="invoice-action-confirm-title"
       >
@@ -1486,6 +1830,51 @@ export function DetailsOfSaleTab({
               latest saved order details and make those changes official.
             </p>
           )}
+
+          {/* Batch A PR 2 (#149): the binding read for this opening. No version
+              number is shown (the MVP shows no version labels). */}
+          {confirmAction === 'rewrite' &&
+            (openRewriteBinding === null ||
+            openRewriteBinding.status === 'loading' ? (
+              <p className="mt-3 text-sm text-slate-500">
+                Checking the current invoice…
+              </p>
+            ) : openRewriteBinding.status === 'error' ? (
+              <div className="mt-3 flex flex-col gap-2 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+                <p className="text-sm text-amber-800">
+                  The current invoice could not be checked, so the rewrite cannot
+                  be confirmed yet.
+                </p>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="sm"
+                  disabled={invoiceActionBusy}
+                  onClick={handleRetryRewriteBinding}
+                >
+                  Try again
+                </Button>
+              </div>
+            ) : (
+              <>
+                {openRewriteBinding.acceptedAt !== null && (
+                  <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50 px-4 py-3">
+                    <p className="break-words text-sm font-semibold text-amber-900">
+                      This invoice was signed by{' '}
+                      {openRewriteBinding.acceptedCustomerName ?? 'the customer'}{' '}
+                      on {formatTimestamp(openRewriteBinding.acceptedAt)}.
+                      Rewriting it clears the signature, and the customer will
+                      need to sign the new invoice again.
+                    </p>
+                  </div>
+                )}
+                {rewriteBindingOverpaid !== null && (
+                  <p className="mt-3 text-sm font-medium text-red-600" role="alert">
+                    {overpaidRewriteMessage(rewriteBindingOverpaid)}
+                  </p>
+                )}
+              </>
+            ))}
 
           {/* Customer-safe manager-approval warning. Always plain red text (no
               yellow background/border, no GP-tier colours, not derived from GP%) —
@@ -1546,7 +1935,7 @@ export function DetailsOfSaleTab({
               type="button"
               variant="secondary"
               size="md"
-              onClick={() => setConfirmAction(null)}
+              onClick={closeInvoiceActionModal}
               disabled={invoiceActionBusy}
             >
               Cancel
@@ -1556,7 +1945,10 @@ export function DetailsOfSaleTab({
               variant="success"
               size="md"
               onClick={handleConfirmInvoiceAction}
-              disabled={invoiceActionBusy}
+              disabled={
+                invoiceActionBusy ||
+                (confirmAction === 'rewrite' && !rewriteConfirmReady)
+              }
             >
               {invoiceActionBusy
                 ? confirmAction === 'rewrite'

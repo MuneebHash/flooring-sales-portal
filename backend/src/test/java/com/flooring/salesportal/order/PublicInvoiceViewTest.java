@@ -699,7 +699,7 @@ class PublicInvoiceViewTest {
     void deadLink_rewrittenByAManualRewrite_viewShowsOnlyStateBusinessNameAndMessage_actionsAre410() throws Exception {
         long orderId = invoicedOrder();
         String token = sendLink(orderId);
-        rewrite(orderId);
+        rewrite(orderId, 1);
         Assertions.assertEquals(2, currentVersion(orderId), "fixture: the Rewrite appended v2");
         Map<String, Object> row = tokenRow(token);
         Assertions.assertEquals("REWRITTEN", row.get("status"), "fixture: the Rewrite killed the link");
@@ -1729,10 +1729,11 @@ class PublicInvoiceViewTest {
                 201, "fixture: D.8 in-store accept");
     }
 
-    /** D.2 manual Rewrite (201). */
-    private void rewrite(long orderId) throws Exception {
+    /** D.2 manual Rewrite carrying {@code currentVersion} as its expected_version_number (201; Batch A PR 2, #149). */
+    private void rewrite(long orderId, int currentVersion) throws Exception {
         staffCall(post(orderUrl(orderId) + "/invoices/rewrite").session(session())
-                .contentType(MediaType.APPLICATION_JSON).content("{}"), 201, "fixture: D.2 rewrite");
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"expected_version_number\":" + currentVersion + "}"), 201, "fixture: D.2 rewrite");
     }
 
     /** D.7 CASH payment (appends a version): 201; returns the payment id. */

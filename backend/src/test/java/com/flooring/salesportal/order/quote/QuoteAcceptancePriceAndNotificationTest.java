@@ -333,10 +333,14 @@ class QuoteAcceptancePriceAndNotificationTest {
     @Test
     void accept_zeroTotalQuote_noLines_nullDetailsOfSale_accepts_zeroPriceWithNullGpPercent() throws Exception {
         long orderId = readyOrder();
-        Assertions.assertNull(jdbcTemplate.queryForObject(
-                "SELECT details_of_sale FROM sales_order WHERE order_id = ?", String.class, orderId));
         saveNonItemisedDraft(orderId, "0.00");
         String token = sendEmailAndExtractToken(orderId);
+        // Batch A PR 2 (#134): a send needs non-blank saved Details of Sale, so a version frozen with NULL details
+        // exists only as legacy data. Seed that legacy snapshot after the legitimate issue (the
+        // QuoteInvoiceConversionControllerTest pattern): the public accept still has no details check (16B §7.2).
+        jdbcTemplate.update("UPDATE quote_version SET details_of_sale_snapshot = NULL "
+                + "WHERE order_id = ? AND version_number = 1", orderId);
+        entityManager.clear();
         Map<String, Object> issued = versionRow(orderId, 1);
         assertMoneyDb("0.00", issued.get("quote_total_inc_gst"), "frozen quote_total_inc_gst");
         assertMoneyDb("0.00", issued.get("quote_total_ex_gst"), "frozen quote_total_ex_gst");
@@ -947,17 +951,21 @@ class QuoteAcceptancePriceAndNotificationTest {
         return insertOrderInStore(STORE_SYD_CBD, status);
     }
 
+    // Batch A PR 2 (#134): a quote send needs non-blank saved Details of Sale, so every order this fixture
+    // seeds carries neutral details (no "Carpet" / "Underlay").
+    private static final String FIXTURE_DETAILS_OF_SALE = "Supply and install as quoted (acceptance price test).";
+
     private long insertOrderInStore(int storeId, String status) {
         int s = ++seq;
         String orderNumber = "QAPRC.ZZ9." + String.format("%05d", s % 100_000);
         return jdbcTemplate.queryForObject(
                 "INSERT INTO sales_order "
                         + "(business_id, store_id, user_id, order_sequence_number, order_number, "
-                        + " flooring_type, order_status, week_number, week_year) "
-                        + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, ?::order_status, 1, 2026) "
+                        + " flooring_type, order_status, week_number, week_year, details_of_sale) "
+                        + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, ?::order_status, 1, 2026, ?) "
                         + "RETURNING order_id",
                 Long.class,
-                BUSINESS_AUSSIE, storeId, USER_LIAM, s, orderNumber, status);
+                BUSINESS_AUSSIE, storeId, USER_LIAM, s, orderNumber, status, FIXTURE_DETAILS_OF_SALE);
     }
 
     /** A send-ready LEAD order in store 1: customer "Quote Accepter" (valid email) + billing address. */

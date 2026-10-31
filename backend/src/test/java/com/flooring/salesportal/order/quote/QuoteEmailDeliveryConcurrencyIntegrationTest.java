@@ -629,6 +629,10 @@ class QuoteEmailDeliveryConcurrencyIntegrationTest {
                 businessId, staffUserId, storeId);
     }
 
+    // Batch A PR 2 (#134): a quote send needs non-blank saved Details of Sale, so the seeded order carries
+    // neutral details.
+    private static final String FIXTURE_DETAILS_OF_SALE = "Supply and install as quoted (email delivery race).";
+
     /**
      * A committed LEAD order ready for a quote send: a customer with a valid email, a BILLING address (the V17
      * snapshot source) and one 100.00 ex / 40.00 cost charge line (so the 250.00-ex quote is never below cost).
@@ -637,10 +641,10 @@ class QuoteEmailDeliveryConcurrencyIntegrationTest {
         String orderNumber = STORE_CODE + "." + STAFF_CODE + ".00001";
         Long orderId = jdbcTemplate.queryForObject(
                 "INSERT INTO sales_order (business_id, store_id, user_id, order_sequence_number, order_number, "
-                        + " flooring_type, order_status, week_number, week_year) "
-                        + "VALUES (?, ?, ?, 1, ?, 'SOFT'::flooring_type, 'LEAD'::order_status, 43, 2026) "
+                        + " flooring_type, order_status, week_number, week_year, details_of_sale) "
+                        + "VALUES (?, ?, ?, 1, ?, 'SOFT'::flooring_type, 'LEAD'::order_status, 43, 2026, ?) "
                         + "RETURNING order_id",
-                Long.class, businessId, storeId, staffUserId, orderNumber);
+                Long.class, businessId, storeId, staffUserId, orderNumber, FIXTURE_DETAILS_OF_SALE);
         Assertions.assertNotNull(orderId, "setup: order insert returned no id");
         jdbcTemplate.update(
                 "INSERT INTO order_customer (order_id, first_name, last_name, email, mobile) "

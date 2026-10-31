@@ -120,15 +120,23 @@ export function createInvoice(
 }
 
 // POST /api/v1/{slug}/orders/{orderId}/invoices/rewrite — regenerate the current invoice from the
-// live order state. The body MUST be {}. BLOCKED on LAID orders (422 ORDER_LOCKED, checked first);
-// 422 INVOICE_REQUIRED when there is no invoice to rewrite; 422 INVOICE_PRECONDITIONS_NOT_MET (with
-// details[]) otherwise.
+// live order state. Since Batch A PR 2 (#149) the body is exactly {"expected_version_number": N}:
+// the version_number of the current invoice the Details of Sale confirmation was bound to (its own
+// fresh read, never the mount probe), which the server only COMPARES with the current version it
+// reads under the order lock — a mismatch is 409 INVOICE_VERSION_STALE ("Invoice updated, please
+// refresh") with nothing written. There is no omit-to-skip form: a missing, null, repeated or
+// non-positive-integer value, any other field (due_date included) or a non-object body is a 400
+// VALIDATION_FAILED (before Batch A PR 2 the body had to be {}). Check order: 422 ORDER_LOCKED (LAID)
+// first, then 422 INVOICE_REQUIRED when there is no invoice to rewrite, then the body, then the
+// stale 409, then 422 CUSTOMER_EMAIL_* / INVOICE_PRECONDITIONS_NOT_MET (with details[]). A matching
+// Rewrite of a signed invoice succeeds and clears the signature (the new version is unsigned).
 export function rewriteInvoice(
   orderId: number,
+  expectedVersionNumber: number,
 ): Promise<ApiSuccess<InvoiceResponse>> {
   return post<ApiSuccess<InvoiceResponse>>(
     apiPath(getActiveSlug(), `/orders/${orderId}/invoices/rewrite`),
-    {},
+    { expected_version_number: expectedVersionNumber },
   )
 }
 

@@ -114,10 +114,12 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
  *       is refused by the strict newer-signature rule D5(b): 409 {@code INVOICE_ALREADY_ACCEPTED} with the Path A
  *       wording. Path A first: Path A converts the accepted quote into a signed v2 and kills the link as SIGNED;
  *       the queued remote accept gets 410 {@code INVOICE_LINK_SIGNED}.</li>
- *   <li><b>Remote accept vs Rewrite.</b> Remote first: the remote signs v2; the queued Rewrite then appends an
- *       unsigned v3 from the live order (the signature cleared) and finds no ACTIVE link to kill - the dead link
- *       stays SIGNED (a dead token never changes status). Rewrite first: Rewrite appends an unsigned v2 and kills
- *       the link as REWRITTEN; the queued remote accept gets 410 {@code INVOICE_LINK_REWRITTEN}.</li>
+ *   <li><b>Remote accept vs Rewrite.</b> Remote first: the remote signs v2; the queued Rewrite, still carrying the
+ *       v1 its confirmation was bound to, is refused under the lock with 409 {@code INVOICE_VERSION_STALE} (Batch
+ *       A PR 2, #149; before it the Rewrite appended an unsigned v3 over the signature) - the dead link stays
+ *       SIGNED. Rewrite first: Rewrite (carrying v1) appends an unsigned v2 and kills the link as REWRITTEN; the
+ *       queued remote accept gets 410 {@code INVOICE_LINK_REWRITTEN} from its token gate, before any version
+ *       comparison.</li>
  *   <li><b>Double remote accept</b> with the same token and the same expected version: the queue head signs, the
  *       queued duplicate gets 410 {@code INVOICE_LINK_SIGNED}; exactly one appended version, one signature file,
  *       one PDF, one customer email and one store notification.</li>
@@ -676,15 +678,16 @@ class RemoteInvoiceAcceptRaceIntegrationTest {
     // ================================================================
 
     /**
-     * The REMOTE ACCEPT locks first: it is observed waiting on the holder, then a Rewrite is observed queued
-     * BEHIND it; the holder rolls back. The remote accept signs v1 into v2 (the link SIGNED, D5(c) applied),
-     * commits, emails v2 and notifies the store. The Rewrite then takes the lock and appends v3 from the LIVE
-     * order - unsigned (Rewrite clears the signature), unemailed, dated today - and finds no ACTIVE link to kill:
-     * the dead link stays SIGNED, never REWRITTEN. The remote's own v2 keeps its delivery stamp while the mirror
-     * follows the current, unemailed v3 (null), whichever of the stamp and the Rewrite committed first.
+     * The REMOTE ACCEPT locks first: it is observed waiting on the holder, then a Rewrite carrying the v1 its
+     * screen was bound to is observed queued BEHIND it; the holder rolls back. The remote accept signs v1 into v2
+     * (the link SIGNED, D5(c) applied), commits, emails v2 and notifies the store. The Rewrite then takes the lock,
+     * reads the current invoice there (the remote's signed v2) and refuses the v1 it carries: 409
+     * {@code INVOICE_VERSION_STALE} (Batch A PR 2, #149). Nothing of the Rewrite's is written - no unsigned v3, no
+     * PDF or stored_file, no mirror reset, no link kill - and it sends nothing, so the remote signature the
+     * salesperson never saw is not cleared. (Before #149 this queued Rewrite appended an unsigned v3.)
      */
     @Test
-    void remoteAcceptVsRewrite_remoteLocksFirst_remoteSignsV2_rewriteAppendsUnsignedV3_signedLinkStaysSigned()
+    void remoteAcceptVsRewrite_remoteLocksFirst_remoteSignsV2_rewriteCarryingV1Gets409InvoiceVersionStale_writesNothing_signedLinkStaysSigned()
             throws Exception {
         LinkedOrder order = seedLinkedOrder();
         Map<String, Object> invoiceV1 = invoiceRow(order.orderId(), 1);
@@ -692,50 +695,49 @@ class RemoteInvoiceAcceptRaceIntegrationTest {
         Map<String, Object> issuedQuote = quoteVersionRow(order.orderId(), 1);
         Map<String, Object> issuedQuoteToken = activeQuoteTokenRow(order.issuedQuoteVersionId());
         OrderSnapshot before = snapshot(order.orderId());
-        LocalDate dayBefore = LocalDate.now();
 
         RaceResults race = raceInOrder(order.orderId(),
                 publicStep("remote accept (carrying v1)", remoteAccept(order.invoiceToken(), 1, REMOTE_SIGNATURE_PNG)),
-                staffStep("Rewrite", rewriteInvoice(order.orderId())));
-        LocalDate dayAfter = LocalDate.now();
+                staffStep("Rewrite (carrying v1)", rewriteInvoice(order.orderId(), 1)));
 
+        // The queue head signed; the Rewrite took the lock only after that commit and refused the v1 it carries.
         assertRemoteAccepted(race.first(), "remote accept (queue head)");
-        assertStatus(race.second(), 201, "Rewrite (queued behind the remote accept)");
-        JsonNode rewriteBody = json(race.second());
-        Assertions.assertEquals(Set.of("data", "message"), fieldNames(rewriteBody), "Rewrite: envelope keys");
-        Assertions.assertEquals(INVOICE_REWRITTEN_MESSAGE, rewriteBody.path("message").asText(), "Rewrite: message");
+        assertRefusal(race.second(), 409, ErrorCode.INVOICE_VERSION_STALE, INVOICE_VERSION_STALE_MESSAGE,
+                "Rewrite (carrying v1, queued behind the remote accept)");
 
-        Assertions.assertEquals(List.of(1, 2, 3), invoiceVersions(order.orderId()),
-                "v1, the remote accept's v2 and the Rewrite's v3");
+        // The winner's writes only: exactly v2, signed remotely and stamped by its delivered email - no v3.
+        Assertions.assertEquals(List.of(1, 2), invoiceVersions(order.orderId()),
+                "exactly v1 and the remote accept's v2 - no unsigned Rewrite version");
         SignedVersion signed = assertSigningVersion(order.orderId(), order.orderNumber(), invoiceV1, 2, senderUserId,
                 REMOTE_SIGNATURE_PNG, SignaturePngNormaliser.normalise(REMOTE_SIGNATURE_PNG), race,
                 "the remote accept's v2");
-        RewrittenVersion rewritten = assertRewriteVersion(order, invoiceV1, 3, dayBefore, dayAfter);
-        assertUnsignedInvoiceDetail(rewriteBody.path("data").path("invoice"), rewritten, "Rewrite 201");
 
-        // The header is unchanged: the mirror follows the current v3 (null), as before the race.
-        assertSnapshot(before.withInvoices(append(before.invoices(), signed.row(), rewritten.row()))
-                        .withStoredFiles(append(before.storedFiles(), signed.signatureFile(), signed.pdfFile(),
-                                rewritten.pdfFile()))
-                        .withFilesOnDisk(plus(before.filesOnDisk(), signed.signaturePath(), signed.pdfPath(),
-                                rewritten.pdfPath()))
+        // The committed state is exactly the seed plus the remote accept's own writes (its stamp moved the mirror
+        // to v2's delivery time) - nothing of the refused Rewrite's.
+        assertSnapshot(before.withHeader(withColumns(before.header(), "last_emailed_at", signed.stamp()))
+                        .withInvoices(append(before.invoices(), signed.row()))
+                        .withStoredFiles(append(before.storedFiles(), signed.signatureFile(), signed.pdfFile()))
+                        .withFilesOnDisk(plus(before.filesOnDisk(), signed.signaturePath(), signed.pdfPath()))
                         .withInvoiceTokens(replaceRow(before.invoiceTokens(), "invoice_token_id",
                                 withColumns(link, "status", "SIGNED", "dead_at", signed.acceptedAt())))
                         .withQuoteVersions(replaceRow(before.quoteVersions(), "quote_version_id",
                                 withColumns(issuedQuote, "status", "CANCELLED")))
                         .withQuoteTokens(replaceRow(before.quoteTokens(), "quote_token_id",
                                 withColumns(issuedQuoteToken, "status", "CANCELLED", "dead_at", signed.acceptedAt()))),
-                snapshot(order.orderId()), "after the remote signing and the Rewrite queued behind it");
+                snapshot(order.orderId()), "after the remote signing and the refused Rewrite queued behind it");
+        assertOnlySignatureImages(order.orderId(), List.of(signed.signatureFile()),
+                "only the remote accept's signature image");
 
         // Messages: exactly the remote accept's email of v2 and its notification - the Rewrite sends nothing.
         assertRaceMessages(order.orderId(), order.orderNumber(), signed, signed, "remote first vs Rewrite");
         Assertions.assertEquals(List.of(), race.serviceWarnings(), "no WARN from either service");
 
-        // Final: the link stays SIGNED (a dead token never changes status); v3 current, unsigned; mirror null.
+        // Final: the link stays SIGNED (a dead token never changes status, and the refused Rewrite killed nothing);
+        // v2 current and signed; the mirror = v2's stamp.
         assertFinalLink(order.orderId(), order.invoiceTokenId(), "SIGNED", signed.acceptedAt());
-        assertCurrentVersionAndMirror(order.orderId(), 3, null, null);
+        assertCurrentVersionAndMirror(order.orderId(), 2, signed.acceptedAt(), signed.stamp());
         assertPublicDeadView(order.invoiceToken(), "SIGNED", INVOICE_LINK_SIGNED_MESSAGE);
-        assertStaffReadShowsNoLink(order.orderId(), 3, null, null);
+        assertStaffReadShowsNoLink(order.orderId(), 2, signed.acceptedAt(), signed.stamp());
     }
 
     /**
@@ -756,7 +758,7 @@ class RemoteInvoiceAcceptRaceIntegrationTest {
         LocalDate dayBefore = LocalDate.now();
 
         RaceResults race = raceInOrder(order.orderId(),
-                staffStep("Rewrite", rewriteInvoice(order.orderId())),
+                staffStep("Rewrite (carrying v1)", rewriteInvoice(order.orderId(), 1)),
                 publicStep("remote accept (carrying v1)", remoteAccept(order.invoiceToken(), 1, REMOTE_SIGNATURE_PNG)));
         LocalDate dayAfter = LocalDate.now();
 
@@ -1294,10 +1296,14 @@ class RemoteInvoiceAcceptRaceIntegrationTest {
                 .content("{\"quote_version_id\": " + seenAcceptedQuoteVersionId + "}");
     }
 
-    /** D.2 manual Rewrite with the empty body. */
-    private RequestBuilder rewriteInvoice(long orderId) {
+    /**
+     * D.2 manual Rewrite (Batch A PR 2, #149): body {@code {"expected_version_number": N}} = the current invoice
+     * version the client's confirmation was bound to.
+     */
+    private RequestBuilder rewriteInvoice(long orderId, int seenVersion) {
         return post(orderUrl(orderId) + "/invoices/rewrite").session(session(staffUserId))
-                .contentType(MediaType.APPLICATION_JSON).content("{}");
+                .contentType(MediaType.APPLICATION_JSON)
+                .content("{\"expected_version_number\": " + seenVersion + "}");
     }
 
     // ================================================================

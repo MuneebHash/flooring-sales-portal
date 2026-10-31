@@ -1293,7 +1293,8 @@ class InvoiceQuoteSourceLifecycleTest {
 
         clearJpaCache();
         MvcResult result = mockMvc.perform(post(invoicesUrl(orderId) + "/rewrite").session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"expected_version_number\":" + currentInvoiceVersion(orderId) + "}"))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.message").value(INVOICE_REWRITTEN_MESSAGE))
                 .andReturn();
@@ -1343,7 +1344,8 @@ class InvoiceQuoteSourceLifecycleTest {
 
         clearJpaCache();
         mockMvc.perform(post(invoicesUrl(orderId) + "/rewrite").session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"expected_version_number\":" + currentInvoiceVersion(orderId) + "}"))
                 .andExpect(status().isCreated())
                 .andExpect(jsonPath("$.message").value(INVOICE_REWRITTEN_MESSAGE));
         clearJpaCache();
@@ -1771,7 +1773,8 @@ class InvoiceQuoteSourceLifecycleTest {
         jdbcTemplate.update("UPDATE order_customer SET email = NULL WHERE order_id = ?", orderId);
         clearJpaCache();
         mockMvc.perform(post(invoicesUrl(orderId) + "/rewrite").session(liamStore1Session())
-                        .contentType(MediaType.APPLICATION_JSON).content("{}"))
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"expected_version_number\":" + currentInvoiceVersion(orderId) + "}"))
                 .andExpect(status().isUnprocessableEntity())
                 .andExpect(jsonPath("$.error.code").value("CUSTOMER_EMAIL_REQUIRED"))
                 .andExpect(jsonPath("$.error.message").value(CUSTOMER_EMAIL_REQUIRED_MESSAGE));

@@ -160,17 +160,21 @@ class PublicQuoteControllerTest {
         entityManager.clear();
     }
 
+    // Batch A PR 2 (#134): a quote send needs non-blank saved Details of Sale, so every order this fixture
+    // seeds carries neutral details (no "Carpet" / "Underlay": some PDF checks require those words absent).
+    private static final String FIXTURE_DETAILS_OF_SALE = "Supply and install as quoted (public quote test).";
+
     private long insertOrder(String status) {
         int s = ++seq;
         String orderNumber = "QPUBT.ZZ9." + String.format("%05d", s % 100_000);
         return jdbcTemplate.queryForObject(
                 "INSERT INTO sales_order "
                         + "(business_id, store_id, user_id, order_sequence_number, order_number, "
-                        + " flooring_type, order_status, week_number, week_year) "
-                        + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, ?::order_status, 1, 2026) "
+                        + " flooring_type, order_status, week_number, week_year, details_of_sale) "
+                        + "VALUES (?, ?, ?, ?, ?, 'SOFT'::flooring_type, ?::order_status, 1, 2026, ?) "
                         + "RETURNING order_id",
                 Long.class,
-                BUSINESS_AUSSIE, STORE_SYD_CBD, USER_LIAM, s, orderNumber, status);
+                BUSINESS_AUSSIE, STORE_SYD_CBD, USER_LIAM, s, orderNumber, status, FIXTURE_DETAILS_OF_SALE);
     }
 
     private void seedCustomer(long orderId) {

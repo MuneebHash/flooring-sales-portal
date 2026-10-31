@@ -65,6 +65,10 @@ public enum ErrorCode {
     QUOTE_NOT_FOUND(HttpStatus.NOT_FOUND, "No quote was found for this order."),
     QUOTE_BELOW_COST(HttpStatus.UNPROCESSABLE_ENTITY, "This quote is below cost and cannot be saved, sent, or accepted."),
     QUOTE_TOTAL_EXCEEDS_LINES(HttpStatus.UNPROCESSABLE_ENTITY, "The quote total cannot exceed the sum of its lines. Add or raise a line instead."),
+    // Batch A PR 2 (#134): send-email and the dormant send-sms (one shared prepareSend) refuse a send or
+    // resend while the order's saved details_of_sale is null or blank, read under the order lock after the
+    // below-cost re-check and before any write or delivery attempt. Single cause, so no details array.
+    QUOTE_DETAILS_OF_SALE_REQUIRED(HttpStatus.UNPROCESSABLE_ENTITY, "Details of sale is required before sending a quote."),
     // Phase 16E-A quote delivery codes (contract §12): cancel (QUOTE_NOT_ISSUED 422 /
     // QUOTE_ALREADY_ACCEPTED 409 — reachable since 16F PR1, when the public accept endpoint creates
     // ACCEPTED versions), stored-PDF download
@@ -98,9 +102,9 @@ public enum ErrorCode {
     QUOTE_LINK_INACTIVE(HttpStatus.GONE, "This quote link is no longer active. Please contact the store."),
     // Phase 16G PR 3 (#69, #123) version preconditions (16G contract §5): the mandatory expected value
     // is only COMPARED with the row read under the order lock, never used to select a row, so an old,
-    // forged or foreign value can only produce these 409s. INVOICE_VERSION_STALE: D.8 in-store accept
-    // and, since 16G PR 4, the public invoice accept and pdf. QUOTE_VERSION_STALE: Path A
-    // (POST .../quote/create-invoice).
+    // forged or foreign value can only produce these 409s. INVOICE_VERSION_STALE: D.8 in-store accept,
+    // since 16G PR 4 the public invoice accept and pdf, and since Batch A PR 2 (#149) D.2 Rewrite (its JSON
+    // expected_version_number). QUOTE_VERSION_STALE: Path A (POST .../quote/create-invoice).
     INVOICE_VERSION_STALE(HttpStatus.CONFLICT, "Invoice updated, please refresh"),
     QUOTE_VERSION_STALE(HttpStatus.CONFLICT, "The accepted quote changed while the confirmation was open. Review the accepted quote before creating an invoice."),
     // Phase 16G PR 4 public invoice-link codes (16G contract §7.2, §9, §14): the token-only public
